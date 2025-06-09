@@ -1,0 +1,12 @@
+__pycache__/
+.ipynb_checkpoints/
+egg-info/
+.~lock*
+*pdf
+*.db
+.env
+*.log
+*.egg-info/
+*.swp
+data/testdata/raw/
+*.mzML
