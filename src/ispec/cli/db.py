@@ -31,13 +31,11 @@ def dispatch(args):
 
     if args.subcommand == "status":
         operations.check_status()
-    elif args.subcommand == "status":
-        operations.check_status()
     elif args.subcommand == "show":
         operations.show_tables()
     elif args.subcommand == "import":
         operations.import_file(args.file)
     elif args.subcommand == "init":
-        operations.init(file_path=args.file)
+        operations.initialize(file_path=args.file)
     else:
         logger.info("no dispatched function provided for %s", args.subcommand)

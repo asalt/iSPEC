@@ -1,5 +1,5 @@
 
-CREATE TABLE IF NOT EXISTS people (
+CREATE TABLE IF NOT EXISTS person (
   ppl_id INTEGER PRIMARY KEY,
   ppl_AddedBy TEXT,
   ppl_CreationTS TEXT,
@@ -108,11 +108,11 @@ CREATE TABLE IF NOT EXISTS project (
   prj_Billing_ReadyToBill INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS letters_of_support (
+CREATE TABLE IF NOT EXISTS letter_of_support (
   id INTEGER PRIMARY KEY
 );
 
-CREATE TABLE IF NOT EXISTS project_people (
+CREATE TABLE IF NOT EXISTS project_person (
   id INTEGER PRIMARY KEY NOT NULL,
   project_id INTEGER NOT NULL,
   person_id INTEGER NOT NULL,
