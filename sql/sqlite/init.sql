@@ -150,7 +150,6 @@ CREATE TABLE IF NOT EXISTS letter_of_support (
 CREATE TABLE IF NOT EXISTS project_person (
   id INTEGER PRIMARY KEY,
   project_id INTEGER REFERENCES project(id),
-  person_id INTEGER REFERENCES person(id)
-);
-
-
+  person_id INTEGER REFERENCES person(id),
+  UNIQUE (person_id, project_id)
+)

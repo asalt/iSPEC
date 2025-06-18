@@ -61,8 +61,8 @@ class TableCRUD:
     TABLE = None
     REQ_COLS = None
 
-    def __init__(self, table_name: str = None, conn: sqlite3.Connection = None):
-        self.table = table_name or TABLE
+    def __init__(self, conn: sqlite3.Connection = None, table_name: str = None):
+        self.table = table_name or self.TABLE
         self.conn = conn
 
     @cache
@@ -70,7 +70,7 @@ class TableCRUD:
         result = self.conn.execute(f"PRAGMA table_info({self.table})")
         return [row[1] for row in result.fetchall()]
 
-    def validate_input(record: dict):
+    def validate_input(self, record: dict):
         if hasattr(self.REQ_COLS, "__iter__"):
             for col in self.REQ_COLS:
                 if col not in record.keys():
@@ -78,7 +78,7 @@ class TableCRUD:
 
     def insert(self, record: Dict[str, str]) -> int:
 
-        validate_input(record)
+        self.validate_input(record)
 
         keys = list(record.keys())
         values = [record[k] for k in keys]
@@ -106,20 +106,23 @@ class TableCRUD:
         return result.rowcount > 0
 
 
+
+
+
 class Person(TableCRUD):
 
     TABLE = "person"
-    REQ_COLS = ("ppl_Name_Last",)
+    REQ_COLS = ("ppl_Name_Last", "ppl_Name_First")
 
     def insert(self, record: dict):
 
-        validate_input(record)
+        self.validate_input(record)
 
-        last_name = person_dict.get("ppl_Name_Last", "").strip().lower()
-        first_name = person_dict.get("ppl_Name_First", "").strip().lower()
+        last_name = record.get("ppl_Name_Last", "").strip().lower()
+        first_name = record.get("ppl_Name_First", "").strip().lower()
 
         # Check for existing person (case-insensitive)
-        result = conn.execute(
+        result = self.conn.execute(
             "SELECT id FROM person WHERE LOWER(ppl_Name_Last) = ? AND LOWER(ppl_Name_First) = ? LIMIT 1",
             (last_name, first_name),
         ).fetchone()
@@ -145,24 +148,32 @@ class Project(TableCRUD):
         # rewrite for project specifi
         # check if project title matches an existing project title in the database
 
-        validate_input(record)
+        self.validate_input(record)
 
-        last_name = person_dict.get("ppl_Name_Last", "").strip().lower()
-        first_name = person_dict.get("ppl_Name_First", "").strip().lower()
+        proj_ProjectTitle = record.get("prj_ProjectTitle", "").strip().lower()
+        proj_ProjectBackground = record.get("proj_ProjectBackground", "").strip().lower()
+        ## 
+
 
         # Check for existing person (case-insensitive)
-        result = conn.execute(
-            "SELECT id FROM person WHERE LOWER(ppl_Name_Last) = ? AND LOWER(ppl_Name_First) = ? LIMIT 1",
-            (last_name, first_name),
+        result = self.conn.execute(
+            "SELECT id FROM project WHERE prj_ProjectTitle = ? LIMIT 1",
+            (proj_ProjectTitle, ),
         ).fetchone()
 
         if result:
             logger.info(
-                f"Person with last name '{last_name}' already exists (ID {result[0]}). Skipping insert."
+                f"Project with title '{last_name}' already exists (ID {result[0]}). Skipping insert."
             )
             return result[0]  # existing ID
 
         return super().insert(record)
+
+
+
+class ProjectPerson(TableCRUD):
+    TABLE = "project_person"
+    REQ_COLS = ("person_id", "project_id")
 
 
 # ADDING DATA TO TABLES.
