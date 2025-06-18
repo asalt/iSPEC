@@ -92,6 +92,23 @@ class TableCRUD:
         logger.info(f"Inserted into {self.table}: {record}")
         return self.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+    def bulk_insert(self, records: list[dict]) -> None:
+        # needs testing
+        if not records:
+            return
+        self.validate_input(records[0])  # assume all rows follow same structure
+
+        keys = list(records[0].keys())
+        placeholders = ", ".join(["?"] * len(keys))
+        columns = ", ".join(keys)
+
+        values = [[r[k] for k in keys] for r in records]
+        self.conn.executemany(
+            f"INSERT INTO {self.table} ({columns}) VALUES ({placeholders})", values
+        )
+        self.conn.commit()
+
+
     def get_by_id(self, record_id: int) -> Optional[Dict[str, str]]:
         result = self.conn.execute(
             f"SELECT * FROM {self.table} WHERE id = ?", (record_id,)
