@@ -1,12 +1,12 @@
 
 CREATE TABLE IF NOT EXISTS person (
-  ppl_id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY,
   ppl_AddedBy TEXT,
   ppl_CreationTS TEXT,
   ppl_ModificationTS TEXT,
   -- ppl_Name TEXT
   ppl_Name_First TEXT,
-  ppl_Name_Last TEXT,
+  ppl_Name_Last TEXT not NULL,
   ppl_Domain TEXT,
   ppl_Email TEXT,
   ppl_Phone TEXT,
@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS person (
 );
 
 CREATE TABLE IF NOT EXISTS project (
-  prj_id INTEGER PRIMARY KEY,
+  id INTEGER PRIMARY KEY,
   prj_AddedBy TEXT,
   prj_CreationTS TEXT,
   prj_ModificationTS TEXT,
@@ -109,13 +109,48 @@ CREATE TABLE IF NOT EXISTS project (
 );
 
 CREATE TABLE IF NOT EXISTS letter_of_support (
-  id INTEGER PRIMARY KEY
+  id INTEGER PRIMARY KEY,
+  los_LOSRecNo INTEGER,
+  los_AddedBy TEXT,
+  los_CreationTS TEXT,
+  los_ModificationTS TEXT,
+  los_ProjectNo INTEGER,
+  los_FileName TEXT,
+  los_PI TEXT KEY,
+  los_PI_Name_Last TEXT,
+  los_PI_Name_First TEXT,
+  los_Institution TEXT,
+  los_Date TEXT,
+  los_Agency TEXT,
+  los_GrantType TEXT,
+  los_LOS_docx BLOB,
+  los_LOS_pdf BLOB,
+  los_Writing TEXT,
+  los_PrelimData TEXT,
+  los_Award_Status TEXT,
+  los_Award_ID INTEGER,
+  los_Award_Name TEXT,
+  los_Award_DateStart TEXT,
+  los_Award_DateEnd TEXT,
+  los_Comment TEXT,
+  los_Award_AnnualDC INTEGER,
+  los_Award_Annual_IDC INTEGER,
+  los_Award_Total REAL,
+  los_CommentType TEXT,
+  -- los_Comment TEXT,
+  los_ATCReportingYear TEXT,
+  los_FoundCount INTEGER,
+  los_FoundCount_T INTEGER,
+  los_FoundCount_TableT INTEGER,
+  year_ TEXT,
+  month_day TEXT
 );
 
+
 CREATE TABLE IF NOT EXISTS project_person (
-  id INTEGER PRIMARY KEY NOT NULL,
-  project_id INTEGER NOT NULL,
-  person_id INTEGER NOT NULL,
-  FOREIGN KEY(project_id) REFERENCES project(prj_id),
-  FOREIGN KEY(person_id) REFERENCES project(ppl_id)
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER REFERENCES project(id),
+  person_id INTEGER REFERENCES person(id)
 );
+
+

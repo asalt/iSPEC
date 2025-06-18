@@ -44,5 +44,6 @@ def get_connection(db_path: Path = None):
     try:
         yield conn
     finally:
+        conn.commit()
         conn.close()
 
