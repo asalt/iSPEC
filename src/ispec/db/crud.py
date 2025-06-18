@@ -108,7 +108,6 @@ class TableCRUD:
         )
         self.conn.commit()
 
-
     def get_by_id(self, record_id: int) -> Optional[Dict[str, str]]:
         result = self.conn.execute(
             f"SELECT * FROM {self.table} WHERE id = ?", (record_id,)
@@ -121,9 +120,6 @@ class TableCRUD:
         )
         self.conn.commit()
         return result.rowcount > 0
-
-
-
 
 
 class Person(TableCRUD):
@@ -168,14 +164,15 @@ class Project(TableCRUD):
         self.validate_input(record)
 
         proj_ProjectTitle = record.get("prj_ProjectTitle", "").strip().lower()
-        proj_ProjectBackground = record.get("proj_ProjectBackground", "").strip().lower()
-        ## 
-
+        proj_ProjectBackground = (
+            record.get("proj_ProjectBackground", "").strip().lower()
+        )
+        ##
 
         # Check for existing person (case-insensitive)
         result = self.conn.execute(
             "SELECT id FROM project WHERE prj_ProjectTitle = ? LIMIT 1",
-            (proj_ProjectTitle, ),
+            (proj_ProjectTitle,),
         ).fetchone()
 
         if result:
@@ -187,10 +184,36 @@ class Project(TableCRUD):
         return super().insert(record)
 
 
-
 class ProjectPerson(TableCRUD):
     TABLE = "project_person"
     REQ_COLS = ("person_id", "project_id")
+
+    def validate_input(self, record: dict):
+        super().validate_input(record)
+
+        person_id = record.get("person_id")
+        project_id = record.get("project_id")
+
+        person_query = self.conn.execute(
+            "SELECT id FROM person where id = ?", (person_id,)
+        ).fetchone()
+
+        logger.info(f"person query {person_query}")
+        if person_query is None:
+            logger.error(
+                f"Tried to make a project person link with an invalid person id {person_id}"
+            )
+            raise ValueError(f"{person_id} not present in person table")
+
+        project_query = self.conn.execute(
+            "SELECT id FROM project where id = ?", (project_id,)
+        ).fetchone()
+
+        if project_query is None:
+            logger.error(
+                f"Tried to make a project person link with an invalid project id {project_id}"
+            )
+            raise ValueError(f"{project_id} not present in projecttable")
 
 
 # ADDING DATA TO TABLES.
