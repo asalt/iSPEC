@@ -105,3 +105,18 @@ def test_link_person_to_project(conn):
     link = conn.execute("SELECT * FROM project_person WHERE id = ?", (link_id,)).fetchone()
     assert link["person_id"] == person_id
     assert link["project_id"] == project_id
+
+
+def test_bulk_insert_projects(conn):
+    project = Project(conn)
+    records = [
+            {"prj_ProjectTitle": "Project Alpha", "prj_ProjectBackground" : " This is a project background " },
+            {"prj_ProjectTitle": "Project Beta", "prj_ProjectBackground" : " This is a project background " },
+            {"prj_ProjectTitle": "Project Gamma", "prj_ProjectBackground" : " This is a project background " },
+    ]
+    project.bulk_insert(records)
+
+    rows = conn.execute("SELECT prj_ProjectTitle FROM project ORDER BY id").fetchall()
+    titles = [row["prj_ProjectTitle"] for row in rows]
+
+    assert titles == ["Project Alpha", "Project Beta", "Project Gamma"]
