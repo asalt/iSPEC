@@ -18,7 +18,10 @@ def show_tables(file_path=None):
         # write sql logic to display all tables
 
 def import_file(file_path):
+    from ispec.io import io_file
     print("preparing to import file.. %s", file_path)
+    io_file.import_file(file_path)
+    # need to validate the file input, and understand which table we are meant to update
 
 def initialize(file_path=None):
     """

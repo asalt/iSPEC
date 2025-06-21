@@ -2,11 +2,11 @@
 CREATE TABLE IF NOT EXISTS person (
   id INTEGER PRIMARY KEY,
   ppl_AddedBy TEXT,
-  ppl_CreationTS TEXT,
-  ppl_ModificationTS TEXT,
+  ppl_CreationTS TIMESTAMP,
+  ppl_ModificationTS TIMESTAMP,
   -- ppl_Name TEXT
   ppl_Name_First TEXT,
-  ppl_Name_Last TEXT not NULL,
+  ppl_Name_Last TEXT,
   ppl_Domain TEXT,
   ppl_Email TEXT,
   ppl_Phone TEXT,
@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS person (
 CREATE TABLE IF NOT EXISTS project (
   id INTEGER PRIMARY KEY,
   prj_AddedBy TEXT,
-  prj_CreationTS TEXT,
-  prj_ModificationTS TEXT,
+  prj_CreationTS TIMESTAMP,
+  prj_ModificationTS TIMESTAMP,
   prj_PRJ_DisplayID TEXT,
   prj_PRJ_DisplayTitle TEXT,
   prj_iLabs_RequestName TEXT,
