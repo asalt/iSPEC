@@ -2,6 +2,7 @@
 from functools import cache
 import sqlite3
 from ispec.db.connect import get_connection
+
 from ispec.logging import get_logger
 from typing import Dict, Optional
 
@@ -75,6 +76,10 @@ class TableCRUD:
             for col in self.REQ_COLS:
                 if col not in record.keys():
                     raise ValueError(f"{col} not in input records")
+        cleaned_record = {k:v for k,v in record.items() if k in self.get_columns()}
+        logger.debug(f"cleaned record keys {cleaned_record.keys()}")
+        return cleaned_record
+
 
     def insert(self, record: Dict[str, str]) -> int:
 
@@ -96,13 +101,17 @@ class TableCRUD:
         # needs testing
         if not records:
             return
-        self.validate_input(records[0])  # assume all rows follow same structure
+        cleaned_records = list(filter(None, [self.validate_input(record) for record in records]))
+        if not cleaned_records:
+            return
+        # import pdb; pdb.set_trace()
+        #self.validate_input(records[0])  # assume all rows follow same structure
 
-        keys = list(records[0].keys())
+        keys = list(cleaned_records[0].keys())
         placeholders = ", ".join(["?"] * len(keys))
         columns = ", ".join(keys)
 
-        values = [[r[k] for k in keys] for r in records]
+        values = [[r[k] for k in keys] for r in cleaned_records]
         self.conn.executemany(
             f"INSERT INTO {self.table} ({columns}) VALUES ({placeholders})", values
         )
@@ -127,26 +136,31 @@ class Person(TableCRUD):
     TABLE = "person"
     REQ_COLS = ("ppl_Name_Last", "ppl_Name_First")
 
-    def insert(self, record: dict):
+    def validate_input(self, record: dict):
+        record = super().validate_input(record)
+        last_name = record.get("ppl_Name_Last", "")
+        first_name = record.get("ppl_Name_First", "")
+        if not last_name:
+            return None
+        last_name = last_name.strip().lower()
+        first_name = first_name.strip().lower()
 
-        self.validate_input(record)
-
-        last_name = record.get("ppl_Name_Last", "").strip().lower()
-        first_name = record.get("ppl_Name_First", "").strip().lower()
 
         # Check for existing person (case-insensitive)
         result = self.conn.execute(
             "SELECT id FROM person WHERE LOWER(ppl_Name_Last) = ? AND LOWER(ppl_Name_First) = ? LIMIT 1",
             (last_name, first_name),
         ).fetchone()
+        # import pdb; pdb.set_trace()
 
         if result:
             logger.info(
                 f"Person with last name '{last_name}' already exists (ID {result[0]}). Skipping insert."
             )
-            return result[0]  # existing ID
+            return None
+            #return result[0]  # existing ID
 
-        return super().insert(record)
+        return record
 
 
 class Project(TableCRUD):
@@ -157,11 +171,11 @@ class Project(TableCRUD):
         "prj_ProjectBackground",
     )
 
-    def insert(self, record: dict):
+    def validate_input(self, record: dict):
         # rewrite for project specifi
         # check if project title matches an existing project title in the database
 
-        self.validate_input(record)
+        record = super().validate_input(record)
 
         proj_ProjectTitle = record.get("prj_ProjectTitle", "").strip().lower()
         proj_ProjectBackground = (
@@ -177,11 +191,12 @@ class Project(TableCRUD):
 
         if result:
             logger.info(
-                f"Project with title '{last_name}' already exists (ID {result[0]}). Skipping insert."
+                f"Project with title '{proj_ProjectTitle}' already exists (ID {result[0]}). Skipping insert."
             )
-            return result[0]  # existing ID
+            return None
+            #return result[0]  # existing ID
 
-        return super().insert(record)
+        return record
 
 
 class ProjectPerson(TableCRUD):
@@ -209,6 +224,7 @@ class ProjectPerson(TableCRUD):
             "SELECT id FROM project where id = ?", (project_id,)
         ).fetchone()
 
+        logger.info(f"project query {project_query}")
         if project_query is None:
             logger.error(
                 f"Tried to make a project person link with an invalid project id {project_id}"
@@ -300,10 +316,7 @@ def connect_project_person(conn, table_name, column_definitions):
             # find projects associated with person.
         ## NEED TO USE AN ACTUAL FUNCTION to modify, not if -- statement
         # UPDATE people/project collums.
-        if "project_person" == table_name:
-            if "project_id" == colname or "person_id" == colname:
-                # Insert ID?
-                row[col] = hypothetical_id
+
 
         return
 
