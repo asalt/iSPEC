@@ -10,3 +10,9 @@ egg-info/
 *.swp
 data/testdata/raw/
 *.mzML
+*.swo
+*.swn
+*.db-journal
+*.xlsx
+*.sqlite
+*.db
