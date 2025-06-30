@@ -21,7 +21,7 @@ logger = get_logger(__file__)
 
 @lru_cache(maxsize=None)
 def get_db_dir() -> Path:
-    db_dir = Path(os.environ.get("ISPEC_DB_DIR", Path.home() / ".ispec"))
+    db_dir = Path(os.environ.get("ISPEC_DB_DIR", Path.home() / "ispec"))
     db_dir.mkdir(parents=True, exist_ok=True)
     logger.info("setting db_dir to %s", str(db_dir))
     return db_dir
@@ -127,7 +127,8 @@ CREATE_TABLE_PATTERN = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+)")
 
 # Session Context Manager
 @contextmanager
-def get_session(db_path: str = "sqlite:///./example.db") -> Session:
+def get_session(db_path: str = None) -> Session:
+    db_file = Path(db_path) if db_path else get_db_path()
     engine = sqlite_engine(db_path)
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
