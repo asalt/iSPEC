@@ -11,7 +11,14 @@ from ispec.db.connect import get_session
 from ispec.logging import get_logger
 
 
-from ispec.db.models import Person, Project, ProjectPerson
+from ispec.db.models import (
+    Person,
+    Project,
+    ProjectPerson,
+    LetterOfSupport,
+    ProjectComment,
+)
+
 
 logger = get_logger(__file__)
 
@@ -153,11 +160,41 @@ class ProjectCRUD(CRUDBase):
         return super().create(session, validated)
 
 
+class ProjectCommentCRUD(CRUDBase):
+    TABLE = "project_comment"
+    REQ_COLS = (
+        "project_id",
+        "person_id",
+    )
+
+    def __init__(self):
+        super().__init__(ProjectComment, req_cols=self.REQ_COLS)
+
+    def validate_input(self, session, record: dict) -> dict:
+        record = super().validate_input(session, record)
+        prj_id = record.get("project_id")
+        ppl_id = record.get("person_id")
+
+        if prj_id is None:
+            raise ValueError("project_id is required for ProjectComment")
+        if prj_id is not None:
+            # Check if project exists
+            project_exists = session.query(Project).filter_by(id=prj_id).first()
+            if not project_exists:
+                raise ValueError(f"Invalid project_id: {prj_id}")
+        if ppl_id is not None:
+            # Check if person exists
+            person_exists = session.query(Person).filter_by(id=ppl_id).first()
+            if not person_exists:
+                raise ValueError(f"Invalid person_id: {ppl_id}")
+        return record
+
+
 class ProjectPersonCRUD(CRUDBase):
     def __init__(self):
         return super().__init__(ProjectPerson)
 
-    def validate_input(self, session: Session, record: dict) -> dict:
+    def validate_input(self, session: Session, record: dict = None) -> dict:
         person_id = record.get("person_id")
         project_id = record.get("project_id")
 
@@ -178,6 +215,23 @@ class ProjectPersonCRUD(CRUDBase):
             logger.warning("Record is None after validation, skipping insert.")
             return None
         return super().create(session, validated)
+
+
+class LetterOfSupportCRUD(CRUDBase):
+    def __init__(self):
+        return super().__init__(LetterOfSupport)
+
+
+# class ProjectComment(TableCRUD):
+#     TABLE = "project_comment"
+#     REQ_COLS = ("i_id",)
+
+#     def validate_input(self, record: dict):
+#         record = super().validate_input(record)
+#         i_id = record.get("i_id")
+#         if not id:
+#             return None
+#         return record
 
 
 #
@@ -362,27 +416,6 @@ class TableCRUD:
 #                 f"Tried to make a project person link with an invalid project id {project_id}"
 #             )
 #             raise ValueError(f"{project_id} not present in projecttable")
-
-
-class ProjectComment(TableCRUD):
-    TABLE = "project_comment"
-    REQ_COLS = ("i_id",)
-
-    def validate_input(self, record: dict):
-        record = super().validate_input(record)
-        i_id = record.get("i_id")
-        if not id:
-            return None
-        return record
-
-
-class LetterOfSupport(TableCRUD):
-    TABLE = "letter_of_support"
-    REQ_COLS = None
-
-    def validate_input(self, record: dict):
-        record = super().validate_input(record)
-        return record
 
 
 class ProjectNote(TableCRUD):

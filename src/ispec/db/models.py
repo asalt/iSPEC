@@ -90,8 +90,8 @@ class Person(TIMESTAMP_MIXINS["ppl"], Base):
     #     DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     # )
 
-    ppl_Name_First: Mapped[str | None] = mapped_column(Text, nullable=True)
-    ppl_Name_Last: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ppl_Name_First: Mapped[str] = mapped_column(Text, nullable=False)
+    ppl_Name_Last: Mapped[str] = mapped_column(Text, nullable=False)
     ppl_Domain: Mapped[str | None] = mapped_column(Text, nullable=True)
     ppl_Email: Mapped[str | None] = mapped_column(Text, nullable=True)
     ppl_Phone: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -261,7 +261,7 @@ class LetterOfSupport(TIMESTAMP_MIXINS["los"], Base):
     __tablename__ = "letter_of_support"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    los_LOSRecNo: Mapped[int] = mapped_column(Integer)
+    # los_LOSRecNo: Mapped[int] = mapped_column(Integer) # we do not need this as we just use id
     los_AddedBy: Mapped[str] = mapped_column(Text)
     # los_CreationTS: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
     # los_ModificationTS: Mapped[datetime] = mapped_column(

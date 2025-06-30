@@ -1,3 +1,4 @@
+# ispec/api/models/modelmaker.py
 from pydantic import BaseModel, create_model
 from typing import get_args, get_origin, Optional, Type, Dict, Any
 from sqlalchemy.orm import (
@@ -84,6 +85,13 @@ def get_models():
             "project": ProjectRead,
         },
     )
+
+    return {
+        "PersonRead": PersonRead,
+        "ProjectRead": ProjectRead,
+        "ProjectUpdate": ProjectUpdate,
+        "ProjectCommentRead": ProjectCommentRead,
+    }
 
 
 if __name__ == "__main__":
