@@ -18,7 +18,7 @@ def make_pydantic_model_from_sqlalchemy(
     exclude_fields: set[str] = {"id"},
     optional_all: bool = False,
     include_relationships: bool = False,
-    related_model_map: Dict[str, Type[BaseModel]] = {},
+    related_model_map: Optional[Dict[str, Type[BaseModel]]] = None,
     strip_prefix: str = "",
 ) -> Type[BaseModel]:
     mapper: Mapper = class_mapper(model_cls)
@@ -33,16 +33,28 @@ def make_pydantic_model_from_sqlalchemy(
             if field_name in exclude_fields:
                 continue
 
-            python_type = col.type.python_type
+            try:
+                python_type = col.type.python_type
+            except NotImplementedError:
+                python_type = Any
+
             if strip_prefix and field_name.startswith(strip_prefix):
                 field_name_out = field_name[len(strip_prefix) :]
             else:
                 field_name_out = field_name
 
-            default = ...
-            if optional_all or col.nullable or col.default or col.server_default:
+            is_optional = (
+                optional_all
+                or col.nullable
+                or col.default is not None
+                or col.server_default is not None
+            )
+
+            if is_optional:
                 python_type = Optional[python_type]
                 default = None
+            else:
+                default = ...
 
             fields[field_name_out] = (python_type, default)
 

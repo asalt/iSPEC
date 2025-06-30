@@ -116,6 +116,8 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     prj_AddedBy: Mapped[str] = mapped_column(Text)
+    prj_ProjectTitle: Mapped[str] = mapped_column(Text, nullable=False)
+    prj_ProjectDescription: Mapped[str] = mapped_column(Text, nullable=False)
     # prj_CreationTS: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # prj_ModificationTS: Mapped[datetime] = mapped_column(
     #     DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -124,7 +126,6 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
     prj_PRJ_DisplayID: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_PRJ_DisplayTitle: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_iLabs_RequestName: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_ProjectTitle: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_RnD: Mapped[bool] = mapped_column(Boolean, default=False)
     prj_CancerRelevance: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_CPRIT_RFP: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -146,7 +147,6 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
     prj_ProjectSamples: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectCoreTasks: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectQuestions: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_ProjectDescription: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Project_SampleType: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Project_FuturePossibilities: Mapped[str | None] = mapped_column(
         Text, nullable=True

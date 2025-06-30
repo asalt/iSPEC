@@ -40,7 +40,7 @@ def generate_crud_router(
     *,
     prefix: str,
     tag: str,
-    strip_prefix: str = "",
+    # strip_prefix: str = "",
     exclude_fields: set[str] = {"id"},
     optional_all: bool = False,
 ) -> APIRouter:
@@ -51,14 +51,15 @@ def generate_crud_router(
     ReadModel = make_pydantic_model_from_sqlalchemy(
         model,
         name_suffix="Read",
-        strip_prefix=strip_prefix,
+        # strip_prefix=strip_prefix,
     )
     CreateModel = make_pydantic_model_from_sqlalchemy(
         model,
         name_suffix="Create",
-        strip_prefix=strip_prefix,
-        exclude_fields=exclude_fields,
+        # strip_prefix=strip_prefix,
+        exclude_fields={*exclude_fields, "CreationTS", "ModificationTS"},
         optional_all=optional_all,
+        # exclude_fields = {""}
     )
 
     @router.get("/{item_id}", response_model=ReadModel)
@@ -68,7 +69,12 @@ def generate_crud_router(
             raise HTTPException(status_code=404, detail=f"{tag} not found")
         return obj
 
-    @router.post("/", response_model=ReadModel)
+    @router.post(
+        "/",
+        response_model=ReadModel,
+        summary=f"Create new {tag}",
+        description="Create a new item. Required fields are marked with * in the request body below.",
+    )
     def create_item(payload: CreateModel, db: Session = Depends(get_session)):
         obj = crud.create(db, payload.model_dump())
         if obj is None:
@@ -114,7 +120,7 @@ router.include_router(
         crud_class=PersonCRUD,
         prefix="/people",
         tag="Person",
-        strip_prefix="ppl_",
+        # strip_prefix="ppl_",
         exclude_fields={"id", "ppl_AddedBy"},
     )
 )
@@ -125,7 +131,7 @@ router.include_router(
         crud_class=ProjectCRUD,
         prefix="/projects",
         tag="Project",
-        strip_prefix="prj_",
+        # strip_prefix="prj_",
         exclude_fields={"id"},
     )
 )
@@ -137,7 +143,12 @@ router.include_router(
         crud_class=ProjectCommentCRUD,
         prefix="/project_comment",
         tag="ProjectComment",
-        strip_prefix="com_",
+        # strip_prefix="com_",
         exclude_fields={"id"},
     )
 )
+
+
+@router.get("/status")
+def status():
+    return {"ok": True}

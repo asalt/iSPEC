@@ -12,6 +12,8 @@ from functools import lru_cache
 import pandas as pd
 
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.engine import Engine
+
 
 from ispec.db.models import sqlite_engine, initialize_db
 from ispec.logging import get_logger
@@ -33,6 +35,7 @@ def get_db_path(file=None) -> Path:
     if file is None:
         db_path = get_db_dir()
         db_file = db_path / "ispec.db"
+        db_file = "sqlite:///" + str(db_file)
     logger.info("setting db_path to %s", str(db_file))
     return db_file
 
@@ -125,11 +128,25 @@ CREATE_TABLE_PATTERN = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+)")
 #         conn.close()
 
 
+def make_session_factory(engine: Engine):
+    SessionLocal = sessionmaker(bind=engine)
+
+    @contextmanager
+    def get_session():
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    return get_session
+
+
 # Session Context Manager
-@contextmanager
-def get_session(db_path: str = None) -> Session:
-    db_file = Path(db_path) if db_path else get_db_path()
+def get_session() -> Session:
+    db_path = os.getenv("ISPEC_DB_PATH", get_db_path())
     engine = sqlite_engine(db_path)
+
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:

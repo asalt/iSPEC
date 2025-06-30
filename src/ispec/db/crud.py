@@ -24,6 +24,9 @@ logger = get_logger(__file__)
 
 
 class CRUDBase:
+
+    prefix = None
+
     def __init__(self, model, req_cols: Optional[List[str]] = None):
         self.model = model
         self.req_cols = req_cols
@@ -36,16 +39,26 @@ class CRUDBase:
         if session is None:
             raise ValueError("A database session is required for validation.")
 
+        # Only keep known columns
+        allowed_keys = self.get_columns()
+        cleaned_record = {}
+        for k, v in record.items():
+            if k not in allowed_keys and f"{self.prefix}{k}" in allowed_keys:
+                cleaned_record[f"{self.prefix}{k}"] = v
+            elif k not in allowed_keys and f"{self.prefix}{k}" not in allowed_keys:
+                logger.warning(f"Key '{k}' not in model columns, removing from record.")
+            else:
+                cleaned_record[k] = v
+
+        # cleaned_record = {k: v for k, v in record.items() if k in allowed_keys}
+        logger.debug(f"Cleaned record keys: {cleaned_record.keys()}")
+
         # Check required columns
         if self.req_cols is not None:
             for col in self.req_cols:
-                if col not in record:
+                if col not in cleaned_record:
                     raise ValueError(f"{col} not in input record")
 
-        # Only keep known columns
-        allowed_keys = self.get_columns()
-        cleaned_record = {k: v for k, v in record.items() if k in allowed_keys}
-        logger.debug(f"Cleaned record keys: {cleaned_record.keys()}")
         return cleaned_record
 
     def get(self, session: Session, id: int):
@@ -83,10 +96,14 @@ class CRUDBase:
 
 
 class PersonCRUD(CRUDBase):
+
+    # prefix = "ppl_"
+
     def __init__(self):
         super().__init__(Person, req_cols=["ppl_Name_Last", "ppl_Name_First"])
 
     def validate_input(self, session: Session, record: dict) -> dict | None:
+
         if session is None:
             raise ValueError("A database session is required for validation.")
 
@@ -124,6 +141,9 @@ class PersonCRUD(CRUDBase):
 
 
 class ProjectCRUD(CRUDBase):
+
+    # prefix = "prj_"
+
     def __init__(self):
         super().__init__(
             Project, req_cols=["prj_ProjectTitle", "prj_ProjectBackground"]
@@ -161,7 +181,9 @@ class ProjectCRUD(CRUDBase):
 
 
 class ProjectCommentCRUD(CRUDBase):
-    TABLE = "project_comment"
+
+    # prefix = "com_"
+    TABLE = "project_comment"  # might not be using this anymore
     REQ_COLS = (
         "project_id",
         "person_id",

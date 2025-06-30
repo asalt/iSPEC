@@ -5,7 +5,12 @@ import pytest
 
 
 import pytest
-from ispec.db.connect import get_session, sqlite_engine, initialize_db
+from ispec.db.connect import (
+    make_session_factory,
+    get_session,
+    sqlite_engine,
+    initialize_db,
+)
 from ispec.db.models import Person, Project, ProjectPerson
 from ispec.db.crud import PersonCRUD, ProjectCRUD, ProjectPersonCRUD
 
@@ -15,7 +20,9 @@ def db_session(tmp_path):
     db_url = f"sqlite:///{tmp_path}/test.db"
     engine = sqlite_engine(db_url)
     initialize_db(engine)
-    with get_session(db_url) as session:
+    get_test_session = make_session_factory(engine)
+
+    with get_test_session() as session:
         yield session
 
 
