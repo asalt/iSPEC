@@ -123,7 +123,7 @@ class ProjectCRUD(CRUDBase):
         )
 
     def validate_input(self, session: Session, record: dict) -> dict | None:
-        record = super().validate_input(record)
+        record = super().validate_input(session, record)
 
         title = record.get("prj_ProjectTitle", "").strip().lower()
         background = record.get("prj_ProjectBackground", "").strip().lower()
