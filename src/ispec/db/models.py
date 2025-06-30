@@ -140,13 +140,17 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
     prj_GrantSupport: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectDomain: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectBackground: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_ProjectSuggestions2Customer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prj_ProjectSuggestions2Customer: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
     prj_ProjectSamples: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectCoreTasks: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectQuestions: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectDescription: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Project_SampleType: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Project_FuturePossibilities: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prj_Project_FuturePossibilities: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
     prj_RequireGelPix: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Experiments_rf: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_RelatedProjects_rf: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -156,34 +160,55 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
     prj_Status: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     prj_Date_Submitted: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    prj_Date_LysatePreparation: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    prj_Date_LysatePreparation: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
 
-<<<<<<< HEAD
-    prj_Date_MSPreparation: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    prj_Date_MSPreparation: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
     prj_RequireGelPix_Sent: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_RequireGelPix_Confirmed: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Date_Analysis: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    prj_Date_Analysis: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
     prj_Comments_Specific: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Comments_General: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Date_Review: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
-    prj_Date_Closed: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    prj_Date_Review: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
+    prj_Date_Closed: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
     prj_Comments_Review: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_IncludeHandouts: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectCostExplanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Service_365_Analysis: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Service_APMS_Experiments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prj_Service_APMS_Experiments: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
     prj_Service_APMS_Analysis: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Service_PerBand_Experiments: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Service_PerBand_Analysis: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prj_Service_PerBand_Experiments: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
+    prj_Service_PerBand_Analysis: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )
     prj_Service_PTM_Analysis: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Service_DesignHours: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectPrice: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Quote: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Invoice: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Invoice_Date: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
-    prj_Billing_Date: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    prj_Invoice_Date: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
+    prj_Billing_Date: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
     prj_PaymentReceived: Mapped[bool] = mapped_column(Boolean, default=False)
-    prj_ProjectDomainMSPC: Mapped[str] = mapped_column(Text, default=None, nullable=True)
+    prj_ProjectDomainMSPC: Mapped[str] = mapped_column(
+        Text, default=None, nullable=True
+    )
     prj_Project_SampleHandling: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ExpCount: Mapped[int] = mapped_column(Integer, default=0)
     prj_ExpRunCount: Mapped[int] = mapped_column(Integer, default=0)
@@ -269,8 +294,12 @@ class LetterOfSupport(TIMESTAMP_MIXINS["los"], Base):
     los_FoundCount: Mapped[int] = mapped_column(Integer)
     los_FoundCount_T: Mapped[int] = mapped_column(Integer)
     los_FoundCount_TableT: Mapped[int] = mapped_column(Integer)
-    year_: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
-    month_day: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
+    year_: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
+    month_day: Mapped[datetime | None] = mapped_column(
+        DateTime, default=None, nullable=True
+    )
 
 
 # SQLite Engine Factory
