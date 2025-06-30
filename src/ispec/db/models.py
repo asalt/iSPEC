@@ -46,35 +46,41 @@ logger = get_logger(__file__)
 def make_timestamp_mixin(prefix: str):
     fields = {
         f"{prefix}_CreationTS": mapped_column(DateTime, default=datetime.utcnow),
-        f"{prefix}_ModificationTS": mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow),
-        '__annotations__': {
+        f"{prefix}_ModificationTS": mapped_column(
+            DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        ),
+        "__annotations__": {
             f"{prefix}_CreationTS": Mapped[datetime],
-            f"{prefix}_ModificationTS": Mapped[datetime]
-        }
+            f"{prefix}_ModificationTS": Mapped[datetime],
+        },
     }
     return type(f"{prefix.capitalize()}TimestampMixin", (object,), fields)
 
 
 # Timestamp conversion functions
-def adapt_timestamp(ts): # This should work for both pd.Timestamp and datetime.datetime.
+def adapt_timestamp(
+    ts,
+):  # This should work for both pd.Timestamp and datetime.datetime.
     return ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
 
 
 def convert_timestamp(s: bytes):
     return pd.Timestamp(s.decode())
 
+
 TIMESTAMP_MIXINS = {
     "prj": make_timestamp_mixin("prj"),
     "ppl": make_timestamp_mixin("ppl"),
     "com": make_timestamp_mixin("com"),
-    "los": make_timestamp_mixin("los")
+    "los": make_timestamp_mixin("los"),
 }
+
 
 class Base(DeclarativeBase):
     __table_args__ = {"sqlite_autoincrement": True}
 
 
-class Person(TIMESTAMP_MIXINS['ppl'], Base):
+class Person(TIMESTAMP_MIXINS["ppl"], Base):
     __tablename__ = "person"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -105,7 +111,7 @@ class Person(TIMESTAMP_MIXINS['ppl'], Base):
     projects: Mapped[List["ProjectPerson"]] = relationship(back_populates="person")
 
 
-class Project(TIMESTAMP_MIXINS['prj'], Base):
+class Project(TIMESTAMP_MIXINS["prj"], Base):
     __tablename__ = "project"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -152,6 +158,7 @@ class Project(TIMESTAMP_MIXINS['prj'], Base):
     prj_Date_Submitted: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     prj_Date_LysatePreparation: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
 
+<<<<<<< HEAD
     prj_Date_MSPreparation: Mapped[datetime | None] = mapped_column(DateTime, default=None, nullable=True)
     prj_RequireGelPix_Sent: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_RequireGelPix_Confirmed: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -185,7 +192,9 @@ class Project(TIMESTAMP_MIXINS['prj'], Base):
     prj_MSPCEmail: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_PaidPrice: Mapped[float | None] = mapped_column(Float, nullable=True)
     prj_ProjectCostMinimum: Mapped[float] = mapped_column(Float, default=0)
-    prj_ProjectCostMaximum: Mapped[float | None] = mapped_column(Float, default=None, nullable=True)
+    prj_ProjectCostMaximum: Mapped[float | None] = mapped_column(
+        Float, default=None, nullable=True
+    )
     prj_Current_FLAG: Mapped[bool] = mapped_column(Boolean, default=False)
     prj_Billing_ReadyToBill: Mapped[bool] = mapped_column(Boolean, default=False)
 
@@ -193,7 +202,7 @@ class Project(TIMESTAMP_MIXINS['prj'], Base):
     people: Mapped[List["ProjectPerson"]] = relationship(back_populates="project")
 
 
-class ProjectComment(TIMESTAMP_MIXINS['com'], Base):
+class ProjectComment(TIMESTAMP_MIXINS["com"], Base):
     __tablename__ = "project_comment"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -210,6 +219,8 @@ class ProjectComment(TIMESTAMP_MIXINS['com'], Base):
 
 
 PrjPersonTSMixin = make_timestamp_mixin("projper")
+
+
 class ProjectPerson(PrjPersonTSMixin, Base):
     __tablename__ = "project_person"
 
@@ -221,7 +232,7 @@ class ProjectPerson(PrjPersonTSMixin, Base):
     person: Mapped[Person] = relationship(back_populates="projects")
 
 
-class LetterOfSupport(TIMESTAMP_MIXINS['los'], Base):
+class LetterOfSupport(TIMESTAMP_MIXINS["los"], Base):
     __tablename__ = "letter_of_support"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -286,6 +297,9 @@ def sqlite_engine(db_path="sqlite:///./example.db") -> Engine:
     return engine
 
 
+def initialize_db(engine: Engine):
+    Base.metadata.create_all(bind=engine)
+
 
 if __name__ == "__main__":
     from sqlalchemy import inspect
@@ -293,7 +307,7 @@ if __name__ == "__main__":
 
     # Create engine and initialize tables
     engine = sqlite_engine("sqlite:///:memory:")
-    #engine = sqlite_engine("file:memdb1?mode=memory&cache=shared")
+    # engine = sqlite_engine("file:memdb1?mode=memory&cache=shared")
     Base.metadata.create_all(engine)
 
     print("\n📦 Tables created in the database:")
@@ -301,7 +315,7 @@ if __name__ == "__main__":
     for table_name in inspector.get_table_names():
         print(f"\n🧱 Table: {table_name}")
         for col in inspector.get_columns(table_name):
-            col_type = col['type'].__class__.__name__
-            nullable = "NULL" if col['nullable'] else "NOT NULL"
-            default = f"DEFAULT {col['default']}" if col['default'] is not None else ""
+            col_type = col["type"].__class__.__name__
+            nullable = "NULL" if col["nullable"] else "NOT NULL"
+            default = f"DEFAULT {col['default']}" if col["default"] is not None else ""
             print(f"  - {col['name']:30} {col_type:15} {nullable:10} {default}")
