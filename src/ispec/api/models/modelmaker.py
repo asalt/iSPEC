@@ -1,7 +1,14 @@
 from pydantic import BaseModel, create_model
 from typing import get_args, get_origin, Optional, Type, Dict, Any
-from sqlalchemy.orm import DeclarativeBase, Mapper, ColumnProperty, RelationshipProperty, class_mapper
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapper,
+    ColumnProperty,
+    RelationshipProperty,
+    class_mapper,
+)
 from sqlalchemy.sql.schema import Column
+
 
 def make_pydantic_model_from_sqlalchemy(
     model_cls: Type[DeclarativeBase],
@@ -27,7 +34,7 @@ def make_pydantic_model_from_sqlalchemy(
 
             python_type = col.type.python_type
             if strip_prefix and field_name.startswith(strip_prefix):
-                field_name_out = field_name[len(strip_prefix):]
+                field_name_out = field_name[len(strip_prefix) :]
             else:
                 field_name_out = field_name
 
@@ -50,20 +57,34 @@ def make_pydantic_model_from_sqlalchemy(
     return create_model(model_name, **fields)
 
 
+#
 
-from ispec.db.models import Person, Project, ProjectComment
 
-PersonRead = make_pydantic_model_from_sqlalchemy(Person, name_suffix="Read", strip_prefix="ppl_")
-ProjectRead = make_pydantic_model_from_sqlalchemy(Project, name_suffix="Read", strip_prefix="prj_")
+def get_models():
 
-ProjectCommentRead = make_pydantic_model_from_sqlalchemy(
-    ProjectComment,
-    name_suffix="Read",
-    strip_prefix="com_",
-    include_relationships=True,
-    related_model_map={
-        "person": PersonRead,
-        "project": ProjectRead,
-    }
-)
+    from ispec.db.models import Person, Project, ProjectComment
 
+    PersonRead = make_pydantic_model_from_sqlalchemy(
+        Person, name_suffix="Read", strip_prefix="ppl_"
+    )
+    ProjectRead = make_pydantic_model_from_sqlalchemy(
+        Project, name_suffix="Read", strip_prefix="prj_"
+    )
+    ProjectUpdate = make_pydantic_model_from_sqlalchemy(
+        Project, name_suffix="Update", strip_prefix="prj_"
+    )
+
+    ProjectCommentRead = make_pydantic_model_from_sqlalchemy(
+        ProjectComment,
+        name_suffix="Read",
+        strip_prefix="com_",
+        include_relationships=True,
+        related_model_map={
+            "person": PersonRead,
+            "project": ProjectRead,
+        },
+    )
+
+
+if __name__ == "__main__":
+    get_models()
