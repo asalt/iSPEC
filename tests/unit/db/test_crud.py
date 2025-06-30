@@ -94,6 +94,7 @@ def test_link_person_to_project(db_session):
         {
             "prj_ProjectTitle": "Moonbase Alpha",
             "prj_ProjectBackground": "This is a project background.",
+            "prj_AddedBy": "tester",
         },
     )
 
@@ -113,6 +114,7 @@ def test_link_person_to_project_invalid_person(db_session):
         {
             "prj_ProjectTitle": "Moonbase Alpha",
             "prj_ProjectBackground": "This is a project background.",
+            "prj_AddedBy": "tester",
         },
     )
 
