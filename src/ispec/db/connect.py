@@ -11,6 +11,9 @@ from functools import lru_cache
 
 import pandas as pd
 
+from sqlalchemy.orm import sessionmaker, Session
+
+from ispec.db.models import sqlite_engine, initialize_db
 from ispec.logging import get_logger
 
 logger = get_logger(__file__)
@@ -26,6 +29,7 @@ def get_db_dir() -> Path:
 
 @lru_cache(maxsize=None)
 def get_db_path(file=None) -> Path:
+    db_file = None
     if file is None:
         db_path = get_db_dir()
         db_file = db_path / "ispec.db"
@@ -64,61 +68,78 @@ def table_exists(conn, table_name):
 CREATE_TABLE_PATTERN = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+)")
 
 
-def initialize_db(file_path=None, conn=None):
-    sql_def = get_sql_file()
-    with open(sql_def) as f:
-        sql_cmds = f.read().strip()
-    table_names = CREATE_TABLE_PATTERN.findall(sql_cmds)
+# def initialize_db(file_path=None, conn=None):
+#     sql_def = get_sql_file()
+#     with open(sql_def) as f:
+#         sql_cmds = f.read().strip()
+#     table_names = CREATE_TABLE_PATTERN.findall(sql_cmds)
 
-    def should_create(conn):
-        return not all(table_exists(conn, t) for t in table_names)
+#     def should_create(conn):
+#         return not all(table_exists(conn, t) for t in table_names)
 
-    if file_path is not None and conn is None:
-        with get_connection(file_path) as conn:
-            if should_create(conn):
-                conn.executescript(sql_cmds)
-                conn.commit()
-        return
-    elif conn is not None:
-        if should_create(conn):
-            conn.executescript(sql_cmds)
-            conn.commit()
-    return
-
-
-def adapt_timestamp(ts):  # pandas.timestamp
-    return ts.isoformat()
+#     if file_path is not None and conn is None:
+#         with get_connection(file_path) as conn:
+#             if should_create(conn):
+#                 conn.executescript(sql_cmds)
+#                 conn.commit()
+#         return
+#     elif conn is not None:
+#         if should_create(conn):
+#             conn.executescript(sql_cmds)
+#             conn.commit()
+#     return
 
 
-def convert_timestamp(s: bytes):
-    return pd.Timestamp(s.decode())
+# def adapt_timestamp(ts):  # pandas.timestamp
+#     return ts.isoformat()
 
 
+# def convert_timestamp(s: bytes):
+#     return pd.Timestamp(s.decode())
+
+
+# @contextmanager
+# def get_connection(db_path: Path = None):
+#     # ensure_db_dir()
+#     db_file = Path(db_path) if db_path else get_db_path()
+
+#     logger.info("connecting to db %s", str(db_file))
+
+#     sqlite3.enable_callback_tracebacks(True)
+#     conn = sqlite3.connect(
+#         str(db_file),
+#         check_same_thread=False,
+#         detect_types=sqlite3.PARSE_DECLTYPES,
+#         # autocommit=False,
+#     )
+#     conn.execute("PRAGMA foreign_keys = ON")
+#     sqlite3.register_adapter(pd.Timestamp, adapt_timestamp)
+#     sqlite3.register_converter("TIMESTAMP", convert_timestamp)
+
+#     conn.set_trace_callback(lambda x: logger.info(x))
+#     initialize_db(conn=conn)
+#     try:
+#         yield conn
+#     finally:
+#         conn.commit()
+#         conn.close()
+
+
+# Session Context Manager
 @contextmanager
-def get_connection(db_path: Path = None):
-    # ensure_db_dir()
-    db_file = Path(db_path) if db_path else get_db_path()
-
-    logger.info("connecting to db %s", str(db_file))
-
-    sqlite3.enable_callback_tracebacks(True)
-    conn = sqlite3.connect(
-        str(db_file),
-        check_same_thread=False,
-        detect_types=sqlite3.PARSE_DECLTYPES,
-        # autocommit=False,
-    )
-    conn.execute("PRAGMA foreign_keys = ON")
-    sqlite3.register_adapter(pd.Timestamp, adapt_timestamp)
-    sqlite3.register_converter("TIMESTAMP", convert_timestamp)
-
-    conn.set_trace_callback(lambda x: logger.info(x))
-    initialize_db(conn=conn)
+def get_session(db_path: str = "sqlite:///./example.db") -> Session:
+    engine = sqlite_engine(db_path)
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
     try:
-        yield conn
+        initialize_db(engine=engine)  # <- Call initializer once per session
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     finally:
-        conn.commit()
-        conn.close()
+        session.close()
 
 
 # def ensure_db_dir():
