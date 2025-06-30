@@ -2,7 +2,6 @@
 from functools import cache
 import sqlite3
 from ispec.db.connect import get_connection
-
 from ispec.logging import get_logger
 from typing import Dict, Optional
 
@@ -12,51 +11,71 @@ from typing import Dict, Optional
 logger = get_logger(__file__)
 
 
-@cache
-def get_table_cols(conn, table):
-    return conn.execute(
-        "PRAGMA table_info(?)",
-    ).fetchall()
+class CRUDBase:
+    def __init__(self, model):
+        self.model = model
+
+    def validate_input(self, records: dict):
+        return True
+
+    def get(self, session: Session, id: int):
+        return session.query(self.model).filter(self.model.id == id).first()
+
+    def create(self, session: Session, obj_in: dict):
+        obj = self.model(**obj_in)
+        session.add(obj)
+        session.commit()
+        session.refresh(obj)
+        return obj
+
+    def bulk_create(self, objects: List[obj_in:dict], db: Session):
+        db_objs = [self.model(**obj) for obj in objects]
+        db.add_all(db_objs)
+        db.commit()
+        return db_objs  # or just return success message
+
+    def delete(self, session: Session, id: int):
+        obj = self.get(session, id)
+        if obj:
+            session.delete(obj)
+            session.commit()
+            return True
+        return False
 
 
-def add_person(person_dict: dict, conn: sqlite3.Connection):
-    # Normalize case
-    last_name = person_dict.get("ppl_Name_Last", "").strip().lower()
-    first_name = person_dict.get("ppl_Name_First", "").strip().lower()
-
-    # Check for existing person (case-insensitive)
-    result = conn.execute(
-        "SELECT id FROM person WHERE LOWER(ppl_Name_Last) = ? AND LOWER(ppl_Name_First) = ? LIMIT 1",
-        (last_name, first_name),
-    ).fetchone()
-
-    if result:
-        logger.info(
-            f"Person with last name '{last_name}' already exists (ID {result[0]}). Skipping insert."
-        )
-        return result[0]  # existing ID
-
-    # Insert
-    keys = person_dict.keys()
-    values = [person_dict[k] for k in keys]
-    placeholders = ", ".join(["?"] * len(keys))
-    columns = ", ".join(keys)
-
-    conn.execute(f"INSERT INTO person ({columns}) VALUES ({placeholders})", values)
-    conn.commit()
-    logger.info(f"Added person: {person_dict}")
-
-    # Return last inserted ID
-    new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    return new_id
+from ispec.db.models import Person, ProjectPerson
 
 
-def update_project_person_table(conn, project_id=None, person_id=None):
-    result = conn.execute("SELECT id from project where id = ?", project_id).fetchall()
-    if not result:
-        add_project(project_dict=dict(id=project_id))
+class PersonCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(Person)
+
+    # Add custom Person logic here
 
 
+class ProjectPersonCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(ProjectPerson)
+
+    def validate_input(self, session: Session, data: dict) -> dict:
+        person_id = data.get("person_id")
+        project_id = data.get("project_id")
+
+        if not session.query(Person).filter_by(id=person_id).first():
+            raise ValueError(f"Invalid person_id: {person_id}")
+
+        if not session.query(Project).filter_by(id=project_id).first():
+            raise ValueError(f"Invalid project_id: {project_id}")
+
+        return data
+
+    def create(self, session: Session, data: dict) -> ProjectPerson:
+        validated = self.validate_input(session, data)
+        return super().create(session, validated)
+
+
+#
+# ==
 class TableCRUD:
 
     TABLE = None
@@ -76,10 +95,9 @@ class TableCRUD:
             for col in self.REQ_COLS:
                 if col not in record.keys():
                     raise ValueError(f"{col} not in input records")
-        cleaned_record = {k:v for k,v in record.items() if k in self.get_columns()}
+        cleaned_record = {k: v for k, v in record.items() if k in self.get_columns()}
         logger.debug(f"cleaned record keys {cleaned_record.keys()}")
         return cleaned_record
-
 
     def insert(self, record: Dict[str, str]) -> int:
 
@@ -101,11 +119,13 @@ class TableCRUD:
         # needs testing
         if not records:
             return
-        cleaned_records = list(filter(None, [self.validate_input(record) for record in records]))
+        cleaned_records = list(
+            filter(None, [self.validate_input(record) for record in records])
+        )
         if not cleaned_records:
             return
         # import pdb; pdb.set_trace()
-        #self.validate_input(records[0])  # assume all rows follow same structure
+        # self.validate_input(records[0])  # assume all rows follow same structure
 
         keys = list(cleaned_records[0].keys())
         placeholders = ", ".join(["?"] * len(keys))
@@ -145,7 +165,6 @@ class Person(TableCRUD):
         last_name = last_name.strip().lower()
         first_name = first_name.strip().lower()
 
-
         # Check for existing person (case-insensitive)
         result = self.conn.execute(
             "SELECT id FROM person WHERE LOWER(ppl_Name_Last) = ? AND LOWER(ppl_Name_First) = ? LIMIT 1",
@@ -158,7 +177,7 @@ class Person(TableCRUD):
                 f"Person with last name '{last_name}' already exists (ID {result[0]}). Skipping insert."
             )
             return None
-            #return result[0]  # existing ID
+            # return result[0]  # existing ID
 
         return record
 
@@ -177,10 +196,12 @@ class Project(TableCRUD):
 
         record = super().validate_input(record)
 
-        proj_ProjectTitle = record.get("prj_ProjectTitle", "").strip().lower()
-        proj_ProjectBackground = (
-            record.get("proj_ProjectBackground", "").strip().lower()
-        )
+        proj_ProjectTitle = record.get("prj_ProjectTitle", "")
+        proj_ProjectBackground = record.get("proj_ProjectBackground", "")
+        if not proj_ProjectTitle:
+            return None
+        proj_ProjectTitle = proj_ProjectTitle.strip().lower()
+        proj_ProjectBackground = proj_ProjectBackground.strip().lower()
         ##
 
         # Check for existing person (case-insensitive)
@@ -194,7 +215,7 @@ class Project(TableCRUD):
                 f"Project with title '{proj_ProjectTitle}' already exists (ID {result[0]}). Skipping insert."
             )
             return None
-            #return result[0]  # existing ID
+            # return result[0]  # existing ID
 
         return record
 
@@ -232,6 +253,39 @@ class ProjectPerson(TableCRUD):
             raise ValueError(f"{project_id} not present in projecttable")
 
 
+class ProjectComment(TableCRUD):
+    TABLE = "project_comment"
+    REQ_COLS = ("i_id",)
+
+    def validate_input(self, record: dict):
+        record = super().validate_input(record)
+        i_id = record.get("i_id")
+        if not id:
+            return None
+        return record
+
+
+class LetterOfSupport(TableCRUD):
+    TABLE = "letter_of_support"
+    REQ_COLS = None
+
+    def validate_input(self, record: dict):
+        record = super().validate_input(record)
+        return record
+
+
+class ProjectNote(TableCRUD):
+    TABLE = "project_note"
+    REQ_COLS = ("i_id",)
+
+    def validate_input(self, record: dict):
+        record = super().validate_input(record)
+        i_id = record.get("i_id")
+        if not id:
+            return None
+        return record
+
+
 # ADDING DATA TO TABLES.
 def insert_df_to_table(conn, table_name, df, column_definitions):
     cursor = conn.execute(f"PRAGMA table_info({table_name})")
@@ -265,60 +319,12 @@ def insert_df_to_table(conn, table_name, df, column_definitions):
     conn.executemany(q, values)
 
 
-# returning data to user from the table/column/ probably not necessary.
-def read_data_from_table(conn, table_name, column_definitions):
-    cursor = conn.execute(
-        f"PRAGMA table_info({table_name})"
-    )  # sets up connection through cursor
-    table_cols = [row[1] for row in cursor]
-
-    # req_data = 0.1 #place holder data
-    return req_data
-
-
-# IDK if possible, but if necessary, removing data from db
-def delete_data_from_table(conn, table_name, column_definitions):
-    return
-
-
-# replacing data w/ input from user into the table/column
-def modify_data_to_table(conn, table_name, column_definitions, data_mod):
-    return
-
-
 # How do I test this?
 
 
 # EXECUTE THIS EVERYTIME A NEW PROJECT OR PERSON IS ADDED
 # INSERT DIFFERENT TABLE NAME BASED ON WHAT IS BEING ADDED, ex you're adding a person: table_name will be person
 # Make sure the table name added
-def connect_project_person(conn, table_name, column_definitions):
-    def read_data_from_table(conn, table_name, column_definitions):
-        cursor = conn.execute(
-            f"PRAGMA table_info({table_name})"
-        )  # sets up connection through cursor
-        table_cols = [row[1] for row in cursor]
-
-        if table_name == "project":
-            # Make sure it is not empty
-            # check for new project
-            if colname == "prj_CreationTS":
-                # find most newest row next
-                explore_this_row = hypothetical_row
-
-            # utilizing explore_this_row
-            # find all people associated
-            # make sure to form an ID between those people and the project
-        if table_name == "person":
-            pass
-            # Make sure it is not empty
-            # check for all the people person - potentially multiple IDS?
-            # find projects associated with person.
-        ## NEED TO USE AN ACTUAL FUNCTION to modify, not if -- statement
-        # UPDATE people/project collums.
-
-
-        return
 
 
 # ADDING PEOPLE - + checking presence
