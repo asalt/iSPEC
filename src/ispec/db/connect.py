@@ -2,6 +2,7 @@
 
 import sqlite3
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
@@ -52,32 +53,37 @@ def get_sql_file(**kwargs):
     return sql_code_file
 
 
-def initialize_db(file_path=None, conn=None):
+def table_exists(conn, table_name):
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table_name,)
+    )
+    return cursor.fetchone() is not None
 
+
+CREATE_TABLE_PATTERN = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+)")
+
+
+def initialize_db(file_path=None, conn=None):
     sql_def = get_sql_file()
     with open(sql_def) as f:
         sql_cmds = f.read().strip()
-        # sql_cmds = f.read().strip().split(';')
+    table_names = CREATE_TABLE_PATTERN.findall(sql_cmds)
 
-    # Note add a check to see if the necessary tables are already created
-    # if so, skip.
+    def should_create(conn):
+        return not all(table_exists(conn, t) for t in table_names)
+
     if file_path is not None and conn is None:
         with get_connection(file_path) as conn:
-            cursor = conn.cursor()
-            # for sql_cmd in sql_cmds:
-            cursor.executescript(sql_cmds)
-            conn.commit()
+            if should_create(conn):
+                conn.executescript(sql_cmds)
+                conn.commit()
         return
     elif conn is not None:
-        cursor = conn.cursor()
-        cursor.executescript(sql_cmds)
-        conn.commit()
+        if should_create(conn):
+            conn.executescript(sql_cmds)
+            conn.commit()
     return
-
-
-# def ensure_db_dir():
-#    logger.debug("ensuring db dir")
-#    get_db_dir().mkdir(parents=True, exist_ok=True)
 
 
 def adapt_timestamp(ts):  # pandas.timestamp
@@ -113,3 +119,32 @@ def get_connection(db_path: Path = None):
     finally:
         conn.commit()
         conn.close()
+
+
+# def ensure_db_dir():
+#    logger.debug("ensuring db dir")
+#    get_db_dir().mkdir(parents=True, exist_ok=True)
+
+
+# def initialize_db(file_path=None, conn=None):
+#
+#     sql_def = get_sql_file()
+#     with open(sql_def) as f:
+#         sql_cmds = f.read().strip()
+#         # parse out the table names and check table_exists for eacH?
+#         # sql_cmds = f.read().strip().split(';')
+#
+#     # Note add a check to see if the necessary tables are already created
+#     # if so, skip.
+#     if file_path is not None and conn is None:
+#         with get_connection(file_path) as conn:
+#             cursor = conn.cursor()
+#             # for sql_cmd in sql_cmds:
+#             cursor.executescript(sql_cmds)
+#             conn.commit()
+#         return
+#     elif conn is not None:
+#         cursor = conn.cursor()
+#         cursor.executescript(sql_cmds)
+#         conn.commit()
+#     return
