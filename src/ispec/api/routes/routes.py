@@ -42,8 +42,11 @@ def generate_crud_router(
     tag: str,
     # strip_prefix: str = "",
     exclude_fields: set[str] = {"id"},
+    create_exclude_fields: set[str] = None,
     optional_all: bool = False,
 ) -> APIRouter:
+
+    create_exclude_fields = create_exclude_fields or {}
     router = APIRouter(prefix=prefix, tags=[tag])
     crud = crud_class()
 
@@ -57,7 +60,7 @@ def generate_crud_router(
         model,
         name_suffix="Create",
         # strip_prefix=strip_prefix,
-        exclude_fields={*exclude_fields, "CreationTS", "ModificationTS"},
+        exclude_fields={*exclude_fields, *create_exclude_fields},
         optional_all=optional_all,
         # exclude_fields = {""}
     )
@@ -121,7 +124,8 @@ router.include_router(
         prefix="/people",
         tag="Person",
         # strip_prefix="ppl_",
-        exclude_fields={"id", "ppl_AddedBy"},
+        exclude_fields={"id",},
+        create_exclude_fields={"ppl_CreationTS", "ppl_ModificationTS"}
     )
 )
 
