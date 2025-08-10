@@ -1,18 +1,18 @@
 from typing import Type, Callable
 from sqlalchemy.orm import Session
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 
 from ispec.db.connect import get_session
 from ispec.db.models import Person, Project, ProjectComment
 from ispec.db.crud import PersonCRUD, ProjectCRUD, ProjectCommentCRUD
-from ispec.api.models.modelmaker import get_models, make_pydantic_model_from_sqlalchemy
 
 from ispec.api.routes.utils.ui_meta import ui_from_column  # used inside schema builder
 from ispec.api.routes.schema import build_form_schema
 
+from ispec.api.models.modelmaker import get_models, make_pydantic_model_from_sqlalchemy
 
-models = get_models()
+# models = get_models() 
 # ProjectRead = models["ProjectRead"]
 # ProjectUpdate = models["ProjectUpdate"]
 

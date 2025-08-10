@@ -1,10 +1,17 @@
 # utils/ui_meta.py
 from __future__ import annotations
-from sqlalchemy import String, Integer, Boolean, DateTime, Enum, JSON
-from sqlalchemy.orm import DeclarativeMeta, Column
-from typing import Any
+from typing import Any, Callable
+from sqlalchemy.orm import DeclarativeMeta
+from sqlalchemy.sql.schema import Column as SAColumn
+# from sqlalchemy import String, Integer, Boolean, DateTime, Enum, JSON
+from sqlalchemy.sql import sqltypes as T  # canonical type classes
 
-def ui_from_column(col: Column) -> dict[str, Any]:
+
+def ui_from_column(
+    col: SAColumn,
+    *,
+    route_prefix_for_table: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
     """
 
     TL;DR
@@ -72,39 +79,63 @@ def ui_from_column(col: Column) -> dict[str, Any]:
 
     """
     # manual override first
-    if (ui := (col.info or {}).get("ui")):
-        return ui
+    # allow explicit overrides: Column(..., info={"ui": {...}})
+    if (col.info or {}).get("ui"):
+        return dict(col.info["ui"])  # copy
 
     t = col.type
     ui: dict[str, Any] = {}
-    if isinstance(t, String):
-        ui["component"] = "Textarea" if (getattr(t, "length", 0) or 0) > 255 else "Text"
-        if getattr(t, "length", None):
-            ui["maxLength"] = t.length
-    elif isinstance(t, Integer):
+
+    # TEXT → textarea by default
+    if isinstance(t, T.Text):
+        ui["component"] = "Textarea"
+    # strings with/without length
+    elif isinstance(t, (T.String, T.Unicode)):
+        if getattr(t, "length", None) and t.length <= 255:
+            ui["component"] = "Text"
+        else:
+            ui["component"] = "Textarea"
+    elif isinstance(t, (T.Integer, T.BigInteger, T.SmallInteger)):
         ui["component"] = "Number"
-    elif isinstance(t, Boolean):
+    elif isinstance(t, (T.Numeric, T.Float, T.REAL, T.DECIMAL)):
+        ui["component"] = "Number"; ui["step"] = "any"
+    elif isinstance(t, T.Boolean):
         ui["component"] = "Checkbox"
-    elif isinstance(t, DateTime):
+    elif isinstance(t, T.DateTime):
         ui["component"] = "DateTime"
-    elif isinstance(t, Enum):
+    elif isinstance(t, T.Date):
+        ui["component"] = "Date"
+    elif isinstance(t, T.Enum):
         ui["component"] = "Select"
-        ui["options"]  = list(t.enums)  # or [e.value for e in t.enums]
-    elif isinstance(t, JSON):
+        if getattr(t, "enums", None):
+            ui["options"] = list(t.enums)
+        elif getattr(t, "enum_class", None):
+            ui["options"] = [e.value for e in t.enum_class]  # python Enum
+    elif isinstance(t, T.JSON):
         ui["component"] = "Json"
     else:
         ui["component"] = "Text"
 
-    # foreign keys → async select
+    # Foreign keys → async select to the *target resource's* /options
     if col.foreign_keys:
         fk = next(iter(col.foreign_keys))
-        target = fk.column.table.name # e.g. "people", "project"
-        ui["component"] = "SelectAsync"
-        ui["optionsEndpoint"] = f"/{target}/options"
-        ui["valueKey"] = "id"; ui["labelKey"] = "name"  # tweak per model
-    if col.default is not None or col.server_default is not None:
-        ui["autofill"] = True
+        target_table = fk.column.table.name
+        endpoint = f"/{target_table}/options"
+        if route_prefix_for_table:
+            # prefer the actual router prefix you registered (handles plurals like /people)
+            endpoint = f"{route_prefix_for_table(target_table)}/options"
+        ui.update({
+            "component": "SelectAsync",
+            "optionsEndpoint": endpoint,
+            "valueKey": "value",
+            "labelKey": "label",
+        })
+
     if col.nullable:
         ui["optional"] = True
-    return ui
 
+    # mark obvious autofill-ish fields
+    if col.default is not None or col.server_default is not None:
+        ui["autofill"] = True
+
+    return ui

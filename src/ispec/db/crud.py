@@ -1,7 +1,7 @@
 # crud.py
 from functools import cache
 import sqlite3
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Sequence, Any
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func
