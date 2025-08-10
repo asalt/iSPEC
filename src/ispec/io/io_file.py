@@ -2,13 +2,25 @@
 from functools import partial
 import pandas as pd
 from ispec.db.connect import get_connection
-from ispec.db.crud import Person, TableCRUD, Project, ProjectPerson
+from ispec.db.crud import (
+    Person,
+    TableCRUD,
+    Project,
+    ProjectPerson,
+    ProjectComment,
+    ProjectNote,
+    LetterOfSupport,
+)
 import numpy as np
 
 tables = {
-    "person" : Person,
-    "project" : Project
+    "person": Person,
+    "project": Project,
+    "comment": ProjectComment,
+    "note": ProjectNote,
+    "letter": LetterOfSupport,
 }
+
 
 def get_reader(file: str, **kwargs):
     if file.endswith(".tsv"):
@@ -23,8 +35,67 @@ def get_reader(file: str, **kwargs):
         return None
 
 
+def connect_project_person(db_file_path):
+    s = None
+    with get_connection(db_file_path) as conn:
+        ccc = conn.cursor()
+        ccc.execute("PRAGMA foreign_keys;")
+        ccc.execute(
+            """
+        INSERT OR IGNORE INTO project_person (project_id, person_id)
+        SELECT project.id, person.id
+        FROM project
+        JOIN person ON project.id = person.id
+        """
+        )
+        # thank u chat gpt
+        # ccc.execute("""
+        # SELECT * FROM (SELECT id, project_id FROM project_person) AS a
+        # JOIN (SELECT id FROM project) AS b
+        # ON a.project_id = b.id""")
+        # ccc.execute("""
+        # SELECT * FROM (SELECT id, person_id FROM project_person) AS a
+        # JOIN (SELECT id FROM person) AS b
+        # ON a.person_id = b.id""")
+        conn.commit()
+        s = ccc.fetchall()
+    return s
+
+
+def connect_project_comment(db_file_path):
+    s = None
+    with get_connection(db_file_path) as conn:
+        ccc = conn.cursor()
+        ccc.execute("PRAGMA foreign_keys;")
+        ccc.execute(
+            """
+        UPDATE project_comment
+        SET project_id = (
+        SELECT project.id
+        FROM project
+        WHERE project.id = project_comment.i_id
+        )
+        WHERE EXISTS (
+        SELECT 1
+        FROM project
+        WHERE project.id = project_comment.i_id
+        )
+       """
+        )
+
+        # ccc.execute("""
+        # INSERT OR IGNORE INTO project_comment (project_id)
+        # SELECT project.id
+        # FROM project
+        # JOIN project_comment ON project.id = project_comment.i_id
+        # """)
+        conn.commit()
+        s = ccc.fetchall()
+    return s
+
+
 def import_file(file_path, table_name, db_file_path=None, **kwargs):
-    
+
     reader = get_reader(file_path)
     df = reader(file_path)
     df = df.replace({np.nan: None}).replace({pd.NaT: None})
@@ -38,11 +109,16 @@ def import_file(file_path, table_name, db_file_path=None, **kwargs):
     if table is None:
         raise ValueError(f"No such table {table} in db")
 
-    with get_connection(db_file_path) as conn:   
-        table_instance = table(conn = conn)
+    with get_connection(db_file_path) as conn:
+        table_instance = table(conn=conn)
         table_instance.bulk_insert(df_dict)
 
-    #with get_connection(db_path=db_file_path) as conn:
+    if ("project" == table_name) or ("person" == table_name):
+        a = connect_project_person(db_file_path)
+    if "comment" == table_name:
+        a = connect_project_comment(db_file_path)
+
+    # with get_connection(db_path=db_file_path) as conn:
     #    table_obj = table(conn)
     #    #records = list(df.to_dict(orient="index").values())
     #    records = list(df_dict_clean)
@@ -51,10 +127,8 @@ def import_file(file_path, table_name, db_file_path=None, **kwargs):
     # done
     return
 
-def connect_project_person():
-    
-    return
 
+"""
 def get_table_colu(db_file_path,table_name):
     if tables.get(table_name) is not None:
         with get_connection(db_path=db_file_path) as conn:
@@ -77,3 +151,4 @@ def clean_up_import(dict,db_file_path,table_name):
         for removable in colsRemove:
             bigKey.pop(removable)
     return dict   
+"""

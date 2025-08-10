@@ -19,7 +19,6 @@ from ispec.db import init
 #  -w- z  z  z >:)
 #Note: your brain keeps forgetting the context of what you're reading. improve your comments.
 
-dbfile = 'test3.db'
 prjFile = 'test_ccsv_PROJECT.csv'
 perFile = 'test_ccsv_PERSON.csv'
 
@@ -36,18 +35,27 @@ def previous():
     conn.close()
 
 def test_import_file():
+    db_path = "test3.db"
+    if os.path.exists(db_path):
+        os.unlink(db_path)
     #import project file first to test
     #Create project object first.
     #init.initialize_db(dbfile)
-    #io_file.import_file(prjFile, 'project', dbfile) #path file must be a str
-    io_file.import_file(perFile, 'person', dbfile)
-    io_file.import_file('ispec_people.xlsx', 'person' , dbfile)
+    io_file.import_file(prjFile, 'project', db_path) #path file must be a str
+    io_file.import_file(perFile, 'person', db_path)
+    io_file.import_file('ispec_people.xlsx', 'person' , db_path)
+    io_file.import_file('ProjectsExport20250623.xlsx', 'project' , db_path)
+
 
 #def test_import_multi_file(conn):
 #def test_connect_prj_person_file(conn): # likely let the crud handle this part for you.
 
-def test_connect_files():
-    return
+def test_import_comment():
+    db_path = "test3.db"
+    #import project file first to test
+    #Create project object first.
+    #init.initialize_db(dbfile)
+    io_file.import_file('test_ccsv_COMMENT.csv','comment', db_path) #path file must be a str
 
 
 
