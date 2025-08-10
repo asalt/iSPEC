@@ -143,7 +143,7 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
                 validate_strings=True,        # rejects values not in the enum
                 ),
             nullable=True,
-            info={"ui" : {"label": "Project Type"}})
+            info={"ui" : {"label": "Project Type", "allowClear": True}})
 
     # prj_CreationTS: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # prj_ModificationTS: Mapped[datetime] = mapped_column(

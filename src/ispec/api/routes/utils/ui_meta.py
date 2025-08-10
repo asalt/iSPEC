@@ -131,9 +131,11 @@ def ui_from_column(
     # add enum options if applicable and not already provided
     if is_enum and "options" not in ui: # add the options
         if getattr(t, "enum_class", None):
-            ui["options"] = [e.value for e in t.enum_class]
+            enum_vals = t.enum_class
         elif getattr(t, "enums", None):
-            ui["options"] = list(t.enums)
+            enum_vals = t.enums
+        ui["options"] = [{"value": e.value, "label": e.value} for e in enum_vals]
+        # or {"value": e.name.lower(), "label": e.value} to store lowercase, display Title Case
 
     # Foreign keys → async select to the *target resource's* /options
     if col.foreign_keys:
