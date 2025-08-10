@@ -78,7 +78,7 @@ def get_models():
     from ispec.db.models import Person, Project, ProjectComment
 
     PersonRead = make_pydantic_model_from_sqlalchemy(
-        Person, name_suffix="Read", strip_prefix="ppl_"
+        Person, name_suffix="Read", # strip_prefix="ppl_" #  not using the strip_prefix anymore
     )
     ProjectRead = make_pydantic_model_from_sqlalchemy(
         Project, name_suffix="Read", strip_prefix="prj_"
