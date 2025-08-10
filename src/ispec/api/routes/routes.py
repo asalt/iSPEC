@@ -182,10 +182,6 @@ def generate_crud_router(
         db.refresh(obj)
         return obj
 
-    @router.get("/schema")
-    def get_schema():
-        return build_form_schema(model, CreateModel)
-
     @router.delete("/{item_id}")
     def delete_item(item_id: int, db: Session = Depends(get_session)):
         success = crud.delete(db, item_id)
@@ -193,7 +189,6 @@ def generate_crud_router(
             raise HTTPException(status_code=404, detail=f"{tag} not found")
         return {"status": "deleted", "id": item_id}
 
-    return router
 
     @router.get("/options")
     def options(
@@ -230,6 +225,7 @@ def generate_crud_router(
         target_crud.model = target_cls
         return target_crud.list_options(db, q=q, limit=limit)
 
+    return router
 
 # person_router = generate_crud_router(
 #     model=Person,
