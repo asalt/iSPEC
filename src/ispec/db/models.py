@@ -1,5 +1,7 @@
 # db/models.py
 import sqlite3
+import enum
+
 from typing import List
 from sqlalchemy import String, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
@@ -23,6 +25,7 @@ from sqlalchemy import (
     DateTime,
     Integer,
     Boolean,
+    Enum
 )
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -117,6 +120,11 @@ class Person(TIMESTAMP_MIXINS["ppl"], Base):
     projects: Mapped[List["ProjectPerson"]] = relationship(back_populates="person")
 
 
+class ProjectType(str, enum.Enum):
+    cprit = "CPRIT"
+    rfp   = "RFP"
+    other = "Other"
+
 class Project(TIMESTAMP_MIXINS["prj"], Base):
     __tablename__ = "project"
 
@@ -126,6 +134,17 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
         info={"ui": {"component": "Text", "label": "Title"}}
     )
     prj_ProjectDescription: Mapped[str] = mapped_column(Text, nullable=True)
+
+    prj_ProjectType = mapped_column(
+            Enum(ProjectType,
+                name="project_type",          # db type name (important for Postgres)
+                native_enum=False,            # store as VARCHAR on all DBs (PG/SQLite)
+                create_constraint=True,       # add CHECK constraint when native_enum=False
+                validate_strings=True,        # rejects values not in the enum
+                ),
+            nullable=True,
+            info={"ui" : {"label": "Project Type"}})
+
     # prj_CreationTS: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # prj_ModificationTS: Mapped[datetime] = mapped_column(
     #     DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

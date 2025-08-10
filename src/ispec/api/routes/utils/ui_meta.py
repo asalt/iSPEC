@@ -7,6 +7,24 @@ from sqlalchemy.sql.schema import Column as SAColumn
 from sqlalchemy.sql import sqltypes as T  # canonical type classes
 
 
+NAME_LIKE = ("name", "title", "displayid", "rfp", "type")
+
+
+
+def _is_enum_type(t) -> bool:
+    # work across dialects / emulated types
+    return isinstance(t, T.Enum) or getattr(t, "enum_class", None) is not None or getattr(t, "enums", None) is not None
+
+
+def _guess_text_component(col: SAColumn) -> str:
+    n = col.name.lower()
+    if any(k in n for k in NAME_LIKE):
+        return "Text"
+    t = col.type
+    if isinstance(t, (T.String, T.Unicode)) and getattr(t, "length", None) and t.length <= 255:
+        return "Text"
+    return "Textarea"
+
 def ui_from_column(
     col: SAColumn,
     *,
@@ -80,41 +98,42 @@ def ui_from_column(
     """
     # manual override first
     # allow explicit overrides: make_column(..., info={"ui": {...}})
-    if (col.info or {}).get("ui"):
-        return dict(col.info["ui"])  # copy
-
+    # start with explicit overrides, then *merge* inferred bits
+    ui: dict[str, Any] = dict((col.info or {}).get("ui", {}))
     t = col.type
-    ui: dict[str, Any] = {}
 
-    # TEXT → textarea by default
-    if isinstance(t, T.Text):
-        ui["component"] = "Textarea"
-    # strings with/without length
-    elif isinstance(t, (T.String, T.Unicode)):
-        if getattr(t, "length", None) and t.length <= 255:
-            ui["component"] = "Text"
+
+    is_enum = _is_enum_type(t)
+
+
+    # infer component if not explicitly set
+    # Text by default
+    if "component" not in ui:
+        if is_enum:
+            ui["component"] = "Select"
+        elif isinstance(t, (T.Text, T.String, T.Unicode)):
+            ui["component"] = _guess_text_component(col)
+        elif isinstance(t, (T.Integer, T.BigInteger, T.SmallInteger, T.Numeric, T.Float, T.REAL, T.DECIMAL)):
+            ui["component"] = "Number"
+            if isinstance(t, (T.Numeric, T.Float, T.REAL, T.DECIMAL)):
+                ui.setdefault("step", "any")
+        elif isinstance(t, T.Boolean):
+            ui["component"] = "Checkbox"
+        elif isinstance(t, T.DateTime):
+            ui["component"] = "DateTime"
+        elif isinstance(t, T.Date):
+            ui["component"] = "Date"
+        elif isinstance(t, T.JSON):
+            ui["component"] = "Json"
         else:
-            ui["component"] = "Textarea"
-    elif isinstance(t, (T.Integer, T.BigInteger, T.SmallInteger)):
-        ui["component"] = "Number"
-    elif isinstance(t, (T.Numeric, T.Float, T.REAL, T.DECIMAL)):
-        ui["component"] = "Number"; ui["step"] = "any"
-    elif isinstance(t, T.Boolean):
-        ui["component"] = "Checkbox"
-    elif isinstance(t, T.DateTime):
-        ui["component"] = "DateTime"
-    elif isinstance(t, T.Date):
-        ui["component"] = "Date"
-    elif isinstance(t, T.Enum):
-        ui["component"] = "Select"
-        if getattr(t, "enums", None):
+            ui["component"] = "Text"
+
+    # add enum options if applicable and not already provided
+    if is_enum and "options" not in ui: # add the options
+        if getattr(t, "enum_class", None):
+            ui["options"] = [e.value for e in t.enum_class]
+        elif getattr(t, "enums", None):
             ui["options"] = list(t.enums)
-        elif getattr(t, "enum_class", None):
-            ui["options"] = [e.value for e in t.enum_class]  # python Enum
-    elif isinstance(t, T.JSON):
-        ui["component"] = "Json"
-    else:
-        ui["component"] = "Text"
 
     # Foreign keys → async select to the *target resource's* /options
     if col.foreign_keys:
@@ -139,3 +158,12 @@ def ui_from_column(
         ui["autofill"] = True
 
     return ui
+
+
+
+
+# from ispec.db.models import Project
+# col = Project.__table__.c.prj_ProjectType
+# print("TYPE:", type(col.type), "enum_class:", getattr(col.type, "enum_class", None), "enums:", getattr(col.type, "enums", None))
+# # on SA 2.x you want TYPE to be sqlalchemy.sql.sqltypes.Enum
+

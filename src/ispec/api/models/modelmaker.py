@@ -9,6 +9,8 @@ from sqlalchemy.orm import (
     class_mapper,
 )
 from sqlalchemy.sql.schema import Column
+from sqlalchemy.sql import sqltypes as T
+
 
 
 def make_pydantic_model_from_sqlalchemy(
@@ -34,7 +36,10 @@ def make_pydantic_model_from_sqlalchemy(
                 continue
 
             try:
-                python_type = col.type.python_type
+                if isinstance(col.type, T.Enum) and getattr(col.type, "enum_class", None):
+                    python_type = col.type.enum_class    # <- prefer the enum class
+                else:
+                    python_type = col.type.python_type
             except NotImplementedError:
                 python_type = Any
 
@@ -81,16 +86,16 @@ def get_models():
         Person, name_suffix="Read", # strip_prefix="ppl_" #  not using the strip_prefix anymore
     )
     ProjectRead = make_pydantic_model_from_sqlalchemy(
-        Project, name_suffix="Read", strip_prefix="prj_"
+        Project, name_suffix="Read", #strip_prefix="prj_"
     )
     ProjectUpdate = make_pydantic_model_from_sqlalchemy(
-        Project, name_suffix="Update", strip_prefix="prj_"
+        Project, name_suffix="Update", #strip_prefix="prj_"
     )
 
     ProjectCommentRead = make_pydantic_model_from_sqlalchemy(
         ProjectComment,
         name_suffix="Read",
-        strip_prefix="com_",
+        #strip_prefix="com_",
         include_relationships=True,
         related_model_map={
             "person": PersonRead,
