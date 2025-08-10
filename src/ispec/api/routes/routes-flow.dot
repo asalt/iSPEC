@@ -1,0 +1,105 @@
+digraph GenerateCrudRouter {
+  rankdir=LR;
+  node [shape=box, fontsize=11];
+
+  // ===== Clusters =====
+  subgraph cluster_model {
+    label="SQLAlchemy Model";
+    color="#bbbbbb";
+    Model [label="model (Declarative)"];
+    Columns [label="model.__table__.columns"];
+  }
+
+  subgraph cluster_pydantic {
+    label="Pydantic Models (auto-derived)";
+    color="#bbbbbb";
+    ReadModel [label="ReadModel = make_pydantic_model_from_sqlalchemy(model, suffix='Read')"];
+    CreateModel [label="CreateModel = make_pydantic_model_from_sqlalchemy(\n  model,\n  suffix='Create',\n  exclude_fields = {id} ∪ create_exclude_fields,\n  optional_all\n)"];
+  }
+
+  subgraph cluster_router {
+    label="FastAPI Router (generated)";
+    color="#bbbbbb";
+    Router [label="APIRouter(prefix, tags=[tag])", shape=component];
+
+    Schema [label="GET /schema\n→ CreateModel.model_json_schema()\n+ per-field ui_from_column()\n+ order/sections/title"];
+    GetItem [label="GET /{item_id}\n→ crud.get(db, id)\n404 if None"];
+    CreateItem [label="POST /\n→ crud.create(db, payload)"];
+    UpdateItem [label="PUT /{item_id}\n→ load obj → set attrs → commit/refresh"];
+    DeleteItem [label="DELETE /{item_id}\n→ crud.delete(db, id)"];
+    Options [label="GET /options\nq, limit, ids, exclude_ids\n→ crud.list_options(...)"];
+    OptionsField [label="GET /options/{field} (WIP)\nresolve rel via sa_inspect(model)\n→ target_crud.list_options(...)"];
+  }
+
+  subgraph cluster_crud {
+    label="CRUD impl";
+    color="#bbbbbb";
+    CrudClass [label="crud_class()"];
+    Methods [label="get • create • delete • list_options", shape=note];
+  }
+
+  subgraph cluster_db {
+    label="DB / Session";
+    color="#bbbbbb";
+    SessionDep [label="Depends(get_session)", shape=parallelogram];
+  }
+
+  subgraph cluster_ui {
+    label="UI Helpers";
+    color="#bbbbbb";
+    UIFunc [label="ui_from_column(col)"];
+    GroupInfo [label="col.info['group'] (optional)"];
+  }
+
+  // ===== Edges =====
+  Model -> Columns;
+  Model -> ReadModel;
+  Model -> CreateModel;
+
+  // Router wiring
+  Router -> Schema;
+  Router -> GetItem;
+  Router -> CreateItem;
+  Router -> UpdateItem;
+  Router -> DeleteItem;
+  Router -> Options;
+  Router -> OptionsField;
+
+  // Schema path enriches with UI
+  Columns -> UIFunc [label="per field"];
+  UIFunc -> Schema;
+  GroupInfo -> Schema [label="optional group"];
+
+  // Endpoints use CRUD + DB
+  CrudClass -> GetItem;
+  CrudClass -> CreateItem;
+  CrudClass -> DeleteItem;
+  CrudClass -> Options;
+
+  SessionDep -> GetItem;
+  SessionDep -> CreateItem;
+  SessionDep -> UpdateItem;
+  SessionDep -> DeleteItem;
+  SessionDep -> Options;
+  SessionDep -> OptionsField;
+
+  // Update path flow
+  CreateModel -> CreateItem [label="payload"];
+  CreateModel -> UpdateItem [label="payload (exclude_unset)"];
+  ReadModel -> GetItem [label="response_model", style=dashed];
+  ReadModel -> CreateItem [label="response_model", style=dashed];
+  ReadModel -> UpdateItem [label="response_model", style=dashed];
+
+  // /options/{field} resolution
+  Model -> OptionsField [label="sa_inspect(model).relationships[field]"];
+  OptionsField -> CrudClass [label="target_crud (same base)", style=dashed];
+
+  // Overall generator
+  Generator [label="generate_crud_router(...)", shape=oval];
+  Generator -> Router [label="returns"];
+
+  // Styling hints
+  {rank=same; ReadModel; CreateModel}
+  {rank=same; GetItem; CreateItem; UpdateItem; DeleteItem; Options; OptionsField}
+}
+

@@ -95,6 +95,59 @@ class CRUDBase:
         return False
 
 
+
+    # hook: expression used for label; override per model if needed
+    def label_expr(self):
+        m = self.model
+        cols = m.__table__.columns.keys()
+        if 'name' in cols:
+            return getattr(m, 'name')
+        if 'title' in cols:
+            return getattr(m, 'title')
+        if {'first_name','last_name'}.issubset(cols):
+            # SQLAlchemy overloads + to CONCAT/||; TRIM avoids double spaces
+            return func.trim(getattr(m, 'first_name') + ' ' + getattr(m, 'last_name'))
+        if 'code' in cols:
+            return getattr(m, 'code')
+        # fallback: cast id to string
+        return cast(getattr(m, 'id'), String)
+
+    def list_options(
+        self,
+        db: Session,
+        *,
+        q: str | None = None,
+        limit: int = 20,
+        ids: Sequence[int] | None = None,
+        exclude_ids: Sequence[int] | None = None,
+        order: str | None = None
+    ) -> list[dict[str, Any]]:
+        M = self.model
+        lbl = self.label_expr().label('label')
+
+        stmt = select(getattr(M, 'id').label('value'), lbl)
+
+        if ids:
+            stmt = stmt.where(getattr(M, 'id').in_(ids))
+        if exclude_ids:
+            stmt = stmt.where(~getattr(M, 'id').in_(exclude_ids))
+
+        if q:
+            # Case-insensitive match; .ilike turns into LIKE on SQLite (still case-insensitive)
+            stmt = stmt.where(lbl.ilike(f"%{q}%"))
+
+        # Sort by label unless caller wants something else
+        if order == 'id':
+            stmt = stmt.order_by(getattr(M, 'id').asc())
+        else:
+            stmt = stmt.order_by(lbl.asc())
+
+        stmt = stmt.limit(limit)
+        rows: Iterable[tuple[int, str]] = db.execute(stmt).all()
+        return [{'value': v, 'label': l} for (v, l) in rows]
+
+
+
 class PersonCRUD(CRUDBase):
 
     # prefix = "ppl_"
@@ -138,6 +191,20 @@ class PersonCRUD(CRUDBase):
         if validated is None:
             return None  # or return existing object or ID if desired
         return super().create(session, validated)
+
+
+
+    def label_expr(self): # override base label_expr 
+        # e.g., "Lastname, Firstname (email)"
+        cols = self.model.__table__.columns.keys()
+        expr = None
+        if {'ppl_Name_Last','ppl_Name_First'}.issubset(cols):
+            expr = getattr(self.model, 'ppl_Name_Last') + ', ' + getattr(self.model, 'ppl_Name_First')
+        else:
+            expr = super().label_expr()
+        if 'ppl_email' in cols:  #this might be the wrong form name
+            expr = expr + ' (' + getattr(self.model, 'ppl_email') + ')'
+        return func.trim(expr)
 
 
 class ProjectCRUD(CRUDBase):

@@ -76,8 +76,14 @@ TIMESTAMP_MIXINS = {
 }
 
 
+# also note a per-column customization feature with pattern
+# Column(..., info = dict(ui = {...}) )
+# we need to use it with mapped_column constructor func
 class Base(DeclarativeBase):
     __table_args__ = {"sqlite_autoincrement": True}
+    __ui__ = {"sections": [...], # model based ui customization
+            "order": [...]
+            }
 
 
 class Person(TIMESTAMP_MIXINS["ppl"], Base):
@@ -117,7 +123,7 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     prj_AddedBy: Mapped[str] = mapped_column(Text)
     prj_ProjectTitle: Mapped[str] = mapped_column(Text, nullable=False)
-    prj_ProjectDescription: Mapped[str] = mapped_column(Text, nullable=False)
+    prj_ProjectDescription: Mapped[str] = mapped_column(Text, nullable=True)
     # prj_CreationTS: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # prj_ModificationTS: Mapped[datetime] = mapped_column(
     #     DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

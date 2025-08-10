@@ -8,6 +8,10 @@ from ispec.db.models import Person, Project, ProjectComment
 from ispec.db.crud import PersonCRUD, ProjectCRUD, ProjectCommentCRUD
 from ispec.api.models.modelmaker import get_models, make_pydantic_model_from_sqlalchemy
 
+from ispec.api.routes.utils.ui_meta import ui_from_column  # used inside schema builder
+from ispec.api.routes.schema import build_form_schema
+
+
 models = get_models()
 # ProjectRead = models["ProjectRead"]
 # ProjectUpdate = models["ProjectUpdate"]
@@ -40,13 +44,69 @@ def generate_crud_router(
     *,
     prefix: str,
     tag: str,
-    # strip_prefix: str = "",
     exclude_fields: set[str] = {"id"},
-    create_exclude_fields: set[str] = None,
+    create_exclude_fields: set[str] | None = None,
     optional_all: bool = False,
 ) -> APIRouter:
+    """
+    Create a FastAPI router providing CRUD and metadata endpoints for a SQLAlchemy model.
 
-    create_exclude_fields = create_exclude_fields or {}
+    This function dynamically generates a FastAPI `APIRouter` for the given
+    SQLAlchemy model and associated CRUD class. It auto-constructs Pydantic
+    models for reading and creating objects, and wires them into standard
+    REST-style endpoints:
+
+      - `GET /schema` – Return the Pydantic create model's JSON schema,
+        annotated with UI metadata from `ui_from_column()` (or from
+        model-level metadata such as `col.info["group"]`).
+      - `GET /{item_id}` – Retrieve a single object by primary key.
+      - `POST /` – Create a new object; required fields marked in schema.
+      - `PUT /{item_id}` – Update an existing object (partial updates supported).
+      - `DELETE /{item_id}` – Delete an object by primary key.
+      - `GET /options` – List available options for select inputs (supports query filtering, ID filtering, and exclusions).
+      - `GET /options/{field}` – List options for a specific relationship
+        field (WIP; resolves related model dynamically).
+
+    The generated router uses `crud_class` for database operations and
+    `make_pydantic_model_from_sqlalchemy()` to derive request/response models.
+
+    Parameters
+    ----------
+    model : SQLAlchemy declarative model class
+        The ORM model to generate endpoints for.
+    crud_class : type
+        A class implementing CRUD methods (`get`, `create`, `delete`, `list_options`).
+    prefix : str
+        URL path prefix for all routes in the router.
+    tag : str
+        Tag name for FastAPI's OpenAPI documentation grouping.
+    exclude_fields : set[str], default={"id"}
+        Fields to exclude from *all* generated Pydantic models.
+    create_exclude_fields : set[str] | None, default=None
+        Fields to exclude from the create/update Pydantic model only.
+    optional_all : bool, default=False
+        If True, marks all fields in the create/update model as optional.
+
+    Returns
+    -------
+    APIRouter
+        A FastAPI router with the generated CRUD and metadata endpoints.
+
+    Notes
+    -----
+    - This function relies on `ui_from_column()` to inject UI-specific hints
+      into the `/schema` output, which can be used by a frontend to render
+      forms automatically.
+    - Foreign key fields in the create model will produce async-select UI
+      components via `/options` endpoints.
+    - The `/options/{field}` endpoint is work-in-progress and may require
+      a CRUD registry for related models.
+    - This function is designed for extensibility — you can add extra
+      endpoints or tweak schema generation after calling it.
+    """
+
+
+    create_exclude_fields = create_exclude_fields or set()
     router = APIRouter(prefix=prefix, tags=[tag])
     crud = crud_class()
 
@@ -65,6 +125,30 @@ def generate_crud_router(
         # exclude_fields = {""}
     )
 
+    # this is for frontend UI form rendering
+    @router.get("/schema")
+    def get_schema():
+        schema = CreateModel.model_json_schema()
+        # attach per-field UI hints
+        props = schema.get("properties", {})
+        column_map = {c.name: c for c in model.__table__.columns}  # type: ignore
+        for name, prop in props.items():
+            col = column_map.get(name)
+            if col is None:
+                continue
+            prop["ui"] = ui_from_column(col)
+            # carry ordering/grouping if present on SA Column
+            if grp := (col.info or {}).get("group"):
+                prop.setdefault("ui", {})["group"] = grp
+
+        # top-level UI (sections/order) — optional
+        schema["ui"] = {
+            "order": [c.name for c in model.__table__.columns if c.name in props],
+            "sections": [],  # you can prefill from model-level metadata if desired
+            "title": tag,
+        }
+        return schema
+
     @router.get("/{item_id}", response_model=ReadModel)
     def get_item(item_id: int, db: Session = Depends(get_session)):
         obj = crud.get(db, item_id)
@@ -77,6 +161,7 @@ def generate_crud_router(
         response_model=ReadModel,
         summary=f"Create new {tag}",
         description="Create a new item. Required fields are marked with * in the request body below.",
+        status_code=201,
     )
     def create_item(payload: CreateModel, db: Session = Depends(get_session)):
         obj = crud.create(db, payload.model_dump())
@@ -97,6 +182,10 @@ def generate_crud_router(
         db.refresh(obj)
         return obj
 
+    @router.get("/schema")
+    def get_schema():
+        return build_form_schema(model, CreateModel)
+
     @router.delete("/{item_id}")
     def delete_item(item_id: int, db: Session = Depends(get_session)):
         success = crud.delete(db, item_id)
@@ -105,6 +194,41 @@ def generate_crud_router(
         return {"status": "deleted", "id": item_id}
 
     return router
+
+    @router.get("/options")
+    def options(
+        q: str | None = None,
+        limit: int = 20,
+        ids: list[int] | None = Query(default=None),
+        exclude_ids: list[int] | None = Query(default=None),
+        db: Session = Depends(get_session),
+    ):
+        return crud.list_options(db, q=q, limit=limit, ids=ids, exclude_ids=exclude_ids)
+
+    # this is WIP
+    @router.get("/options/{field}")
+    def options_for_field(
+        field: str,
+        q: str | None = None,
+        limit: int = 20,
+        db: Session = Depends(get_session),
+    ):
+        # Resolve the related model via ORM relationship
+        from sqlalchemy import inspect as sa_inspect
+
+        mapper = sa_inspect(model)
+        rel = mapper.relationships.get(field)
+        if not rel:
+            raise HTTPException(
+                status_code=404, detail=f"No relationship named '{field}'"
+            )
+        target_cls = rel.mapper.class_
+        # Use the target's CRUD (you can keep a registry {Model: CRUD})
+        target_crud = (
+            crud.__class__()
+        )  # if your CRUDs share a base, use a registry instead
+        target_crud.model = target_cls
+        return target_crud.list_options(db, q=q, limit=limit)
 
 
 # person_router = generate_crud_router(
@@ -117,6 +241,12 @@ def generate_crud_router(
 #     optional_all=False,  # Change to True if you want POST to accept partial fields
 # )
 
+
+# the crud_classes have custom methods for providing list_schema
+# UI components guide
+# other things
+
+# ========================= Person ==============================
 router.include_router(
     generate_crud_router(
         model=Person,
@@ -124,11 +254,15 @@ router.include_router(
         prefix="/people",
         tag="Person",
         # strip_prefix="ppl_",
-        exclude_fields={"id",},
-        create_exclude_fields={"ppl_CreationTS", "ppl_ModificationTS"}
+        exclude_fields={
+            "id",
+        },
+        create_exclude_fields={"ppl_CreationTS", "ppl_ModificationTS"},
     )
 )
 
+
+# ========================= Project ==============================
 router.include_router(
     generate_crud_router(
         model=Project,
@@ -141,6 +275,7 @@ router.include_router(
 )
 
 
+# ========================= ProjectComment ==============================
 router.include_router(
     generate_crud_router(
         model=ProjectComment,
