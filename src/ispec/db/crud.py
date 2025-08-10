@@ -1,10 +1,14 @@
 # crud.py
+from typing import Dict, Optional, List, Sequence, Any
 from functools import cache
 import sqlite3
-from typing import Dict, Optional, List, Sequence, Any
 
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+
+from sqlalchemy import select, func, cast
+from sqlalchemy.sql import sqltypes as T   # canonical type classes (String, Text, etc.)
+from sqlalchemy.orm import Session
 
 # from ispec.db.connect import get_connection
 from ispec.db.connect import get_session
@@ -98,19 +102,28 @@ class CRUDBase:
 
     # hook: expression used for label; override per model if needed
     def label_expr(self):
-        m = self.model
-        cols = m.__table__.columns.keys()
+        """Default human label for options(). Override per model if needed."""
+        M = self.model
+        cols = M.__table__.columns.keys()
+
+        # helpers: COALESCE to avoid NULL-propagation in concatenation
+        def coalesce(colname: str, fallback: str = ""):
+            return func.coalesce(getattr(M, colname), fallback)
+
         if 'name' in cols:
-            return getattr(m, 'name')
+            return getattr(M, 'name')
         if 'title' in cols:
-            return getattr(m, 'title')
-        if {'first_name','last_name'}.issubset(cols):
-            # SQLAlchemy overloads + to CONCAT/||; TRIM avoids double spaces
-            return func.trim(getattr(m, 'first_name') + ' ' + getattr(m, 'last_name'))
+            return getattr(M, 'title')
+        if {'first_name', 'last_name'}.issubset(cols):
+            # "Last, First" and trim extra spaces if one side empty
+            return func.trim(coalesce('last_name') + ', ' + coalesce('first_name'))
         if 'code' in cols:
-            return getattr(m, 'code')
-        # fallback: cast id to string
-        return cast(getattr(m, 'id'), String)
+            return getattr(M, 'code')
+
+        # fallback: cast id to text
+        return cast(getattr(M, 'id'), T.String())
+
+
 
     def list_options(
         self,
@@ -125,7 +138,8 @@ class CRUDBase:
         M = self.model
         lbl = self.label_expr().label('label')
 
-        stmt = select(getattr(M, 'id').label('value'), lbl)
+        id_col = getattr(M, 'id').label('value')
+        stmt = select(id_col, lbl)
 
         if ids:
             stmt = stmt.where(getattr(M, 'id').in_(ids))
@@ -205,6 +219,14 @@ class PersonCRUD(CRUDBase):
         if 'ppl_email' in cols:  #this might be the wrong form name
             expr = expr + ' (' + getattr(self.model, 'ppl_email') + ')'
         return func.trim(expr)
+
+    # def label_expr(self):
+    # is this one safe ? above attr check maybe better?
+    #     M = self.model
+    #     return func.trim(
+    #         func.coalesce(M.last_name, '') + ', ' +
+    #         func.coalesce(M.first_name, '')
+    #     )
 
 
 class ProjectCRUD(CRUDBase):

@@ -79,7 +79,7 @@ def ui_from_column(
 
     """
     # manual override first
-    # allow explicit overrides: Column(..., info={"ui": {...}})
+    # allow explicit overrides: make_column(..., info={"ui": {...}})
     if (col.info or {}).get("ui"):
         return dict(col.info["ui"])  # copy
 

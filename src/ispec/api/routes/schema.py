@@ -1,5 +1,5 @@
 # schemas.py
-from typing import Any, Type
+from typing import Any, Type, Callable
 from functools import cache
 from pydantic import BaseModel
 
@@ -20,15 +20,22 @@ from .utils.ui_meta import ui_from_column
 
 
 @cache
-def build_form_schema(model: Type[Any], CreateModel: Type[BaseModel]) -> dict:
+def build_form_schema(
+        model: Type[Any],
+        CreateModel: Type[BaseModel],
+        *,
+        route_prefix_for_table: Callable[[str], str] | None = None,
+        ) -> dict:
     schema = CreateModel.model_json_schema()
     props = schema.get("properties", {})
-    columns = {c.name: c for c in model.__table__.columns}  # type: ignore
+    colmap = {c.name: c for c in model.__table__.columns}  # type: ignore
 
     # attach per-field UI
     for name, prop in props.items():
-        if name in columns:
-            prop["ui"] = ui_from_column(columns[name])
+        if name in colmap:
+            # prop["ui"] = ui_from_column(colmap[name])
+            prop["ui"] = ui_from_column(colmap[name], route_prefix_for_table=route_prefix_for_table)
+
 
     # top-level UI affordances
     order = [c.name for c in model.__table__.columns if c.name in props]

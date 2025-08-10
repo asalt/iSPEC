@@ -38,6 +38,10 @@ router = APIRouter()
 #     return obj
 
 
+
+ROUTE_PREFIX_BY_TABLE: dict[str, str] = {}
+
+
 def generate_crud_router(
     model,
     crud_class,
@@ -110,6 +114,15 @@ def generate_crud_router(
     router = APIRouter(prefix=prefix, tags=[tag])
     crud = crud_class()
 
+
+    # register prefix for FK resolution (e.g., "person" -> "/people")
+    ROUTE_PREFIX_BY_TABLE[model.__table__.name] = prefix
+
+
+    def route_prefix_for_table(table: str) -> str:
+        return ROUTE_PREFIX_BY_TABLE.get(table, f"/{table}")
+
+
     # Generate models
     ReadModel = make_pydantic_model_from_sqlalchemy(
         model,
@@ -128,26 +141,29 @@ def generate_crud_router(
     # this is for frontend UI form rendering
     @router.get("/schema")
     def get_schema():
-        schema = CreateModel.model_json_schema()
-        # attach per-field UI hints
-        props = schema.get("properties", {})
-        column_map = {c.name: c for c in model.__table__.columns}  # type: ignore
-        for name, prop in props.items():
-            col = column_map.get(name)
-            if col is None:
-                continue
-            prop["ui"] = ui_from_column(col)
-            # carry ordering/grouping if present on SA Column
-            if grp := (col.info or {}).get("group"):
-                prop.setdefault("ui", {})["group"] = grp
+        return build_form_schema(model, CreateModel, route_prefix_for_table=route_prefix_for_table)
 
-        # top-level UI (sections/order) — optional
-        schema["ui"] = {
-            "order": [c.name for c in model.__table__.columns if c.name in props],
-            "sections": [],  # you can prefill from model-level metadata if desired
-            "title": tag,
-        }
-        return schema
+        # this is now in build_form_schema
+        # schema = CreateModel.model_json_schema()
+        # # attach per-field UI hints
+        # props = schema.get("properties", {})
+        # column_map = {c.name: c for c in model.__table__.columns}  # type: ignore
+        # for name, prop in props.items():
+        #     col = column_map.get(name)
+        #     if col is None:
+        #         continue
+        #     prop["ui"] = ui_from_column(col)
+        #     # carry ordering/grouping if present on SA Column
+        #     if grp := (col.info or {}).get("group"):
+        #         prop.setdefault("ui", {})["group"] = grp
+
+        # # top-level UI (sections/order) — optional
+        # schema["ui"] = {
+        #     "order": [c.name for c in model.__table__.columns if c.name in props],
+        #     "sections": [],  # you can prefill from model-level metadata if desired
+        #     "title": tag,
+        # }
+        # return schema
 
     @router.get("/{item_id}", response_model=ReadModel)
     def get_item(item_id: int, db: Session = Depends(get_session)):
