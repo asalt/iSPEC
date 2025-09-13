@@ -35,9 +35,11 @@ def get_db_path(file=None) -> Path:
     if file is None:
         db_path = get_db_dir()
         db_file = db_path / "ispec.db"
-        db_file = "sqlite:///" + str(db_file)
-    logger.info("setting db_path to %s", str(db_file))
-    return db_file
+    else:
+        db_file = Path(file)
+    db_uri = "sqlite:///" + str(db_file)
+    logger.info("setting db_path to %s", db_uri)
+    return db_uri
 
 
 @lru_cache(maxsize=None)
