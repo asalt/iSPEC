@@ -2,6 +2,11 @@ from typing import List, Dict, Optional, Tuple
 from sentence_transformers import SentenceTransformer, util
 from difflib import get_close_matches
 import numpy as np
+import logging
+
+from ispec.logging import get_logger
+
+logger = get_logger(__file__)
 
 # Preload model
 _default_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -34,28 +39,47 @@ def match_columns(
     model: Optional[SentenceTransformer] = None,
     threshold: float = 0.6,
     fallback: bool = True,
+    verbose: bool = False,
 ) -> Dict[str, Optional[str]]:
     """
     Match source column names to target columns using semantic similarity.
     Falls back to difflib.get_close_matches if score below threshold.
+
+    Parameters
+    ----------
+    source_columns : List[str]
+        Columns we are trying to map.
+    target_columns : List[str]
+        Possible target columns to match against.
+    model : Optional[SentenceTransformer]
+        Embedding model to use; defaults to a preloaded miniLM model.
+    threshold : float, optional
+        Minimum similarity score to accept a match, by default 0.6.
+    fallback : bool, optional
+        When True, attempt a difflib-based match if semantic match is below
+        threshold.
+    verbose : bool, optional
+        If True, emit debug logs detailing the matching process.
     """
+    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+
     model = model or _default_model
     sim_matrix = score_matches(source_columns, target_columns, model)
 
     matches = {}
     for i, src in enumerate(source_columns):
-        print(f"looking for best match for {src}")
+        logger.debug("looking for best match for %s", src)
         best_idx = int(np.argmax(sim_matrix[i]))
         best_score = sim_matrix[i][best_idx]
         if best_score >= threshold:
             best_match = target_columns[best_idx]
-            print(f"best match : {best_match}")
+            logger.debug("best match : %s", best_match)
             matches[src] = best_match
         elif fallback:
             # Use difflib if transformer match is too weak
-            print("couldn't find a top match")
+            logger.debug("couldn't find a top match")
             close = get_close_matches(src, target_columns, n=1, cutoff=0.0)
-            print(f"close matches : {close}")
+            logger.debug("close matches : %s", close)
             matches[src] = close[0] if close else None
         else:
             matches[src] = None
