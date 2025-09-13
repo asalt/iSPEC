@@ -4,7 +4,6 @@ from fastapi import APIRouter
 from api.models.project import Project
 
 # import the necessary db objects
-from ispec.db.connect import get_connection
 from ispec.db.crud import (
     Person,
     TableCRUD,

@@ -73,71 +73,21 @@ def table_exists(conn, table_name):
 CREATE_TABLE_PATTERN = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+)")
 
 
-# def initialize_db(file_path=None, conn=None):
-#     sql_def = get_sql_file()
-#     with open(sql_def) as f:
-#         sql_cmds = f.read().strip()
-#     table_names = CREATE_TABLE_PATTERN.findall(sql_cmds)
-
-#     def should_create(conn):
-#         return not all(table_exists(conn, t) for t in table_names)
-
-#     if file_path is not None and conn is None:
-#         with get_connection(file_path) as conn:
-#             if should_create(conn):
-#                 conn.executescript(sql_cmds)
-#                 conn.commit()
-#         return
-#     elif conn is not None:
-#         if should_create(conn):
-#             conn.executescript(sql_cmds)
-#             conn.commit()
-#     return
-
-
-# def adapt_timestamp(ts):  # pandas.timestamp
-#     return ts.isoformat()
-
-
-# def convert_timestamp(s: bytes):
-#     return pd.Timestamp(s.decode())
-
-
-# @contextmanager
-# def get_connection(db_path: Path = None):
-#     # ensure_db_dir()
-#     db_file = Path(db_path) if db_path else get_db_path()
-
-#     logger.info("connecting to db %s", str(db_file))
-
-#     sqlite3.enable_callback_tracebacks(True)
-#     conn = sqlite3.connect(
-#         str(db_file),
-#         check_same_thread=False,
-#         detect_types=sqlite3.PARSE_DECLTYPES,
-#         # autocommit=False,
-#     )
-#     conn.execute("PRAGMA foreign_keys = ON")
-#     sqlite3.register_adapter(pd.Timestamp, adapt_timestamp)
-#     sqlite3.register_converter("TIMESTAMP", convert_timestamp)
-
-#     conn.set_trace_callback(lambda x: logger.info(x))
-#     initialize_db(conn=conn)
-#     try:
-#         yield conn
-#     finally:
-#         conn.commit()
-#         conn.close()
 
 
 def make_session_factory(engine: Engine):
     SessionLocal = sessionmaker(bind=engine)
+    initialize_db(engine=engine)
 
     @contextmanager
     def get_session():
         session = SessionLocal()
         try:
             yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
         finally:
             session.close()
 
@@ -145,14 +95,32 @@ def make_session_factory(engine: Engine):
 
 
 # Session Context Manager
-def get_session() -> Session:
-    db_path = os.getenv("ISPEC_DB_PATH", get_db_path())
-    engine = sqlite_engine(db_path)
+@contextmanager
+def get_session(file_path: str | Path | None = None) -> Session:
+    """Provide a transactional scope around a series of operations.
+
+    Parameters
+    ----------
+    file_path:
+        Optional path to the SQLite database file. If not provided, the
+        ``ISPEC_DB_PATH`` environment variable or the default path from
+        :func:`get_db_path` is used.
+    """
+
+    db_path = os.getenv("ISPEC_DB_PATH") if file_path is None else file_path
+    if db_path is None:
+        db_path = get_db_path()
+    # ensure sqlite URI prefix
+    db_uri = str(db_path)
+    if not str(db_uri).startswith("sqlite"):
+        db_uri = "sqlite:///" + str(db_uri)
+
+    engine = sqlite_engine(db_uri)
+    initialize_db(engine=engine)
 
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:
-        initialize_db(engine=engine)  # <- Call initializer once per session
         yield session
         session.commit()
     except Exception:
@@ -167,25 +135,3 @@ def get_session() -> Session:
 #    get_db_dir().mkdir(parents=True, exist_ok=True)
 
 
-# def initialize_db(file_path=None, conn=None):
-#
-#     sql_def = get_sql_file()
-#     with open(sql_def) as f:
-#         sql_cmds = f.read().strip()
-#         # parse out the table names and check table_exists for eacH?
-#         # sql_cmds = f.read().strip().split(';')
-#
-#     # Note add a check to see if the necessary tables are already created
-#     # if so, skip.
-#     if file_path is not None and conn is None:
-#         with get_connection(file_path) as conn:
-#             cursor = conn.cursor()
-#             # for sql_cmd in sql_cmds:
-#             cursor.executescript(sql_cmds)
-#             conn.commit()
-#         return
-#     elif conn is not None:
-#         cursor = conn.cursor()
-#         cursor.executescript(sql_cmds)
-#         conn.commit()
-#     return

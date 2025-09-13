@@ -1,7 +1,10 @@
 # db/init.py 
-from ispec.db.connect import get_connection
 from pathlib import Path
 from functools import lru_cache
+from typing import Union
+
+from ispec.db.connect import get_db_path
+from ispec.db.models import sqlite_engine, initialize_db as orm_initialize_db
 
 
 
@@ -24,16 +27,26 @@ def get_sql_file(**kwargs):
     return sql_code_file
 
 
-def initialize_db(file_path=None):
+def initialize_db(file_path: Union[str, Path, None] = None):
+    """Create all database tables using SQLAlchemy models.
 
-    sql_def = get_sql_file()
-    with open(sql_def) as f:
-        sql_cmds = f.read().strip()
-        #sql_cmds = f.read().strip().split(';')
-    
-    with get_connection(file_path) as conn:
-        cursor = conn.cursor()
-        #for sql_cmd in sql_cmds:
-        cursor.executescript(sql_cmds)
-        conn.commit()
+    Parameters
+    ----------
+    file_path:
+        Optional path to the SQLite database file. When ``None`` the default
+        path returned by :func:`get_db_path` is used.
+
+    Returns
+    -------
+    Engine
+        The SQLAlchemy engine connected to the initialized database.
+    """
+
+    db_uri = file_path or get_db_path()
+    if not str(db_uri).startswith("sqlite"):
+        db_uri = "sqlite:///" + str(db_uri)
+
+    engine = sqlite_engine(db_uri)
+    orm_initialize_db(engine)
+    return engine
 
