@@ -10,7 +10,6 @@ from sqlalchemy import select, func, cast
 from sqlalchemy.sql import sqltypes as T   # canonical type classes (String, Text, etc.)
 from sqlalchemy.orm import Session
 
-# from ispec.db.connect import get_connection
 from ispec.db.connect import get_session
 from ispec.logging import get_logger
 

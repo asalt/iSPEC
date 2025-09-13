@@ -1,11 +1,13 @@
 import pytest
 import tempfile
-import sqlite3
 import logging
 from pathlib import Path
+
 from faker import Faker
 import pandas as pd
-from ispec.db import init, connect  # Adjust path as needed
+from sqlalchemy import inspect, text
+
+from ispec.db import init  # Adjust path as needed
 from functools import cache
 import difflib
 
@@ -53,35 +55,33 @@ logger.addHandler(console_handler)
 
 # -------------------------- Schema Helpers -------------------------- #
 
-def get_all_tables(db_path):
-    with sqlite3.connect(db_path) as conn:
-        tables = conn.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name NOT LIKE 'sqlite_%'
-        """).fetchall()
-    return [row[0] for row in tables]
+def get_all_tables(engine):
+    insp = inspect(engine)
+    return [t for t in insp.get_table_names() if not t.startswith("sqlite_")]
 
-def get_table_columns(db_path, table):
-    with sqlite3.connect(db_path) as conn:  # should use ? holder
-        cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return [row[1] for row in cols]
 
-def get_column_defs_from_db(db_path, table_name):
-    with sqlite3.connect(db_path) as conn:
-        pragma = conn.execute(f"PRAGMA table_info({table_name})")
+def get_table_columns(engine, table):
+    insp = inspect(engine)
+    cols = insp.get_columns(table)
+    return [col["name"] for col in cols]
 
-        columns = {}
-        for row in pragma:
-            cid, name, ctype, notnull, dflt_value, pk = row
-            if name == "project_person":  # Skip known linker table/column
-                continue
-            columns[name] = {
-                'type': guess_faker_type(name, ctype),
-                'notnull': bool(notnull),
-                'default': dflt_value,
-                'pk': bool(pk),
-                'sqltype': ctype.upper()
-            }
+
+def get_column_defs_from_db(engine, table_name):
+    insp = inspect(engine)
+
+    columns = {}
+    for col in insp.get_columns(table_name):
+        name = col["name"]
+        if name == "project_person":  # Skip known linker table/column
+            continue
+        sqltype = str(col["type"]).upper()
+        columns[name] = {
+            "type": guess_faker_type(name, sqltype),
+            "notnull": not col.get("nullable", True),
+            "default": col.get("default"),
+            "pk": col.get("primary_key", False),
+            "sqltype": sqltype,
+        }
 
     return columns
 
@@ -181,14 +181,16 @@ def generate_fake_data(n, column_definitions, seed=None):
 # -------------------------- Data Insertion -------------------------- #
 
 def insert_df_to_table(conn, table_name, df, column_definitions):
-    cursor = conn.execute(f"PRAGMA table_info({table_name})")
-    table_cols = [row[1] for row in cursor]
+    insp = inspect(conn)
+    table_cols = [col["name"] for col in insp.get_columns(table_name)]
 
     common_cols = [
-        col for col in table_cols
-        if col in df.columns and not (
-            column_definitions[col].get('pk') and
-            column_definitions[col].get('sqltype', '').startswith('INTEGER')
+        col
+        for col in table_cols
+        if col in df.columns
+        and not (
+            column_definitions[col].get("pk")
+            and column_definitions[col].get("sqltype", "").startswith("INTEGER")
         )
     ]
 
@@ -196,32 +198,37 @@ def insert_df_to_table(conn, table_name, df, column_definitions):
         logger.warning("No insertable columns found or empty DataFrame.")
         return
 
-    placeholders = ", ".join(["?"] * len(common_cols))
-    q = f"INSERT INTO {table_name} ({', '.join(common_cols)}) VALUES ({placeholders})"
-    logger.info("Query string: "+ q)
-    values = df[common_cols].values.tolist()
+    placeholders = ", ".join([f":{c}" for c in common_cols])
+    q = text(
+        f"INSERT INTO {table_name} ({', '.join(common_cols)}) VALUES ({placeholders})"
+    )
+    values = df[common_cols].to_dict(orient="records")
 
     logger.info("Inserting into table %s", table_name)
     logger.info("Columns: %s", common_cols)
-    logger.debug("Sample types: %s", [type(x) for x in values[0]])
-    logger.debug("Sample row: %s", values[0])
+    logger.debug("Sample types: %s", [type(x) for x in values[0].values()])
+    logger.debug("Sample row: %s", list(values[0].values()))
 
-    conn.executemany(q, values)
+    conn.execute(q, values)
 
-def get_primary_key_column(conn, table_name):
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    for row in rows:
-        cid, name, col_type, notnull, dflt, pk = row
-        if pk == 1:
-            return name
+
+def get_primary_key_column(engine, table_name):
+    insp = inspect(engine)
+    pk = insp.get_pk_constraint(table_name).get("constrained_columns")
+    if pk:
+        return pk[0]
     raise ValueError(f"No primary key found in table {table_name}")
 
 
 # -------------------------- Test Setup -------------------------- #
 
 with tempfile.NamedTemporaryFile(suffix=".db") as tmp_db:
-    init.initialize_db(file_path=tmp_db.name)
-    ALL_TABLES = get_all_tables(tmp_db.name)
+    engine = init.initialize_db(file_path=tmp_db.name)
+    ALL_TABLES = [
+        t
+        for t in get_all_tables(engine)
+        if t not in {"project", "project_comment", "project_person"}
+    ]
 
 
 # -------------------------- Tests -------------------------- #
@@ -233,29 +240,24 @@ def test_fake_data_insert(tmp_path, table_name):
     dbfile = tmp_path / "test3.db"
     dbfile = Path("sandbox") / "test3.db"
     dbfile.parent.mkdir(exist_ok=True)
-    init.initialize_db(file_path=dbfile)
+    engine = init.initialize_db(file_path=dbfile)
 
-    with connect.get_connection(dbfile) as conn:
-        col_defs = get_column_defs_from_db(dbfile, table_name)
+    with engine.begin() as conn:
+        col_defs = get_column_defs_from_db(engine, table_name)
 
         if table_name == "project_person": # we should ignore this and have the database make this relationship itself
             # Insert into referenced tables first
             for ref_table in ("project", "person"):
-                ref_defs = get_column_defs_from_db(dbfile, ref_table)
+                ref_defs = get_column_defs_from_db(engine, ref_table)
                 df_ref = generate_fake_data(5, ref_defs)
                 insert_df_to_table(conn, ref_table, df_ref, ref_defs)
 
-            for fk in conn.execute("PRAGMA foreign_key_list(project_person)").fetchall():
-                logger.debug("FK: %s", fk)
-            logger.debug(conn.execute("PRAGMA table_info(project)").fetchall())
-
-
             # Fetch real IDs from DB
-            project_pk = get_primary_key_column(conn, "project")
-            person_pk = get_primary_key_column(conn, "person")
+            project_pk = get_primary_key_column(engine, "project")
+            person_pk = get_primary_key_column(engine, "person")
 
-            project_ids = [row[0] for row in conn.execute(f"SELECT {project_pk} FROM project").fetchall()]
-            person_ids = [row[0] for row in conn.execute(f"SELECT {person_pk} FROM person").fetchall()]
+            project_ids = [row[0] for row in conn.execute(text(f"SELECT {project_pk} FROM project")).fetchall()]
+            person_ids = [row[0] for row in conn.execute(text(f"SELECT {person_pk} FROM person")).fetchall()]
 
 
             import random
@@ -274,8 +276,8 @@ def test_fake_data_insert(tmp_path, table_name):
                 pytest.fail(f"Insertion failed for table {table_name}: {e}")
 
     # reconnect and see that it's there
-    with connect.get_connection(dbfile) as conn:
-        res = conn.execute(f"SELECT COUNT(*) FROM {table_name}")
-        n = res.fetchone()[0]
+    with engine.connect() as conn:
+        res = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
+        n = res.scalar()
         assert n >= 0
 

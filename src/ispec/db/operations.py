@@ -1,7 +1,6 @@
 # from ispec.db import init
 # from ispec.db.init import initialize_db
 
-# from ispec.db.connect import get_connection
 from ispec.db.connect import get_session
 from ispec.logging import get_logger
 
@@ -12,8 +11,6 @@ logger = get_logger(__file__)
 def check_status():
     logger.info("checking db status...")
     with get_session() as session:
-        # session = get_connection()
-        # logger.info(f"Session is : {session}")
         # write sql logic to check db status
         # e.g. session.execute("SELECT sqlite_version();")
         # for row in session.fetchall():
@@ -26,8 +23,6 @@ def check_status():
 def show_tables(file_path=None):
     logger.info("showing tables..")
     with get_session(file_path=file_path) as session:
-        # session = get_connection(file_path)
-        # logger.info(f"Session is : {session}")
         # write sql logic to display all tables
         # e.g. session.execute("SELECT name FROM sqlite_master WHERE type='table';")
         # for row in session.fetchall():

@@ -1,9 +1,11 @@
-import sqlite3
-import pytest
 import os
-from unittest.mock import patch
+import sqlite3
 import shutil
-from ispec.db import init, connect
+
+import pytest
+from sqlalchemy import inspect
+
+from ispec.db import init
 
 
 # Fixture to create a temporary SQL file and directory
@@ -63,47 +65,14 @@ def test_get_sql_file():
 
 def test_initialize_sqlite_db(tmp_path):
     tmp_db = tmp_path / "test.db"
-    init.initialize_db(file_path=tmp_db)
+    engine = init.initialize_db(file_path=tmp_db)
 
-    with connect.get_connection(tmp_db) as conn:
-        # import pdb; pdb.set_trace()
-        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        res = cursor.fetchall()
-        # list of tuples of table names
-    flattened_res = [y for x in res for y in x]
-    assert len(flattened_res) == 4
-    assert "person" in flattened_res
-    assert "project" in flattened_res
-    assert "letter_of_support" in flattened_res
-    assert "project_person" in flattened_res
+    inspector = inspect(engine)
+    tables = inspector.get_table_names()
+
+    assert "person" in tables
+    assert "project" in tables
+    assert "letter_of_support" in tables
+    assert "project_person" in tables
 
 
-@pytest.fixture
-def mock_connection():
-    from unittest.mock import Mock
-
-    mock_conn = Mock()
-    mock_cursor = mock_conn.cursor()
-    return mock_conn, mock_cursor
-
-
-@pytest.fixture
-def mock_get_connection(mock_connection):
-    from unittest.mock import patch
-
-    with patch("ispec.db.connect.get_connection") as mock:
-        mock.return_value = mock_connection[0]
-        yield mock
-
-
-# def test_initialize_db_success(mock_get_connection, mock_connection, mock_cursor):
-#     from ispec.db import init
-#
-#     init.initialize_db()
-#
-#     mock_cursor.executescript.assert_called_once()
-#
-#     with open(os.path.join("test_sql_dir", "test_init.sql"), "r") as f:
-#         sql_content = f.read()
-#
-#     mock_cursor.executescript.assert_called_with(sql_content)

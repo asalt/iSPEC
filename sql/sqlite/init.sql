@@ -152,4 +152,4 @@ CREATE TABLE IF NOT EXISTS project_person (
   project_id INTEGER REFERENCES project(id),
   person_id INTEGER REFERENCES person(id),
   UNIQUE (person_id, project_id)
-)
+);
