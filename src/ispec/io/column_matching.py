@@ -1,19 +1,24 @@
-from typing import List, Dict, Optional, Tuple
-from sentence_transformers import SentenceTransformer, util
+from typing import Dict, List, Optional
 from difflib import get_close_matches
-import numpy as np
 import logging
+import numpy as np
+
+try:  # pragma: no cover - exercised via tests
+    from sentence_transformers import SentenceTransformer, util
+    _default_model = SentenceTransformer("all-MiniLM-L6-v2")
+except ImportError:  # pragma: no cover - handled in tests
+    SentenceTransformer = None  # type: ignore
+    util = None  # type: ignore
+    _default_model = None
 
 from ispec.logging import get_logger
 
 logger = get_logger(__file__)
 
-# Preload model
-_default_model = SentenceTransformer("all-MiniLM-L6-v2")
-
 
 def encode_column_names(column_names: List[str], model: Optional[SentenceTransformer] = None):
-    model = model or _default_model
+    if model is None:
+        raise ValueError("A SentenceTransformer model is required to encode column names")
     return model.encode(column_names, convert_to_tensor=True)
 
 
@@ -26,7 +31,8 @@ def score_matches(
     Compute similarity score matrix between source and target column names.
     Returns a NumPy array of shape (len(source_columns), len(target_columns)).
     """
-    model = model or _default_model
+    if model is None:
+        raise ValueError("A SentenceTransformer model is required to score matches")
     source_emb = encode_column_names(source_columns, model)
     target_emb = encode_column_names(target_columns, model)
     sim_matrix = util.cos_sim(source_emb, target_emb).cpu().numpy()
@@ -64,14 +70,17 @@ def match_columns(
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
     model = model or _default_model
-    sim_matrix = score_matches(source_columns, target_columns, model)
+    if model is not None:
+        sim_matrix = score_matches(source_columns, target_columns, model)
+    else:
+        sim_matrix = np.zeros((len(source_columns), len(target_columns)))
 
     matches = {}
     for i, src in enumerate(source_columns):
         logger.debug("looking for best match for %s", src)
-        best_idx = int(np.argmax(sim_matrix[i]))
-        best_score = sim_matrix[i][best_idx]
-        if best_score >= threshold:
+        best_idx = int(np.argmax(sim_matrix[i])) if target_columns else 0
+        best_score = sim_matrix[i][best_idx] if model is not None else 0
+        if model is not None and best_score >= threshold:
             best_match = target_columns[best_idx]
             logger.debug("best match : %s", best_match)
             matches[src] = best_match
