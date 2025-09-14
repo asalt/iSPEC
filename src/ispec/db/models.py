@@ -1,42 +1,24 @@
 # db/models.py
 import sqlite3
 import enum
-
-from typing import List
-from sqlalchemy import String, ForeignKey
-from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
-from sqlalchemy import (
-    Column,
-    Integer,
-    String,
-    Text,
-    Float,
-    DateTime,
-    LargeBinary,
-    ForeignKey,
-    create_engine,
-    event,
-    ForeignKey,
-    LargeBinary,
-    create_engine,
-    event,
-    Text,
-    Float,
-    DateTime,
-    Integer,
-    Boolean,
-    Enum
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.engine import Engine
-
-
-from sqlalchemy.orm import relationship
 from datetime import datetime, UTC
-import pandas as pd
+from typing import List
 
-#
+import pandas as pd
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    Text,
+    create_engine,
+    event,
+)
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ispec.logging import get_logger
 
