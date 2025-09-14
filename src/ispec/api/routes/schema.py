@@ -26,6 +26,12 @@ def build_form_schema(
         *,
         route_prefix_for_table: Callable[[str], str] | None = None,
         ) -> dict:
+    """Build a JSON schema annotated with UI metadata for a SQLAlchemy model.
+
+    The returned schema includes per-field UI hints and top-level ordering
+    information to aid frontend form generation. Results are cached for
+    repeated calls with the same arguments.
+    """
     schema = CreateModel.model_json_schema()
     props = schema.get("properties", {})
     colmap = {c.name: c for c in model.__table__.columns}  # type: ignore

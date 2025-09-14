@@ -2,13 +2,12 @@
 import sqlite3
 import enum
 from datetime import datetime, UTC
-from typing import List
 
 import pandas as pd
 from sqlalchemy import (
     Boolean,
     DateTime,
-    Enum,
+    Enum as SAEnum,
     Float,
     ForeignKey,
     Integer,
@@ -98,8 +97,8 @@ class Person(TIMESTAMP_MIXINS["ppl"], Base):
     ppl_Roles_Collaborator: Mapped[str | None] = mapped_column(Text, nullable=True)
     ppl_Roles: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    comments: Mapped[List["ProjectComment"]] = relationship(back_populates="person")
-    projects: Mapped[List["ProjectPerson"]] = relationship(back_populates="person")
+    comments: Mapped[list["ProjectComment"]] = relationship(back_populates="person")
+    projects: Mapped[list["ProjectPerson"]] = relationship(back_populates="person")
 
 
 class ProjectType(str, enum.Enum):
@@ -118,14 +117,10 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
     prj_ProjectDescription: Mapped[str] = mapped_column(Text, nullable=True)
 
     prj_ProjectType = mapped_column(
-            Enum(ProjectType,
-                name="project_type",          # db type name (important for Postgres)
-                native_enum=False,            # store as VARCHAR on all DBs (PG/SQLite)
-                create_constraint=True,       # add CHECK constraint when native_enum=False
-                validate_strings=True,        # rejects values not in the enum
-                ),
-            nullable=True,
-            info={"ui" : {"label": "Project Type", "allowClear": True}})
+        SAEnum(ProjectType, native_enum=True, validate_strings=True),
+        nullable=True,
+        info={"ui": {"label": "Project Type", "allowClear": True}},
+    )
 
     # prj_CreationTS: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # prj_ModificationTS: Mapped[datetime] = mapped_column(
@@ -232,8 +227,8 @@ class Project(TIMESTAMP_MIXINS["prj"], Base):
     prj_Current_FLAG: Mapped[bool] = mapped_column(Boolean, default=False)
     prj_Billing_ReadyToBill: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    comments: Mapped[List["ProjectComment"]] = relationship(back_populates="project")
-    people: Mapped[List["ProjectPerson"]] = relationship(back_populates="project")
+    comments: Mapped[list["ProjectComment"]] = relationship(back_populates="project")
+    people: Mapped[list["ProjectPerson"]] = relationship(back_populates="project")
 
 
 class ProjectComment(TIMESTAMP_MIXINS["com"], Base):

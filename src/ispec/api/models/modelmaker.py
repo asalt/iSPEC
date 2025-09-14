@@ -1,5 +1,5 @@
 # ispec/api/models/modelmaker.py
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, ConfigDict, create_model
 from typing import get_args, get_origin, Optional, Type, Dict, Any
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -72,7 +72,8 @@ def make_pydantic_model_from_sqlalchemy(
                 fields[rel_name] = (related_model_map[rel_name], None)
 
     model_name = f"{model_cls.__name__}{name_suffix}"
-    return create_model(model_name, **fields)
+    config = ConfigDict(from_attributes=True)
+    return create_model(model_name, __config__=config, **fields)
 
 
 #

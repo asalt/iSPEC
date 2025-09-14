@@ -165,16 +165,17 @@ def generate_crud_router(
         # }
         # return schema
 
-    @router.get("/{item_id}", response_model=ReadModel)
+    @router.get("/{item_id}", response_model=ReadModel, response_model_exclude_none=True)
     def get_item(item_id: int, db: Session = Depends(get_session)):
         obj = crud.get(db, item_id)
         if obj is None:
             raise HTTPException(status_code=404, detail=f"{tag} not found")
-        return obj
+        return ReadModel.model_validate(obj)
 
     @router.post(
         "/",
         response_model=ReadModel,
+        response_model_exclude_none=True,
         summary=f"Create new {tag}",
         description="Create a new item. Required fields are marked with * in the request body below.",
         status_code=201,
@@ -183,9 +184,9 @@ def generate_crud_router(
         obj = crud.create(db, payload.model_dump())
         if obj is None:
             raise HTTPException(status_code=409, detail=f"{tag} already exists")
-        return obj
+        return ReadModel.model_validate(obj)
 
-    @router.put("/{item_id}", response_model=ReadModel)
+    @router.put("/{item_id}", response_model=ReadModel, response_model_exclude_none=True)
     def update_item(
         item_id: int, payload: CreateModel, db: Session = Depends(get_session)
     ):
@@ -196,7 +197,7 @@ def generate_crud_router(
             setattr(obj, field, value)
         db.commit()
         db.refresh(obj)
-        return obj
+        return ReadModel.model_validate(obj)
 
     @router.delete("/{item_id}")
     def delete_item(item_id: int, db: Session = Depends(get_session)):
@@ -209,7 +210,7 @@ def generate_crud_router(
     @router.get("/options")
     def options(
         q: str | None = None,
-        limit: int = 20,
+        limit: int = Query(default=20, ge=1, le=100),
         ids: list[int] | None = Query(default=None),
         exclude_ids: list[int] | None = Query(default=None),
         db: Session = Depends(get_session),
