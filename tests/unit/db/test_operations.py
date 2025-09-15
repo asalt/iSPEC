@@ -26,10 +26,15 @@ def test_show_tables_logs_tables(tmp_path, monkeypatch, caplog):
     logger.propagate = True
     try:
         with caplog.at_level(logging.INFO):
-            operations.show_tables()
+            tables = operations.show_tables()
     finally:
         logger.propagate = orig_prop
     assert "person" in caplog.text
+    assert "person" in tables
+    person_columns = {column["name"]: column for column in tables["person"]}
+    assert "ppl_Name_First" in person_columns
+    assert not person_columns["ppl_Name_First"]["nullable"]
+    assert "TEXT" in person_columns["ppl_Name_First"]["type"].upper()
 
 
 def test_export_table_writes_csv(tmp_path, monkeypatch):

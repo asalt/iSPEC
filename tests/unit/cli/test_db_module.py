@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from ispec.cli import db
+from rich.console import Console
 
 
 @pytest.mark.parametrize("table_name", ["person", "project", "comment", "letter"])
@@ -42,13 +43,15 @@ def test_register_subcommands_parses_export_command():
 def test_dispatch_calls_correct_operations(monkeypatch):
     init_mock = MagicMock()
     status_mock = MagicMock()
-    show_mock = MagicMock()
+    show_mock = MagicMock(return_value={})
+    render_mock = MagicMock()
     import_mock = MagicMock()
     export_mock = MagicMock()
 
     monkeypatch.setattr("ispec.cli.db.operations.initialize", init_mock)
     monkeypatch.setattr("ispec.cli.db.operations.check_status", status_mock)
     monkeypatch.setattr("ispec.cli.db.operations.show_tables", show_mock)
+    monkeypatch.setattr("ispec.cli.db._render_table_overview", render_mock)
     monkeypatch.setattr("ispec.cli.db.operations.import_file", import_mock)
     monkeypatch.setattr("ispec.cli.db.operations.export_table", export_mock)
 
@@ -57,6 +60,7 @@ def test_dispatch_calls_correct_operations(monkeypatch):
 
     db.dispatch(types.SimpleNamespace(subcommand="show"))
     show_mock.assert_called_once()
+    render_mock.assert_called_once_with({})
 
     db.dispatch(types.SimpleNamespace(subcommand="init", file="db.sqlite"))
     init_mock.assert_called_once_with(file_path="db.sqlite")
@@ -81,4 +85,27 @@ def test_dispatch_export_calls_operations(monkeypatch):
         types.SimpleNamespace(subcommand="export", table_name="person", file="out.csv")
     )
     export_mock.assert_called_once_with("person", "out.csv")
+
+
+def test_render_table_overview_outputs_columns():
+    console = Console(record=True)
+    table_definitions = {
+        "person": [
+            {"name": "id", "type": "INTEGER", "nullable": False, "default": None},
+            {
+                "name": "ppl_Name_First",
+                "type": "TEXT",
+                "nullable": False,
+                "default": None,
+            },
+        ],
+        "project": [],
+    }
+
+    db._render_table_overview(table_definitions, console=console)
+
+    output = console.export_text()
+    assert "person" in output
+    assert "id" in output
+    assert "INTEGER" in output
 
