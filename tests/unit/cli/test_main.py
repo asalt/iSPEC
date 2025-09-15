@@ -80,12 +80,15 @@ def test_api_start(monkeypatch):
 def test_logging_set_level(monkeypatch):
     reset_mock = MagicMock()
     get_mock = MagicMock()
+    save_mock = MagicMock()
     monkeypatch.setattr("ispec.cli.logging.reset_logger", reset_mock)
     monkeypatch.setattr("ispec.cli.logging.get_logger", get_mock)
+    monkeypatch.setattr("ispec.cli.logging.save_log_level", save_mock)
     monkeypatch.setattr(sys, "argv", ["ispec", "logging", "set-level", "WARNING"])
     main()
     reset_mock.assert_called_once_with()
     assert get_mock.call_args.kwargs["level"] == logging.WARNING
+    save_mock.assert_called_once_with("WARNING")
 
 
 def test_logging_show_path(monkeypatch, capsys):
