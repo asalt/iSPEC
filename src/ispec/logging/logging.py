@@ -7,12 +7,6 @@ from pathlib import Path
 
 _DEFAULT_LOG_DIR = Path(os.environ.get("ISPEC_LOG_DIR", Path.home() / ".ispec" / "logs"))
 _DEFAULT_LOG_FILE = _DEFAULT_LOG_DIR / "ispec.log"
-
-def ensure_log_dir():
-    _DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-
 # Singleton record to track which loggers are already configured
 _LOGGER_INITIALIZED = {}
 
