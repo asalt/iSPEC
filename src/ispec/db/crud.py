@@ -1,16 +1,10 @@
 # crud.py
-from typing import Dict, Optional, List, Sequence, Any
-from functools import cache
-import sqlite3
-
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+from typing import Any, Iterable, List, Optional, Sequence
 
 from sqlalchemy import select, func, cast
-from sqlalchemy.sql import sqltypes as T   # canonical type classes (String, Text, etc.)
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import sqltypes as T  # canonical type classes (String, Text, etc.)
 
-from ispec.db.connect import get_session
 from ispec.logging import get_logger
 
 
