@@ -8,6 +8,7 @@ handlers.
 import logging
 
 from ispec.logging import get_logger, reset_logger
+from ispec.logging.config import save_log_level
 from ispec.logging.logging import _resolve_log_file
 
 
@@ -36,7 +37,9 @@ def dispatch(args):
     """Execute the logging command associated with ``args.subcommand``."""
 
     if args.subcommand == "set-level":
-        level = getattr(logging, args.level.upper())
+        level_name = args.level.upper()
+        level = getattr(logging, level_name)
+        save_log_level(level_name)
         reset_logger()
         get_logger(level=level)
     elif args.subcommand == "show-path":
