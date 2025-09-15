@@ -36,3 +36,16 @@ def test_operations_initialize_creates_db_file(tmp_path):
     db_path = tmp_path / 'cli.db'
     operations.initialize(file_path=str(db_path))
     assert db_path.exists()
+
+
+def test_import_file_unsupported_extension_logs_error(tmp_path, caplog):
+    db_path = tmp_path / 'test.db'
+    bad_file = tmp_path / 'data.txt'
+    bad_file.write_text('content')
+
+    io_file.logger.addHandler(caplog.handler)
+    with caplog.at_level("ERROR", logger=io_file.logger.name):
+        io_file.import_file(str(bad_file), 'person', db_file_path=str(db_path))
+    io_file.logger.removeHandler(caplog.handler)
+
+    assert "Unsupported file extension" in caplog.text

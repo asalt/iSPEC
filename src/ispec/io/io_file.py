@@ -33,8 +33,7 @@ def get_reader(file: str, **kwargs):
         return partial(pd.read_excel, **kwargs)
 
     else:
-        logger.error(f"do not know how to read file: {file}")
-        return None
+        raise ValueError(f"Unsupported file extension: {file}")
 
 
 def connect_project_person(db_file_path):
@@ -73,8 +72,12 @@ def connect_project_comment(db_file_path):
 
 
 def import_file(file_path, table_name, db_file_path=None, **kwargs):
+    try:
+        reader = get_reader(file_path)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return
 
-    reader = get_reader(file_path)
     df = reader(file_path)
     df = df.replace({np.nan: None}).replace({pd.NaT: None})
     df_dict = df.to_dict(orient="records")
