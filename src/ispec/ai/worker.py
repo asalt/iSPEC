@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Optional
 
 from .api import put_response
@@ -13,11 +14,16 @@ from .task_queue import TaskQueue
 
 @dataclass
 class ChatWorker:
-    """Process user messages using a background task queue."""
+    """Process user messages using a background task queue.
+
+    Thread-safe updates to the underlying :class:`ChatSession` are ensured by
+    guarding all mutations with a :class:`threading.Lock`.
+    """
 
     backend_url: Optional[str] = None
     session: ChatSession = field(default_factory=ChatSession)
     queue: TaskQueue = field(default_factory=TaskQueue)
+    session_lock: Lock = field(default_factory=Lock)
 
     def start(self) -> None:
         self.queue.start()
@@ -32,7 +38,8 @@ class ChatWorker:
 
     # internal --------------------------------------------------------------
     def _process_message(self, content: str) -> None:
-        self.session = self.session.add_user_message(content)
-        self.session = generate_response(self.session)
+        with self.session_lock:
+            self.session = self.session.add_user_message(content)
+            self.session = generate_response(self.session)
         if self.backend_url:
             put_response(self.backend_url, {"response": self.session.messages[-1].content})
