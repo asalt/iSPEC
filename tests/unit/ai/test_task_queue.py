@@ -1,6 +1,8 @@
 """Tests for the threaded task queue."""
 
-from unittest.mock import MagicMock
+import time
+from threading import Thread
+from unittest.mock import patch
 
 from ispec.ai.task_queue import TaskQueue
 
@@ -19,15 +21,12 @@ def test_task_queue_executes_tasks():
 def test_start_called_only_once():
     """Starting the queue twice should not spawn extra threads."""
 
-    queue = TaskQueue()
-    original_start = queue._thread.start
-    queue._thread.start = MagicMock(side_effect=original_start)
-
-    queue.start()
-    queue.start()
-    queue.stop()
-
-    assert queue._thread.start.call_count == 1
+    queue = TaskQueue(max_workers=2)
+    with patch("ispec.ai.task_queue.Thread.start") as mock_start:
+        queue.start()
+        queue.start()
+        queue.stop()
+    assert mock_start.call_count == 2
 
 
 def test_tasks_accept_kwargs():
@@ -66,6 +65,33 @@ def test_exception_does_not_stop_queue():
     queue.stop()
 
     assert results == ["boom", "ok"]
+
+
+def test_task_error_reporting():
+    queue = TaskQueue()
+    queue.start()
+
+    def boom():
+        raise ValueError("boom")
+
+    task = queue.add_task(boom)
+    queue.join()
+    queue.stop()
+
+    assert isinstance(task.error, ValueError)
+
+
+def test_concurrency_controls():
+    queue = TaskQueue(max_workers=2)
+    queue.start()
+
+    start = time.time()
+    for _ in range(2):
+        queue.add_task(time.sleep, 0.2)
+    queue.join()
+    queue.stop()
+    elapsed = time.time() - start
+    assert elapsed < 0.35
 
 
 def test_stop_before_start():

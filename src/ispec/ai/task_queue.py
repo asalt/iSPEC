@@ -1,11 +1,11 @@
-"""Thread-based task queue for processing work items sequentially."""
+"""Thread-based task queue with optional concurrency and error reporting."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from queue import Queue, Empty
+from queue import Empty, Queue
 from threading import Event, Thread
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -15,40 +15,58 @@ class Task:
     func: Callable[..., Any]
     args: Tuple[Any, ...] = ()
     kwargs: Dict[str, Any] = field(default_factory=dict)
+    error: Optional[Exception] = field(default=None, init=False)
 
     def run(self) -> None:
         self.func(*self.args, **self.kwargs)
 
 
 class TaskQueue:
-    """Simple task queue running in a dedicated thread.
+    """Simple task queue running in background threads.
 
-    The queue uses a background thread to execute submitted tasks one after
-    the other. It can be started and stopped to control processing.
+    Tasks are processed by a configurable number of worker threads. The
+    default is one worker which preserves the previous sequential behaviour.
+    Errors raised by tasks are stored on the task object for later
+    inspection.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_workers: int = 1) -> None:
         self._queue: Queue[Task | None] = Queue()
         self._stop_event = Event()
-        self._thread = Thread(target=self._worker, daemon=True)
+        self._max_workers = max_workers
+        self._threads: List[Thread] = []
+        self._started = False
 
     def start(self) -> None:
-        """Start the worker thread if not already running."""
+        """Start the worker threads if not already running."""
 
-        if not self._thread.is_alive():
-            self._thread.start()
+        if self._started:
+            return
+        self._stop_event.clear()
+        for _ in range(self._max_workers):
+            thread = Thread(target=self._worker, daemon=True)
+            thread.start()
+            self._threads.append(thread)
+        self._started = True
 
     def stop(self) -> None:
-        """Signal the worker thread to exit and wait for it."""
-        self._stop_event.set()
-        if self._thread.is_alive():
-            self._queue.put(None)
-            self._thread.join()
+        """Signal the worker threads to exit and wait for them."""
 
-    def add_task(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        self._stop_event.set()
+        for _ in self._threads:
+            self._queue.put(None)
+        for thread in self._threads:
+            if thread.is_alive():
+                thread.join()
+        self._threads.clear()
+        self._started = False
+
+    def add_task(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Task:
         """Submit a callable to be executed by the queue."""
 
-        self._queue.put(Task(func, args, kwargs))
+        task = Task(func, args, kwargs)
+        self._queue.put(task)
+        return task
 
     def join(self) -> None:
         """Block until all tasks have been processed."""
@@ -62,11 +80,11 @@ class TaskQueue:
             except Empty:
                 continue
             if task is None:
+                self._queue.task_done()
                 break
             try:
                 task.run()
-            except Exception:
-                # Swallow exceptions so one bad task doesn't stop the queue
-                pass
+            except Exception as exc:
+                task.error = exc
             finally:
                 self._queue.task_done()
