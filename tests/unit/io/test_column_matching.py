@@ -30,3 +30,39 @@ def test_match_columns_with_transformer(monkeypatch):
     res = column_matching.match_columns(["foo"], ["foo"])
     assert res == {"foo": "foo"}
     assert called["flag"]
+
+
+def test_partial_matches_leave_unmatched(monkeypatch):
+    # Simulate transformer producing scores where only the first column clears the threshold
+    def fake_score(src_cols, tgt_cols, model=None):
+        return np.array([[0.9, 0.1], [0.5, 0.4]])
+
+    monkeypatch.setattr(column_matching, "score_matches", fake_score)
+    monkeypatch.setattr(column_matching, "_default_model", object())
+
+    res = column_matching.match_columns(
+        ["good_match", "partial"],
+        ["good_match_target", "other_target"],
+        threshold=0.6,
+        fallback=False,
+    )
+
+    assert res == {"good_match": "good_match_target", "partial": None}
+
+
+def test_score_matches_called_with_multiple_columns(monkeypatch):
+    called = {"count": 0, "args": None}
+
+    def fake_score(src_cols, tgt_cols, model=None):
+        called["count"] += 1
+        called["args"] = (src_cols, tgt_cols)
+        return np.array([[0.9, 0.1], [0.2, 0.8]])
+
+    monkeypatch.setattr(column_matching, "score_matches", fake_score)
+    monkeypatch.setattr(column_matching, "_default_model", object())
+
+    res = column_matching.match_columns(["a", "b"], ["a", "b"])
+
+    assert res == {"a": "a", "b": "b"}
+    assert called["count"] == 1
+    assert called["args"] == (["a", "b"], ["a", "b"])
