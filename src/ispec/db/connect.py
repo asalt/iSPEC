@@ -3,13 +3,10 @@
 import sqlite3
 import os
 import re
-from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from contextlib import contextmanager
-
-from functools import lru_cache
-
-import pandas as pd
+from datetime import datetime
 
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.engine import Engine
@@ -19,7 +16,6 @@ from ispec.db.models import sqlite_engine, initialize_db
 from ispec.logging import get_logger
 
 logger = get_logger(__file__)
-
 
 @lru_cache(maxsize=None)
 def get_db_dir() -> Path:
