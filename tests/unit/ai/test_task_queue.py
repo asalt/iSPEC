@@ -69,16 +69,40 @@ def test_exception_does_not_stop_queue():
 
 def test_task_error_reporting():
     queue = TaskQueue()
+    with patch("ispec.ai.task_queue.logger.exception") as mock_log:
+        queue.start()
+
+        def boom():
+            raise ValueError("boom")
+
+        task = queue.add_task(boom)
+        queue.join()
+        queue.stop()
+
+        mock_log.assert_called_once()
+
+    assert isinstance(task.error, ValueError)
+    errors = queue.get_errors()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+
+
+def test_get_errors_clear():
+    queue = TaskQueue()
     queue.start()
 
     def boom():
         raise ValueError("boom")
 
-    task = queue.add_task(boom)
+    queue.add_task(boom)
     queue.join()
     queue.stop()
 
-    assert isinstance(task.error, ValueError)
+    assert queue.get_errors()  # initial error present
+    cleared = queue.get_errors(clear=True)
+    assert len(cleared) == 1
+    assert isinstance(cleared[0], ValueError)
+    assert queue.get_errors() == []
 
 
 def test_concurrency_controls():
