@@ -41,8 +41,13 @@ def connect_project_person(db_file_path):
         session.execute(
             text(
                 """
-            INSERT OR IGNORE INTO project_person (project_id, person_id)
-            SELECT project.id, person.id
+            INSERT OR IGNORE INTO project_person (
+                project_id,
+                person_id,
+                projper_CreationTS,
+                projper_ModificationTS
+            )
+            SELECT project.id, person.id, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             FROM project
             JOIN person ON project.id = person.id
             """
