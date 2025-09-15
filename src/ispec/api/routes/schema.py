@@ -39,8 +39,19 @@ def build_form_schema(
     # attach per-field UI
     for name, prop in props.items():
         if name in colmap:
-            # prop["ui"] = ui_from_column(colmap[name])
-            prop["ui"] = ui_from_column(colmap[name], route_prefix_for_table=route_prefix_for_table)
+            ui = ui_from_column(
+                colmap[name], route_prefix_for_table=route_prefix_for_table
+            )
+            prop["ui"] = ui
+
+            # also inject into the pydantic field metadata so downstream
+            # consumers can access the information without regenerating the
+            # schema
+            if name in CreateModel.model_fields:
+                field = CreateModel.model_fields[name]
+                extra = dict(getattr(field, "json_schema_extra", {}) or {})
+                extra["ui"] = ui
+                field.json_schema_extra = extra
 
 
     # top-level UI affordances
