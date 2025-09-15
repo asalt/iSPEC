@@ -81,6 +81,66 @@ def test_cli_import_inserts_data(tmp_path, monkeypatch):
     assert rows == [("Alice", "Smith")]
 
 
+def test_cli_export_writes_csv(tmp_path, monkeypatch):
+    """Exporting data via the CLI should create a CSV file with table rows."""
+
+    db_file = tmp_path / "test.db"
+
+    # Initialize database
+    monkeypatch.setattr(sys, "argv", ["ispec", "db", "init", "--file", str(db_file)])
+    main()
+    assert db_file.exists()
+
+    # Prepare and import sample data
+    csv_file = tmp_path / "people.csv"
+    pd.DataFrame(
+        [
+            {
+                "id": 1,
+                "ppl_AddedBy": "tester",
+                "ppl_Name_First": "Alice",
+                "ppl_Name_Last": "Smith",
+            }
+        ]
+    ).to_csv(csv_file, index=False)
+
+    monkeypatch.setenv("ISPEC_DB_PATH", str(db_file))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ispec",
+            "db",
+            "import",
+            "--table-name",
+            "person",
+            "--file",
+            str(csv_file),
+        ],
+    )
+    main()
+
+    # Export table
+    export_file = tmp_path / "export.csv"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ispec",
+            "db",
+            "export",
+            "--table-name",
+            "person",
+            "--file",
+            str(export_file),
+        ],
+    )
+    main()
+
+    df = pd.read_csv(export_file)
+    assert df.iloc[0]["ppl_Name_First"] == "Alice"
+
+
 def test_db_status_prints_sqlite_version(tmp_path, monkeypatch, caplog):
     """Running `ispec db status` should output the SQLite version."""
 
