@@ -1,8 +1,9 @@
 # io/io_file.py
+import sqlite3
 from functools import partial
 
-import numpy as np
 import pandas as pd
+import numpy as np
 from sqlalchemy import text
 
 from ispec.db.connect import get_session
