@@ -5,6 +5,12 @@ This module provides utilities to register database-related subcommands with an
 database operations.
 """
 
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from rich.console import Console
+from rich.table import Table
+
 from ispec.db import operations
 from ispec.logging import get_logger
 
@@ -85,7 +91,8 @@ def dispatch(args):
     if args.subcommand == "status":
         operations.check_status()
     elif args.subcommand == "show":
-        operations.show_tables()
+        table_definitions = operations.show_tables()
+        _render_table_overview(table_definitions)
     elif args.subcommand == "import":
         operations.import_file(args.file, args.table_name)
     elif args.subcommand == "export":
@@ -94,3 +101,46 @@ def dispatch(args):
         operations.initialize(file_path=args.file)
     else:
         logger.info("no dispatched function provided for %s", args.subcommand)
+
+
+def _render_table_overview(
+    table_definitions: Mapping[str, Sequence[Mapping[str, Any]]],
+    console: Console | None = None,
+) -> None:
+    """Pretty-print table metadata using ``rich``."""
+
+    if console is None:
+        console = Console()
+
+    table = Table(title="iSPEC Database Schema", show_lines=True)
+    table.add_column("Table", style="bold cyan")
+    table.add_column("Column", style="magenta")
+    table.add_column("Type", style="green")
+    table.add_column("Nullable", justify="center", style="yellow")
+    table.add_column("Default", style="bright_black")
+
+    table_names = sorted(table_definitions)
+    if not table_names:
+        table.add_row("[dim]No tables found[/dim]", "", "", "", "")
+        console.print(table)
+        return
+
+    for table_index, table_name in enumerate(table_names):
+        columns = table_definitions[table_name]
+        if not columns:
+            table.add_row(table_name, "[dim]-[/dim]", "[dim]-[/dim]", "", "")
+        else:
+            for column_index, column in enumerate(columns):
+                default = column.get("default")
+                default_display = "" if default in (None, "") else str(default)
+                table.add_row(
+                    table_name if column_index == 0 else "",
+                    str(column.get("name", "")),
+                    str(column.get("type", "")),
+                    "Yes" if column.get("nullable", True) else "No",
+                    default_display,
+                )
+        if table_index < len(table_names) - 1:
+            table.add_section()
+
+    console.print(table)
