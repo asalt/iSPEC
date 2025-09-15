@@ -17,6 +17,7 @@ test = [
     "pytest",
     "numpy",
     "pandas",
+    "openpyxl",
     "sqlalchemy",
     "fastapi",
     "httpx",
