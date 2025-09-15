@@ -31,13 +31,16 @@ def test_register_subcommands_parses_show_level():
 def test_dispatch_set_level_invokes_logging_helpers(monkeypatch):
     reset_mock = MagicMock()
     get_mock = MagicMock()
+    save_mock = MagicMock()
     monkeypatch.setattr(logging_cli, "reset_logger", reset_mock)
     monkeypatch.setattr(logging_cli, "get_logger", get_mock)
+    monkeypatch.setattr(logging_cli, "save_log_level", save_mock)
     args = types.SimpleNamespace(subcommand="set-level", level="INFO")
     logging_cli.dispatch(args)
     reset_mock.assert_called_once_with()
     get_mock.assert_called_once()
     assert get_mock.call_args.kwargs["level"] == logging.INFO
+    save_mock.assert_called_once_with("INFO")
 
 
 def test_dispatch_show_path_prints_resolved_path(monkeypatch, capsys):

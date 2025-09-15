@@ -164,8 +164,9 @@ ispec logging set-level INFO
 ispec logging show-path
 ```
 
-The logging CLI resets handlers when you change levels and reports the active
-log file path resolved by the logging utility module.【F:src/ispec/cli/logging.py†L11-L55】【F:src/ispec/logging/logging.py†L1-L74】
+The logging CLI persists the selected level to a JSON config alongside the
+logs, resets handlers when you change levels, and reports the active log file
+path resolved by the logging utility module.【F:src/ispec/cli/logging.py†L11-L55】【F:src/ispec/logging/config.py†L1-L90】【F:src/ispec/logging/logging.py†L1-L88】
 
 ## API service
 
@@ -192,8 +193,9 @@ materialize whole tables to CSV files.【F:src/ispec/db/operations.py†L39-L54�
 ## Logging
 
 Logging helpers resolve configurable directories (`ISPEC_LOG_DIR`), create log
-files if needed, and attach both file and console handlers. Use the CLI to
-adjust levels at runtime or inspect the log location.【F:src/ispec/logging/logging.py†L1-L74】【F:src/ispec/cli/logging.py†L11-L55】
+files if needed, persist log level choices, and load saved levels when
+``get_logger`` is called without an explicit override. Use the CLI to adjust
+levels at runtime or inspect the log location.【F:src/ispec/logging/logging.py†L1-L94】【F:src/ispec/logging/config.py†L1-L90】【F:src/ispec/cli/logging.py†L11-L55】
 
 ## Running tests
 
