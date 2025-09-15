@@ -1,4 +1,5 @@
 from sqlalchemy import text
+import pandas as pd
 
 from ispec.db.init import initialize_db
 from ispec.db.connect import get_session
@@ -46,4 +47,21 @@ def initialize(file_path=None):
     file_path can be gathered from environment variable or a sensible default if not provided
     """
     return initialize_db(file_path=file_path)
+
+
+def export_table(table_name: str, file_path: str) -> None:
+    """Export a database table to a CSV file.
+
+    Parameters
+    ----------
+    table_name:
+        Name of the table to export.
+    file_path:
+        Destination path for the CSV file.
+    """
+
+    logger.info("exporting table %s to %s", table_name, file_path)
+    with get_session() as session:
+        df = pd.read_sql_table(table_name, session.bind)
+    df.to_csv(file_path, index=False)
 

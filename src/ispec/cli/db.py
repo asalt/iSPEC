@@ -27,6 +27,11 @@ def register_subcommands(subparsers):
     >>> parser.parse_args(["init", "--file", "test.db"])
     Namespace(subcommand='init', file='test.db')
 
+    Exporting data::
+
+    >>> parser.parse_args(["export", "--table-name", "person", "--file", "out.csv"])
+    Namespace(subcommand='export', table_name='person', file='out.csv')
+
     """
 
     init_parser = subparsers.add_parser("init", help="initialize db")
@@ -40,6 +45,10 @@ def register_subcommands(subparsers):
         "--table-name", required=True, choices=("person", "project")
     )
     import_parser.add_argument("--file", required=True)
+
+    export_parser = subparsers.add_parser("export", help="Export table to CSV")
+    export_parser.add_argument("--table-name", required=True, choices=("person", "project"))
+    export_parser.add_argument("--file", required=True, help="Output CSV file")
 
 
 def dispatch(args):
@@ -62,6 +71,11 @@ def dispatch(args):
         >>> args = types.SimpleNamespace(subcommand="import", file="data.csv", table_name="person")
         >>> dispatch(args)  # doctest: +SKIP
 
+    Exporting data::
+
+        >>> args = types.SimpleNamespace(subcommand="export", table_name="person", file="out.csv")
+        >>> dispatch(args)  # doctest: +SKIP
+
     """
 
     logger = get_logger(__file__)
@@ -72,6 +86,8 @@ def dispatch(args):
         operations.show_tables()
     elif args.subcommand == "import":
         operations.import_file(args.file, args.table_name)
+    elif args.subcommand == "export":
+        operations.export_table(args.table_name, args.file)
     elif args.subcommand == "init":
         operations.initialize(file_path=args.file)
     else:
