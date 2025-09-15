@@ -42,7 +42,9 @@ def register_subcommands(subparsers):
 
     import_parser = subparsers.add_parser("import", help="Import file")
     import_parser.add_argument(
-        "--table-name", required=True, choices=("person", "project")
+        "--table-name",
+        required=True,
+        choices=("person", "project", "comment", "letter"),
     )
     import_parser.add_argument("--file", required=True)
 
