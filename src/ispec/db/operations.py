@@ -1,3 +1,5 @@
+from sqlalchemy import text
+
 from ispec.db import init
 from ispec.db.init import initialize_db
 from ispec.db.connect import get_session
@@ -10,11 +12,11 @@ logger = get_logger(__file__)
 def check_status():
     logger.info("checking db status...")
     with get_session() as session:
-        # write sql logic to check db status
-        # e.g. session.execute("SELECT sqlite_version();")
-        # for row in session.fetchall():
-        #     print(row)
-        pass
+        result = session.execute(text("SELECT sqlite_version();")).fetchone()
+        if result:
+            logger.info("sqlite version: %s", result[0])
+        else:
+            logger.warning("sqlite version query returned no result")
     init.get_sql_file()
     # logger.info(f"Sql file is : {sql_file}")
 
@@ -22,11 +24,11 @@ def check_status():
 def show_tables(file_path=None):
     logger.info("showing tables..")
     with get_session(file_path=file_path) as session:
-        # write sql logic to display all tables
-        # e.g. session.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        # for row in session.fetchall():
-        #     print(row)
-        pass
+        result = session.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;")
+        ).fetchall()
+        tables = [row[0] for row in result]
+        logger.info("tables: %s", tables)
 
 
 def import_file(file_path, table_name, db_file_path=None):
