@@ -40,10 +40,10 @@ class TaskQueue:
 
     def stop(self) -> None:
         """Signal the worker thread to exit and wait for it."""
-
         self._stop_event.set()
-        self._queue.put(None)
-        self._thread.join()
+        if self._thread.is_alive():
+            self._queue.put(None)
+            self._thread.join()
 
     def add_task(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
         """Submit a callable to be executed by the queue."""
@@ -65,5 +65,8 @@ class TaskQueue:
                 break
             try:
                 task.run()
+            except Exception:
+                # Swallow exceptions so one bad task doesn't stop the queue
+                pass
             finally:
                 self._queue.task_done()
