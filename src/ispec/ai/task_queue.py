@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from ispec.logging import get_logger
+
+logger = get_logger(__file__)
 
 
 @dataclass
@@ -36,6 +40,8 @@ class TaskQueue:
         self._max_workers = max_workers
         self._threads: List[Thread] = []
         self._started = False
+        self._errors: List[Exception] = []
+        self._error_lock = Lock()
 
     def start(self) -> None:
         """Start the worker threads if not already running."""
@@ -73,6 +79,20 @@ class TaskQueue:
 
         self._queue.join()
 
+    def get_errors(self, clear: bool = False) -> List[Exception]:
+        """Return a list of errors raised by tasks.
+
+        Parameters
+        ----------
+        clear: bool, optional
+            If True, clear the stored errors after retrieval.
+        """
+        with self._error_lock:
+            errors = list(self._errors)
+            if clear:
+                self._errors.clear()
+        return errors
+
     def _worker(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -86,5 +106,8 @@ class TaskQueue:
                 task.run()
             except Exception as exc:
                 task.error = exc
+                logger.exception("Task raised an exception: %s", exc)
+                with self._error_lock:
+                    self._errors.append(exc)
             finally:
                 self._queue.task_done()
