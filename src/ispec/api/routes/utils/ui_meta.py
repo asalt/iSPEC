@@ -1,4 +1,10 @@
 # utils/ui_meta.py
+"""Generate UI metadata from SQLAlchemy columns.
+
+This module offers helpers, such as :func:`ui_from_column`, to infer UI
+components and options from SQLAlchemy ``Column`` objects.
+"""
+
 from __future__ import annotations
 from typing import Any, Callable
 from sqlalchemy import Column as SAColumn, types as T
