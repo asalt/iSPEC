@@ -1,0 +1,79 @@
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from ispec.api.routes.routes import generate_crud_router, ROUTE_PREFIX_BY_TABLE
+from ispec.db.crud import PersonCRUD
+from ispec.db.models import Person
+from ispec.db.connect import get_session, make_session_factory, sqlite_engine, initialize_db
+
+
+@pytest.fixture
+def client(tmp_path):
+    db_url = f"sqlite:///{tmp_path}/test.db"
+    engine = sqlite_engine(db_url)
+    initialize_db(engine)
+    test_session = make_session_factory(engine)
+
+    # ensure clean ROUTE_PREFIX_BY_TABLE for test isolation
+    ROUTE_PREFIX_BY_TABLE.clear()
+
+    app = FastAPI()
+    person_router = generate_crud_router(
+        model=Person,
+        crud_class=PersonCRUD,
+        prefix="/people",
+        tag="Person",
+        exclude_fields=set(),
+        create_exclude_fields={"id", "ppl_CreationTS", "ppl_ModificationTS"},
+    )
+    app.include_router(person_router)
+
+    def override_get_session():
+        with test_session() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = override_get_session
+
+    with TestClient(app) as client:
+        client.session_factory = test_session  # type: ignore[attr-defined]
+        yield client
+
+
+def test_person_router_crud_and_route_prefix(client):
+    # ROUTE_PREFIX_BY_TABLE should register the person table for FK resolution
+    assert ROUTE_PREFIX_BY_TABLE["person"] == "/people"
+
+    # schema endpoint should expose model schema
+    resp = client.get("/people/schema")
+    assert resp.status_code == 200
+    schema = resp.json()
+    assert "ppl_Name_First" in schema["properties"]
+
+    payload = {
+        "ppl_Name_First": "Jane",
+        "ppl_Name_Last": "Doe",
+        "ppl_AddedBy": "tester",
+    }
+
+    # create person
+    resp = client.post("/people/", json=payload)
+    assert resp.status_code == 201
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        person_id = db.query(Person).filter_by(ppl_Name_First="Jane", ppl_Name_Last="Doe").first().id
+
+    # retrieve person
+    resp = client.get(f"/people/{person_id}")
+    assert resp.status_code == 200
+    assert resp.json()["ppl_Name_First"] == payload["ppl_Name_First"]
+
+    # delete person
+    resp = client.delete(f"/people/{person_id}")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "deleted"
+
+    # ensure person is gone
+    resp = client.get(f"/people/{person_id}")
+    assert resp.status_code == 404
+
