@@ -74,3 +74,36 @@ def get_logger(
         _LOGGER_INITIALIZED[name] = True
 
     return logger
+
+
+def reset_logger(name=None):
+    """Reset configured loggers so they can be reconfigured.
+
+    Parameters
+    ----------
+    name : str, optional
+        Name of the logger to reset. If omitted, all loggers tracked by
+        :func:`get_logger` are reset.
+
+    Examples
+    --------
+    >>> logger = get_logger("demo", level=logging.DEBUG)
+    >>> reset_logger("demo")
+    >>> logger = get_logger("demo", level=logging.INFO)
+    """
+    if name is None:
+        names = list(_LOGGER_INITIALIZED.keys())
+    else:
+        names = [name]
+
+    for n in names:
+        logger = logging.getLogger(n)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+    if name is None:
+        _LOGGER_INITIALIZED.clear()
+    else:
+        _LOGGER_INITIALIZED.pop(name, None)
+
