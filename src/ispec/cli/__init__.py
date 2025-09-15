@@ -1,6 +1,9 @@
 """Command-line interface utilities for iSPEC."""
 
-from .main import main
+# don't expose this. makes it more confusing
+# easier to simply call src/agi/cli/main.main() this way
 
-__all__ = ["main"]
+# from .main import main
+
+# __all__ = ["main"]
 
