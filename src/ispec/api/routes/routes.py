@@ -1,9 +1,7 @@
-from typing import Type, Callable
-from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Query
-
-
+from sqlalchemy.orm import Session
 from ispec.db.connect import get_session
+from typing import Type, Callable
 from ispec.db.models import Person, Project, ProjectComment
 from ispec.db.crud import PersonCRUD, ProjectCRUD, ProjectCommentCRUD
 
