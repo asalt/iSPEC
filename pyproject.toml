@@ -12,6 +12,17 @@ readme = "README.md"
 dependencies = [ ]
 requires-python = ">=3.8"
 
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "numpy",
+    "pandas",
+    "sqlalchemy",
+    "fastapi",
+    "httpx",
+    "faker",
+]
+
 [project.scripts]
 ispec = "ispec.cli:main.main"
 
