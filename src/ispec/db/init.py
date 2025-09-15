@@ -1,19 +1,18 @@
-# db/init.py 
-from pathlib import Path
 from functools import lru_cache
+from pathlib import Path
 from typing import Union
 
 from ispec.db.connect import get_db_path
 from ispec.db.models import sqlite_engine, initialize_db as orm_initialize_db
 
 
-
 @lru_cache(maxsize=None)
 def get_sql_code_dir(path="sqlite"):
     sql_code_path = Path(__file__).parent.parent.parent.parent / "sql" / path
     if not sql_code_path.exists():
-        raise ValueError(f"sql script path {sql_code_path} does not exist")   
+        raise ValueError(f"sql script path {sql_code_path} does not exist")
     return sql_code_path
+
 
 @lru_cache(maxsize=None)
 def get_sql_file(**kwargs):
@@ -23,7 +22,7 @@ def get_sql_file(**kwargs):
     sql_code_path = get_sql_code_dir(**kwargs)
     sql_code_file = sql_code_path / "init.sql"
     if not sql_code_file.exists():
-        raise ValueError(f"sql script file {sql_code_file} does not exist")   
+        raise ValueError(f"sql script file {sql_code_file} does not exist")
     return sql_code_file
 
 
@@ -43,10 +42,10 @@ def initialize_db(file_path: Union[str, Path, None] = None):
     """
 
     db_uri = file_path or get_db_path()
-    if not str(db_uri).startswith("sqlite"):
-        db_uri = "sqlite:///" + str(db_uri)
+    db_uri_str = str(db_uri)
+    if not db_uri_str.startswith("sqlite"):
+        db_uri_str = "sqlite:///" + db_uri_str
 
-    engine = sqlite_engine(db_uri)
+    engine = sqlite_engine(db_uri_str)
     orm_initialize_db(engine)
     return engine
-
