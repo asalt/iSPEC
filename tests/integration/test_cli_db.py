@@ -8,6 +8,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from ispec.cli.main import main
+from ispec.db import operations
 
 
 def test_db_init_creates_tables(tmp_path, monkeypatch):
@@ -78,4 +79,42 @@ def test_cli_import_inserts_data(tmp_path, monkeypatch):
         ).fetchall()
 
     assert rows == [("Alice", "Smith")]
+
+
+def test_db_status_prints_sqlite_version(tmp_path, monkeypatch, caplog):
+    """Running `ispec db status` should output the SQLite version."""
+
+    db_file = tmp_path / "test.db"
+    monkeypatch.setenv("ISPEC_DB_PATH", str(db_file))
+    monkeypatch.setattr(sys, "argv", ["ispec", "db", "status"])
+    operations.logger.addHandler(caplog.handler)
+    with caplog.at_level("INFO", logger=operations.logger.name):
+        main()
+    operations.logger.removeHandler(caplog.handler)
+
+    assert sqlite3.sqlite_version in caplog.text
+
+
+def test_db_show_lists_tables(tmp_path, monkeypatch, caplog):
+    """After initialization, `ispec db show` should list tables."""
+
+    db_file = tmp_path / "test.db"
+
+    monkeypatch.setattr(sys, "argv", ["ispec", "db", "init", "--file", str(db_file)])
+    operations.logger.addHandler(caplog.handler)
+    with caplog.at_level("INFO", logger=operations.logger.name):
+        main()
+    operations.logger.removeHandler(caplog.handler)
+    assert db_file.exists()
+    caplog.clear()
+
+    monkeypatch.setenv("ISPEC_DB_PATH", str(db_file))
+    monkeypatch.setattr(sys, "argv", ["ispec", "db", "show"])
+    operations.logger.addHandler(caplog.handler)
+    with caplog.at_level("INFO", logger=operations.logger.name):
+        main()
+    operations.logger.removeHandler(caplog.handler)
+
+    assert "person" in caplog.text
+    assert "project" in caplog.text
 
