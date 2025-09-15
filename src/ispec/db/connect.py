@@ -26,8 +26,22 @@ def get_db_dir() -> Path:
 
 
 @lru_cache(maxsize=None)
-def get_db_path(file=None) -> Path:
-    db_file = None
+def get_db_path(file: str | Path | None = None) -> str:
+    """Return a SQLite database URI string.
+
+    Parameters
+    ----------
+    file:
+        Optional path to a SQLite database file. When ``None`` the default
+        directory from :func:`get_db_dir` and the filename ``ispec.db`` are
+        used.
+
+    Returns
+    -------
+    str
+        SQLite URI pointing to the database file.
+    """
+
     if file is None:
         db_path = get_db_dir()
         db_file = db_path / "ispec.db"
@@ -98,8 +112,8 @@ def get_session(file_path: str | Path | None = None) -> Session:
     Parameters
     ----------
     file_path:
-        Optional path to the SQLite database file. If not provided, the
-        ``ISPEC_DB_PATH`` environment variable or the default path from
+        Optional path or URI to the SQLite database. If not provided, the
+        ``ISPEC_DB_PATH`` environment variable or the default URI from
         :func:`get_db_path` is used.
     """
 
