@@ -4,12 +4,18 @@ from ispec.io import column_matching
 
 
 def test_match_columns_without_transformer(monkeypatch):
-    # Simulate environment without sentence_transformers
-    monkeypatch.setattr(column_matching, "_default_model", None)
+    # Simulate environment without sentence_transformers by forcing get_default_model
+    # to raise ImportError and ensuring score_matches is never called.
+
+    def raise_import_error():  # pragma: no cover - behaviour validated in tests
+        raise ImportError
 
     def fail(*args, **kwargs):
-        raise AssertionError("score_matches should not be called when transformer is unavailable")
+        raise AssertionError(
+            "score_matches should not be called when transformer is unavailable"
+        )
 
+    monkeypatch.setattr(column_matching, "get_default_model", raise_import_error)
     monkeypatch.setattr(column_matching, "score_matches", fail)
 
     res = column_matching.match_columns(["foo"], ["foo", "bar"])
@@ -25,7 +31,7 @@ def test_match_columns_with_transformer(monkeypatch):
         return np.array([[0.9]])
 
     monkeypatch.setattr(column_matching, "score_matches", fake_score)
-    monkeypatch.setattr(column_matching, "_default_model", object())
+    monkeypatch.setattr(column_matching, "get_default_model", lambda: object())
 
     res = column_matching.match_columns(["foo"], ["foo"])
     assert res == {"foo": "foo"}
@@ -34,11 +40,12 @@ def test_match_columns_with_transformer(monkeypatch):
 
 def test_partial_matches_leave_unmatched(monkeypatch):
     # Simulate transformer producing scores where only the first column clears the threshold
+
     def fake_score(src_cols, tgt_cols, model=None):
         return np.array([[0.9, 0.1], [0.5, 0.4]])
 
     monkeypatch.setattr(column_matching, "score_matches", fake_score)
-    monkeypatch.setattr(column_matching, "_default_model", object())
+    monkeypatch.setattr(column_matching, "get_default_model", lambda: object())
 
     res = column_matching.match_columns(
         ["good_match", "partial"],
@@ -59,7 +66,7 @@ def test_score_matches_called_with_multiple_columns(monkeypatch):
         return np.array([[0.9, 0.1], [0.2, 0.8]])
 
     monkeypatch.setattr(column_matching, "score_matches", fake_score)
-    monkeypatch.setattr(column_matching, "_default_model", object())
+    monkeypatch.setattr(column_matching, "get_default_model", lambda: object())
 
     res = column_matching.match_columns(["a", "b"], ["a", "b"])
 
