@@ -51,6 +51,7 @@ def generate_crud_router(
     exclude_fields: set[str] = {"id"},
     create_exclude_fields: set[str] | None = None,
     optional_all: bool = False,
+    route_prefix_by_table: dict[str, str] | None = None,
 ) -> APIRouter:
     """
     Create a FastAPI router providing CRUD and metadata endpoints for a SQLAlchemy model.
@@ -91,6 +92,11 @@ def generate_crud_router(
     optional_all : bool, default=False
         If True, marks all fields in the create/update model as optional.
 
+    route_prefix_by_table : dict[str, str] | None, default=None
+        Mapping of table names to route prefixes. If not provided, a module-level
+        global registry is used. This is primarily useful for testing to avoid
+        mutating global state.
+
     Returns
     -------
     APIRouter
@@ -114,13 +120,13 @@ def generate_crud_router(
     router = APIRouter(prefix=prefix, tags=[tag])
     crud = crud_class()
 
+    prefix_map = route_prefix_by_table if route_prefix_by_table is not None else ROUTE_PREFIX_BY_TABLE
 
     # register prefix for FK resolution (e.g., "person" -> "/people")
-    ROUTE_PREFIX_BY_TABLE[model.__table__.name] = prefix
-
+    prefix_map[model.__table__.name] = prefix
 
     def route_prefix_for_table(table: str) -> str:
-        return ROUTE_PREFIX_BY_TABLE.get(table, f"/{table}")
+        return prefix_map.get(table, f"/{table}")
 
 
     # Generate models
