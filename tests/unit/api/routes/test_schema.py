@@ -1,6 +1,6 @@
 import pytest
 
-from ispec.db.models import Person
+from ispec.db.models import Person, Project, ProjectType
 from ispec.api.models.modelmaker import make_pydantic_model_from_sqlalchemy
 from ispec.api.routes.schema import build_form_schema
 from ispec.api.routes.utils.ui_meta import ui_from_column
@@ -29,3 +29,14 @@ def test_ui_metadata_injected_into_fields():
         expected_ui = ui_from_column(Person.__table__.columns[name])
         assert field.json_schema_extra["ui"] == expected_ui
         assert schema["properties"][name]["ui"] == expected_ui
+
+
+def test_enum_field_has_select_options():
+    ProjectCreate = make_pydantic_model_from_sqlalchemy(Project, name_suffix="Create")
+    schema = build_form_schema(Project, ProjectCreate)
+
+    field_name = Project.prj_ProjectType.key
+    ui = schema["properties"][field_name]["ui"]
+    assert ui["component"] == "Select"
+    option_values = {opt["value"] for opt in ui["options"]}
+    assert option_values >= {e.value for e in ProjectType}
