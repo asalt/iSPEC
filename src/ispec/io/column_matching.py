@@ -5,11 +5,29 @@ import numpy as np
 
 try:  # pragma: no cover - exercised via tests
     from sentence_transformers import SentenceTransformer, util
-    _default_model = SentenceTransformer("all-MiniLM-L6-v2")
 except ImportError:  # pragma: no cover - handled in tests
     SentenceTransformer = None  # type: ignore
     util = None  # type: ignore
-    _default_model = None
+
+_default_model: Optional["SentenceTransformer"] = None
+
+
+def get_default_model() -> "SentenceTransformer":
+    """Return the cached default :class:`SentenceTransformer` instance.
+
+    The model is instantiated only on first use so that environments without
+    ``sentence_transformers`` can still import this module.  An ``ImportError``
+    is raised if the package is unavailable when the model is requested.
+    """
+
+    global _default_model
+    if _default_model is None:
+        if SentenceTransformer is None:  # pragma: no cover - exercised in tests
+            raise ImportError(
+                "sentence_transformers is required to load the default model"
+            )
+        _default_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _default_model
 
 from ispec.logging import get_logger
 
@@ -69,7 +87,12 @@ def match_columns(
     """
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
 
-    model = model or _default_model
+    if model is None:
+        try:
+            model = get_default_model()
+        except ImportError:  # pragma: no cover - handled in tests
+            model = None
+
     if model is not None:
         sim_matrix = score_matches(source_columns, target_columns, model)
     else:
