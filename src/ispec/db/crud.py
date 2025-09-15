@@ -529,7 +529,7 @@ class ProjectNote(TableCRUD):
     def validate_input(self, record: dict):
         record = super().validate_input(record)
         i_id = record.get("i_id")
-        if not id:
+        if not i_id:
             return None
         return record
 
