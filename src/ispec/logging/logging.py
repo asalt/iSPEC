@@ -107,3 +107,10 @@ def reset_logger(name=None):
     else:
         _LOGGER_INITIALIZED.pop(name, None)
 
+
+def get_configured_level(name="ispec"):
+    """Return the configured logging level name for ``name``."""
+
+    level = logging.getLogger(name).getEffectiveLevel()
+    return logging.getLevelName(level)
+

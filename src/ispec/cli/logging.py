@@ -8,7 +8,7 @@ handlers.
 import logging
 
 from ispec.logging import get_logger, reset_logger
-from ispec.logging.logging import _resolve_log_file
+from ispec.logging.logging import _resolve_log_file, get_configured_level
 
 
 def register_subcommands(subparsers):
@@ -30,6 +30,9 @@ def register_subcommands(subparsers):
     )
 
     subparsers.add_parser("show-path", help="Show the log file location")
+    subparsers.add_parser(
+        "show-level", help="Show the configured logging level"
+    )
 
 
 def dispatch(args):
@@ -42,5 +45,8 @@ def dispatch(args):
     elif args.subcommand == "show-path":
         path = _resolve_log_file().resolve()
         print(path)
+    elif args.subcommand == "show-level":
+        level = get_configured_level()
+        print(level)
     else:
         get_logger(__file__).error("No handler for subcommand: %s", args.subcommand)
