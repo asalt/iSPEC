@@ -25,7 +25,7 @@ test = [
 ]
 
 [project.scripts]
-ispec = "ispec.cli:main.main"
+ispec = "ispec.cli.main:main"
 
 
 [tool.setuptools]
