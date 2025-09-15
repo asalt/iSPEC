@@ -40,7 +40,7 @@ def dispatch(args):
     elif args.subcommand == "show":
         operations.show_tables()
     elif args.subcommand == "import":
-        operations.import_file(args.file)
+        operations.import_file(args.file, args.table_name)
     elif args.subcommand == "init":
         operations.initialize(file_path=args.file)
     else:
