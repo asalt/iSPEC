@@ -1,0 +1,5 @@
+This directory contains Alembic configuration for managing database migrations.
+
+The ``env.py`` module pulls SQLAlchemy metadata from ``ispec.db.models`` so
+revisions can autogenerate schema changes, and ``versions/`` stores individual
+migration scripts.
