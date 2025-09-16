@@ -17,6 +17,7 @@ can manage people, projects, and supporting documents from one place.
   - [Database location](#database-location)
 - [Command line interface](#command-line-interface)
   - [Database commands](#database-commands)
+  - [Database migrations](#database-migrations)
   - [API commands](#api-commands)
   - [Logging commands](#logging-commands)
 - [API service](#api-service)
@@ -142,6 +143,26 @@ ispec db export --table-name project --file project.csv
 These commands delegate to the CRUD layer and IO helpers that batch insert
 rows, update relationship tables, and log progress.【F:src/ispec/cli/db.py†L11-L78】【F:tests/integration/test_cli_db.py†L27-L128】【F:src/ispec/io/io_file.py†L1-L82】
 
+### Database migrations
+
+Alembic migrations live in the top-level ``alembic`` directory. The migration
+environment imports the SQLAlchemy metadata from ``ispec.db.models`` so
+autogeneration and revision scripts stay in sync with the ORM definitions.【F:alembic/env.py†L1-L66】
+An initial revision provisions all tables defined by the models by calling
+``Base.metadata.create_all`` inside Alembic's ``upgrade`` hook.【F:alembic/versions/0001_initial.py†L1-L26】
+
+Run migrations through the CLI:
+
+```bash
+ispec db upgrade            # apply all migrations to the head revision
+ispec db downgrade -1       # roll back the most recent revision
+ispec db upgrade head --database ./custom.db
+```
+
+The CLI builds an Alembic configuration at runtime, resolves the project root,
+and forwards the ``--database`` option so you can target specific SQLite files
+or URLs when applying migrations.【F:src/ispec/cli/db.py†L36-L148】
+
 ### API commands
 
 Start the FastAPI server with custom host/port options or check its status:
@@ -210,6 +231,8 @@ pytest
 
 Tests cover CLI flows, API endpoints, and IO utilities to ensure the core
 workflows behave as expected.【F:tests/integration/test_cli_db.py†L1-L129】【F:tests/integration/test_api_endpoints.py†L1-L121】
+Alembic migrations are validated by executing ``alembic upgrade head`` against a
+temporary database as part of the unit test suite.【F:tests/unit/db/test_migrations.py†L1-L39】
 
 ## Documentation utilities
 

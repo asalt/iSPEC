@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 from sqlalchemy import inspect, text
@@ -9,17 +10,24 @@ from ispec.logging import get_logger
 from ispec.io.io_file import get_writer
 
 
-logger = get_logger(__file__)
+logger = get_logger(__file__, propagate=True)
+
+
+def _log_info(message: str, *args: Any) -> None:
+    """Log ``message`` using both the module logger and the root logger."""
+
+    logger.info(message, *args)
+    logging.getLogger().info(message, *args)
 
 
 def check_status():
     """Query the database for its SQLite version and log/return it."""
-    logger.info("checking db status...")
+    _log_info("checking db status...")
     with get_session() as session:
         result = session.execute(text("SELECT sqlite_version();")).fetchone()
         if result:
             version = result[0]
-            logger.info("sqlite version: %s", version)
+            _log_info("sqlite version: %s", version)
             return version
         logger.warning("sqlite version query returned no result")
         return None
@@ -42,11 +50,11 @@ def show_tables(file_path: str | None = None) -> dict[str, list[dict[str, Any]]]
         keys.
     """
 
-    logger.info("showing tables..")
+    _log_info("showing tables..")
     with get_session(file_path=file_path) as session:
         inspector = inspect(session.bind)
         table_names = sorted(inspector.get_table_names())
-        logger.info("tables: %s", table_names)
+        _log_info("tables: %s", table_names)
 
         table_definitions: dict[str, list[dict[str, Any]]] = {}
         for table_name in table_names:
