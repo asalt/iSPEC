@@ -6,6 +6,7 @@ import pandas as pd
 from ispec.db.init import initialize_db
 from ispec.db.connect import get_session
 from ispec.logging import get_logger
+from ispec.io.io_file import get_writer
 
 
 logger = get_logger(__file__)
@@ -80,18 +81,20 @@ def initialize(file_path=None):
 
 
 def export_table(table_name: str, file_path: str) -> None:
-    """Export a database table to a CSV file.
+    """Export a database table to a file.
 
     Parameters
     ----------
     table_name:
         Name of the table to export.
     file_path:
-        Destination path for the CSV file.
+        Destination path for the exported file. Supported extensions include
+        ``.csv`` and ``.json``.
     """
 
     logger.info("exporting table %s to %s", table_name, file_path)
     with get_session() as session:
         df = pd.read_sql_table(table_name, session.bind)
-    df.to_csv(file_path, index=False)
+    writer = get_writer(file_path)
+    writer(df)
 

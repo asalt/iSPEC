@@ -1,6 +1,7 @@
 # io/io_file.py
 import sqlite3
 from functools import partial
+from collections.abc import Callable
 
 import pandas as pd
 import numpy as np
@@ -30,11 +31,34 @@ def get_reader(file: str, **kwargs):
         return partial(pd.read_table, **kwargs)
     elif file.endswith(".csv"):
         return partial(pd.read_csv, **kwargs)
+    elif file.endswith(".json"):
+        return partial(pd.read_json, **kwargs)
     elif file.endswith(".xlsx"):
         return partial(pd.read_excel, **kwargs)
 
     else:
         raise ValueError(f"Unsupported file extension: {file}")
+
+
+def get_writer(file: str, **kwargs) -> Callable[[pd.DataFrame], None]:
+    """Return a callable that exports a DataFrame based on ``file`` extension."""
+
+    if file.endswith(".csv"):
+        def write_csv(df: pd.DataFrame) -> None:
+            csv_kwargs = {"index": False}
+            csv_kwargs.update(kwargs)
+            df.to_csv(file, **csv_kwargs)
+
+        return write_csv
+    elif file.endswith(".json"):
+        def write_json(df: pd.DataFrame) -> None:
+            json_kwargs = {"orient": "records"}
+            json_kwargs.update(kwargs)
+            df.to_json(file, **json_kwargs)
+
+        return write_json
+
+    raise ValueError(f"Unsupported file extension: {file}")
 
 
 def connect_project_person(db_file_path):
