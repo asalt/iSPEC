@@ -25,6 +25,7 @@ can manage people, projects, and supporting documents from one place.
 - [Logging](#logging)
 - [Running tests](#running-tests)
 - [Documentation utilities](#documentation-utilities)
+- [Deployment](#deployment)
 - [Contributing](#contributing)
 <!-- TOC_END -->
 
@@ -244,6 +245,15 @@ response.【F:docs/api-schema.md†L1-L132】
 
 `docs/update_readme.py` refreshes the table of contents and project layout
 sections of this README so they always reflect the current repository state.
+
+## Deployment
+
+Refer to `docs/deployment.md` for a step-by-step production guide that covers
+virtual environment setup, environment variable configuration, database
+provisioning, process management, and upgrade routines.【F:docs/deployment.md†L1-L189】
+The repository also includes `.env.example`, which lists the environment
+variables consumed by the CLI and API so administrators can tailor paths for
+their infrastructure.【F:.env.example†L1-L21】
 
 ## Contributing
 
