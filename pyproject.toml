@@ -9,7 +9,7 @@ description = "A Python package for database"
 authors = [{ name = "Your Name", email = "alexander.saltzman@bcm.edu" }]
 license = { file = "LICENSE" }
 readme = "README.md"
-dependencies = [ ]
+dependencies = ["requests", "uvicorn", "rich"]
 requires-python = ">=3.8"
 
 [project.optional-dependencies]
@@ -25,7 +25,7 @@ test = [
 ]
 
 [project.scripts]
-ispec = "ispec.cli:main.main"
+ispec = "ispec.cli.main:main"
 
 
 [tool.setuptools]

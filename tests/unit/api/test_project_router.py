@@ -2,7 +2,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from ispec.api.routes.routes import generate_crud_router, ROUTE_PREFIX_BY_TABLE
+from ispec.api.routes.routes import generate_crud_router
 from ispec.db.crud import ProjectCRUD
 from ispec.db.models import Project
 from ispec.db.connect import get_session, make_session_factory, sqlite_engine, initialize_db
@@ -15,10 +15,8 @@ def client(tmp_path):
     initialize_db(engine)
     test_session = make_session_factory(engine)
 
-    # ensure clean ROUTE_PREFIX_BY_TABLE for test isolation
-    ROUTE_PREFIX_BY_TABLE.clear()
-
     app = FastAPI()
+    route_prefix_map: dict[str, str] = {}
     project_router = generate_crud_router(
         model=Project,
         crud_class=ProjectCRUD,
@@ -26,6 +24,7 @@ def client(tmp_path):
         tag="Project",
         exclude_fields=set(),
         create_exclude_fields={"id", "prj_CreationTS", "prj_ModificationTS"},
+        route_prefix_by_table=route_prefix_map,
     )
     app.include_router(project_router)
 
@@ -37,12 +36,13 @@ def client(tmp_path):
 
     with TestClient(app) as client:
         client.session_factory = test_session  # type: ignore[attr-defined]
+        client.route_prefix_map = route_prefix_map  # type: ignore[attr-defined]
         yield client
 
 
 def test_project_router_crud_and_route_prefix(client):
-    # ROUTE_PREFIX_BY_TABLE should register the project table for FK resolution
-    assert ROUTE_PREFIX_BY_TABLE["project"] == "/projects"
+    # Route prefix mapping should register the project table for FK resolution
+    assert client.route_prefix_map["project"] == "/projects"  # type: ignore[attr-defined]
 
     # schema endpoint should expose model schema
     resp = client.get("/projects/schema")

@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 # from functools import lru_cache
 
+from .config import load_log_level
+
 _DEFAULT_LOG_DIR = Path(os.environ.get("ISPEC_LOG_DIR", Path.home() / ".ispec" / "logs"))
 _DEFAULT_LOG_FILE = _DEFAULT_LOG_DIR / "ispec.log"
 # Singleton record to track which loggers are already configured
@@ -26,7 +28,7 @@ def ensure_log_dir(log_dir=None):
 
 def get_logger(
     name="ispec",
-    level=logging.INFO,
+    level=None,
     log_file=None,
     log_dir=None,
     console=True,
@@ -39,7 +41,8 @@ def get_logger(
     """
     Get or create a logger with optional configuration.
     - name: Logger name (default 'ispec')
-    - level: Logging level (default logging.INFO)
+    - level: Logging level. When omitted or ``None``, the persisted configuration
+      is used or defaults to ``logging.INFO`` if no setting exists.
     - log_file: File path for logs (default: <log_dir>/ispec.log)
     - log_dir: Directory for logs (default: ~/.ispec/logs)
     - console: If True, logs also go to stderr
@@ -49,9 +52,23 @@ def get_logger(
     - propagate: Whether to propagate to root logger (default False)
     """
     logger = logging.getLogger(name)
+    if level is None:
+        config_level = load_log_level()
+        if config_level is not None:
+            level = config_level
+        else:
+            level = logging.INFO
+    elif isinstance(level, str):
+        resolved = logging.getLevelName(level.upper())
+        if isinstance(resolved, int):
+            level = resolved
+        else:
+            raise ValueError(f"Unknown logging level: {level!r}")
+
+    logger.setLevel(level)
+
     if not _LOGGER_INITIALIZED.get(name, False):
         ensure_log_dir(log_dir)
-        logger.setLevel(level)
         logger.propagate = propagate  # Typically False for application loggers
         formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
 
@@ -74,3 +91,43 @@ def get_logger(
         _LOGGER_INITIALIZED[name] = True
 
     return logger
+
+
+def reset_logger(name=None):
+    """Reset configured loggers so they can be reconfigured.
+
+    Parameters
+    ----------
+    name : str, optional
+        Name of the logger to reset. If omitted, all loggers tracked by
+        :func:`get_logger` are reset.
+
+    Examples
+    --------
+    >>> logger = get_logger("demo", level=logging.DEBUG)
+    >>> reset_logger("demo")
+    >>> logger = get_logger("demo", level=logging.INFO)
+    """
+    if name is None:
+        names = list(_LOGGER_INITIALIZED.keys())
+    else:
+        names = [name]
+
+    for n in names:
+        logger = logging.getLogger(n)
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
+
+    if name is None:
+        _LOGGER_INITIALIZED.clear()
+    else:
+        _LOGGER_INITIALIZED.pop(name, None)
+
+
+def get_configured_level(name="ispec"):
+    """Return the configured logging level name for ``name``."""
+
+    level = logging.getLogger(name).getEffectiveLevel()
+    return logging.getLevelName(level)
+

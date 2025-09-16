@@ -1,10 +1,13 @@
 # utils/ui_meta.py
+"""Generate UI metadata from SQLAlchemy columns.
+
+This module offers helpers, such as :func:`ui_from_column`, to infer UI
+components and options from SQLAlchemy ``Column`` objects.
+"""
+
 from __future__ import annotations
 from typing import Any, Callable
-from sqlalchemy.orm import DeclarativeMeta
-from sqlalchemy.sql.schema import Column as SAColumn
-# from sqlalchemy import String, Integer, Boolean, DateTime, Enum, JSON
-from sqlalchemy.sql import sqltypes as T  # canonical type classes
+from sqlalchemy import Column as SAColumn, types as T
 
 
 NAME_LIKE = ("name", "title", "displayid", "rfp", "type")
@@ -21,7 +24,8 @@ def _guess_text_component(col: SAColumn) -> str:
     if any(k in n for k in NAME_LIKE):
         return "Text"
     t = col.type
-    if isinstance(t, (T.String, T.Unicode)) and getattr(t, "length", None) and t.length <= 255:
+    length = getattr(t, "length", None)
+    if isinstance(t, (T.String, T.Unicode)) and length is not None and length <= 255:
         return "Text"
     return "Textarea"
 
@@ -129,11 +133,10 @@ def ui_from_column(
             ui["component"] = "Text"
 
     # add enum options if applicable and not already provided
-    if is_enum and "options" not in ui: # add the options
-        if getattr(t, "enum_class", None):
-            enum_vals = t.enum_class
-        elif getattr(t, "enums", None):
-            enum_vals = t.enums
+    if is_enum and "options" not in ui:  # add the options
+        enum_class = getattr(t, "enum_class", None)
+        enums_attr = getattr(t, "enums", None)
+        enum_vals = enum_class or enums_attr or []
         ui["options"] = [{"value": e.value, "label": e.value} for e in enum_vals]
         # or {"value": e.name.lower(), "label": e.value} to store lowercase, display Title Case
 
