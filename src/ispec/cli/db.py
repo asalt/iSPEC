@@ -35,8 +35,8 @@ def register_subcommands(subparsers):
 
     Exporting data::
 
-    >>> parser.parse_args(["export", "--table-name", "person", "--file", "out.csv"])
-    Namespace(subcommand='export', table_name='person', file='out.csv')
+    >>> parser.parse_args(["export", "--table-name", "person", "--file", "out.json"])
+    Namespace(subcommand='export', table_name='person', file='out.json')
 
     """
 
@@ -54,9 +54,9 @@ def register_subcommands(subparsers):
     )
     import_parser.add_argument("--file", required=True)
 
-    export_parser = subparsers.add_parser("export", help="Export table to CSV")
+    export_parser = subparsers.add_parser("export", help="Export table to CSV or JSON")
     export_parser.add_argument("--table-name", required=True, choices=("person", "project"))
-    export_parser.add_argument("--file", required=True, help="Output CSV file")
+    export_parser.add_argument("--file", required=True, help="Output file (CSV or JSON)")
 
 
 def dispatch(args):
@@ -81,7 +81,7 @@ def dispatch(args):
 
     Exporting data::
 
-        >>> args = types.SimpleNamespace(subcommand="export", table_name="person", file="out.csv")
+        >>> args = types.SimpleNamespace(subcommand="export", table_name="person", file="out.json")
         >>> dispatch(args)  # doctest: +SKIP
 
     """
