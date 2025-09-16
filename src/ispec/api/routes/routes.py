@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from ispec.db.connect import get_session
 from typing import Type, Callable
 from ispec.db.models import Person, Project, ProjectComment
-from ispec.db.crud import PersonCRUD, ProjectCRUD, ProjectCommentCRUD
+from ispec.db.crud import CRUDBase, PersonCRUD, ProjectCRUD, ProjectCommentCRUD
 
 from ispec.api.routes.schema import build_form_schema
 
@@ -114,8 +114,18 @@ def _add_options_endpoints(router: APIRouter, crud, *, model) -> None:
         if not rel:
             raise HTTPException(status_code=404, detail=f"No relationship named '{field}'")
         target_cls = rel.mapper.class_
-        target_crud = crud.__class__()
-        target_crud.model = target_cls
+        crud_class_map = {
+            Person: PersonCRUD,
+            Project: ProjectCRUD,
+            ProjectComment: ProjectCommentCRUD,
+        }
+
+        target_crud_cls = crud_class_map.get(target_cls, CRUDBase)
+        if target_crud_cls is CRUDBase:
+            target_crud = target_crud_cls(target_cls)
+        else:
+            target_crud = target_crud_cls()
+            target_crud.model = target_cls
         return target_crud.list_options(db, q=q, limit=limit)
 
 
@@ -219,10 +229,16 @@ def generate_crud_router(
     _add_schema_endpoint(
         router, model, CreateModel, route_prefix_for_table=route_prefix_for_table
     )
+    # Register the options endpoints *before* CRUD handlers so that the
+    # ``/options`` and ``/options/{field}`` paths take precedence over the
+    # generic ``/{item_id}`` route. Starlette matches routes in definition
+    # order and would otherwise treat ``/options`` as a candidate for
+    # ``/{item_id}``, resulting in a ``422`` response when the path parameter
+    # fails integer validation.
+    _add_options_endpoints(router, crud, model=model)
     _add_crud_endpoints(
         router, crud, ReadModel, CreateModel, tag=tag
     )
-    _add_options_endpoints(router, crud, model=model)
 
     return router
 
