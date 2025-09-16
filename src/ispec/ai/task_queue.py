@@ -69,8 +69,9 @@ class TaskQueue:
 
     def add_task(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Task:
         """Submit a callable to be executed by the queue."""
-
         task = Task(func, args, kwargs)
+        if not self._started:
+            self.start()
         self._queue.put(task)
         return task
 

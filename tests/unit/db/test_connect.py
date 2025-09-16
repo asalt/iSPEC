@@ -19,3 +19,11 @@ def test_get_db_path_custom(tmp_path):
     expected = "sqlite:///" + str(custom)
     assert connect.get_db_path(custom) == expected
 
+
+def test_get_db_path_returns_str(tmp_path, monkeypatch):
+    monkeypatch.setenv("ISPEC_DB_DIR", str(tmp_path))
+    _clear_caches()
+    uri = connect.get_db_path()
+    assert isinstance(uri, str)
+    assert uri.startswith("sqlite:///")
+

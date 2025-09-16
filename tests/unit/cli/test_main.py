@@ -1,6 +1,7 @@
 import sys
 import types
 from pathlib import Path
+import logging
 from unittest.mock import MagicMock
 
 # Ensure the src directory is on the Python path
@@ -74,3 +75,25 @@ def test_api_start(monkeypatch):
     run_mock.assert_called_once()
     assert run_mock.call_args.kwargs["host"] == "0.0.0.0"
     assert run_mock.call_args.kwargs["port"] == 5000
+
+
+def test_logging_set_level(monkeypatch):
+    reset_mock = MagicMock()
+    get_mock = MagicMock()
+    save_mock = MagicMock()
+    monkeypatch.setattr("ispec.cli.logging.reset_logger", reset_mock)
+    monkeypatch.setattr("ispec.cli.logging.get_logger", get_mock)
+    monkeypatch.setattr("ispec.cli.logging.save_log_level", save_mock)
+    monkeypatch.setattr(sys, "argv", ["ispec", "logging", "set-level", "WARNING"])
+    main()
+    reset_mock.assert_called_once_with()
+    assert get_mock.call_args.kwargs["level"] == logging.WARNING
+    save_mock.assert_called_once_with("WARNING")
+
+
+def test_logging_show_path(monkeypatch, capsys):
+    path = Path("/tmp/ispec.log")
+    monkeypatch.setattr("ispec.cli.logging._resolve_log_file", lambda: path)
+    monkeypatch.setattr(sys, "argv", ["ispec", "logging", "show-path"])
+    main()
+    assert capsys.readouterr().out.strip() == str(path.resolve())

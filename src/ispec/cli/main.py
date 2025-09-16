@@ -1,7 +1,6 @@
 # ispec/cli/main.py
 import argparse
-from ispec.cli import db, api
-from ispec.logging import get_logger
+from ispec.cli import api, db, logging as logging_cli
 
 
 def main():
@@ -17,16 +16,19 @@ def main():
     api_subparsers = api_parser.add_subparsers(dest="subcommand", required=True)
     api.register_subcommands(api_subparsers)
 
-    # se_parser = subparsers.add_parser("somethingelse", help="Other stuff")
-    # se_subparsers = se_parser.add_subparsers(dest="subcommand", required=True)
-    # somethingelse.register_subcommands(se_subparsers)
+    logging_parser = subparsers.add_parser("logging", help="Logging utilities")
+    logging_subparsers = logging_parser.add_subparsers(
+        dest="subcommand", required=True
+    )
+    logging_cli.register_subcommands(logging_subparsers)
+
 
     args = parser.parse_args()
 
     # can expand this later, can use a hashmap/dict lookup if becomes larger
     if args.command == "db":
         db.dispatch(args)
-    if args.command == "api":
+    elif args.command == "api":
         api.dispatch(args)
-    elif args.command == "somethingelse":
-        somethingelse.dispatch(args)
+    elif args.command == "logging":
+        logging_cli.dispatch(args)

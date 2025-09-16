@@ -1,45 +1,132 @@
-from typing import Type, Callable
-from sqlalchemy.orm import Session
 from fastapi import APIRouter, Depends, HTTPException, Query
-
-
+from sqlalchemy.orm import Session
 from ispec.db.connect import get_session
+from typing import Type, Callable
 from ispec.db.models import Person, Project, ProjectComment
-from ispec.db.crud import PersonCRUD, ProjectCRUD, ProjectCommentCRUD
+from ispec.db.crud import CRUDBase, PersonCRUD, ProjectCRUD, ProjectCommentCRUD
 
-from ispec.api.routes.utils.ui_meta import ui_from_column  # used inside schema builder
 from ispec.api.routes.schema import build_form_schema
 
-from ispec.api.models.modelmaker import get_models, make_pydantic_model_from_sqlalchemy
-
-# models = get_models() 
-# ProjectRead = models["ProjectRead"]
-# ProjectUpdate = models["ProjectUpdate"]
+from ispec.api.models.modelmaker import make_pydantic_model_from_sqlalchemy
 
 router = APIRouter()
 
 
-# @router.get("/projects/{project_id}", response_model=ProjectRead)
-# def read_project(project_id: int, db: Session = Depends(get_session)):
-#     project_crud = ProjectCRUD()
-#     return project_crud.get(db, project_id)
+# The router previously relied on a module level ROUTE_PREFIX_BY_TABLE for
+# resolving foreign-key option endpoints.  Global state makes isolated testing
+# difficult, so the mapping is now provided via dependency injection.  Each
+# call to ``generate_crud_router`` accepts a mapping which is shared across
+# routers when needed.
 
 
-# @router.put("/projects/{project_id}", response_model=ProjectRead)
-# def update_project(
-#     project_id: int, payload: ProjectUpdate, db: Session = Depends(get_session)
-# ):
-#     project_crud = ProjectCRUD()
-#     obj = project_crud.get(db, project_id)
-#     for field, value in payload.model_dump(exclude_unset=True).items():
-#         setattr(obj, field, value)
-#     db.commit()
-#     db.refresh(obj)
-#     return obj
+def _add_schema_endpoint(
+    router: APIRouter,
+    model,
+    create_model,
+    *,
+    route_prefix_for_table: Callable[[str], str],
+) -> None:
+    """Register the ``/schema`` endpoint on ``router``."""
+
+    @router.get("/schema")
+    def get_schema():  # pragma: no cover - trivial wrapper
+        return build_form_schema(
+            model, create_model, route_prefix_for_table=route_prefix_for_table
+        )
 
 
+def _add_crud_endpoints(
+    router: APIRouter,
+    crud,
+    read_model,
+    create_model,
+    *,
+    tag: str,
+) -> None:
+    """Attach basic CRUD endpoints to ``router``."""
 
-ROUTE_PREFIX_BY_TABLE: dict[str, str] = {}
+    @router.get("/{item_id}", response_model=read_model, response_model_exclude_none=True)
+    def get_item(item_id: int, db: Session = Depends(get_session)):
+        obj = crud.get(db, item_id)
+        if obj is None:
+            raise HTTPException(status_code=404, detail=f"{tag} not found")
+        return read_model.model_validate(obj).model_dump()
+
+    @router.post(
+        "/",
+        response_model=read_model,
+        response_model_exclude_none=True,
+        summary=f"Create new {tag}",
+        description="Create a new item. Required fields are marked with * in the request body below.",
+        status_code=201,
+    )
+    def create_item(payload: create_model, db: Session = Depends(get_session)):
+        obj = crud.create(db, payload.model_dump())
+        if obj is None:
+            raise HTTPException(status_code=409, detail=f"{tag} already exists")
+        return read_model.model_validate(obj).model_dump()
+
+    @router.put("/{item_id}", response_model=read_model, response_model_exclude_none=True)
+    def update_item(item_id: int, payload: create_model, db: Session = Depends(get_session)):
+        obj = crud.get(db, item_id)
+        if obj is None:
+            raise HTTPException(status_code=404, detail=f"{tag} not found")
+        for field, value in payload.model_dump(exclude_unset=True).items():
+            setattr(obj, field, value)
+        db.commit()
+        db.refresh(obj)
+        return read_model.model_validate(obj).model_dump()
+
+    @router.delete("/{item_id}")
+    def delete_item(item_id: int, db: Session = Depends(get_session)):
+        success = crud.delete(db, item_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=f"{tag} not found")
+        return {"status": "deleted", "id": item_id}
+
+
+def _add_options_endpoints(router: APIRouter, crud, *, model) -> None:
+    """Attach ``/options`` endpoints for async select components."""
+
+    @router.get("/options")
+    def options(
+        q: str | None = None,
+        limit: int = Query(default=20, ge=1, le=100),
+        ids: list[int] | None = Query(default=None),
+        exclude_ids: list[int] | None = Query(default=None),
+        db: Session = Depends(get_session),
+    ):
+        return crud.list_options(
+            db, q=q, limit=limit, ids=ids, exclude_ids=exclude_ids
+        )
+
+    @router.get("/options/{field}")
+    def options_for_field(
+        field: str,
+        q: str | None = None,
+        limit: int = 20,
+        db: Session = Depends(get_session),
+    ):
+        from sqlalchemy import inspect as sa_inspect
+
+        mapper = sa_inspect(model)
+        rel = mapper.relationships.get(field)
+        if not rel:
+            raise HTTPException(status_code=404, detail=f"No relationship named '{field}'")
+        target_cls = rel.mapper.class_
+        crud_class_map = {
+            Person: PersonCRUD,
+            Project: ProjectCRUD,
+            ProjectComment: ProjectCommentCRUD,
+        }
+
+        target_crud_cls = crud_class_map.get(target_cls, CRUDBase)
+        if target_crud_cls is CRUDBase:
+            target_crud = target_crud_cls(target_cls)
+        else:
+            target_crud = target_crud_cls()
+            target_crud.model = target_cls
+        return target_crud.list_options(db, q=q, limit=limit)
 
 
 def generate_crud_router(
@@ -51,6 +138,7 @@ def generate_crud_router(
     exclude_fields: set[str] = {"id"},
     create_exclude_fields: set[str] | None = None,
     optional_all: bool = False,
+    route_prefix_by_table: dict[str, str] | None = None,
 ) -> APIRouter:
     """
     Create a FastAPI router providing CRUD and metadata endpoints for a SQLAlchemy model.
@@ -91,6 +179,11 @@ def generate_crud_router(
     optional_all : bool, default=False
         If True, marks all fields in the create/update model as optional.
 
+    route_prefix_by_table : dict[str, str] | None, default=None
+        Mapping of table names to route prefixes.  When multiple routers are
+        generated the mapping should be shared so that foreign-key fields can
+        resolve the appropriate ``/options`` endpoint for related tables.
+
     Returns
     -------
     APIRouter
@@ -114,133 +207,38 @@ def generate_crud_router(
     router = APIRouter(prefix=prefix, tags=[tag])
     crud = crud_class()
 
+    prefix_map = route_prefix_by_table if route_prefix_by_table is not None else {}
 
     # register prefix for FK resolution (e.g., "person" -> "/people")
-    ROUTE_PREFIX_BY_TABLE[model.__table__.name] = prefix
-
+    prefix_map[model.__table__.name] = prefix
 
     def route_prefix_for_table(table: str) -> str:
-        return ROUTE_PREFIX_BY_TABLE.get(table, f"/{table}")
+        return prefix_map.get(table, f"/{table}")
 
-
-    # Generate models
     ReadModel = make_pydantic_model_from_sqlalchemy(
         model,
         name_suffix="Read",
-        # strip_prefix=strip_prefix,
     )
     CreateModel = make_pydantic_model_from_sqlalchemy(
         model,
         name_suffix="Create",
-        # strip_prefix=strip_prefix,
         exclude_fields={*exclude_fields, *create_exclude_fields},
         optional_all=optional_all,
-        # exclude_fields = {""}
     )
 
-    # this is for frontend UI form rendering
-    @router.get("/schema")
-    def get_schema():
-        return build_form_schema(model, CreateModel, route_prefix_for_table=route_prefix_for_table)
-
-        # this is now in build_form_schema
-        # schema = CreateModel.model_json_schema()
-        # # attach per-field UI hints
-        # props = schema.get("properties", {})
-        # column_map = {c.name: c for c in model.__table__.columns}  # type: ignore
-        # for name, prop in props.items():
-        #     col = column_map.get(name)
-        #     if col is None:
-        #         continue
-        #     prop["ui"] = ui_from_column(col)
-        #     # carry ordering/grouping if present on SA Column
-        #     if grp := (col.info or {}).get("group"):
-        #         prop.setdefault("ui", {})["group"] = grp
-
-        # # top-level UI (sections/order) — optional
-        # schema["ui"] = {
-        #     "order": [c.name for c in model.__table__.columns if c.name in props],
-        #     "sections": [],  # you can prefill from model-level metadata if desired
-        #     "title": tag,
-        # }
-        # return schema
-
-    @router.get("/{item_id}", response_model=ReadModel, response_model_exclude_none=True)
-    def get_item(item_id: int, db: Session = Depends(get_session)):
-        obj = crud.get(db, item_id)
-        if obj is None:
-            raise HTTPException(status_code=404, detail=f"{tag} not found")
-        return ReadModel.model_validate(obj)
-
-    @router.post(
-        "/",
-        response_model=ReadModel,
-        response_model_exclude_none=True,
-        summary=f"Create new {tag}",
-        description="Create a new item. Required fields are marked with * in the request body below.",
-        status_code=201,
+    _add_schema_endpoint(
+        router, model, CreateModel, route_prefix_for_table=route_prefix_for_table
     )
-    def create_item(payload: CreateModel, db: Session = Depends(get_session)):
-        obj = crud.create(db, payload.model_dump())
-        if obj is None:
-            raise HTTPException(status_code=409, detail=f"{tag} already exists")
-        return ReadModel.model_validate(obj)
-
-    @router.put("/{item_id}", response_model=ReadModel, response_model_exclude_none=True)
-    def update_item(
-        item_id: int, payload: CreateModel, db: Session = Depends(get_session)
-    ):
-        obj = crud.get(db, item_id)
-        if obj is None:
-            raise HTTPException(status_code=404, detail=f"{tag} not found")
-        for field, value in payload.model_dump(exclude_unset=True).items():
-            setattr(obj, field, value)
-        db.commit()
-        db.refresh(obj)
-        return ReadModel.model_validate(obj)
-
-    @router.delete("/{item_id}")
-    def delete_item(item_id: int, db: Session = Depends(get_session)):
-        success = crud.delete(db, item_id)
-        if not success:
-            raise HTTPException(status_code=404, detail=f"{tag} not found")
-        return {"status": "deleted", "id": item_id}
-
-
-    @router.get("/options")
-    def options(
-        q: str | None = None,
-        limit: int = Query(default=20, ge=1, le=100),
-        ids: list[int] | None = Query(default=None),
-        exclude_ids: list[int] | None = Query(default=None),
-        db: Session = Depends(get_session),
-    ):
-        return crud.list_options(db, q=q, limit=limit, ids=ids, exclude_ids=exclude_ids)
-
-    # this is WIP
-    @router.get("/options/{field}")
-    def options_for_field(
-        field: str,
-        q: str | None = None,
-        limit: int = 20,
-        db: Session = Depends(get_session),
-    ):
-        # Resolve the related model via ORM relationship
-        from sqlalchemy import inspect as sa_inspect
-
-        mapper = sa_inspect(model)
-        rel = mapper.relationships.get(field)
-        if not rel:
-            raise HTTPException(
-                status_code=404, detail=f"No relationship named '{field}'"
-            )
-        target_cls = rel.mapper.class_
-        # Use the target's CRUD (you can keep a registry {Model: CRUD})
-        target_crud = (
-            crud.__class__()
-        )  # if your CRUDs share a base, use a registry instead
-        target_crud.model = target_cls
-        return target_crud.list_options(db, q=q, limit=limit)
+    # Register the options endpoints *before* CRUD handlers so that the
+    # ``/options`` and ``/options/{field}`` paths take precedence over the
+    # generic ``/{item_id}`` route. Starlette matches routes in definition
+    # order and would otherwise treat ``/options`` as a candidate for
+    # ``/{item_id}``, resulting in a ``422`` response when the path parameter
+    # fails integer validation.
+    _add_options_endpoints(router, crud, model=model)
+    _add_crud_endpoints(
+        router, crud, ReadModel, CreateModel, tag=tag
+    )
 
     return router
 
@@ -260,6 +258,8 @@ def generate_crud_router(
 # other things
 
 # ========================= Person ==============================
+_ROUTE_PREFIX_MAP: dict[str, str] = {}
+
 router.include_router(
     generate_crud_router(
         model=Person,
@@ -271,6 +271,7 @@ router.include_router(
             "id",
         },
         create_exclude_fields={"ppl_CreationTS", "ppl_ModificationTS"},
+        route_prefix_by_table=_ROUTE_PREFIX_MAP,
     )
 )
 
@@ -284,6 +285,7 @@ router.include_router(
         tag="Project",
         # strip_prefix="prj_",
         exclude_fields={"id"},
+        route_prefix_by_table=_ROUTE_PREFIX_MAP,
     )
 )
 
@@ -297,6 +299,7 @@ router.include_router(
         tag="ProjectComment",
         # strip_prefix="com_",
         exclude_fields={"id"},
+        route_prefix_by_table=_ROUTE_PREFIX_MAP,
     )
 )
 

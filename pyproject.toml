@@ -9,7 +9,18 @@ description = "A Python package for database"
 authors = [{ name = "Your Name", email = "alexander.saltzman@bcm.edu" }]
 license = { file = "LICENSE" }
 readme = "README.md"
-dependencies = [ ]
+dependencies = [
+    "alembic",
+    "fastapi",
+    "numpy",
+    "openpyxl",
+    "pandas",
+    "pydantic",
+    "requests",
+    "rich",
+    "sqlalchemy",
+    "uvicorn",
+]
 requires-python = ">=3.8"
 
 [project.optional-dependencies]
@@ -22,10 +33,11 @@ test = [
     "fastapi",
     "httpx",
     "faker",
+    "alembic",
 ]
 
 [project.scripts]
-ispec = "ispec.cli:main.main"
+ispec = "ispec.cli.main:main"
 
 
 [tool.setuptools]

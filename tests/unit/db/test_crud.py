@@ -1,29 +1,9 @@
 # test_crud.py
 
-import sqlite3
 import pytest
 
-
-import pytest
-from ispec.db.connect import (
-    make_session_factory,
-    get_session,
-    sqlite_engine,
-    initialize_db,
-)
 from ispec.db.models import Person, Project, ProjectPerson
 from ispec.db.crud import PersonCRUD, ProjectCRUD, ProjectPersonCRUD
-
-
-@pytest.fixture(scope="function")
-def db_session(tmp_path):
-    db_url = f"sqlite:///{tmp_path}/test.db"
-    engine = sqlite_engine(db_url)
-    initialize_db(engine)
-    get_test_session = make_session_factory(engine)
-
-    with get_test_session() as session:
-        yield session
 
 
 def test_insert_and_get(db_session):

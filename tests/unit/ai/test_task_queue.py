@@ -18,6 +18,16 @@ def test_task_queue_executes_tasks():
     assert results == [1, 2]
 
 
+def test_add_task_starts_queue_automatically():
+    """Adding a task should start the queue if needed."""
+    queue = TaskQueue()
+    results: list[int] = []
+    queue.add_task(results.append, 1)
+    queue.join()
+    queue.stop()
+    assert results == [1]
+
+
 def test_start_called_only_once():
     """Starting the queue twice should not spawn extra threads."""
 
