@@ -8,7 +8,7 @@ handlers.
 import logging
 
 from ispec.logging import get_logger, reset_logger
-from ispec.logging.logging import _resolve_log_file, get_configured_level, _resolve_log_file
+from ispec.logging.logging import get_configured_level, _resolve_log_file
 from ispec.logging.config import save_log_level
 
 
@@ -50,7 +50,6 @@ def dispatch(args):
         path = _resolve_log_file().resolve()
         print(path)
     elif args.subcommand == "show-level":
-        level = get_configured_level()
-        print(level)
+        print(get_configured_level())
     else:
         get_logger(__file__).error("No handler for subcommand: %s", args.subcommand)

@@ -162,11 +162,13 @@ Control logging output without editing code:
 ```bash
 ispec logging set-level INFO
 ispec logging show-path
+ispec logging show-level
 ```
 
 The logging CLI persists the selected level to a JSON config alongside the
-logs, resets handlers when you change levels, and reports the active log file
-path resolved by the logging utility module.【F:src/ispec/cli/logging.py†L11-L55】【F:src/ispec/logging/config.py†L1-L90】【F:src/ispec/logging/logging.py†L1-L88】
+logs, resets handlers when you change levels, reports the active log file
+path resolved by the logging utility module, and prints the configured log
+level for quick inspection.【F:src/ispec/cli/logging.py†L11-L55】【F:src/ispec/logging/config.py†L1-L90】【F:src/ispec/logging/logging.py†L1-L88】
 
 ## API service
 
