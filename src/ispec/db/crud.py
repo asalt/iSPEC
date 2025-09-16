@@ -1,3 +1,5 @@
+"""CRUD helper classes and utilities for working with SQLAlchemy models."""
+
 # crud.py
 from typing import Any, Iterable, List, Optional, Sequence
 
@@ -21,6 +23,7 @@ logger = get_logger(__file__)
 
 
 class CRUDBase:
+    """Base class providing common CRUD helpers for SQLAlchemy models."""
 
     prefix = None
 
@@ -29,9 +32,18 @@ class CRUDBase:
         self.req_cols = req_cols
 
     def get_columns(self):
+        """Return the list of column names defined on the mapped table."""
         return [col.name for col in self.model.__table__.columns]
 
     def validate_input(self, session: Session, record: dict = None) -> dict:
+        """Validate and normalize user supplied data before persistence.
+
+        The method removes keys that do not correspond to model columns, applies
+        the optional :attr:`prefix` mapping for alternate names, enforces any
+        required columns specified via ``req_cols``, and logs unexpected keys.
+        ``record`` must be a dictionary, and ``session`` must be an active
+        SQLAlchemy session to support downstream lookups in subclasses.
+        """
 
         if session is None:
             raise ValueError("A database session is required for validation.")
@@ -59,9 +71,11 @@ class CRUDBase:
         return cleaned_record
 
     def get(self, session: Session, id: int):
+        """Return the instance with the given primary key or ``None``."""
         return session.query(self.model).filter(self.model.id == id).first()
 
     def create(self, session: Session, record: dict):
+        """Insert a new row into the database and return the resulting object."""
         record = self.validate_input(session, record)
         if record is None:
             logger.warning("Record is None after validation, skipping insert.")
@@ -74,6 +88,7 @@ class CRUDBase:
         return obj
 
     def bulk_create(self, session: Session, records: List[dict]):
+        """Insert multiple records in one transaction and return the objects."""
         if not records:
             return []
         cleaned = [self.validate_input(session, r) for r in records]
@@ -84,6 +99,7 @@ class CRUDBase:
         return objs
 
     def delete(self, session: Session, id: int) -> bool:
+        """Delete the row with the supplied id, returning ``True`` on success."""
         obj = self.get(session, id)
         if obj:
             session.delete(obj)
