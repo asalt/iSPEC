@@ -1,5 +1,6 @@
+"""High-level helpers for importing tabular data files into the iSPEC database."""
+
 # io/io_file.py
-import sqlite3
 from functools import partial
 from collections.abc import Callable
 
@@ -126,28 +127,3 @@ def import_file(file_path, table_name, db_file_path=None, **kwargs):
 
     return
 
-
-"""
-def get_table_colu(db_file_path,table_name):
-    if tables.get(table_name) is not None:
-        with sqlite3.connect(db_file_path) as conn:
-            c = conn.cursor()
-            c.execute("SELECT * FROM " + table_name)
-            res = c.fetchall()
-        return res
-        
-        
-
-def clean_up_import(dict,db_file_path,table_name):
-    checkName = get_table_colu(db_file_path,table_name)
-    colsRemove = []
-    for bigKey in dict:
-        for key in bigKey:
-            if "RecNo" in key:
-                key = "id"
-            if key not in checkName and key != "id":
-                colsRemove.append(key)
-        for removable in colsRemove:
-            bigKey.pop(removable)
-    return dict   
-"""
