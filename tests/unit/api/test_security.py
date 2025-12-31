@@ -1,0 +1,102 @@
+import pytest
+from starlette.requests import Request
+from fastapi import HTTPException
+
+from ispec.api.security import (
+    create_session,
+    delete_session,
+    get_current_user,
+    hash_password,
+    require_access,
+    session_cookie_name,
+    verify_password,
+)
+from ispec.db.models import AuthSession, AuthUser, UserRole
+
+
+def _make_request(*, method: str, cookie: str | None = None) -> Request:
+    headers: list[tuple[bytes, bytes]] = []
+    if cookie:
+        headers.append((b"cookie", cookie.encode("latin-1")))
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": "/",
+        "query_string": b"",
+        "headers": headers,
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+    }
+    return Request(scope)
+
+
+def test_password_hash_round_trip(monkeypatch):
+    monkeypatch.setenv("ISPEC_PASSWORD_PEPPER", "dev-pepper")
+    salt_b64, hash_b64, iterations = hash_password("supersecret")
+    assert verify_password(
+        "supersecret",
+        salt_b64=salt_b64,
+        hash_b64=hash_b64,
+        iterations=iterations,
+    )
+    assert not verify_password(
+        "wrong",
+        salt_b64=salt_b64,
+        hash_b64=hash_b64,
+        iterations=iterations,
+    )
+
+
+def test_session_round_trip_and_delete(db_session):
+    user = AuthUser(
+        username="alice",
+        password_hash="x",
+        password_salt="y",
+        password_iterations=1,
+        role=UserRole.admin,
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    token = create_session(db_session, user=user)
+    assert isinstance(token, str) and token
+
+    stored = db_session.query(AuthSession).one()
+    assert stored.token_hash != token
+
+    cookie = f"{session_cookie_name()}={token}"
+    request = _make_request(method="GET", cookie=cookie)
+    current = get_current_user(request, db_session)
+    assert current is not None
+    assert current.username == "alice"
+
+    delete_session(db_session, token=token)
+    assert db_session.query(AuthSession).count() == 0
+
+
+def test_require_access_enforces_viewer_is_read_only(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_REQUIRE_LOGIN", "1")
+
+    user = AuthUser(
+        username="viewer",
+        password_hash="x",
+        password_salt="y",
+        password_iterations=1,
+        role=UserRole.viewer,
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    token = create_session(db_session, user=user)
+    cookie = f"{session_cookie_name()}={token}"
+    request = _make_request(method="POST", cookie=cookie)
+
+    with pytest.raises(HTTPException) as exc:
+        require_access(request, db_session, provided_api_key=None)
+    assert exc.value.status_code == 403
