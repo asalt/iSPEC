@@ -3,11 +3,39 @@
 # crud.py
 from typing import Any, Iterable, List, Optional, Sequence
 
-from sqlalchemy import select, func, cast
+from sqlalchemy import select, func, cast, and_, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.sql import sqltypes as T  # canonical type classes (String, Text, etc.)
 
 from ispec.logging import get_logger
+
+# Optional gene identifier normalizer (file-driven; may be None)
+try:
+    from ispec.genomics.identifiers import GeneNormalizer, TackleGeneNormalizer  # type: ignore
+except Exception:  # pragma: no cover - optional component
+    GeneNormalizer = None  # type: ignore
+    TackleGeneNormalizer = None  # type: ignore
+
+_GENE_NORMALIZER = None
+
+
+def _get_gene_normalizer():  # pragma: no cover - trivial
+    global _GENE_NORMALIZER
+    if _GENE_NORMALIZER is None:
+        # 1) file-driven mapping via env
+        if GeneNormalizer is not None:
+            try:
+                _GENE_NORMALIZER = GeneNormalizer.from_env()
+            except Exception:
+                _GENE_NORMALIZER = None
+        # 2) tackle-based mapping as a fallback
+        if _GENE_NORMALIZER is None and TackleGeneNormalizer is not None:
+            try:
+                if TackleGeneNormalizer.available():
+                    _GENE_NORMALIZER = TackleGeneNormalizer()
+            except Exception:
+                _GENE_NORMALIZER = None
+    return _GENE_NORMALIZER
 
 
 from ispec.db.models import (
@@ -16,6 +44,13 @@ from ispec.db.models import (
     ProjectPerson,
     LetterOfSupport,
     ProjectComment,
+    E2G,
+    ExperimentRun,
+    Experiment,
+    Job,
+    JobStatus,
+    PSM,
+    MSRawFile,
 )
 
 
@@ -244,7 +279,7 @@ class ProjectCRUD(CRUDBase):
 
     def __init__(self):
         super().__init__(
-            Project, req_cols=["prj_ProjectTitle", "prj_ProjectBackground"]
+            Project, req_cols=["prj_ProjectTitle"]
         )
 
     def validate_input(self, session: Session, record: dict) -> dict | None:
@@ -340,6 +375,264 @@ class ProjectPersonCRUD(CRUDBase):
 class LetterOfSupportCRUD(CRUDBase):
     def __init__(self):
         return super().__init__(LetterOfSupport)
+
+
+class E2GCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(E2G)
+
+
+class PSMCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(PSM)
+
+    def label_expr(self):
+        M = self.model
+        cols = M.__table__.columns.keys()
+        parts = []
+        if "peptide" in cols:
+            parts.append(getattr(M, "peptide"))
+        if "charge" in cols:
+            parts.append(func.coalesce(func.cast(getattr(M, "charge"), T.String()), ""))
+        if parts:
+            # peptide(+charge) for readability
+            return func.trim(parts[0] + " +" + parts[1])
+        return super().label_expr()
+
+
+class MSRawFileCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(MSRawFile)
+
+    def label_expr(self):
+        cols = self.model.__table__.columns.keys()
+        if "uri" in cols:
+            return getattr(self.model, "uri")
+        return super().label_expr()
+        self._normalizer = None  # lazy-load to avoid heavy import costs
+
+    def validate_input(self, session: Session, record: dict | None) -> dict:
+        if session is None:
+            raise ValueError("A database session is required for validation.")
+        if record is None:
+            raise ValueError("Record cannot be None")
+
+        exp_run_id = record.get("experiment_run_id")
+        if exp_run_id is None:
+            raise ValueError("experiment_run_id is required for E2G")
+        exists = session.query(ExperimentRun).filter_by(id=exp_run_id).first()
+        if not exists:
+            raise ValueError(f"Invalid experiment_run_id: {exp_run_id}")
+
+        # basic duplicate check (per run, gene, type, label)
+        gene = (record.get("gene") or "").strip()
+        geneidtype = (record.get("geneidtype") or "").strip()
+        label = (record.get("label") or "0").strip()
+        if gene and geneidtype:
+            # consider equivalent identifiers if a normalizer is configured
+            pairs = [(geneidtype, gene)]
+            norm = self._normalizer or _get_gene_normalizer()
+            self._normalizer = norm
+            if norm is not None:
+                try:
+                    pairs = norm.equivalents(gene, geneidtype) or pairs
+                except Exception:
+                    pairs = pairs
+            conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
+            dup = (
+                session.query(E2G)
+                .filter(
+                    E2G.experiment_run_id == exp_run_id,
+                    E2G.label == label,
+                    or_(*conds),
+                )
+                .first()
+            )
+            if dup:
+                return None
+
+        return super().validate_input(session, record)
+
+    def label_expr(self):
+        # show gene string for options and listings
+        return getattr(self.model, "gene")
+
+    def bulk_upsert(
+        self,
+        session: Session,
+        records: list[dict],
+        *,
+        match_keys: tuple[str, ...] = ("experiment_run_id", "gene", "geneidtype", "label"),
+        update_fields: tuple[str, ...] = ("iBAQ_dstrAdj", "peptideprint"),
+    ) -> dict:
+        inserted = 0
+        updated = 0
+
+        for rec in records:
+            # Ensure defaults
+            rec = dict(rec)
+            rec.setdefault("label", "0")
+            validated = self.validate_input(session, rec)
+            if validated is None:
+                continue
+
+            exp_run_id = validated.get("experiment_run_id")
+            gene = (validated.get("gene") or "").strip()
+            geneidtype = (validated.get("geneidtype") or "").strip()
+            label = (validated.get("label") or "0").strip()
+
+            # Try to find existing row considering identifier equivalents
+            pairs = [(geneidtype, gene)]
+            norm = self._normalizer or _get_gene_normalizer()
+            self._normalizer = norm
+            if norm is not None:
+                try:
+                    pairs = norm.equivalents(gene, geneidtype) or pairs
+                except Exception:
+                    pairs = pairs
+            conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
+            existing = (
+                session.query(self.model)
+                .filter(
+                    E2G.experiment_run_id == exp_run_id,
+                    E2G.label == label,
+                    or_(*conds),
+                )
+                .first()
+            )
+            if existing:
+                changed = False
+                for f in update_fields:
+                    if f in validated and getattr(existing, f) != validated[f]:
+                        setattr(existing, f, validated[f])
+                        changed = True
+                if changed:
+                    session.add(existing)
+                    updated += 1
+            else:
+                obj = self.model(**validated)
+                session.add(obj)
+                inserted += 1
+
+        session.commit()
+        return {"inserted": inserted, "updated": updated}
+
+
+class ExperimentCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(Experiment)
+
+    def validate_input(self, session: Session, record: dict | None) -> dict | None:
+        if session is None:
+            raise ValueError("A database session is required for validation.")
+        if record is None:
+            return None
+
+        project_id = record.get("project_id")
+        if project_id is None:
+            raise ValueError("project_id is required for Experiment")
+        exists = session.query(Project).filter_by(id=project_id).first()
+        if not exists:
+            raise ValueError(f"Invalid project_id: {project_id}")
+
+        # basic duplicate check on record_no within a project
+        rec = (record.get("record_no") or "").strip()
+        if rec:
+            dup = (
+                session.query(Experiment)
+                .filter_by(project_id=project_id, record_no=rec)
+                .first()
+            )
+            if dup:
+                return None
+
+        return super().validate_input(session, record)
+
+
+class ExperimentRunCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(ExperimentRun)
+
+    def validate_input(self, session: Session, record: dict | None) -> dict | None:
+        if session is None:
+            raise ValueError("A database session is required for validation.")
+        if record is None:
+            return None
+
+        experiment_id = record.get("experiment_id")
+        if experiment_id is None:
+            raise ValueError("experiment_id is required for ExperimentRun")
+        exists = session.query(Experiment).filter_by(id=experiment_id).first()
+        if not exists:
+            raise ValueError(f"Invalid experiment_id: {experiment_id}")
+
+        # avoid unique constraint violation by pre-checking
+        run_no = record.get("run_no", 1)
+        search_no = record.get("search_no", 1)
+        dup = (
+            session.query(ExperimentRun)
+            .filter_by(experiment_id=experiment_id, run_no=run_no, search_no=search_no)
+            .first()
+        )
+        if dup:
+            return None
+
+        return super().validate_input(session, record)
+
+
+class JobCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(Job)
+
+    def validate_input(self, session: Session, record: dict | None) -> dict | None:
+        if session is None:
+            raise ValueError("A database session is required for validation.")
+        if record is None:
+            return None
+        run_id = record.get("experiment_run_id")
+        if run_id is None:
+            raise ValueError("experiment_run_id is required for Job")
+        exists = session.query(ExperimentRun).filter_by(id=run_id).first()
+        if not exists:
+            raise ValueError(f"Invalid experiment_run_id: {run_id}")
+        return super().validate_input(session, record)
+
+    def start(self, session: Session, job_id: int) -> Job | None:
+        obj = self.get(session, job_id)
+        if not obj:
+            return None
+        obj.status = JobStatus.running
+        from datetime import datetime, UTC
+        obj.started_at = datetime.now(UTC)
+        session.commit()
+        session.refresh(obj)
+        return obj
+
+    def succeed(self, session: Session, job_id: int, message: str | None = None) -> Job | None:
+        obj = self.get(session, job_id)
+        if not obj:
+            return None
+        obj.status = JobStatus.succeeded
+        if message:
+            obj.message = message
+        from datetime import datetime, UTC
+        obj.finished_at = datetime.now(UTC)
+        session.commit()
+        session.refresh(obj)
+        return obj
+
+    def fail(self, session: Session, job_id: int, message: str | None = None) -> Job | None:
+        obj = self.get(session, job_id)
+        if not obj:
+            return None
+        obj.status = JobStatus.failed
+        if message:
+            obj.message = message
+        from datetime import datetime, UTC
+        obj.finished_at = datetime.now(UTC)
+        session.commit()
+        session.refresh(obj)
+        return obj
 
 
 # class ProjectComment(TableCRUD):

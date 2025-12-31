@@ -10,7 +10,7 @@ from ispec.api.routes.routes import (
 from ispec.api.models.modelmaker import make_pydantic_model_from_sqlalchemy
 from ispec.db.models import Person
 from ispec.db.crud import PersonCRUD
-from ispec.db.connect import get_session, make_session_factory, sqlite_engine, initialize_db
+from ispec.db.connect import get_session_dep, make_session_factory, sqlite_engine, initialize_db
 
 
 def test_add_schema_endpoint_exposes_schema():
@@ -58,7 +58,7 @@ def crud_client(tmp_path):
         with session_factory() as session:
             yield session
 
-    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_session_dep] = override_session
 
     with TestClient(app) as client:
         client.session_factory = session_factory  # type: ignore[attr-defined]
@@ -102,7 +102,7 @@ def options_client(tmp_path):
         with session_factory() as session:
             yield session
 
-    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[get_session_dep] = override_session
 
     with TestClient(app) as client:
         client.session_factory = session_factory  # type: ignore[attr-defined]

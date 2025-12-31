@@ -3,7 +3,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ispec.api.main import app
-from ispec.db.connect import get_session as db_get_session
+from ispec.db.connect import get_session as db_get_session, get_session_dep
 from ispec.db.models import Person, Project, ProjectComment, logger as db_logger
 
 
@@ -64,7 +64,7 @@ def client(tmp_path, monkeypatch):
         with db_get_session() as session:
             yield session
 
-    app.dependency_overrides[db_get_session] = override_get_session
+    app.dependency_overrides[get_session_dep] = override_get_session
     client = TestClient(app)
     try:
         yield client

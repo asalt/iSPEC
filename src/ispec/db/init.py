@@ -1,29 +1,8 @@
-from functools import lru_cache
 from pathlib import Path
 from typing import Union
 
 from ispec.db.connect import get_db_path
 from ispec.db.models import sqlite_engine, initialize_db as orm_initialize_db
-
-
-@lru_cache(maxsize=None)
-def get_sql_code_dir(path="sqlite"):
-    sql_code_path = Path(__file__).parent.parent.parent.parent / "sql" / path
-    if not sql_code_path.exists():
-        raise ValueError(f"sql script path {sql_code_path} does not exist")
-    return sql_code_path
-
-
-@lru_cache(maxsize=None)
-def get_sql_file(**kwargs):
-    """
-    **kwargs passed to get_sql_dir
-    """
-    sql_code_path = get_sql_code_dir(**kwargs)
-    sql_code_file = sql_code_path / "init.sql"
-    if not sql_code_file.exists():
-        raise ValueError(f"sql script file {sql_code_file} does not exist")
-    return sql_code_file
 
 
 def initialize_db(file_path: Union[str, Path, None] = None):

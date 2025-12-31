@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from ispec.api.routes.routes import generate_crud_router
 from ispec.db.crud import ProjectCRUD
 from ispec.db.models import Project
-from ispec.db.connect import get_session, make_session_factory, sqlite_engine, initialize_db
+from ispec.db.connect import get_session_dep, make_session_factory, sqlite_engine, initialize_db
 
 
 @pytest.fixture
@@ -32,7 +32,7 @@ def client(tmp_path):
         with test_session() as session:
             yield session
 
-    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_session_dep] = override_get_session
 
     with TestClient(app) as client:
         client.session_factory = test_session  # type: ignore[attr-defined]
@@ -50,6 +50,15 @@ def test_project_router_crud_and_route_prefix(client):
     schema = resp.json()
     assert "prj_ProjectTitle" in schema["properties"]
 
+    # list should be empty initially
+    resp = client.get("/projects")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+    resp = client.get("/projects/")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
     payload = {
         "prj_AddedBy": "tester",
         "prj_ProjectTitle": "Test Project",
@@ -57,7 +66,7 @@ def test_project_router_crud_and_route_prefix(client):
     }
 
     # create project
-    resp = client.post("/projects/", json=payload)
+    resp = client.post("/projects", json=payload)
     assert resp.status_code == 201
 
     with client.session_factory() as db:  # type: ignore[attr-defined]
@@ -67,6 +76,11 @@ def test_project_router_crud_and_route_prefix(client):
     resp = client.get(f"/projects/{project_id}")
     assert resp.status_code == 200
     assert resp.json()["prj_ProjectTitle"] == payload["prj_ProjectTitle"]
+
+    # list should now contain one entry
+    resp = client.get("/projects/")
+    assert resp.status_code == 200
+    assert any(row["id"] == project_id for row in resp.json())
 
     # delete project
     resp = client.delete(f"/projects/{project_id}")

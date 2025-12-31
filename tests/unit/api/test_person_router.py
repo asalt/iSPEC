@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from ispec.api.routes.routes import generate_crud_router
 from ispec.db.crud import PersonCRUD
 from ispec.db.models import Person
-from ispec.db.connect import get_session, make_session_factory, sqlite_engine, initialize_db
+from ispec.db.connect import get_session_dep, make_session_factory, sqlite_engine, initialize_db
 
 
 @pytest.fixture
@@ -32,7 +32,7 @@ def client(tmp_path):
         with test_session() as session:
             yield session
 
-    app.dependency_overrides[get_session] = override_get_session
+    app.dependency_overrides[get_session_dep] = override_get_session
 
     with TestClient(app) as client:
         client.session_factory = test_session  # type: ignore[attr-defined]
@@ -49,6 +49,11 @@ def test_person_router_crud_and_route_prefix(client):
     assert resp.status_code == 200
     schema = resp.json()
     assert "ppl_Name_First" in schema["properties"]
+
+    # list should be empty initially
+    resp = client.get("/people/")
+    assert resp.status_code == 200
+    assert resp.json() == []
 
     payload = {
         "ppl_Name_First": "Jane",
@@ -68,6 +73,11 @@ def test_person_router_crud_and_route_prefix(client):
     assert resp.status_code == 200
     assert resp.json()["ppl_Name_First"] == payload["ppl_Name_First"]
 
+    # list should now contain one entry
+    resp = client.get("/people/")
+    assert resp.status_code == 200
+    assert any(row["id"] == person_id for row in resp.json())
+
     # delete person
     resp = client.delete(f"/people/{person_id}")
     assert resp.status_code == 200
@@ -76,4 +86,3 @@ def test_person_router_crud_and_route_prefix(client):
     # ensure person is gone
     resp = client.get(f"/people/{person_id}")
     assert resp.status_code == 404
-

@@ -1,12 +1,11 @@
 # ispec/db/connect.py
 
-import sqlite3
 import os
-import re
 from functools import lru_cache
 from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime
+from typing import Iterator
 
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.engine import Engine
@@ -52,35 +51,11 @@ def get_db_path(file: str | Path | None = None) -> str:
     return db_uri
 
 
-@lru_cache(maxsize=None)
-def get_sql_code_dir(path="sqlite"):
-    sql_code_path = Path(__file__).parent.parent.parent.parent / "sql" / path
-    if not sql_code_path.exists():
-        raise ValueError(f"sql script path {sql_code_path} does not exist")
-    return sql_code_path
-
-
-@lru_cache(maxsize=None)
-def get_sql_file(**kwargs):
-    """
-    **kwargs passed to get_sql_dir
-    """
-    sql_code_path = get_sql_code_dir(**kwargs)
-    sql_code_file = sql_code_path / "init.sql"
-    if not sql_code_file.exists():
-        raise ValueError(f"sql script file {sql_code_file} does not exist")
-    return sql_code_file
-
-
-def table_exists(conn, table_name):
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table_name,)
-    )
-    return cursor.fetchone() is not None
-
-
-CREATE_TABLE_PATTERN = re.compile(r"CREATE TABLE IF NOT EXISTS (\w+)")
+"""
+Legacy helpers for reading raw SQL initialization scripts have been removed.
+Database initialization now relies solely on SQLAlchemy models
+via ispec.db.models.initialize_db.
+"""
 
 
 
@@ -140,8 +115,18 @@ def get_session(file_path: str | Path | None = None) -> Session:
         session.close()
 
 
+def get_session_dep() -> Iterator[Session]:
+    """FastAPI dependency that yields a SQLAlchemy session.
+
+    ``get_session`` is a ``contextmanager`` for CLI/scripts. FastAPI expects a
+    generator dependency (``yield``) so it can manage teardown after the
+    request. This wrapper bridges the two.
+    """
+
+    with get_session() as session:
+        yield session
+
+
 # def ensure_db_dir():
 #    logger.debug("ensuring db dir")
 #    get_db_dir().mkdir(parents=True, exist_ok=True)
-
-

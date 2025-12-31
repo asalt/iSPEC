@@ -14,3 +14,5 @@ app.add_middleware(
 
 
 app.include_router(router)
+# Also expose under /api for frontend consistency
+app.include_router(router, prefix="/api")

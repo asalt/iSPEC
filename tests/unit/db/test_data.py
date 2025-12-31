@@ -180,9 +180,46 @@ def generate_fake_data(n, column_definitions, seed=None):
 
 # -------------------------- Data Insertion -------------------------- #
 
-def insert_df_to_table(conn, table_name, df, column_definitions):
+def insert_df_to_table(conn, table_name, df, column_definitions, _depth: int = 0):
+    """Insert a DataFrame into a table while satisfying foreign keys.
+
+    - Ensures referenced tables have rows (recursively seeds them if needed)
+    - Rewrites FK columns in df to valid IDs from the referenced tables
+    - Skips autoincrement PK columns
+    """
     insp = inspect(conn)
+
+    # Guard against runaway recursion
+    if _depth > 5:
+        raise RuntimeError("Exceeded recursion while seeding foreign keys")
+
     table_cols = [col["name"] for col in insp.get_columns(table_name)]
+
+    # Foreign key handling: ensure parents exist and map FK cols to valid IDs
+    fks = insp.get_foreign_keys(table_name)
+    for fk in fks:
+        referred_table = fk.get("referred_table")
+        constrained_cols = fk.get("constrained_columns", [])
+        referred_cols = fk.get("referred_columns", [])
+
+        if not referred_table or not constrained_cols or not referred_cols:
+            continue
+
+        referred_col = referred_cols[0]
+        constrained_col = constrained_cols[0]
+
+        # Seed parent table if empty
+        parent_count = conn.execute(text(f"SELECT COUNT(*) FROM {referred_table}")).scalar()
+        if parent_count == 0:
+            parent_defs = get_column_defs_from_db(conn, referred_table)
+            parent_df = generate_fake_data(5, parent_defs)
+            insert_df_to_table(conn, referred_table, parent_df, parent_defs, _depth=_depth + 1)
+
+        # Fetch available parent IDs and map into df
+        parent_ids = [row[0] for row in conn.execute(text(f"SELECT {referred_col} FROM {referred_table}")).fetchall()]
+        if parent_ids and constrained_col in df.columns:
+            import random
+            df[constrained_col] = [random.choice(parent_ids) for _ in range(len(df))]
 
     common_cols = [
         col
@@ -206,8 +243,9 @@ def insert_df_to_table(conn, table_name, df, column_definitions):
 
     logger.info("Inserting into table %s", table_name)
     logger.info("Columns: %s", common_cols)
-    logger.debug("Sample types: %s", [type(x) for x in values[0].values()])
-    logger.debug("Sample row: %s", list(values[0].values()))
+    if values:
+        logger.debug("Sample types: %s", [type(x) for x in values[0].values()])
+        logger.debug("Sample row: %s", list(values[0].values()))
 
     conn.execute(q, values)
 
@@ -245,39 +283,16 @@ def test_fake_data_insert(tmp_path, table_name):
     with engine.begin() as conn:
         col_defs = get_column_defs_from_db(engine, table_name)
 
-        if table_name == "project_person": # we should ignore this and have the database make this relationship itself
-            # Insert into referenced tables first
-            for ref_table in ("project", "person"):
-                ref_defs = get_column_defs_from_db(engine, ref_table)
-                df_ref = generate_fake_data(5, ref_defs)
-                insert_df_to_table(conn, ref_table, df_ref, ref_defs)
-
-            # Fetch real IDs from DB
-            project_pk = get_primary_key_column(engine, "project")
-            person_pk = get_primary_key_column(engine, "person")
-
-            project_ids = [row[0] for row in conn.execute(text(f"SELECT {project_pk} FROM project")).fetchall()]
-            person_ids = [row[0] for row in conn.execute(text(f"SELECT {person_pk} FROM person")).fetchall()]
-
-
-            import random
-            data = [{
-                'project_id': random.choice(project_ids),
-                'person_id': random.choice(person_ids)
-            } for _ in range(10)]
-
-            df = pd.DataFrame(data)
+        # Generic approach: generate data and let insert_df_to_table handle
+        # seeding and FK mapping for all tables, including linkers.
+        df = generate_fake_data(10, col_defs)
+        try:
             insert_df_to_table(conn, table_name, df, col_defs)
-        else:
-            df = generate_fake_data(10, col_defs)
-            try:
-                insert_df_to_table(conn, table_name, df, col_defs)
-            except Exception as e:
-                pytest.fail(f"Insertion failed for table {table_name}: {e}")
+        except Exception as e:
+            pytest.fail(f"Insertion failed for table {table_name}: {e}")
 
     # reconnect and see that it's there
     with engine.connect() as conn:
         res = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
         n = res.scalar()
         assert n >= 0
-
