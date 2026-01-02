@@ -1,3 +1,4 @@
+import os
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 from ispec.db.connect import get_session_dep
@@ -37,6 +38,53 @@ router = APIRouter()
 # Pydantic read models used by some convenience endpoints
 E2GRead = make_pydantic_model_from_sqlalchemy(E2G, name_suffix="Read")
 JobRead = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
+
+_ALL_RESOURCES: set[str] = {
+    "people",
+    "projects",
+    "experiments",
+    "experiment_runs",
+    "experiment_to_gene",
+    "jobs",
+    "psms",
+    "msraw_files",
+    "project_comment",
+    "project_person",
+}
+
+_DEFAULT_RESOURCES: set[str] = {"projects", "people", "project_comment"}
+
+
+def _parse_csv_set(raw: str) -> set[str]:
+    return {part.strip().lstrip("/").lower() for part in raw.split(",") if part.strip()}
+
+
+def get_exposed_resources() -> set[str]:
+    """Return the set of enabled API resource prefixes.
+
+    Configure via ``ISPEC_API_RESOURCES`` (comma separated). Use ``all`` or ``*``
+    to expose everything that is wired into this router module.
+    """
+
+    raw = os.getenv("ISPEC_API_RESOURCES")
+    if not raw:
+        return set(_DEFAULT_RESOURCES)
+
+    resources = _parse_csv_set(raw)
+    if not resources:
+        return set()
+
+    if "all" in resources or "*" in resources:
+        return set(_ALL_RESOURCES)
+
+    return resources
+
+
+EXPOSED_RESOURCES = get_exposed_resources()
+
+
+def _enabled(resource: str) -> bool:
+    return resource.lstrip("/").lower() in EXPOSED_RESOURCES
 
 
 # The router previously relied on a module level ROUTE_PREFIX_BY_TABLE for
@@ -292,7 +340,15 @@ def generate_crud_router(
     """
 
 
-    create_exclude_fields = create_exclude_fields or set()
+    create_exclude_fields = set(create_exclude_fields or set())
+    # Never ask users to supply timestamp mixin fields on create/update.
+    create_exclude_fields.update(
+        {
+            c.name
+            for c in model.__table__.columns  # type: ignore[attr-defined]
+            if c.name.endswith("_CreationTS") or c.name.endswith("_ModificationTS")
+        }
+    )
     router = APIRouter(prefix=prefix, tags=[tag])
     crud = crud_class()
 
@@ -342,6 +398,39 @@ def generate_crud_router(
             rows = query.order_by(E2G.id.asc()).limit(limit).offset(offset).all()
             return [ReadModel.model_validate(r).model_dump() for r in rows]
 
+    if model is PSM:
+        @router.get("/by_run/{run_id}", response_model=list[ReadModel])
+        def list_psms_by_run(
+            run_id: int,
+            q: str | None = None,
+            limit: int = Query(default=200, ge=1, le=5000),
+            offset: int = Query(default=0, ge=0),
+            db: Session = Depends(get_session_dep),
+        ):
+            query = db.query(PSM).filter(PSM.experiment_run_id == run_id)
+            if q:
+                # lightweight search over common text fields
+                query = query.filter(
+                    (PSM.peptide.ilike(f"%{q}%")) | (PSM.protein.ilike(f"%{q}%"))
+                )
+            rows = query.order_by(PSM.id.asc()).limit(limit).offset(offset).all()
+            return [ReadModel.model_validate(r).model_dump() for r in rows]
+
+    if model is MSRawFile:
+        @router.get("/by_run/{run_id}", response_model=list[ReadModel])
+        def list_raw_files_by_run(
+            run_id: int,
+            q: str | None = None,
+            limit: int = Query(default=200, ge=1, le=5000),
+            offset: int = Query(default=0, ge=0),
+            db: Session = Depends(get_session_dep),
+        ):
+            query = db.query(MSRawFile).filter(MSRawFile.experiment_run_id == run_id)
+            if q:
+                query = query.filter(MSRawFile.uri.ilike(f"%{q}%"))
+            rows = query.order_by(MSRawFile.id.asc()).limit(limit).offset(offset).all()
+            return [ReadModel.model_validate(r).model_dump() for r in rows]
+
     # Register the options endpoints *before* CRUD handlers so that the
     # ``/options`` and ``/options/{field}`` paths take precedence over the
     # generic ``/{item_id}`` route. Starlette matches routes in definition
@@ -373,351 +462,469 @@ def generate_crud_router(
 # ========================= Person ==============================
 _ROUTE_PREFIX_MAP: dict[str, str] = {}
 
-router.include_router(
-    generate_crud_router(
-        model=Person,
-        crud_class=PersonCRUD,
-        prefix="/people",
-        tag="Person",
-        # strip_prefix="ppl_",
-        exclude_fields={
-            "id",
-        },
-        create_exclude_fields={"ppl_CreationTS", "ppl_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("people"):
+    router.include_router(
+        generate_crud_router(
+            model=Person,
+            crud_class=PersonCRUD,
+            prefix="/people",
+            tag="Person",
+            # strip_prefix="ppl_",
+            exclude_fields={
+                "id",
+            },
+            create_exclude_fields={"ppl_CreationTS", "ppl_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 
 # ========================= Project ==============================
-router.include_router(
-    generate_crud_router(
-        model=Project,
-        crud_class=ProjectCRUD,
-        prefix="/projects",
-        tag="Project",
-        # strip_prefix="prj_",
-        exclude_fields={"id"},
-        create_exclude_fields={"prj_CreationTS", "prj_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("projects"):
+    router.include_router(
+        generate_crud_router(
+            model=Project,
+            crud_class=ProjectCRUD,
+            prefix="/projects",
+            tag="Project",
+            # strip_prefix="prj_",
+            exclude_fields={"id"},
+            create_exclude_fields={"prj_CreationTS", "prj_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
+
+    @router.get("/projects/stats")
+    def project_stats(db: Session = Depends(get_session_dep)):
+        from sqlalchemy import func
+
+        total = db.query(func.count(Project.id)).scalar() or 0
+        current = (
+            db.query(func.count(Project.id))
+            .filter(Project.prj_Current_FLAG.is_(True))
+            .scalar()
+            or 0
+        )
+        to_bill = (
+            db.query(func.count(Project.id))
+            .filter(Project.prj_Billing_ReadyToBill.is_(True))
+            .scalar()
+            or 0
+        )
+        paid = (
+            db.query(func.count(Project.id))
+            .filter(Project.prj_PaymentReceived.is_(True))
+            .scalar()
+            or 0
+        )
+        return {
+            "projects_total": int(total),
+            "projects_current": int(current),
+            "projects_to_bill": int(to_bill),
+            "projects_paid": int(paid),
+        }
 
 
 # ========================= Experiment ==============================
-router.include_router(
-    generate_crud_router(
-        model=Experiment,
-        crud_class=ExperimentCRUD,
-        prefix="/experiments",
-        tag="Experiment",
-        exclude_fields={"id"},
-        create_exclude_fields={"Experiment_CreationTS", "Experiment_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("experiments"):
+    router.include_router(
+        generate_crud_router(
+            model=Experiment,
+            crud_class=ExperimentCRUD,
+            prefix="/experiments",
+            tag="Experiment",
+            exclude_fields={"id"},
+            create_exclude_fields={"Experiment_CreationTS", "Experiment_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 
 # ========================= ExperimentRun ==============================
-router.include_router(
-    generate_crud_router(
-        model=ExperimentRun,
-        crud_class=ExperimentRunCRUD,
-        prefix="/experiment_runs",
-        tag="ExperimentRun",
-        exclude_fields={"id"},
-        create_exclude_fields={"ExperimentRun_CreationTS", "ExperimentRun_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("experiment_runs"):
+    router.include_router(
+        generate_crud_router(
+            model=ExperimentRun,
+            crud_class=ExperimentRunCRUD,
+            prefix="/experiment_runs",
+            tag="ExperimentRun",
+            exclude_fields={"id"},
+            create_exclude_fields={"ExperimentRun_CreationTS", "ExperimentRun_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 # ========================= PSM ==============================
-router.include_router(
-    generate_crud_router(
-        model=PSM,
-        crud_class=PSMCRUD,
-        prefix="/psms",
-        tag="PSM",
-        exclude_fields={"id"},
-        create_exclude_fields={"psm_CreationTS", "psm_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("psms"):
+    router.include_router(
+        generate_crud_router(
+            model=PSM,
+            crud_class=PSMCRUD,
+            prefix="/psms",
+            tag="PSM",
+            exclude_fields={"id"},
+            create_exclude_fields={"psm_CreationTS", "psm_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 # ========================= MS Raw File ==============================
-router.include_router(
-    generate_crud_router(
-        model=MSRawFile,
-        crud_class=MSRawFileCRUD,
-        prefix="/msraw_files",
-        tag="MSRawFile",
-        exclude_fields={"id"},
-        create_exclude_fields={"msraw_CreationTS", "msraw_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("msraw_files"):
+    router.include_router(
+        generate_crud_router(
+            model=MSRawFile,
+            crud_class=MSRawFileCRUD,
+            prefix="/msraw_files",
+            tag="MSRawFile",
+            exclude_fields={"id"},
+            create_exclude_fields={"msraw_CreationTS", "msraw_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 
 # ========================= ProjectComment ==============================
-router.include_router(
-    generate_crud_router(
-        model=ProjectComment,
-        crud_class=ProjectCommentCRUD,
-        prefix="/project_comment",
-        tag="ProjectComment",
-        # strip_prefix="com_",
-        exclude_fields={"id"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("project_comment"):
+    router.include_router(
+        generate_crud_router(
+            model=ProjectComment,
+            crud_class=ProjectCommentCRUD,
+            prefix="/project_comment",
+            tag="ProjectComment",
+            # strip_prefix="com_",
+            exclude_fields={"id"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 
 # ========================= ProjectPerson ==============================
-router.include_router(
-    generate_crud_router(
-        model=ProjectPerson,
-        crud_class=ProjectPersonCRUD,
-        prefix="/project_person",
-        tag="ProjectPerson",
-        exclude_fields={"id"},
-        create_exclude_fields={"projper_CreationTS", "projper_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("project_person"):
+    router.include_router(
+        generate_crud_router(
+            model=ProjectPerson,
+            crud_class=ProjectPersonCRUD,
+            prefix="/project_person",
+            tag="ProjectPerson",
+            exclude_fields={"id"},
+            create_exclude_fields={"projper_CreationTS", "projper_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 
 # ========================= E2G (experiment_to_gene) ==================
-router.include_router(
-    generate_crud_router(
-        model=E2G,
-        crud_class=E2GCRUD,
-        prefix="/experiment_to_gene",
-        tag="E2G",
-        exclude_fields={"id"},
-        create_exclude_fields={"E2G_CreationTS", "E2G_ModificationTS"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("experiment_to_gene"):
+    router.include_router(
+        generate_crud_router(
+            model=E2G,
+            crud_class=E2GCRUD,
+            prefix="/experiment_to_gene",
+            tag="E2G",
+            exclude_fields={"id"},
+            create_exclude_fields={"E2G_CreationTS", "E2G_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
 
 
 # ========================= Job ==============================
-router.include_router(
-    generate_crud_router(
-        model=Job,
-        crud_class=JobCRUD,
-        prefix="/jobs",
-        tag="Job",
-        exclude_fields={"id"},
-        create_exclude_fields={"job_CreationTS", "job_ModificationTS", "started_at", "finished_at"},
-        route_prefix_by_table=_ROUTE_PREFIX_MAP,
+if _enabled("jobs"):
+    router.include_router(
+        generate_crud_router(
+            model=Job,
+            crud_class=JobCRUD,
+            prefix="/jobs",
+            tag="Job",
+            exclude_fields={"id"},
+            create_exclude_fields={"job_CreationTS", "job_ModificationTS", "started_at", "finished_at"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
     )
-)
-
-
-@router.get("/status")
-def status():
-    return {"ok": True}
 
 
 # ========================= Convenience: E2G by relations ==========
 from sqlalchemy import func as _sa_func
 
 
-@router.get("/experiment_to_gene/by_run/{run_id}", response_model=list[E2GRead])
-def list_genes_by_run(
-    run_id: int,
-    q: str | None = None,
-    geneidtype: str | None = None,
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_session_dep),
-):
-    query = db.query(E2G).filter(E2G.experiment_run_id == run_id)
-    if q:
-        query = query.filter(E2G.gene.ilike(f"%{q}%"))
-    if geneidtype:
-        query = query.filter(E2G.geneidtype == geneidtype)
-    rows = query.order_by(E2G.id.asc()).limit(limit).offset(offset).all()
-    return [E2GRead.model_validate(r).model_dump() for r in rows]
+if _enabled("experiment_to_gene"):
+
+    @router.post("/experiment_to_gene/bulk")
+    def bulk_e2g(
+        payload: list[dict],
+        upsert: bool = Query(default=True),
+        db: Session = Depends(get_session_dep),
+    ):
+        """Bulk insert or upsert E2G rows.
+
+        Accepts a list of E2G-like dicts. When ``upsert`` is True, matches on
+        (experiment_run_id, gene, geneidtype, label) and updates selected fields;
+        otherwise inserts new rows.
+        """
+        crud = E2GCRUD()
+        rows = payload
+        if upsert:
+            result = crud.bulk_upsert(db, rows)
+        else:
+            objs = crud.bulk_create(db, rows)
+            result = {"inserted": len(objs), "updated": 0}
+        return result
 
 
-@router.post("/experiment_to_gene/bulk")
-def bulk_e2g(
-    payload: list[dict],
-    upsert: bool = Query(default=True),
-    db: Session = Depends(get_session_dep),
-):
-    """Bulk insert or upsert E2G rows.
+if _enabled("experiment_to_gene") and _enabled("experiment_runs"):
 
-    Accepts a list of E2G-like dicts. When ``upsert`` is True, matches on
-    (experiment_run_id, gene, geneidtype, label) and updates selected fields;
-    otherwise inserts new rows.
-    """
-    crud = E2GCRUD()
-    rows = payload
-    if upsert:
-        result = crud.bulk_upsert(db, rows)
-    else:
-        objs = crud.bulk_create(db, rows)
-        result = {"inserted": len(objs), "updated": 0}
-    return result
+    @router.post("/experiment_runs/{run_id}/genes/bulk")
+    def bulk_e2g_for_run(
+        run_id: int,
+        payload: list[dict],
+        upsert: bool = Query(default=True),
+        db: Session = Depends(get_session_dep),
+    ):
+        crud = E2GCRUD()
+        rows = [dict(r, experiment_run_id=run_id) for r in payload]
+        if upsert:
+            result = crud.bulk_upsert(db, rows)
+        else:
+            objs = crud.bulk_create(db, rows)
+            result = {"inserted": len(objs), "updated": 0}
+        return result
 
 
-@router.post("/experiment_runs/{run_id}/genes/bulk")
-def bulk_e2g_for_run(
-    run_id: int,
-    payload: list[dict],
-    upsert: bool = Query(default=True),
-    db: Session = Depends(get_session_dep),
-):
-    crud = E2GCRUD()
-    rows = [dict(r, experiment_run_id=run_id) for r in payload]
-    if upsert:
-        result = crud.bulk_upsert(db, rows)
-    else:
-        objs = crud.bulk_create(db, rows)
-        result = {"inserted": len(objs), "updated": 0}
-    return result
+if _enabled("experiments"):
+
+    @router.get("/experiments/by_project/{project_id}")
+    def list_experiments_by_project(
+        project_id: int,
+        limit: int = Query(default=200, ge=1, le=2000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        rows = (
+            db.query(Experiment)
+            .filter(Experiment.project_id == project_id)
+            .order_by(Experiment.id.asc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
+        Read = make_pydantic_model_from_sqlalchemy(Experiment, name_suffix="Read")
+        return [Read.model_validate(r).model_dump() for r in rows]
 
 
-@router.get("/experiments/by_project/{project_id}")
-def list_experiments_by_project(
-    project_id: int,
-    limit: int = Query(default=200, ge=1, le=2000),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_session_dep),
-):
-    rows = (
-        db.query(Experiment)
-        .filter(Experiment.project_id == project_id)
-        .order_by(Experiment.id.asc())
-        .limit(limit)
-        .offset(offset)
-        .all()
+if _enabled("project_comment"):
+
+    @router.get("/project_comment/by_project/{project_id}")
+    def list_comments_by_project(
+        project_id: int,
+        limit: int = Query(default=200, ge=1, le=2000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        from ispec.db.models import Person as _Person
+
+        rows = (
+            db.query(ProjectComment, _Person)
+            .outerjoin(_Person, ProjectComment.person_id == _Person.id)
+            .filter(ProjectComment.project_id == project_id)
+            .order_by(ProjectComment.id.desc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
+        Read = make_pydantic_model_from_sqlalchemy(ProjectComment, name_suffix="Read")
+        payload = []
+        for comment, person in rows:
+            item = Read.model_validate(comment).model_dump()
+            if person is not None:
+                first = getattr(person, "ppl_Name_First", "") or ""
+                last = getattr(person, "ppl_Name_Last", "") or ""
+                label = f"{last}, {first}".strip().strip(",")
+                item["person_label"] = label or str(person.id)
+            else:
+                item["person_label"] = None
+            payload.append(item)
+        return payload
+
+
+if _enabled("project_person"):
+
+    @router.get("/project_person/by_project/{project_id}")
+    def list_project_people_by_project(
+        project_id: int,
+        limit: int = Query(default=200, ge=1, le=2000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        from ispec.db.models import Person as _Person
+
+        rows = (
+            db.query(ProjectPerson, _Person)
+            .outerjoin(_Person, ProjectPerson.person_id == _Person.id)
+            .filter(ProjectPerson.project_id == project_id)
+            .order_by(ProjectPerson.id.asc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
+        Read = make_pydantic_model_from_sqlalchemy(ProjectPerson, name_suffix="Read")
+        payload = []
+        for project_person, person in rows:
+            item = Read.model_validate(project_person).model_dump()
+            if person is not None:
+                first = getattr(person, "ppl_Name_First", "") or ""
+                last = getattr(person, "ppl_Name_Last", "") or ""
+                label = f"{last}, {first}".strip().strip(",")
+                item["person_label"] = label or str(person.id)
+            else:
+                item["person_label"] = None
+            payload.append(item)
+        return payload
+
+
+if _enabled("experiment_runs"):
+
+    @router.get("/experiment_runs/by_experiment/{experiment_id}")
+    def list_runs_by_experiment(
+        experiment_id: int,
+        limit: int = Query(default=200, ge=1, le=2000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        rows = (
+            db.query(ExperimentRun)
+            .filter(ExperimentRun.experiment_id == experiment_id)
+            .order_by(ExperimentRun.id.asc())
+            .limit(limit)
+            .offset(offset)
+            .all()
+        )
+        Read = make_pydantic_model_from_sqlalchemy(ExperimentRun, name_suffix="Read")
+        return [Read.model_validate(r).model_dump() for r in rows]
+
+
+if _enabled("experiment_runs") and _enabled("experiments"):
+
+    @router.get("/experiment_runs/by_project/{project_id}")
+    def list_runs_by_project(
+        project_id: int,
+        limit: int = Query(default=500, ge=1, le=5000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        query = (
+            db.query(ExperimentRun)
+            .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
+            .filter(Experiment.project_id == project_id)
+            .order_by(ExperimentRun.id.asc())
+        )
+        rows = query.limit(limit).offset(offset).all()
+        Read = make_pydantic_model_from_sqlalchemy(ExperimentRun, name_suffix="Read")
+        return [Read.model_validate(r).model_dump() for r in rows]
+
+
+if _enabled("experiment_to_gene"):
+
+    @router.get(
+        "/experiment_to_gene/by_experiment/{experiment_id}", response_model=list[E2GRead]
     )
-    Read = make_pydantic_model_from_sqlalchemy(Experiment, name_suffix="Read")
-    return [Read.model_validate(r).model_dump() for r in rows]
+    def list_genes_by_experiment(
+        experiment_id: int,
+        q: str | None = None,
+        geneidtype: str | None = None,
+        limit: int = Query(default=200, ge=1, le=2000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        from ispec.db.models import ExperimentRun as _Run
+
+        query = db.query(E2G).join(_Run, E2G.experiment_run_id == _Run.id).filter(
+            _Run.experiment_id == experiment_id
+        )
+        if q:
+            query = query.filter(E2G.gene.ilike(f"%{q}%"))
+        if geneidtype:
+            query = query.filter(E2G.geneidtype == geneidtype)
+        rows = query.order_by(E2G.id.asc()).limit(limit).offset(offset).all()
+        return [E2GRead.model_validate(r).model_dump() for r in rows]
 
 
-@router.get("/experiment_runs/by_experiment/{experiment_id}")
-def list_runs_by_experiment(
-    experiment_id: int,
-    limit: int = Query(default=200, ge=1, le=2000),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_session_dep),
-):
-    rows = (
-        db.query(ExperimentRun)
-        .filter(ExperimentRun.experiment_id == experiment_id)
-        .order_by(ExperimentRun.id.asc())
-        .limit(limit)
-        .offset(offset)
-        .all()
+    @router.get(
+        "/experiment_to_gene/by_project/{project_id}", response_model=list[E2GRead]
     )
-    Read = make_pydantic_model_from_sqlalchemy(ExperimentRun, name_suffix="Read")
-    return [Read.model_validate(r).model_dump() for r in rows]
+    def list_genes_by_project(
+        project_id: int,
+        q: str | None = None,
+        geneidtype: str | None = None,
+        limit: int = Query(default=500, ge=1, le=5000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        from ispec.db.models import ExperimentRun as _Run, Experiment as _Exp
+
+        query = (
+            db.query(E2G)
+            .join(_Run, E2G.experiment_run_id == _Run.id)
+            .join(_Exp, _Run.experiment_id == _Exp.id)
+            .filter(_Exp.project_id == project_id)
+        )
+        if q:
+            query = query.filter(E2G.gene.ilike(f"%{q}%"))
+        if geneidtype:
+            query = query.filter(E2G.geneidtype == geneidtype)
+        rows = query.order_by(E2G.id.asc()).limit(limit).offset(offset).all()
+        return [E2GRead.model_validate(r).model_dump() for r in rows]
 
 
-@router.get(
-    "/experiment_to_gene/by_experiment/{experiment_id}", response_model=list[E2GRead]
-)
-def list_genes_by_experiment(
-    experiment_id: int,
-    q: str | None = None,
-    geneidtype: str | None = None,
-    limit: int = Query(default=200, ge=1, le=2000),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_session_dep),
-):
-    from ispec.db.models import ExperimentRun as _Run
+if _enabled("jobs"):
 
-    query = db.query(E2G).join(_Run, E2G.experiment_run_id == _Run.id).filter(
-        _Run.experiment_id == experiment_id
-    )
-    if q:
-        query = query.filter(E2G.gene.ilike(f"%{q}%"))
-    if geneidtype:
-        query = query.filter(E2G.geneidtype == geneidtype)
-    rows = query.order_by(E2G.id.asc()).limit(limit).offset(offset).all()
-    return [E2GRead.model_validate(r).model_dump() for r in rows]
-
-
-@router.get(
-    "/experiment_to_gene/by_project/{project_id}", response_model=list[E2GRead]
-)
-def list_genes_by_project(
-    project_id: int,
-    q: str | None = None,
-    geneidtype: str | None = None,
-    limit: int = Query(default=500, ge=1, le=5000),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_session_dep),
-):
-    from ispec.db.models import ExperimentRun as _Run, Experiment as _Exp
-
-    query = (
-        db.query(E2G)
-        .join(_Run, E2G.experiment_run_id == _Run.id)
-        .join(_Exp, _Run.experiment_id == _Exp.id)
-        .filter(_Exp.project_id == project_id)
-    )
-    if q:
-        query = query.filter(E2G.gene.ilike(f"%{q}%"))
-    if geneidtype:
-        query = query.filter(E2G.geneidtype == geneidtype)
-    rows = query.order_by(E2G.id.asc()).limit(limit).offset(offset).all()
-    return [E2GRead.model_validate(r).model_dump() for r in rows]
+    # ========================= Job convenience + transitions ===============
+    @router.get("/jobs/by_run/{run_id}")
+    def list_jobs_by_run(
+        run_id: int,
+        limit: int = Query(default=100, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        db: Session = Depends(get_session_dep),
+    ):
+        from ispec.db.models import Job as _Job
+        rows = (
+            db.query(_Job)
+            .filter(_Job.experiment_run_id == run_id)
+            .order_by(_Job.id.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
+        return [Read.model_validate(r).model_dump() for r in rows]
 
 
-# ========================= Job convenience + transitions ===============
-
-@router.get("/jobs/by_run/{run_id}")
-def list_jobs_by_run(
-    run_id: int,
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-    db: Session = Depends(get_session_dep),
-):
-    from ispec.db.models import Job as _Job
-    rows = (
-        db.query(_Job)
-        .filter(_Job.experiment_run_id == run_id)
-        .order_by(_Job.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
-    return [Read.model_validate(r).model_dump() for r in rows]
+    @router.post("/jobs/{job_id}/start")
+    def start_job(job_id: int, db: Session = Depends(get_session_dep)):
+        crud = JobCRUD()
+        obj = crud.start(db, job_id)
+        if not obj:
+            raise HTTPException(status_code=404, detail="Job not found")
+        Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
+        return Read.model_validate(obj).model_dump()
 
 
-@router.post("/jobs/{job_id}/start")
-def start_job(job_id: int, db: Session = Depends(get_session_dep)):
-    crud = JobCRUD()
-    obj = crud.start(db, job_id)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Job not found")
-    Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
-    return Read.model_validate(obj).model_dump()
+    @router.post("/jobs/{job_id}/succeed")
+    def succeed_job(job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)):
+        crud = JobCRUD()
+        obj = crud.succeed(db, job_id, message)
+        if not obj:
+            raise HTTPException(status_code=404, detail="Job not found")
+        Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
+        return Read.model_validate(obj).model_dump()
 
 
-@router.post("/jobs/{job_id}/succeed")
-def succeed_job(job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)):
-    crud = JobCRUD()
-    obj = crud.succeed(db, job_id, message)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Job not found")
-    Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
-    return Read.model_validate(obj).model_dump()
-
-
-@router.post("/jobs/{job_id}/fail")
-def fail_job(job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)):
-    crud = JobCRUD()
-    obj = crud.fail(db, job_id, message)
-    if not obj:
-        raise HTTPException(status_code=404, detail="Job not found")
-    Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
-    return Read.model_validate(obj).model_dump()
+    @router.post("/jobs/{job_id}/fail")
+    def fail_job(job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)):
+        crud = JobCRUD()
+        obj = crud.fail(db, job_id, message)
+        if not obj:
+            raise HTTPException(status_code=404, detail="Job not found")
+        Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
+        return Read.model_validate(obj).model_dump()
 
 # Convenience read models for list endpoints

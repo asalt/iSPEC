@@ -282,6 +282,12 @@ class ProjectCRUD(CRUDBase):
             Project, req_cols=["prj_ProjectTitle"]
         )
 
+    def label_expr(self):
+        cols = self.model.__table__.columns.keys()
+        if "prj_ProjectTitle" in cols:
+            return getattr(self.model, "prj_ProjectTitle")
+        return super().label_expr()
+
     def validate_input(self, session: Session, record: dict) -> dict | None:
         record = super().validate_input(session, record)
 
@@ -522,6 +528,12 @@ class ExperimentCRUD(CRUDBase):
     def __init__(self):
         super().__init__(Experiment)
 
+    def label_expr(self):
+        cols = self.model.__table__.columns.keys()
+        if "record_no" in cols:
+            return getattr(self.model, "record_no")
+        return super().label_expr()
+
     def validate_input(self, session: Session, record: dict | None) -> dict | None:
         if session is None:
             raise ValueError("A database session is required for validation.")
@@ -552,6 +564,19 @@ class ExperimentCRUD(CRUDBase):
 class ExperimentRunCRUD(CRUDBase):
     def __init__(self):
         super().__init__(ExperimentRun)
+
+    def label_expr(self):
+        M = self.model
+        cols = M.__table__.columns.keys()
+        if {"experiment_id", "run_no", "search_no"}.issubset(cols):
+            return func.trim(
+                cast(getattr(M, "experiment_id"), T.String())
+                + "-"
+                + cast(getattr(M, "run_no"), T.String())
+                + "-"
+                + cast(getattr(M, "search_no"), T.String())
+            )
+        return super().label_expr()
 
     def validate_input(self, session: Session, record: dict | None) -> dict | None:
         if session is None:

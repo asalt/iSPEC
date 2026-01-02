@@ -103,6 +103,10 @@ def _probe_host(host: str) -> str:
     return host
 
 
+def _is_local_bind_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 def _is_server_running(host: str, port: int, *, logger) -> bool:
     """Return ``True`` if the FastAPI server responds to its status endpoint."""
 
@@ -198,6 +202,15 @@ def dispatch(args):
         return
 
     if args.subcommand == "start":
+        api_key = (os.environ.get("ISPEC_API_KEY") or "").strip()
+        if not _is_local_bind_host(args.host) and not api_key:
+            logger.error(
+                "Refusing to start API bound to %s without ISPEC_API_KEY; "
+                "set ISPEC_API_KEY or use --host 127.0.0.1 for local-only dev.",
+                args.host,
+            )
+            raise SystemExit(2)
+
         from ispec.api.main import app
         import uvicorn
 

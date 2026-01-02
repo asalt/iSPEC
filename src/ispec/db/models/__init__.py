@@ -7,6 +7,7 @@ from .experiment import Experiment, ExperimentRun, E2G, Job, JobType, JobStatus
 from .omics import PSM
 from .files import MSRawFile, RawFileType, RawFileState, StorageBackend
 from .support import LetterOfSupport
+from .auth import AuthUser, AuthSession, UserRole
 from .engine import sqlite_engine, initialize_db
 
 # Backwards-compatible module-level logger
@@ -32,6 +33,9 @@ __all__ = [
     "RawFileState",
     "StorageBackend",
     "LetterOfSupport",
+    "AuthUser",
+    "AuthSession",
+    "UserRole",
     "sqlite_engine",
     "initialize_db",
     "logger",

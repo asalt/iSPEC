@@ -97,7 +97,26 @@ class Project(PrjTimestamp, Base):
     prj_Comments_Meeting: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Comments_Billing: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_Comments_iLAB: Mapped[str | None] = mapped_column(Text, nullable=True)
-    prj_Status: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prj_Status: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={
+            "ui": {
+                "label": "Status",
+                "component": "RadioGroup",
+                "options": [
+                    {"value": "inquiry", "label": "inquiry"},
+                    {"value": "consultation", "label": "consultation"},
+                    {"value": "waiting", "label": "waiting"},
+                    {"value": "processing", "label": "processing"},
+                    {"value": "analysis", "label": "analysis"},
+                    {"value": "summary", "label": "summary"},
+                    {"value": "closed", "label": "closed"},
+                    {"value": "hibernate", "label": "hibernate"},
+                ],
+            }
+        },
+    )
 
     prj_Date_Submitted: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     prj_Date_LysatePreparation: Mapped[datetime | None] = mapped_column(
