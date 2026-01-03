@@ -282,6 +282,17 @@ class ProjectCRUD(CRUDBase):
             Project, req_cols=["prj_ProjectTitle"]
         )
 
+    @staticmethod
+    def _ensure_display_fields(project: Project) -> None:
+        display_id = getattr(project, "prj_PRJ_DisplayID", None)
+        if not (isinstance(display_id, str) and display_id.strip()):
+            project.prj_PRJ_DisplayID = f"MSPC{project.id:06d}"
+
+        display_title = getattr(project, "prj_PRJ_DisplayTitle", None)
+        if not (isinstance(display_title, str) and display_title.strip()):
+            title = getattr(project, "prj_ProjectTitle", "") or ""
+            project.prj_PRJ_DisplayTitle = f"{project.prj_PRJ_DisplayID} - {title}".strip()
+
     def label_expr(self):
         cols = self.model.__table__.columns.keys()
         if "prj_ProjectTitle" in cols:
@@ -316,7 +327,15 @@ class ProjectCRUD(CRUDBase):
         validated = self.validate_input(session, record)
         if validated is None:
             return None
-        return super().create(session, validated)
+
+        obj = self.model(**validated)
+        session.add(obj)
+        session.flush()
+        self._ensure_display_fields(obj)
+        session.commit()
+        session.refresh(obj)
+        logger.info(f"Inserted into {self.model.__tablename__}: {validated}")
+        return obj
 
 
 class ProjectCommentCRUD(CRUDBase):

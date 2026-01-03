@@ -1,5 +1,6 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from ispec.db.connect import get_session_dep
 from typing import Type, Callable
@@ -14,6 +15,7 @@ from ispec.db.models import (
     Job,
     PSM,
     MSRawFile,
+    LetterOfSupport,
 )
 from ispec.db.crud import (
     CRUDBase,
@@ -27,6 +29,7 @@ from ispec.db.crud import (
     JobCRUD,
     PSMCRUD,
     MSRawFileCRUD,
+    LetterOfSupportCRUD,
 )
 
 from ispec.api.routes.schema import build_form_schema
@@ -50,6 +53,7 @@ _ALL_RESOURCES: set[str] = {
     "msraw_files",
     "project_comment",
     "project_person",
+    "letter_of_support",
 }
 
 _DEFAULT_RESOURCES: set[str] = {"projects", "people", "project_comment"}
@@ -85,6 +89,66 @@ EXPOSED_RESOURCES = get_exposed_resources()
 
 def _enabled(resource: str) -> bool:
     return resource.lstrip("/").lower() in EXPOSED_RESOURCES
+
+
+# ----- shared list helpers --------------------------------------------------
+
+
+def _parse_order_part(part: str) -> tuple[str, str] | None:
+    raw = (part or "").strip()
+    if not raw:
+        return None
+
+    direction = "asc"
+    if raw[0] in "+-":
+        if raw[0] == "-":
+            direction = "desc"
+        raw = raw[1:].strip()
+
+    if ":" in raw:
+        field, dir_part = raw.split(":", 1)
+        dir_part = dir_part.strip().lower()
+        if dir_part in {"desc", "d"}:
+            direction = "desc"
+        elif dir_part in {"asc", "a"}:
+            direction = "asc"
+        raw = field.strip()
+
+    lower = raw.lower()
+    if lower.endswith("_desc"):
+        raw = raw[:-5].strip()
+        direction = "desc"
+    elif lower.endswith("_asc"):
+        raw = raw[:-4].strip()
+        direction = "asc"
+
+    if not raw:
+        return None
+    return raw, direction
+
+
+def _apply_ordering(query, model, order: str | None):
+    order = (order or "").strip()
+    if not order:
+        return query.order_by(getattr(model, "id").asc())
+
+    columns = set(getattr(model.__table__, "columns").keys())  # type: ignore[attr-defined]
+    parts = [p.strip() for p in order.split(",") if p.strip()]
+    order_by = []
+    for part in parts:
+        parsed = _parse_order_part(part)
+        if not parsed:
+            continue
+        field, direction = parsed
+        if field not in columns:
+            continue
+        expr = getattr(model, field)
+        order_by.append(expr.desc() if direction == "desc" else expr.asc())
+
+    if not order_by:
+        return query.order_by(getattr(model, "id").asc())
+
+    return query.order_by(*order_by)
 
 
 # The router previously relied on a module level ROUTE_PREFIX_BY_TABLE for
@@ -141,16 +205,24 @@ def _add_crud_endpoints(
         if exclude_ids:
             query = query.filter(~getattr(model, "id").in_(exclude_ids))
         if q:
+            q = q.strip()
+            q_int: int | None = None
+            if q.isdigit():
+                try:
+                    q_int = int(q)
+                except Exception:
+                    q_int = None
             try:
-                query = query.filter(crud.label_expr().ilike(f"%{q}%"))
+                expr = crud.label_expr().ilike(f"%{q}%")
+                if q_int is not None:
+                    query = query.filter(or_(getattr(model, "id") == q_int, expr))
+                else:
+                    query = query.filter(expr)
             except Exception:
-                pass
+                if q_int is not None:
+                    query = query.filter(getattr(model, "id") == q_int)
 
-        if order == "id":
-            query = query.order_by(getattr(model, "id").asc())
-        else:
-            # default stable ordering
-            query = query.order_by(getattr(model, "id").asc())
+        query = _apply_ordering(query, model, order)
 
         # compute total before pagination
         try:
@@ -195,7 +267,9 @@ def _add_crud_endpoints(
         status_code=201,
     )
     def create_item(payload: create_model, db: Session = Depends(get_session_dep)):
-        obj = crud.create(db, payload.model_dump())
+        # Use exclude_unset so SQLAlchemy/Python defaults can still apply when
+        # the client omits optional fields (instead of forcing NULL).
+        obj = crud.create(db, payload.model_dump(exclude_unset=True))
         if obj is None:
             raise HTTPException(status_code=409, detail=f"{tag} already exists")
         return read_model.model_validate(obj).model_dump()
@@ -481,19 +555,6 @@ if _enabled("people"):
 
 # ========================= Project ==============================
 if _enabled("projects"):
-    router.include_router(
-        generate_crud_router(
-            model=Project,
-            crud_class=ProjectCRUD,
-            prefix="/projects",
-            tag="Project",
-            # strip_prefix="prj_",
-            exclude_fields={"id"},
-            create_exclude_fields={"prj_CreationTS", "prj_ModificationTS"},
-            route_prefix_by_table=_ROUTE_PREFIX_MAP,
-        )
-    )
-
     @router.get("/projects/stats")
     def project_stats(db: Session = Depends(get_session_dep)):
         from sqlalchemy import func
@@ -523,6 +584,19 @@ if _enabled("projects"):
             "projects_to_bill": int(to_bill),
             "projects_paid": int(paid),
         }
+
+    router.include_router(
+        generate_crud_router(
+            model=Project,
+            crud_class=ProjectCRUD,
+            prefix="/projects",
+            tag="Project",
+            # strip_prefix="prj_",
+            exclude_fields={"id"},
+            create_exclude_fields={"prj_CreationTS", "prj_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
+    )
 
 
 # ========================= Experiment ==============================
@@ -581,6 +655,121 @@ if _enabled("msraw_files"):
             route_prefix_by_table=_ROUTE_PREFIX_MAP,
         )
     )
+
+
+# ========================= LetterOfSupport ==============================
+if _enabled("letter_of_support"):
+    los_router = APIRouter(prefix="/letter_of_support", tags=["LetterOfSupport"])
+    los_crud = LetterOfSupportCRUD()
+
+    LetterRead = make_pydantic_model_from_sqlalchemy(
+        LetterOfSupport,
+        name_suffix="Read",
+        exclude_fields={"los_LOS_docx", "los_LOS_pdf"},
+    )
+
+    @los_router.get("")
+    @los_router.get("/")
+    def list_letters(
+        response: Response,
+        q: str | None = None,
+        limit: int = Query(default=50, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        order: str | None = None,
+        ids: list[int] | None = Query(default=None),
+        exclude_ids: list[int] | None = Query(default=None),
+        wrap: bool = Query(default=False, description="Wrap response as {items,total}"),
+        db: Session = Depends(get_session_dep),
+    ):
+        model = los_crud.model
+        query = db.query(model)
+
+        if ids:
+            query = query.filter(getattr(model, "id").in_(ids))
+        if exclude_ids:
+            query = query.filter(~getattr(model, "id").in_(exclude_ids))
+        if q:
+            try:
+                query = query.filter(los_crud.label_expr().ilike(f"%{q}%"))
+            except Exception:
+                pass
+
+        if order == "id":
+            query = query.order_by(getattr(model, "id").asc())
+        else:
+            query = query.order_by(getattr(model, "id").asc())
+
+        try:
+            total = query.order_by(None).count()
+        except Exception:
+            total = query.count()
+
+        rows = query.offset(offset).limit(limit).all()
+        payload = [LetterRead.model_validate(r).model_dump() for r in rows]
+        try:
+            if response is not None:
+                response.headers["X-Total-Count"] = str(total)
+        except Exception:
+            pass
+
+        if wrap:
+            return {"items": payload, "total": total}
+        return payload
+
+    @los_router.get("/{item_id}", response_model=LetterRead, response_model_exclude_none=True)
+    def get_letter(item_id: int, db: Session = Depends(get_session_dep)):
+        obj = los_crud.get(db, item_id)
+        if obj is None:
+            raise HTTPException(status_code=404, detail="LetterOfSupport not found")
+        return LetterRead.model_validate(obj).model_dump()
+
+    def _download_letter_blob(
+        item_id: int,
+        *,
+        blob_attr: str,
+        media_type: str,
+        default_ext: str,
+        db: Session,
+    ) -> Response:
+        obj = los_crud.get(db, item_id)
+        if obj is None:
+            raise HTTPException(status_code=404, detail="LetterOfSupport not found")
+
+        blob = getattr(obj, blob_attr, None)
+        if not blob:
+            raise HTTPException(status_code=404, detail="File not found")
+
+        base = (getattr(obj, "los_FileName", None) or f"letter_{item_id}").strip() or f"letter_{item_id}"
+        filename = base
+        lower = filename.lower()
+        if not lower.endswith(default_ext):
+            filename = f"{filename}{default_ext}"
+
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return Response(content=blob, media_type=media_type, headers=headers)
+
+    @los_router.get("/{item_id}/pdf")
+    def download_letter_pdf(item_id: int, db: Session = Depends(get_session_dep)):
+        return _download_letter_blob(
+            item_id,
+            blob_attr="los_LOS_pdf",
+            media_type="application/pdf",
+            default_ext=".pdf",
+            db=db,
+        )
+
+    @los_router.get("/{item_id}/docx")
+    def download_letter_docx(item_id: int, db: Session = Depends(get_session_dep)):
+        return _download_letter_blob(
+            item_id,
+            blob_attr="los_LOS_docx",
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            default_ext=".docx",
+            db=db,
+        )
+
+    router.include_router(los_router)
+    _ROUTE_PREFIX_MAP[LetterOfSupport.__table__.name] = "/letter_of_support"
 
 
 # ========================= ProjectComment ==============================

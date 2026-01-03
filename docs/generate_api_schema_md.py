@@ -50,6 +50,7 @@ ROUTERS: list[RouterDoc] = [
         prefix="/projects",
         tag="Project",
         exclude_fields={"id"},
+        create_exclude_fields={"prj_CreationTS", "prj_ModificationTS"},
     ),
     RouterDoc(
         model=ProjectComment,

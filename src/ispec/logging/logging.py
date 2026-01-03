@@ -24,7 +24,11 @@ def _resolve_log_file(log_file=None, log_dir=None):
 
 def ensure_log_dir(log_dir=None):
     dir_ = _resolve_log_dir(log_dir)
-    dir_.mkdir(parents=True, exist_ok=True)
+    try:
+        dir_.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return dir_
 
 def get_logger(
     name="ispec",
@@ -68,22 +72,28 @@ def get_logger(
     logger.setLevel(level)
 
     if not _LOGGER_INITIALIZED.get(name, False):
-        ensure_log_dir(log_dir)
         logger.propagate = propagate  # Typically False for application loggers
         formatter = logging.Formatter(fmt=fmt, datefmt=datefmt)
 
-        if log_file or log_dir:
-            file_path = _resolve_log_file(log_file, log_dir)
-        else:
-            file_path = _resolve_log_file()
+        # Best-effort file logging; fall back to console-only if sandboxed or
+        # filesystem permissions prevent writing to the default path.
+        log_dir_path = ensure_log_dir(log_dir)
+        if log_dir_path is not None:
+            if log_file or log_dir:
+                file_path = _resolve_log_file(log_file, log_dir)
+            else:
+                file_path = _resolve_log_file()
 
-        # File handler
-        fh = logging.FileHandler(file_path, mode=filemode, encoding=encoding)
-        fh.setFormatter(formatter)
-        logger.addHandler(fh)
+            try:
+                fh = logging.FileHandler(file_path, mode=filemode, encoding=encoding)
+                fh.setFormatter(formatter)
+                logger.addHandler(fh)
+            except OSError:
+                # Continue without a file handler.
+                pass
 
         # Console handler
-        if console:
+        if console or not logger.handlers:
             ch = logging.StreamHandler(sys.stderr)
             ch.setFormatter(formatter)
             logger.addHandler(ch)
@@ -130,4 +140,3 @@ def get_configured_level(name="ispec"):
 
     level = logging.getLogger(name).getEffectiveLevel()
     return logging.getLevelName(level)
-

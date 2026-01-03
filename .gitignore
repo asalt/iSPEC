@@ -16,3 +16,6 @@ data/testdata/raw/
 *.xlsx
 *.sqlite
 *.db
+.venv
+build/
+data/

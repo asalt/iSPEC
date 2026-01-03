@@ -8,10 +8,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 def make_timestamp_mixin(prefix: str):
     """Dynamically build a mixin with creation/modification timestamps."""
+
+    def utcnow() -> datetime:
+        return datetime.now(UTC)
+
     fields = {
-        f"{prefix}_CreationTS": mapped_column(DateTime, default=datetime.now(UTC)),
+        f"{prefix}_CreationTS": mapped_column(DateTime, default=utcnow),
         f"{prefix}_ModificationTS": mapped_column(
-            DateTime, default=datetime.now(UTC), onupdate=datetime.now(UTC)
+            DateTime, default=utcnow, onupdate=utcnow
         ),
         "__annotations__": {
             f"{prefix}_CreationTS": Mapped[datetime],

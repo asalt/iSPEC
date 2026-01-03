@@ -316,3 +316,35 @@ def require_access(
         )
 
     return user
+
+
+def require_assistant_access(
+    request: Request,
+    db: Session = Depends(get_session_dep),
+    provided_api_key: str | None = Depends(_provided_api_key),
+) -> AuthUser | None:
+    """Access rules for assistant endpoints.
+
+    Same as :func:`require_access` but does not block ``viewer`` users on POST
+    requests (assistant chat and feedback still write, but not to core tables).
+    """
+
+    expected = _expected_api_key()
+    if expected is not None and (
+        provided_api_key is None or not secrets.compare_digest(provided_api_key, expected)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key.",
+        )
+
+    if not _require_login():
+        return None
+
+    user = get_current_user(request, db)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
+        )
+
+    return user

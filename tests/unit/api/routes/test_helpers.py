@@ -84,6 +84,22 @@ def test_add_crud_endpoints_crud_operations(crud_client):
     assert resp.json()["status"] == "deleted"
 
 
+def test_list_ordering_supports_multiple_columns(crud_client):
+    payloads = [
+        {"ppl_Name_First": "Bob", "ppl_Name_Last": "Alpha", "ppl_AddedBy": "tester"},
+        {"ppl_Name_First": "Alice", "ppl_Name_Last": "Zulu", "ppl_AddedBy": "tester"},
+    ]
+
+    for payload in payloads:
+        resp = crud_client.post("/people/", json=payload)
+        assert resp.status_code == 201
+
+    resp = crud_client.get("/people/?order=ppl_Name_Last:desc,id:asc")
+    assert resp.status_code == 200
+    rows = resp.json()
+    assert rows[0]["ppl_Name_Last"] == "Zulu"
+
+
 @pytest.fixture
 def options_client(tmp_path):
     db_url = f"sqlite:///{tmp_path}/opts.db"

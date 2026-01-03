@@ -17,6 +17,7 @@ class Person(PplTimestamp, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ppl_AddedBy: Mapped[str] = mapped_column(Text)
+    ppl_LegacyImportTS: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     ppl_Name_First: Mapped[str] = mapped_column(Text, nullable=False)
     ppl_Name_Last: Mapped[str] = mapped_column(Text, nullable=False)
@@ -50,6 +51,7 @@ class Project(PrjTimestamp, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     prj_AddedBy: Mapped[str] = mapped_column(Text)
+    prj_LegacyImportTS: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     prj_ProjectTitle: Mapped[str] = mapped_column(
         Text,
         nullable=False,
@@ -80,6 +82,7 @@ class Project(PrjTimestamp, Base):
     prj_Services: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_GrantSupport: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectDomain: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prj_ProjectPriceLevel: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectBackground: Mapped[str | None] = mapped_column(Text, nullable=True)
     prj_ProjectSuggestions2Customer: Mapped[str | None] = mapped_column(
         Text, nullable=True
@@ -163,6 +166,9 @@ class Project(PrjTimestamp, Base):
 
     comments: Mapped[list["ProjectComment"]] = relationship(back_populates="project")
     people: Mapped[list["ProjectPerson"]] = relationship(back_populates="project")
+    files: Mapped[list["ProjectFile"]] = relationship(
+        "ProjectFile", back_populates="project", cascade="all, delete-orphan"
+    )
     experiments: Mapped[list["Experiment"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
@@ -174,7 +180,10 @@ class ProjectComment(ComTimestamp, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("project.id"))
     person_id: Mapped[int] = mapped_column(ForeignKey("person.id"))
+    com_LegacyImportTS: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     com_Comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    com_CommentType: Mapped[str | None] = mapped_column(Text, nullable=True)
+    com_AddedBy: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     project: Mapped["Project"] = relationship(back_populates="comments")
     person: Mapped["Person"] = relationship(back_populates="comments")

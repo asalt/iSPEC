@@ -5,9 +5,10 @@ from .base import Base, make_timestamp_mixin
 from .core import Person, ProjectType, Project, ProjectComment, ProjectPerson
 from .experiment import Experiment, ExperimentRun, E2G, Job, JobType, JobStatus
 from .omics import PSM
-from .files import MSRawFile, RawFileType, RawFileState, StorageBackend
+from .files import MSRawFile, ProjectFile, RawFileType, RawFileState, StorageBackend
 from .support import LetterOfSupport
 from .auth import AuthUser, AuthSession, UserRole
+from .sync import LegacySyncState
 from .engine import sqlite_engine, initialize_db
 
 # Backwards-compatible module-level logger
@@ -29,6 +30,7 @@ __all__ = [
     "JobType",
     "JobStatus",
     "MSRawFile",
+    "ProjectFile",
     "RawFileType",
     "RawFileState",
     "StorageBackend",
@@ -36,6 +38,7 @@ __all__ = [
     "AuthUser",
     "AuthSession",
     "UserRole",
+    "LegacySyncState",
     "sqlite_engine",
     "initialize_db",
     "logger",

@@ -52,14 +52,17 @@ def sqlite_engine(db_path: str = "sqlite:///./example.db") -> Engine:
 def initialize_db(engine: Engine):
     Base.metadata.create_all(bind=engine)
     _ensure_project_type_column(engine)
+    _ensure_project_comment_columns(engine)
+    _ensure_legacy_import_tracking_columns(engine)
+    _ensure_experiment_columns(engine)
 
 
 def _ensure_project_type_column(engine: Engine) -> None:
-    """Ensure the legacy SQLite schema includes ``project.prj_ProjectType``.
+    """Ensure legacy SQLite schemas include newer project columns.
 
-    Older dev databases may have been created before the enum-backed project type
-    field was introduced. SQLAlchemy won't auto-migrate existing tables, so we
-    add the missing nullable column to keep the API usable in-place.
+    Older dev databases may have been created before newer project fields were
+    introduced. SQLAlchemy won't auto-migrate existing tables, so we add missing
+    nullable columns to keep the API usable in-place.
     """
 
     try:
@@ -67,9 +70,99 @@ def _ensure_project_type_column(engine: Engine) -> None:
     except Exception:
         return
 
-    if "prj_ProjectType" in columns:
+    missing: list[str] = []
+    if "prj_ProjectType" not in columns:
+        missing.append("prj_ProjectType")
+    if "prj_ProjectPriceLevel" not in columns:
+        missing.append("prj_ProjectPriceLevel")
+
+    if not missing:
         return
 
     with engine.begin() as conn:
-        conn.execute(text('ALTER TABLE project ADD COLUMN "prj_ProjectType" TEXT'))
-    logger.info("Added missing column project.prj_ProjectType")
+        for column in missing:
+            conn.execute(text(f'ALTER TABLE project ADD COLUMN "{column}" TEXT'))
+    logger.info("Added missing columns project.%s", ", ".join(missing))
+
+
+def _ensure_project_comment_columns(engine: Engine) -> None:
+    """Ensure legacy SQLite schemas include newer project_comment columns."""
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("project_comment")}
+    except Exception:
+        return
+
+    missing = [c for c in ("com_CommentType", "com_AddedBy") if c not in columns]
+    if not missing:
+        return
+
+    with engine.begin() as conn:
+        for col in missing:
+            conn.execute(text(f'ALTER TABLE project_comment ADD COLUMN "{col}" TEXT'))
+    logger.info("Added missing columns project_comment.%s", ", ".join(missing))
+
+
+def _ensure_legacy_import_tracking_columns(engine: Engine) -> None:
+    """Ensure legacy SQLite schemas include import tracking timestamp columns."""
+
+    desired = {
+        "project": ("prj_LegacyImportTS", "DATETIME"),
+        "person": ("ppl_LegacyImportTS", "DATETIME"),
+        "project_comment": ("com_LegacyImportTS", "DATETIME"),
+    }
+
+    for table, (column, col_type) in desired.items():
+        try:
+            columns = {col["name"] for col in inspect(engine).get_columns(table)}
+        except Exception:
+            continue
+
+        if column in columns:
+            continue
+
+        with engine.begin() as conn:
+            conn.execute(text(f'ALTER TABLE {table} ADD COLUMN "{column}" {col_type}'))
+        logger.info("Added missing column %s.%s", table, column)
+
+
+def _ensure_experiment_columns(engine: Engine) -> None:
+    """Ensure legacy SQLite schemas include newer experiment columns."""
+
+    desired: list[tuple[str, str]] = [
+        ("exp_LabelFLAG", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("exp_Type", "TEXT"),
+        ("exp_Name", "TEXT"),
+        ("exp_Date", "DATETIME"),
+        ("exp_PreparationNo", "TEXT"),
+        ("exp_CellTissue", "TEXT"),
+        ("exp_Genotype", "TEXT"),
+        ("exp_Treatment", "TEXT"),
+        ("exp_Fractions", "TEXT"),
+        ("exp_Lysis", "TEXT"),
+        ("exp_DTT", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("exp_IAA", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("exp_Amount", "TEXT"),
+        ("exp_Adjustments", "TEXT"),
+        ("exp_Batch", "TEXT"),
+        ("exp_Data_FLAG", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("exp_exp2gene_FLAG", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("exp_Description", "TEXT"),
+    ]
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("experiment")}
+    except Exception:
+        return
+
+    missing = [(name, ddl) for (name, ddl) in desired if name not in columns]
+    if not missing:
+        return
+
+    with engine.begin() as conn:
+        for name, ddl in missing:
+            conn.execute(text(f'ALTER TABLE experiment ADD COLUMN "{name}" {ddl}'))
+
+    logger.info(
+        "Added missing columns experiment.%s", ", ".join(name for name, _ in missing)
+    )

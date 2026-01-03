@@ -41,7 +41,7 @@ digraph GenerateCrudRouter {
   subgraph cluster_db {
     label="DB / Session";
     color="#bbbbbb";
-    SessionDep [label="Depends(get_session)", shape=parallelogram];
+    SessionDep [label="Depends(get_session_dep)", shape=parallelogram];
   }
 
   subgraph cluster_ui {
@@ -102,4 +102,3 @@ digraph GenerateCrudRouter {
   {rank=same; ReadModel; CreateModel}
   {rank=same; GetItem; CreateItem; UpdateItem; DeleteItem; Options; OptionsField}
 }
-

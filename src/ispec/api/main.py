@@ -7,7 +7,10 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ispec.api.routes.auth import router as auth_router
-from ispec.api.routes.routes import router
+from ispec.api.routes.project_files import router as project_files_router
+from ispec.api.routes.routes import router as crud_router
+from ispec.api.routes.schedule import router as schedule_router
+from ispec.api.routes.support import router as support_router
 from ispec.api.security import require_access, require_api_key
 from ispec.logging import get_logger
 
@@ -57,8 +60,17 @@ app.include_router(auth_router, prefix="/api", dependencies=[Depends(require_api
 
 # Protected CRUD routes (both legacy root routes and /api/*).
 if legacy_root_routes:
-    app.include_router(router, dependencies=[Depends(require_access)])
-app.include_router(router, prefix="/api", dependencies=[Depends(require_access)])
+    app.include_router(crud_router, dependencies=[Depends(require_access)])
+app.include_router(crud_router, prefix="/api", dependencies=[Depends(require_access)])
+
+# Support assistant endpoints (/api/support/*).
+app.include_router(support_router, prefix="/api")
+
+# Project file attachment endpoints (/api/projects/{id}/files/*).
+app.include_router(project_files_router, prefix="/api")
+
+# Public scheduling endpoints (/api/schedule/*).
+app.include_router(schedule_router, prefix="/api")
 
 
 @app.on_event("startup")

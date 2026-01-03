@@ -197,7 +197,7 @@ level for quick inspection.【F:src/ispec/cli/logging.py†L11-L55】【F:src/is
 The FastAPI application bundles multiple routers generated from SQLAlchemy
 models and CRUD classes, yielding endpoints such as:
 
-- `GET /status` health probe.【F:src/ispec/api/routes/routes.py†L205-L208】
+- `GET /status` health probe.【F:src/ispec/api/main.py†L47-L49】
 - CRUD endpoints under `/people`, `/projects`, and `/project_comment` that
   accept and return dynamically built Pydantic models.【F:src/ispec/api/routes/routes.py†L90-L141】【F:tests/integration/test_api_endpoints.py†L27-L121】
 - `GET /<resource>/schema` for JSON form metadata and `GET /<resource>/options`
@@ -205,6 +205,12 @@ models and CRUD classes, yielding endpoints such as:
 
 Routers use dependency-injected sessions from `ispec.db.connect.get_session`, so
 tests can swap in temporary databases with ease.【F:src/ispec/db/connect.py†L95-L152】【F:tests/integration/test_api_endpoints.py†L1-L26】
+
+The service supports optional request authentication and exposure controls:
+
+- `ISPEC_API_RESOURCES` limits which CRUD resources are registered (defaults to `projects,people,project_comment`).
+- `ISPEC_API_KEY` enables an `X-API-Key` / Bearer-token gate for protected routes.
+- `ISPEC_REQUIRE_LOGIN=1` enables cookie-backed user sessions via `/api/auth/*` (bootstrap/login/logout/me).
 
 ## Data import and export
 

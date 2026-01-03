@@ -1,11 +1,12 @@
 import enum
 
-from sqlalchemy import Enum as SAEnum, Float, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy import Enum as SAEnum, Float, ForeignKey, Integer, LargeBinary, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, make_timestamp_mixin
 
 RawTimestamp = make_timestamp_mixin("msraw")
+ProjectFileTimestamp = make_timestamp_mixin("prjfile")
 
 
 class RawFileType(str, enum.Enum):
@@ -73,3 +74,25 @@ class MSRawFile(RawTimestamp, Base):
     experiment_run: Mapped["ExperimentRun"] = relationship(
         "ExperimentRun", back_populates="raw_files"
     )
+
+
+class ProjectFile(ProjectFileTimestamp, Base):
+    """Binary file attachment linked to a Project.
+
+    This stores the file bytes directly in SQLite for simplicity in dev.
+    """
+
+    __tablename__ = "project_file"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+    )
+    prjfile_FileName: Mapped[str] = mapped_column(Text, nullable=False)
+    prjfile_ContentType: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prjfile_SizeBytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    prjfile_Sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prjfile_AddedBy: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prjfile_Data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    project: Mapped["Project"] = relationship("Project", back_populates="files")

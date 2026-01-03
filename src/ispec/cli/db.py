@@ -61,6 +61,36 @@ def register_subcommands(subparsers):
     export_parser.add_argument("--table-name", required=True, choices=("person", "project"))
     export_parser.add_argument("--file", required=True, help="Output file (CSV or JSON)")
 
+    legacy_parser = subparsers.add_parser(
+        "import-legacy", help="Import a FileMaker XLSX dump (projects/people/history)"
+    )
+    legacy_parser.add_argument(
+        "--data-dir",
+        required=True,
+        help="Directory containing 20260101_projects.xlsx, 20260101_people.xlsx, 20260101_project_history.xlsx",
+    )
+    legacy_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    legacy_parser.add_argument(
+        "--mode",
+        choices=("merge", "overwrite"),
+        default="merge",
+        help="Import mode (default: merge). Use overwrite to replace the destination DB file.",
+    )
+    legacy_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite the destination database file if it already exists (deprecated; use --mode overwrite)",
+    )
+    legacy_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Parse and report what would be imported without writing",
+    )
+
     upgrade_parser = subparsers.add_parser(
         "upgrade", help="Apply Alembic migrations up to a revision"
     )
@@ -89,6 +119,65 @@ def register_subcommands(subparsers):
         "--database",
         dest="database",
         help="Database URL or filesystem path to migrate",
+    )
+
+    sync_projects_parser = subparsers.add_parser(
+        "sync-legacy-projects",
+        help="Incrementally sync legacy iSPEC Projects via the legacy API",
+    )
+    sync_projects_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    sync_projects_parser.add_argument(
+        "--legacy-url",
+        dest="legacy_url",
+        help="Legacy API base URL (defaults to ISPEC_LEGACY_API_URL or iSPEC/data/ispec-legacy-schema.json base_url)",
+    )
+    sync_projects_parser.add_argument(
+        "--id",
+        dest="project_id",
+        type=int,
+        help="Sync a single legacy project by PRJRecNo (debug/verification)",
+    )
+    sync_projects_parser.add_argument(
+        "--mapping",
+        dest="mapping",
+        help="Path to legacy-mapping.json (default: iSPEC/data/legacy-mapping.json)",
+    )
+    sync_projects_parser.add_argument(
+        "--schema",
+        dest="schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
+    )
+    sync_projects_parser.add_argument("--limit", type=int, default=1000)
+    sync_projects_parser.add_argument("--max-pages", type=int, default=None)
+    sync_projects_parser.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="Ignore stored sync cursor and start from the beginning (fetches all rows)",
+    )
+    sync_projects_parser.add_argument(
+        "--since",
+        dest="since",
+        help="Override cursor timestamp (ISO-8601 recommended)",
+    )
+    sync_projects_parser.add_argument(
+        "--since-pk",
+        dest="since_pk",
+        type=int,
+        help="Override cursor PK tie-breaker (integer)",
+    )
+    sync_projects_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch + compute changes without writing to the DB or advancing the cursor",
+    )
+    sync_projects_parser.add_argument(
+        "--backfill-missing",
+        action="store_true",
+        help="When a row is conflicted, still fill NULL/blank fields from legacy without overwriting existing values.",
     )
 
 
@@ -132,10 +221,40 @@ def dispatch(args):
         operations.export_table(args.table_name, args.file)
     elif args.subcommand == "init":
         operations.initialize(file_path=args.file)
+    elif args.subcommand == "import-legacy":
+        mode = getattr(args, "mode", "merge")
+        overwrite = bool(getattr(args, "overwrite", False))
+        if overwrite:
+            mode = "overwrite"
+        operations.import_legacy_dump(
+            data_dir=args.data_dir,
+            db_file_path=args.database,
+            mode=mode,
+            overwrite=overwrite,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
     elif args.subcommand == "upgrade":
         _run_alembic_command("upgrade", args.revision, database=args.database)
     elif args.subcommand == "downgrade":
         _run_alembic_command("downgrade", args.revision, database=args.database)
+    elif args.subcommand == "sync-legacy-projects":
+        from ispec.db.legacy_sync import sync_legacy_projects
+
+        summary = sync_legacy_projects(
+            legacy_url=getattr(args, "legacy_url", None),
+            mapping_path=getattr(args, "mapping", None),
+            schema_path=getattr(args, "schema", None),
+            db_file_path=getattr(args, "database", None),
+            project_id=getattr(args, "project_id", None),
+            limit=int(getattr(args, "limit", 1000)),
+            max_pages=getattr(args, "max_pages", None),
+            reset_cursor=bool(getattr(args, "reset_cursor", False)),
+            since=getattr(args, "since", None),
+            since_pk=getattr(args, "since_pk", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            backfill_missing=bool(getattr(args, "backfill_missing", False)),
+        )
+        logger.info("legacy projects sync summary: %s", summary)
     else:
         logger.info("no dispatched function provided for %s", args.subcommand)
 

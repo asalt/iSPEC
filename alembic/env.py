@@ -64,7 +64,7 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-def _run_with_connection(connection: Connection) -> None:
+def _run_with_connection(connection: Connection, *, external: bool = False) -> None:
     """Configure Alembic to run migrations using ``connection``."""
 
     context.configure(
@@ -77,6 +77,18 @@ def _run_with_connection(connection: Connection) -> None:
     with context.begin_transaction():
         context.run_migrations()
 
+    # When Alembic is supplied an existing Connection (common in unit tests with
+    # an in-memory SQLite StaticPool), inspecting the engine can check out the
+    # same underlying DBAPI connection and issue an implicit ROLLBACK, which can
+    # wipe the uncommitted alembic_version row. We commit at the DBAPI level so
+    # the surrounding SQLAlchemy transaction context manager remains usable.
+    if external and connection.dialect.name == "sqlite":
+        try:
+            dbapi_conn = connection.connection
+            dbapi_conn.commit()
+        except Exception:  # pragma: no cover - best effort
+            pass
+
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
@@ -85,11 +97,11 @@ def run_migrations_online() -> None:
 
     if isinstance(existing, Engine):
         with existing.connect() as connection:
-            _run_with_connection(connection)
+            _run_with_connection(connection, external=True)
         return
 
     if isinstance(existing, Connection):
-        _run_with_connection(existing)
+        _run_with_connection(existing, external=True)
         return
 
     url = _get_database_url()
@@ -103,7 +115,7 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        _run_with_connection(connection)
+        _run_with_connection(connection, external=False)
 
 
 if context.is_offline_mode():
