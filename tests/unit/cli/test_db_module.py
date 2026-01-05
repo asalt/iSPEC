@@ -59,6 +59,8 @@ def test_register_subcommands_parses_import_e2g_command():
     assert args.data_dir == "/tmp/e2g"
     assert args.database == "db.sqlite"
     assert args.create_missing_runs is True
+    assert args.create_missing_experiments is True
+    assert args.skip_imported is True
     assert args.store_metadata is True
 
 

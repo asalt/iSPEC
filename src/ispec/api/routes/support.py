@@ -18,7 +18,12 @@ from ispec.assistant.formatting import split_plan_final
 from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
-from ispec.assistant.service import _system_prompt, generate_reply
+from ispec.assistant.service import (
+    _system_prompt_answer,
+    _system_prompt_planner,
+    _system_prompt_review,
+    generate_reply,
+)
 from ispec.assistant.tools import (
     TOOL_CALL_PREFIX,
     extract_tool_call_line,
@@ -357,6 +362,18 @@ def chat(
     history_limit = _history_limit()
     max_tokens = _max_prompt_tokens()
 
+    tool_protocol = _tool_protocol()
+    max_tool_calls = _max_tool_calls()
+    used_tool_calls = 0
+    tools_enabled = max_tool_calls > 0
+    tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
+
+    tools_available = bool(tool_schemas) and tools_enabled
+    planner_prompt = _system_prompt_planner(tools_available=tools_available)
+    answer_prompt = _system_prompt_answer()
+    review_prompt = _system_prompt_review()
+    prompt_for_budget = planner_prompt if tools_enabled else answer_prompt
+
     selected_history: list[SupportMessage] = []
     context_message = ""
 
@@ -397,7 +414,7 @@ def chat(
         context_message = _context_message(payload=context_payload)
 
         base_messages = [
-            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": prompt_for_budget},
             {"role": "system", "content": context_message},
             {"role": "user", "content": payload.message},
         ]
@@ -438,19 +455,14 @@ def chat(
         if row.role in {"user", "assistant", "system"} and row.content
     ]
 
-    tool_protocol = _tool_protocol()
-    tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" else None
-
     tool_calls: list[dict[str, Any]] = []
     tool_messages: list[dict[str, Any]] = []
     reply = None
 
-    max_tool_calls = _max_tool_calls()
-    used_tool_calls = 0
-    tools_enabled = True
     while True:
+        system_prompt = planner_prompt if tools_enabled else answer_prompt
         base_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": system_prompt},
             {"role": "system", "content": context_message},
             {"role": "user", "content": payload.message},
             *tool_messages,
@@ -466,7 +478,7 @@ def chat(
         trimmed_history = list(reversed(trimmed_rev))
 
         messages_for_llm: list[dict[str, Any]] = [
-            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": system_prompt},
             {"role": "system", "content": context_message},
             *trimmed_history,
             {"role": "user", "content": payload.message},
@@ -581,7 +593,7 @@ def chat(
     if reply is None:
         reply = generate_reply(
             messages=[
-                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": answer_prompt},
                 {"role": "system", "content": context_message},
                 *history_payload,
                 {"role": "user", "content": payload.message},
@@ -613,7 +625,7 @@ def chat(
         )
         review_reply = generate_reply(
             messages=[
-                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": review_prompt},
                 {"role": "system", "content": context_message},
                 {"role": "user", "content": payload.message},
                 *tool_messages,

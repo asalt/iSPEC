@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
@@ -44,9 +44,26 @@ def _read_prompt_from_env(path_env: str) -> str | None:
     return _read_text_file(raw)
 
 
-def _system_prompt() -> str:
+def _prompt_extras() -> str | None:
+    """Return optional prompt additions appended to the default system prompts."""
+
+    chunks: list[str] = []
+
+    file_extra = _read_prompt_from_env("ISPEC_ASSISTANT_SYSTEM_PROMPT_EXTRA_PATH")
+    if file_extra:
+        chunks.append(file_extra.strip())
+
+    extra = (os.getenv("ISPEC_ASSISTANT_SYSTEM_PROMPT_EXTRA") or "").strip()
+    if extra:
+        chunks.append(extra)
+
+    combined = "\n\n".join(chunk for chunk in chunks if chunk)
+    return combined.strip() or None
+
+
+def _default_prompt_base() -> str:
     identity = (os.getenv("ISPEC_ASSISTANT_NAME") or "iSPEC").strip() or "iSPEC"
-    prompt = (
+    return (
         f"You are {identity}, the built-in support assistant for the iSPEC web app.\n"
         "Your job is to help staff use iSPEC to track projects, people, experiments, and runs.\n"
         "\n"
@@ -63,51 +80,113 @@ def _system_prompt() -> str:
         "context as authoritative.\n"
         "If CONTEXT.session.state.conversation_summary is present, it is a rolling summary\n"
         "of older turns that may be omitted from the message history.\n"
-        "\n"
-        "Tool use (optional):\n"
-        "- If you need more iSPEC DB info than CONTEXT provides, request a tool.\n"
-        "- For count questions like 'how many projects', prefer count_projects.\n"
-        "- For status breakdowns, use project_status_counts.\n"
-        "- For 'latest projects' / 'recent changes', use latest_projects and latest_project_comments.\n"
-        "- For experiments in a specific project, use experiments_for_project.\n"
-        "- Prefer tool-calling (OpenAI-style tools) when available.\n"
-        f"- If tool-calling is not available, request a tool by outputting exactly one line starting with {TOOL_CALL_PREFIX}:\n"
-        f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
-        f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative.\n"
-        "\n"
-        f"{tool_prompt()}\n"
-        "\n"
-        "Response format:\n"
-        "- If you call a tool, output only the TOOL_CALL line.\n"
-        "- Otherwise, output two sections:\n"
-        "  PLAN:\n"
-        "  - (short bullet plan)\n"
-        "  FINAL:\n"
-        "  (your user-facing answer)\n"
-        "- Do not include any extra preamble outside PLAN/FINAL.\n"
-        "UI routes (common): /projects, /project/<id>, /people, /experiments,\n"
-        "/experiment/<id>, /experiment-runs, /experiment-run/<id>.\n"
-        "Project status values: inquiry, consultation, waiting, processing, analysis,\n"
-        "summary, closed, hibernate.\n"
+    )
+
+def _system_prompt_answer() -> str:
+    prompt = (
+        _default_prompt_base().rstrip()
+        + "\n\n"
+        + "Response format:\n"
+        + "- Output only:\n"
+        + "  FINAL:\n"
+        + "  <your user-facing answer>\n"
+        + "- Do not include PLAN.\n"
+        + "\n"
+        + "UI routes (common): /projects, /project/<id>, /people, /experiments,\n"
+        + "/experiment/<id>, /experiment-runs, /experiment-run/<id>.\n"
+        + "Project status values: inquiry, consultation, waiting, processing, analysis,\n"
+        + "summary, closed, hibernate.\n"
     )
 
     file_override = _read_prompt_from_env("ISPEC_ASSISTANT_SYSTEM_PROMPT_PATH")
     if file_override:
-        prompt = file_override
+        prompt = file_override.strip()
 
     override = (os.getenv("ISPEC_ASSISTANT_SYSTEM_PROMPT") or "").strip()
     if override:
-        prompt = override
+        prompt = override.strip()
 
-    file_extra = _read_prompt_from_env("ISPEC_ASSISTANT_SYSTEM_PROMPT_EXTRA_PATH")
-    if file_extra:
-        prompt = prompt.rstrip() + "\n\n" + file_extra.strip()
-
-    extra = (os.getenv("ISPEC_ASSISTANT_SYSTEM_PROMPT_EXTRA") or "").strip()
-    if extra:
-        prompt = prompt.rstrip() + "\n\n" + extra
+    extras = _prompt_extras()
+    if extras:
+        prompt = prompt.rstrip() + "\n\n" + extras
 
     return prompt.strip()
+
+
+def _system_prompt_planner(*, tools_available: bool) -> str:
+    prompt = (
+        _default_prompt_base().rstrip()
+        + "\n\n"
+        + "Tool use (optional):\n"
+        + "- If you need more iSPEC DB info than CONTEXT provides, request a tool.\n"
+        + "- Never invent database values, IDs, or outcomes.\n"
+        + "- For count questions like 'how many projects', prefer count_projects.\n"
+        + "- For 'latest projects' / 'recent changes', use latest_projects and latest_project_comments.\n"
+        + "- For experiments in a specific project, use experiments_for_project.\n"
+    )
+
+    if tools_available:
+        prompt += (
+            "\n"
+            "Tool calling protocol:\n"
+            "- Use OpenAI-style tool_calls (tools/tool_choice are provided).\n"
+            "- When calling tools, do not include PLAN/FINAL in the content.\n"
+            f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative.\n"
+        )
+    else:
+        prompt += (
+            "\n"
+            "Tool calling protocol:\n"
+            f"- Request a tool by outputting exactly one line starting with {TOOL_CALL_PREFIX}:\n"
+            f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
+            f"- Tool results arrive as a {TOOL_RESULT_PREFIX} system message; treat them as authoritative.\n"
+            "\n"
+            f"{tool_prompt()}\n"
+        )
+
+    prompt += (
+        "\n"
+        "Response format:\n"
+        "- If you call a tool: output only the tool call (or tool_calls), with no extra text.\n"
+        "- Otherwise, output only:\n"
+        "  FINAL:\n"
+        "  <your user-facing answer>\n"
+    )
+
+    extras = _prompt_extras()
+    if extras:
+        prompt = prompt.rstrip() + "\n\n" + extras
+
+    return prompt.strip()
+
+
+def _system_prompt_review() -> str:
+    prompt = (
+        _default_prompt_base().rstrip()
+        + "\n\n"
+        + "You are in review mode.\n"
+        + "- Review the draft answer for correctness (grounded in CONTEXT / tool results), clarity, and iSPEC tone.\n"
+        + "- Do not call tools.\n"
+        + "- If the draft is already good, repeat it verbatim.\n"
+        + "- Otherwise, rewrite it.\n"
+        + "\n"
+        + "Response format:\n"
+        + "- Output only:\n"
+        + "  FINAL:\n"
+        + "  <answer>\n"
+    )
+
+    extras = _prompt_extras()
+    if extras:
+        prompt = prompt.rstrip() + "\n\n" + extras
+
+    return prompt.strip()
+
+
+def _system_prompt() -> str:
+    """Backwards-compatible alias (answer stage)."""
+
+    return _system_prompt_answer()
 
 
 def _ollama_url() -> str:
@@ -213,12 +292,19 @@ def generate_reply(
     context: str | None = None,
     messages: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    stage: Literal["planner", "answer", "review"] = "answer",
 ) -> AssistantReply:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub").strip().lower()
     if messages is None:
         if message is None:
             raise ValueError("message is required when messages is not provided")
-        messages = _build_messages(message=message, history=history, context=context)
+        messages = _build_messages(
+            message=message,
+            history=history,
+            context=context,
+            stage=stage,
+            tools_available=bool(tools),
+        )
     if provider == "ollama":
         return _generate_ollama_reply(messages=messages, tools=tools)
     if provider == "vllm":
@@ -240,10 +326,22 @@ def _build_messages(
     message: str,
     history: list[dict[str, Any]] | None,
     context: str | None,
+    stage: Literal["planner", "answer", "review"] = "answer",
+    tools_available: bool = False,
 ) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = [{"role": "system", "content": _system_prompt()}]
+    if stage == "planner":
+        system_prompt = _system_prompt_planner(tools_available=tools_available)
+    elif stage == "review":
+        system_prompt = _system_prompt_review()
+    else:
+        system_prompt = _system_prompt_answer()
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if context:
         messages.append({"role": "system", "content": context})
+
+    if stage == "review":
+        history = None
 
     history_items: list[dict[str, Any]] = []
     limit = _history_limit()

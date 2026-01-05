@@ -234,3 +234,50 @@ def test_system_prompt_can_load_from_files(tmp_path, monkeypatch):
     prompt = service._system_prompt()
     assert "SYSTEM PROMPT FROM FILE" in prompt
     assert "EXTRA PROMPT FROM FILE" in prompt
+
+
+def test_build_messages_planner_prompt_omits_tool_list_when_tools_available(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_NAME", "iSPEC")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+
+    messages = service._build_messages(
+        message="Hello",
+        history=[{"role": "user", "content": "Old"}],
+        context="CONTEXT v1 (read-only JSON):\n{}",
+        stage="planner",
+        tools_available=True,
+    )
+    system_prompt = messages[0]["content"]
+    assert "Available tools (read-only)" not in system_prompt
+    assert "TOOL_CALL" not in system_prompt
+
+
+def test_build_messages_planner_prompt_includes_tool_list_when_tools_unavailable(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_NAME", "iSPEC")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+
+    messages = service._build_messages(
+        message="Hello",
+        history=None,
+        context=None,
+        stage="planner",
+        tools_available=False,
+    )
+    system_prompt = messages[0]["content"]
+    assert "Available tools (read-only)" in system_prompt
+    assert "TOOL_CALL" in system_prompt
+
+
+def test_build_messages_review_stage_drops_history(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_NAME", "iSPEC")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+
+    messages = service._build_messages(
+        message="Review this",
+        history=[{"role": "user", "content": "Old user"}, {"role": "assistant", "content": "Old assistant"}],
+        context="CONTEXT v1 (read-only JSON):\n{}",
+        stage="review",
+        tools_available=False,
+    )
+    roles = [msg.get("role") for msg in messages]
+    assert roles == ["system", "system", "user"]
