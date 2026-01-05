@@ -17,7 +17,7 @@ def make_pydantic_model_from_sqlalchemy(
     model_cls: Type[DeclarativeBase],
     *,
     name_suffix: str = "Create",
-    exclude_fields: set[str] = {"id"},
+    exclude_fields: set[str] | None = None,
     optional_all: bool = False,
     include_relationships: bool = False,
     related_model_map: Optional[Dict[str, Type[BaseModel]]] = None,
@@ -25,6 +25,11 @@ def make_pydantic_model_from_sqlalchemy(
 ) -> Type[BaseModel]:
     mapper: Mapper = class_mapper(model_cls)
     fields: Dict[str, Any] = {}
+
+    if exclude_fields is None:
+        exclude_fields = set() if name_suffix.strip().lower() == "read" else {"id"}
+    else:
+        exclude_fields = set(exclude_fields)
 
     for prop in mapper.iterate_properties:
         # Column properties

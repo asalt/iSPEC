@@ -3,10 +3,8 @@ from __future__ import annotations
 import re
 
 
-_PLAN_FINAL_RE = re.compile(
-    r"(?is)^\s*PLAN:\s*(?P<plan>.*?)\n\s*FINAL:\s*(?P<final>.*)\s*$"
-)
-_FINAL_ONLY_RE = re.compile(r"(?is)^\s*FINAL:\s*(?P<final>.*)\s*$")
+_PLAN_MARKER_RE = re.compile(r"(?im)^[ \t]*PLAN:\s*")
+_FINAL_MARKER_RE = re.compile(r"(?im)^[ \t]*FINAL:\s*")
 
 
 def split_plan_final(text: str) -> tuple[str | None, str]:
@@ -19,17 +17,22 @@ def split_plan_final(text: str) -> tuple[str | None, str]:
     if not raw:
         return None, ""
 
-    match = _PLAN_FINAL_RE.match(raw)
-    if match:
-        plan = (match.group("plan") or "").strip() or None
-        final = (match.group("final") or "").strip()
-        if final:
-            return plan, final
+    final_matches = list(_FINAL_MARKER_RE.finditer(raw))
+    if not final_matches:
+        return None, raw
 
-    match = _FINAL_ONLY_RE.match(raw)
-    if match:
-        final = (match.group("final") or "").strip()
-        if final:
-            return None, final
+    final_match = final_matches[-1]
+    final_text = raw[final_match.end() :].strip()
+    if not final_text:
+        return None, raw
 
-    return None, raw
+    plan_text: str | None = None
+    plan_matches = [
+        match for match in _PLAN_MARKER_RE.finditer(raw) if match.start() < final_match.start()
+    ]
+    if plan_matches:
+        plan_match = plan_matches[-1]
+        extracted = raw[plan_match.end() : final_match.start()].strip()
+        plan_text = extracted or None
+
+    return plan_text, final_text

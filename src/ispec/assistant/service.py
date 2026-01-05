@@ -18,6 +18,7 @@ class AssistantReply:
     provider: str
     model: str | None = None
     meta: dict[str, Any] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 _PROMPT_FILE_MAX_CHARS = 80_000
@@ -54,6 +55,7 @@ def _system_prompt() -> str:
         "- Ask a single clarifying question when needed.\n"
         "- Never invent database values, IDs, or outcomes.\n"
         "- If you reference a record, include its id and title when available.\n"
+        "- If users share product feedback or feature requests, thank them and ask for specifics (page/route, what they expected).\n"
         "- Do not reveal secrets (API keys, env vars, credentials) or internal paths.\n"
         "\n"
         "You may be provided an additional system message called CONTEXT that contains\n"
@@ -64,9 +66,14 @@ def _system_prompt() -> str:
         "\n"
         "Tool use (optional):\n"
         "- If you need more iSPEC DB info than CONTEXT provides, request a tool.\n"
-        f"- To call a tool, respond with exactly one line starting with {TOOL_CALL_PREFIX}:\n"
+        "- For count questions like 'how many projects', prefer count_projects.\n"
+        "- For status breakdowns, use project_status_counts.\n"
+        "- For 'latest projects' / 'recent changes', use latest_projects and latest_project_comments.\n"
+        "- For experiments in a specific project, use experiments_for_project.\n"
+        "- Prefer tool-calling (OpenAI-style tools) when available.\n"
+        f"- If tool-calling is not available, request a tool by outputting exactly one line starting with {TOOL_CALL_PREFIX}:\n"
         f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
-        f"- After you receive a {TOOL_RESULT_PREFIX} system message, continue with the user-facing answer.\n"
+        f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative.\n"
         "\n"
         f"{tool_prompt()}\n"
         "\n"
@@ -77,6 +84,7 @@ def _system_prompt() -> str:
         "  - (short bullet plan)\n"
         "  FINAL:\n"
         "  (your user-facing answer)\n"
+        "- Do not include any extra preamble outside PLAN/FINAL.\n"
         "UI routes (common): /projects, /project/<id>, /people, /experiments,\n"
         "/experiment/<id>, /experiment-runs, /experiment-run/<id>.\n"
         "Project status values: inquiry, consultation, waiting, processing, analysis,\n"
@@ -183,17 +191,38 @@ def _history_limit() -> int:
         return 20
 
 
+def _assistant_temperature() -> float | None:
+    raw = (os.getenv("ISPEC_ASSISTANT_TEMPERATURE") or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value < 0:
+        value = 0.0
+    if value > 2:
+        value = 2.0
+    return value
+
+
 def generate_reply(
     *,
-    message: str,
-    history: list[dict[str, str]] | None = None,
+    message: str | None = None,
+    history: list[dict[str, Any]] | None = None,
     context: str | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> AssistantReply:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub").strip().lower()
+    if messages is None:
+        if message is None:
+            raise ValueError("message is required when messages is not provided")
+        messages = _build_messages(message=message, history=history, context=context)
     if provider == "ollama":
-        return _generate_ollama_reply(message=message, history=history, context=context)
+        return _generate_ollama_reply(messages=messages, tools=tools)
     if provider == "vllm":
-        return _generate_vllm_reply(message=message, history=history, context=context)
+        return _generate_vllm_reply(messages=messages, tools=tools)
     return AssistantReply(
         content=(
             "Support assistant is running in stub mode. "
@@ -206,39 +235,70 @@ def generate_reply(
     )
 
 
-def _generate_ollama_reply(
+def _build_messages(
     *,
     message: str,
-    history: list[dict[str, str]] | None,
+    history: list[dict[str, Any]] | None,
     context: str | None,
-) -> AssistantReply:
-    url = f"{_ollama_url()}/api/chat"
-    model = _ollama_model()
-    timeout = _ollama_timeout_seconds()
-
-    messages: list[dict[str, str]] = [{"role": "system", "content": _system_prompt()}]
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": _system_prompt()}]
     if context:
         messages.append({"role": "system", "content": context})
-    history_items: list[dict[str, str]] = []
+
+    history_items: list[dict[str, Any]] = []
     limit = _history_limit()
     if history:
         for item in history[-limit:] if limit else []:
-            content = str(item.get("content", "") or "").strip()
-            if not content:
+            if not isinstance(item, dict):
                 continue
-            history_items.append({"role": str(item.get("role", "user")), "content": content})
+            role = str(item.get("role", "user"))
+            content = str(item.get("content", "") or "")
+            content_stripped = content.strip()
+            extra: dict[str, Any] = {}
+            if "tool_call_id" in item:
+                extra["tool_call_id"] = item.get("tool_call_id")
+            if "tool_calls" in item:
+                extra["tool_calls"] = item.get("tool_calls")
+
+            if not content_stripped and not extra:
+                continue
+
+            history_items.append({"role": role, "content": content, **extra})
+
         # The frontend includes the current user message in history *and* as
         # the `message` field; avoid duplicating it in the prompt.
         if (
             history_items
             and history_items[-1].get("role") == "user"
-            and history_items[-1].get("content", "").strip() == message.strip()
+            and str(history_items[-1].get("content", "") or "").strip() == message.strip()
         ):
             history_items.pop()
-        messages.extend(history_items)
-    messages.append({"role": "user", "content": message})
 
-    payload = {"model": model, "messages": messages, "stream": False}
+        messages.extend(history_items)
+
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> AssistantReply:
+    url = f"{_ollama_url()}/api/chat"
+    model = _ollama_model()
+    timeout = _ollama_timeout_seconds()
+
+    allowed_roles = {"system", "user", "assistant"}
+    normalized_messages: list[dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "user")
+        if role not in allowed_roles:
+            role = "system"
+        normalized_messages.append({"role": role, "content": str(item.get("content", "") or "")})
+
+    payload = {"model": model, "messages": normalized_messages, "stream": False}
+    temperature = _assistant_temperature()
+    if temperature is not None:
+        payload["options"] = {"temperature": temperature}
     started = time.monotonic()
     try:
         response = requests.post(url, json=payload, timeout=timeout)
@@ -258,7 +318,7 @@ def _generate_ollama_reply(
         message_obj = data.get("message") or {}
         if isinstance(message_obj, dict):
             content = str(message_obj.get("content") or "")
-    if not content:
+    if not content and not tool_calls:
         content = json.dumps(data)[:4000]
 
     return AssistantReply(
@@ -266,15 +326,11 @@ def _generate_ollama_reply(
         provider="ollama",
         model=model,
         meta={"url": url, "elapsed_ms": elapsed_ms},
+        tool_calls=None,
     )
 
 
-def _generate_vllm_reply(
-    *,
-    message: str,
-    history: list[dict[str, str]] | None,
-    context: str | None,
-) -> AssistantReply:
+def _generate_vllm_reply(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> AssistantReply:
     base_url = _vllm_url()
     url = f"{base_url}/v1/chat/completions"
     timeout = _vllm_timeout_seconds()
@@ -289,35 +345,17 @@ def _generate_vllm_reply(
             provider="vllm",
             model=model,
             meta={"url": base_url, "error": repr(exc)},
+            tool_calls=None,
         )
     model = model or "unknown"
 
-    messages: list[dict[str, str]] = [{"role": "system", "content": _system_prompt()}]
-    if context:
-        messages.append({"role": "system", "content": context})
-
-    history_items: list[dict[str, str]] = []
-    limit = _history_limit()
-    if history:
-        for item in history[-limit:] if limit else []:
-            content = str(item.get("content", "") or "").strip()
-            if not content:
-                continue
-            history_items.append({"role": str(item.get("role", "user")), "content": content})
-
-        # Avoid duplicating the current message if the caller already included it.
-        if (
-            history_items
-            and history_items[-1].get("role") == "user"
-            and history_items[-1].get("content", "").strip() == message.strip()
-        ):
-            history_items.pop()
-
-        messages.extend(history_items)
-
-    messages.append({"role": "user", "content": message})
-
     payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+    temperature = _assistant_temperature()
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if tools is not None:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     started = time.monotonic()
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=timeout)
@@ -329,11 +367,13 @@ def _generate_vllm_reply(
             provider="vllm",
             model=model,
             meta={"url": url, "error": repr(exc)},
+            tool_calls=None,
         )
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
     content = ""
     usage: dict[str, Any] | None = None
+    tool_calls: list[dict[str, Any]] | None = None
     if isinstance(data, dict):
         usage_obj = data.get("usage")
         if isinstance(usage_obj, dict):
@@ -346,6 +386,9 @@ def _generate_vllm_reply(
                 message_obj = choice0.get("message")
                 if isinstance(message_obj, dict):
                     content = str(message_obj.get("content") or "")
+                    tool_calls_obj = message_obj.get("tool_calls")
+                    if isinstance(tool_calls_obj, list) and tool_calls_obj:
+                        tool_calls = [tc for tc in tool_calls_obj if isinstance(tc, dict)]
                 if not content and "text" in choice0:
                     content = str(choice0.get("text") or "")
     if not content:
@@ -360,4 +403,5 @@ def _generate_vllm_reply(
         provider="vllm",
         model=model,
         meta=meta,
+        tool_calls=tool_calls,
     )

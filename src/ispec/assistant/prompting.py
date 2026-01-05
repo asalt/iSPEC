@@ -51,6 +51,8 @@ def summarize_messages(messages: Iterable[dict[str, str]], *, max_chars: int) ->
     This is intentionally non-LLM and deterministic: it builds a short,
     truncated transcript that is suitable as a "memory" hint when full history
     cannot fit in the prompt.
+
+    eventually we will likely transition to an llm based - or llm assisted - summary
     """
 
     lines: list[str] = []
