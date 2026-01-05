@@ -57,6 +57,44 @@ def register_subcommands(subparsers):
     )
     import_parser.add_argument("--file", required=True)
 
+    import_e2g_parser = subparsers.add_parser(
+        "import-e2g", help="Import gpgrouper E2G QUAL/QUANT TSVs"
+    )
+    import_e2g_parser.add_argument(
+        "--dir",
+        dest="data_dir",
+        help="Directory containing *_e2g_QUAL.tsv / *_e2g_QUANT.tsv files",
+    )
+    import_e2g_parser.add_argument(
+        "--qual",
+        dest="qual_paths",
+        action="append",
+        default=[],
+        help="Path to a *_e2g_QUAL.tsv file (repeatable)",
+    )
+    import_e2g_parser.add_argument(
+        "--quant",
+        dest="quant_paths",
+        action="append",
+        default=[],
+        help="Path to a *_e2g_QUANT.tsv file (repeatable)",
+    )
+    import_e2g_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    import_e2g_parser.add_argument(
+        "--create-missing-runs",
+        action="store_true",
+        help="Create missing ExperimentRun rows when needed (experiment must exist).",
+    )
+    import_e2g_parser.add_argument(
+        "--store-metadata",
+        action="store_true",
+        help="Store a small subset of extra columns in metadata_json.",
+    )
+
     export_parser = subparsers.add_parser("export", help="Export table to CSV or JSON")
     export_parser.add_argument("--table-name", required=True, choices=("person", "project"))
     export_parser.add_argument("--file", required=True, help="Output file (CSV or JSON)")
@@ -307,6 +345,16 @@ def dispatch(args):
         _render_table_overview(table_definitions)
     elif args.subcommand == "import":
         operations.import_file(args.file, args.table_name)
+    elif args.subcommand == "import-e2g":
+        summary = operations.import_e2g(
+            data_dir=getattr(args, "data_dir", None),
+            qual_paths=list(getattr(args, "qual_paths", []) or []),
+            quant_paths=list(getattr(args, "quant_paths", []) or []),
+            db_file_path=getattr(args, "database", None),
+            create_missing_runs=bool(getattr(args, "create_missing_runs", False)),
+            store_metadata=bool(getattr(args, "store_metadata", False)),
+        )
+        logger.info("E2G import summary: %s", summary)
     elif args.subcommand == "export":
         operations.export_table(args.table_name, args.file)
     elif args.subcommand == "init":

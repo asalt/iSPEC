@@ -27,8 +27,8 @@ def test_support_chat_can_call_tools(tmp_path, db_session, monkeypatch):
 
     captured: list[dict[str, Any]] = []
 
-    def fake_generate_reply(*, message: str, history=None, context=None) -> AssistantReply:
-        captured.append({"message": message, "history": history, "context": context})
+    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
+        captured.append({"messages": messages, "tools": tools})
         if len(captured) == 1:
             return AssistantReply(
                 content=f'TOOL_CALL {{"name":"get_project","arguments":{{"id":{project.id}}}}}',
@@ -37,10 +37,10 @@ def test_support_chat_can_call_tools(tmp_path, db_session, monkeypatch):
                 meta=None,
             )
 
-        assert isinstance(history, list)
-        assert history[-1]["role"] == "system"
-        assert history[-1]["content"].startswith("TOOL_RESULT get_project")
-        assert "Tool Project" in history[-1]["content"]
+        assert isinstance(messages, list)
+        assert messages[-1]["role"] == "system"
+        assert messages[-1]["content"].startswith("TOOL_RESULT get_project")
+        assert "Tool Project" in messages[-1]["content"]
         return AssistantReply(
             content=f"Project {project.id}: Tool Project",
             provider="test",
@@ -108,8 +108,8 @@ def test_support_chat_can_call_schedule_tools(tmp_path, db_session, monkeypatch)
 
         captured: list[dict[str, Any]] = []
 
-        def fake_generate_reply(*, message: str, history=None, context=None) -> AssistantReply:
-            captured.append({"message": message, "history": history, "context": context})
+        def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
+            captured.append({"messages": messages, "tools": tools})
             if len(captured) == 1:
                 return AssistantReply(
                     content=(
@@ -121,10 +121,10 @@ def test_support_chat_can_call_schedule_tools(tmp_path, db_session, monkeypatch)
                     meta=None,
                 )
 
-            assert isinstance(history, list)
-            assert history[-1]["role"] == "system"
-            assert history[-1]["content"].startswith("TOOL_RESULT list_schedule_slots")
-            assert f'"id":{slot.id}' in history[-1]["content"]
+            assert isinstance(messages, list)
+            assert messages[-1]["role"] == "system"
+            assert messages[-1]["content"].startswith("TOOL_RESULT list_schedule_slots")
+            assert f'"id":{slot.id}' in messages[-1]["content"]
             return AssistantReply(
                 content="Found schedule slots.",
                 provider="test",

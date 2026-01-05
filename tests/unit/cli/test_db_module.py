@@ -40,6 +40,28 @@ def test_register_subcommands_parses_export_command():
     assert args.file == "out.csv"
 
 
+def test_register_subcommands_parses_import_e2g_command():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    db.register_subcommands(subparsers)
+    args = parser.parse_args(
+        [
+            "import-e2g",
+            "--dir",
+            "/tmp/e2g",
+            "--database",
+            "db.sqlite",
+            "--create-missing-runs",
+            "--store-metadata",
+        ]
+    )
+    assert args.subcommand == "import-e2g"
+    assert args.data_dir == "/tmp/e2g"
+    assert args.database == "db.sqlite"
+    assert args.create_missing_runs is True
+    assert args.store_metadata is True
+
+
 def test_dispatch_calls_correct_operations(monkeypatch):
     init_mock = MagicMock()
     status_mock = MagicMock()
@@ -77,6 +99,24 @@ def test_dispatch_import_calls_operations(monkeypatch, table_name):
     import_mock.assert_called_once_with("data.csv", table_name)
 
 
+def test_dispatch_import_e2g_calls_operations(monkeypatch):
+    import_mock = MagicMock(return_value={"files": [], "inserted": 0, "updated": 0, "errors": []})
+    monkeypatch.setattr("ispec.cli.db.operations.import_e2g", import_mock)
+
+    db.dispatch(
+        types.SimpleNamespace(
+            subcommand="import-e2g",
+            data_dir="/tmp/e2g",
+            qual_paths=["a.tsv"],
+            quant_paths=["b.tsv"],
+            database="db.sqlite",
+            create_missing_runs=False,
+            store_metadata=True,
+        )
+    )
+    import_mock.assert_called_once()
+
+
 def test_dispatch_export_calls_operations(monkeypatch):
     export_mock = MagicMock()
     monkeypatch.setattr("ispec.cli.db.operations.export_table", export_mock)
@@ -108,4 +148,3 @@ def test_render_table_overview_outputs_columns():
     assert "person" in output
     assert "id" in output
     assert "INTEGER" in output
-

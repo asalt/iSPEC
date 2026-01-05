@@ -1108,7 +1108,7 @@ if _enabled("experiments"):
         rows = (
             db.query(Experiment)
             .filter(Experiment.project_id == project_id)
-            .order_by(Experiment.id.asc())
+            .order_by(Experiment.id.desc())
             .limit(limit)
             .offset(offset)
             .all()
@@ -1199,7 +1199,7 @@ if _enabled("experiment_runs"):
         rows = (
             db.query(ExperimentRun)
             .filter(ExperimentRun.experiment_id == experiment_id)
-            .order_by(ExperimentRun.id.asc())
+            .order_by(ExperimentRun.id.desc())
             .limit(limit)
             .offset(offset)
             .all()
@@ -1221,7 +1221,7 @@ if _enabled("experiment_runs") and _enabled("experiments"):
             db.query(ExperimentRun)
             .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
             .filter(Experiment.project_id == project_id)
-            .order_by(ExperimentRun.id.asc())
+            .order_by(ExperimentRun.id.desc())
         )
         rows = query.limit(limit).offset(offset).all()
         Read = make_pydantic_model_from_sqlalchemy(ExperimentRun, name_suffix="Read")

@@ -71,7 +71,7 @@ def test_sync_legacy_experiments_single_id_inserts_experiment(tmp_path, monkeypa
         assert exp.record_no == "57454"
         assert exp.exp_Name == "TBK1 profiling"
         assert exp.exp_Type == "Affinity-XL"
-        assert exp.exp_LabelFLAG is True
+        assert exp.exp_LabelFLAG == 1
         assert exp.exp_Lysis == "ABC"
         assert exp.exp_DTT is False
         assert exp.exp_IAA is True

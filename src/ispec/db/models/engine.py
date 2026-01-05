@@ -55,6 +55,7 @@ def initialize_db(engine: Engine):
     _ensure_project_comment_columns(engine)
     _ensure_legacy_import_tracking_columns(engine)
     _ensure_experiment_columns(engine)
+    _ensure_e2g_columns(engine)
     _ensure_auth_user_columns(engine)
 
 
@@ -131,7 +132,7 @@ def _ensure_experiment_columns(engine: Engine) -> None:
     """Ensure legacy SQLite schemas include newer experiment columns."""
 
     desired: list[tuple[str, str]] = [
-        ("exp_LabelFLAG", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("exp_LabelFLAG", "INTEGER NOT NULL DEFAULT 0"),
         ("exp_Type", "TEXT"),
         ("exp_Name", "TEXT"),
         ("exp_Date", "DATETIME"),
@@ -166,6 +167,47 @@ def _ensure_experiment_columns(engine: Engine) -> None:
 
     logger.info(
         "Added missing columns experiment.%s", ", ".join(name for name, _ in missing)
+    )
+
+
+def _ensure_e2g_columns(engine: Engine) -> None:
+    """Ensure legacy SQLite schemas include newer experiment_to_gene columns."""
+
+    desired: list[tuple[str, str]] = [
+        ("gene_symbol", "TEXT"),
+        ("description", "TEXT"),
+        ("taxon_id", "INTEGER"),
+        ("sra", "TEXT"),
+        ("psms", "INTEGER"),
+        ("psms_u2g", "INTEGER"),
+        ("peptide_count", "INTEGER"),
+        ("peptide_count_u2g", "INTEGER"),
+        ("coverage", "FLOAT"),
+        ("coverage_u2g", "FLOAT"),
+        ("area_sum_u2g_0", "FLOAT"),
+        ("area_sum_u2g_all", "FLOAT"),
+        ("area_sum_max", "FLOAT"),
+        ("area_sum_dstrAdj", "FLOAT"),
+        ("iBAQ_dstrAdj", "FLOAT"),
+        ("peptideprint", "TEXT"),
+        ("metadata_json", "TEXT"),
+    ]
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("experiment_to_gene")}
+    except Exception:
+        return
+
+    missing = [(name, ddl) for (name, ddl) in desired if name not in columns]
+    if not missing:
+        return
+
+    with engine.begin() as conn:
+        for name, ddl in missing:
+            conn.execute(text(f'ALTER TABLE experiment_to_gene ADD COLUMN "{name}" {ddl}'))
+
+    logger.info(
+        "Added missing columns experiment_to_gene.%s", ", ".join(name for name, _ in missing)
     )
 
 

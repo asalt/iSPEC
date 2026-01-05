@@ -65,6 +65,96 @@ def test_generate_reply_vllm_calls_chat_completions(monkeypatch):
     assert sum(1 for item in messages if item.get("role") == "user" and item.get("content") == "Hello") == 1
 
 
+def test_generate_reply_vllm_passes_temperature_from_env(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ISPEC_VLLM_MODEL", "test-model")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TEMPERATURE", "0")
+
+    captured: dict[str, object] = {}
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _DummyResponse:
+        captured["json"] = json
+        return _DummyResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"total_tokens": 1}}
+        )
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+
+    reply = service.generate_reply(message="Ping", history=None, context=None)
+    assert reply.provider == "vllm"
+    assert reply.content == "OK"
+
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["temperature"] == 0.0
+
+
+def test_generate_reply_vllm_can_send_and_parse_openai_tool_calls(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ISPEC_VLLM_MODEL", "test-model")
+
+    captured: dict[str, object] = {}
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _DummyResponse:
+        captured["json"] = json
+        return _DummyResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "count_projects", "arguments": "{}"},
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 1},
+            }
+        )
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "count_projects",
+                "description": "Count projects.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    reply = service.generate_reply(message="Ping", history=None, context=None, tools=tools)
+    assert reply.provider == "vllm"
+    assert reply.tool_calls and reply.tool_calls[0]["id"] == "call_1"
+
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["tools"] == tools
+    assert payload["tool_choice"] == "auto"
+
+
 def test_generate_reply_vllm_can_auto_select_first_model(monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
     monkeypatch.setenv("ISPEC_VLLM_URL", "http://localhost:8000")
@@ -102,6 +192,31 @@ def test_generate_reply_vllm_can_auto_select_first_model(monkeypatch):
         ("get", "http://localhost:8000/v1/models"),
         ("post", "http://localhost:8000/v1/chat/completions"),
     ]
+
+
+def test_generate_reply_ollama_passes_temperature_as_options(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "ollama")
+    monkeypatch.setenv("ISPEC_OLLAMA_URL", "http://127.0.0.1:11434")
+    monkeypatch.setenv("ISPEC_OLLAMA_MODEL", "llama3.2:3b")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TEMPERATURE", "0")
+
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, *, json: dict[str, Any], timeout: float) -> _DummyResponse:
+        captured["url"] = url
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return _DummyResponse({"message": {"content": "OK"}})
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+
+    reply = service.generate_reply(message="Ping", history=None, context=None)
+    assert reply.provider == "ollama"
+    assert reply.content == "OK"
+
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["options"]["temperature"] == 0.0
 
 
 def test_system_prompt_can_load_from_files(tmp_path, monkeypatch):

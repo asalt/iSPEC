@@ -984,7 +984,10 @@ def _build_experiment_record(
             continue
         record[local_field] = _coerce_model_field(Experiment, local_field, item.get(legacy_field))
 
-    for bool_key in ("exp_LabelFLAG", "exp_DTT", "exp_IAA", "exp_Data_FLAG", "exp_exp2gene_FLAG"):
+    if "exp_LabelFLAG" in record and record["exp_LabelFLAG"] is None:
+        record["exp_LabelFLAG"] = 0
+
+    for bool_key in ("exp_DTT", "exp_IAA", "exp_Data_FLAG", "exp_exp2gene_FLAG"):
         if bool_key in record and record[bool_key] is None:
             record[bool_key] = False
 

@@ -8,50 +8,62 @@ from ispec.api.routes.support import ChatRequest, chat
 from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportSession
 from ispec.assistant.service import AssistantReply
-from ispec.db.models import Experiment
+from ispec.db.models import Project
 from ispec.schedule.connect import get_schedule_session
 
 
-def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session, monkeypatch):
+def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
 
-    exp1 = Experiment(record_no="EXP-001", exp_Name="First")
-    exp2 = Experiment(record_no="EXP-002", exp_Name="Second")
-    db_session.add_all([exp1, exp2])
+    db_session.add_all(
+        [
+            Project(prj_AddedBy="test", prj_ProjectTitle="One"),
+            Project(prj_AddedBy="test", prj_ProjectTitle="Two"),
+            Project(prj_AddedBy="test", prj_ProjectTitle="Three"),
+        ]
+    )
     db_session.commit()
-    db_session.refresh(exp1)
-    db_session.refresh(exp2)
 
-    captured: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
 
     def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
-        captured.append({"messages": messages, "tools": tools})
-
-        if len(captured) == 1:
+        calls.append({"messages": messages, "tools": tools})
+        if len(calls) == 1:
+            assert isinstance(tools, list)
+            assert any(
+                isinstance(tool, dict)
+                and isinstance(tool.get("function"), dict)
+                and tool["function"].get("name") == "count_projects"
+                for tool in tools
+            )
             return AssistantReply(
-                content='TOOL_CALL {"name":"latest_experiments","arguments":{"limit":2}}',
+                content="",
                 provider="test",
                 model="test-model",
                 meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "count_projects", "arguments": "{}"},
+                    }
+                ],
             )
 
         assert isinstance(messages, list)
-        assert messages[-1]["role"] == "system"
-        assert messages[-1]["content"].startswith("TOOL_RESULT latest_experiments")
-        tool_payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
+        tool_message = next(
+            msg for msg in messages if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1"
+        )
+        tool_payload = json.loads(str(tool_message.get("content") or "{}"))
         assert tool_payload["ok"] is True
-        ids = [row["id"] for row in tool_payload["result"]["experiments"]]
-        assert ids == sorted(ids, reverse=True)
+        assert tool_payload["result"]["count"] == 3
 
         return AssistantReply(
-            content=(
-                "PLAN:\n"
-                "- List the most recent experiments\n"
-                f"FINAL:\nLatest experiments: {ids[0]}, {ids[1]}"
-            ),
+            content="FINAL:\nWe have 3 projects.",
             provider="test",
             model="test-model",
             meta=None,
@@ -68,7 +80,7 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
         payload = ChatRequest.model_validate(
             {
                 "sessionId": "session-1",
-                "message": "Fetch the latest experiments",
+                "message": "How many projects do we have?",
                 "history": [],
                 "ui": None,
             }
@@ -83,9 +95,8 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
                 schedule_db=schedule_db,
                 user=None,
             )
-        assert response.sessionId == "session-1"
-        assert response.message.startswith("Latest experiments:")
-        assert "PLAN:" not in response.message
+
+        assert response.message == "We have 3 projects."
 
         assistant_row = (
             assistant_db.query(support_routes.SupportMessage)
@@ -96,7 +107,5 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert meta["tool_calls"][0]["name"] == "latest_experiments"
-        assert meta["tool_calls"][0]["ok"] is True
-        assert meta["plan"].startswith("- List")
-        assert "FINAL:" in meta["raw_content"]
+        assert meta["tool_calls"][0]["name"] == "count_projects"
+        assert meta["tool_calls"][0]["protocol"] == "openai"

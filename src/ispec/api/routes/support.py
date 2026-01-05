@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -20,7 +21,9 @@ from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_me
 from ispec.assistant.service import _system_prompt, generate_reply
 from ispec.assistant.tools import (
     TOOL_CALL_PREFIX,
+    extract_tool_call_line,
     format_tool_result_message,
+    openai_tools_for_user,
     parse_tool_call,
     run_tool,
 )
@@ -135,6 +138,21 @@ def _max_tool_calls() -> int:
         return 2
 
 
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _self_review_enabled() -> bool:
+    return _is_truthy(os.getenv("ISPEC_ASSISTANT_SELF_REVIEW"))
+
+
+def _tool_protocol() -> str:
+    raw = (os.getenv("ISPEC_ASSISTANT_TOOL_PROTOCOL") or "").strip().lower()
+    return raw if raw in {"line", "openai"} else "line"
+
+
 def _load_state(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
@@ -244,11 +262,19 @@ def _extract_id_from_path(regex: re.Pattern[str], path: str | None) -> int | Non
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     payload: ChatRequest,
+    request: Request = None,
     assistant_db: Session = Depends(get_assistant_session_dep),
     core_db: Session = Depends(get_session_dep),
     schedule_db: Session = Depends(get_schedule_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ):
+    api_schema: dict[str, Any] | None = None
+    if request is not None:
+        try:
+            api_schema = request.app.openapi()
+        except Exception:
+            api_schema = None
+
     session = (
         assistant_db.query(SupportSession)
         .filter(SupportSession.session_id == payload.sessionId)
@@ -412,37 +438,110 @@ def chat(
         if row.role in {"user", "assistant", "system"} and row.content
     ]
 
+    tool_protocol = _tool_protocol()
+    tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" else None
+
     tool_calls: list[dict[str, Any]] = []
-    tool_messages: list[dict[str, str]] = []
+    tool_messages: list[dict[str, Any]] = []
     reply = None
 
     max_tool_calls = _max_tool_calls()
     used_tool_calls = 0
+    tools_enabled = True
     while True:
-        if tool_messages:
-            base_messages = [
-                {"role": "system", "content": _system_prompt()},
-                {"role": "system", "content": context_message},
-                *tool_messages,
-                {"role": "user", "content": payload.message},
-            ]
-            tokens = estimate_tokens_for_messages(base_messages)
-            trimmed_rev: list[dict[str, str]] = []
-            for item in reversed(history_payload):
-                message_tokens = estimate_tokens_for_messages([item])
-                if tokens + message_tokens > max_tokens:
-                    break
-                tokens += message_tokens
-                trimmed_rev.append(item)
-            history_for_llm = list(reversed(trimmed_rev)) + tool_messages
-        else:
-            history_for_llm = history_payload
+        base_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": context_message},
+            {"role": "user", "content": payload.message},
+            *tool_messages,
+        ]
+        tokens = estimate_tokens_for_messages(base_messages)
+        trimmed_rev: list[dict[str, Any]] = []
+        for item in reversed(history_payload):
+            message_tokens = estimate_tokens_for_messages([item])
+            if tokens + message_tokens > max_tokens:
+                break
+            tokens += message_tokens
+            trimmed_rev.append(item)
+        trimmed_history = list(reversed(trimmed_rev))
+
+        messages_for_llm: list[dict[str, Any]] = [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": context_message},
+            *trimmed_history,
+            {"role": "user", "content": payload.message},
+            *tool_messages,
+        ]
 
         reply = generate_reply(
-            message=payload.message,
-            history=history_for_llm,
-            context=context_message,
+            messages=messages_for_llm,
+            tools=tool_schemas if tools_enabled else None,
         )
+
+        if reply.tool_calls:
+            tool_messages.append(
+                {
+                    "role": "assistant",
+                    "content": reply.content or "",
+                    "tool_calls": reply.tool_calls,
+                }
+            )
+            for tool_call in reply.tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = str(tool_call.get("id") or tool_call.get("tool_call_id") or "")
+                if not call_id:
+                    call_id = f"call_{used_tool_calls + 1}"
+                func_obj = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                tool_name = str(func_obj.get("name") or "").strip()
+                args_raw = func_obj.get("arguments")
+                try:
+                    if isinstance(args_raw, str):
+                        parsed_args = json.loads(args_raw) if args_raw.strip() else {}
+                    elif isinstance(args_raw, dict):
+                        parsed_args = args_raw
+                    else:
+                        parsed_args = {}
+                except Exception:
+                    parsed_args = {}
+
+                if used_tool_calls >= max_tool_calls:
+                    tool_payload = {
+                        "ok": False,
+                        "tool": tool_name or None,
+                        "error": "Tool call limit exceeded; no further tools executed.",
+                    }
+                    tools_enabled = False
+                else:
+                    used_tool_calls += 1
+                    tool_payload = run_tool(
+                        name=tool_name,
+                        args=parsed_args if isinstance(parsed_args, dict) else {},
+                        core_db=core_db,
+                        schedule_db=schedule_db,
+                        user=user,
+                        api_schema=api_schema,
+                    )
+                    if used_tool_calls >= max_tool_calls:
+                        tools_enabled = False
+
+                tool_calls.append(
+                    {
+                        "name": tool_name,
+                        "arguments": parsed_args if isinstance(parsed_args, dict) else {},
+                        "ok": bool(tool_payload.get("ok")),
+                        "error": tool_payload.get("error"),
+                        "protocol": "openai",
+                    }
+                )
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(tool_payload, ensure_ascii=False),
+                    }
+                )
+            continue
 
         tool_call = parse_tool_call(reply.content)
         if tool_call is None:
@@ -460,6 +559,7 @@ def chat(
             core_db=core_db,
             schedule_db=schedule_db,
             user=user,
+            api_schema=api_schema,
         )
         tool_calls.append(
             {
@@ -467,52 +567,116 @@ def chat(
                 "arguments": tool_args,
                 "ok": bool(tool_payload.get("ok")),
                 "error": tool_payload.get("error"),
+                "protocol": "line",
             }
         )
+        tool_call_line = extract_tool_call_line(reply.content) or reply.content.strip()
         tool_messages.extend(
             [
-                {"role": "assistant", "content": reply.content.strip()},
+                {"role": "assistant", "content": tool_call_line},
                 {"role": "system", "content": format_tool_result_message(tool_name, tool_payload)},
             ]
         )
 
     if reply is None:
         reply = generate_reply(
-            message=payload.message,
-            history=history_payload
-            + [{"role": "system", "content": f"{TOOL_CALL_PREFIX} limit exceeded; answer without tools."}],
-            context=context_message,
+            messages=[
+                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": context_message},
+                *history_payload,
+                {"role": "user", "content": payload.message},
+                *tool_messages,
+                {"role": "system", "content": f"{TOOL_CALL_PREFIX} limit exceeded; answer without tools."},
+            ],
+            tools=None,
         )
 
-    raw_reply_content = reply.content or ""
-    plan_text, assistant_content = split_plan_final(raw_reply_content)
-    if not assistant_content.strip():
-        assistant_content = raw_reply_content.strip()
+    # First-pass reply (after any tool calls).
+    draft_raw_reply_content = reply.content or ""
+    draft_plan_text, draft_assistant_content = split_plan_final(draft_raw_reply_content)
+    if not draft_assistant_content.strip():
+        draft_assistant_content = draft_raw_reply_content.strip()
+
+    plan_text = draft_plan_text
+    assistant_content = draft_assistant_content
+    final_reply = reply
+    final_raw_reply_content = draft_raw_reply_content
+
+    self_review_changed = False
+    self_review_error: str | None = None
+    if _self_review_enabled() and assistant_content.strip():
+        review_instruction = (
+            "Review the assistant answer above for correctness (grounded in CONTEXT/TOOL_RESULT), "
+            "clarity, and iSPEC tone. If it's already good, repeat it verbatim. "
+            "If it needs changes, rewrite it. Do not call tools.\n"
+            "Output only:\nFINAL:\n<answer>"
+        )
+        review_reply = generate_reply(
+            messages=[
+                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": context_message},
+                {"role": "user", "content": payload.message},
+                *tool_messages,
+                {"role": "assistant", "content": assistant_content},
+                {"role": "user", "content": review_instruction},
+            ],
+            tools=None,
+        )
+
+        review_tool_call = parse_tool_call(review_reply.content)
+        if review_tool_call is not None or review_reply.tool_calls:
+            self_review_error = "review_requested_tool_call"
+        else:
+            review_raw = (review_reply.content or "").strip()
+            review_plan_text, review_final_content = split_plan_final(review_raw)
+            reviewed_content = (review_final_content or review_raw).strip()
+            if reviewed_content:
+                final_reply = reply
+                final_raw_reply_content = draft_raw_reply_content
+                assistant_content = draft_assistant_content
+
+                if reviewed_content != assistant_content.strip():
+                    self_review_changed = True
+                    assistant_content = reviewed_content
+                    final_reply = review_reply
+                    final_raw_reply_content = review_raw
+            else:
+                self_review_error = "empty_review_output"
 
     meta: dict[str, Any] = {
-        "provider": reply.provider,
-        "model": reply.model,
+        "provider": final_reply.provider,
+        "model": final_reply.model,
         "references": {
             "projects": referenced_projects
             if referenced_projects
             else ([focused_project_id] if focused_project_id is not None else []),
         },
     }
-    if reply.meta:
-        meta["provider_meta"] = reply.meta
+    if final_reply.meta:
+        meta["provider_meta"] = final_reply.meta
     if tool_calls:
         meta["tool_calls"] = tool_calls
     if plan_text:
         meta["plan"] = plan_text
-    if raw_reply_content.strip() and raw_reply_content.strip() != assistant_content.strip():
-        meta["raw_content"] = raw_reply_content.strip()
+    raw_final = final_raw_reply_content.strip()
+    if raw_final and raw_final != assistant_content.strip():
+        meta["raw_content"] = raw_final
+    if _self_review_enabled():
+        meta["self_review"] = {
+            "changed": self_review_changed,
+            "error": self_review_error,
+        }
+        if self_review_changed:
+            draft_raw = draft_raw_reply_content.strip()
+            if draft_raw and draft_raw != raw_final:
+                meta["draft_raw_content"] = draft_raw
 
     assistant_message = SupportMessage(
         session_pk=session.id,
         role="assistant",
         content=assistant_content,
-        provider=reply.provider,
-        model=reply.model,
+        provider=final_reply.provider,
+        model=final_reply.model,
         meta_json=json.dumps(meta, ensure_ascii=False),
     )
     assistant_db.add(assistant_message)

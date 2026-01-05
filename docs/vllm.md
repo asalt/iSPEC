@@ -38,6 +38,18 @@ ISPEC_VLLM_URL=http://127.0.0.1:8000
 ISPEC_VLLM_MODEL=allenai/Llama-3.1-Tulu-3-8B
 ```
 
+Optional: enable a second internal "self review" pass (adds latency):
+
+```bash
+ISPEC_ASSISTANT_SELF_REVIEW=1
+```
+
+Optional: use structured OpenAI-style tool calling (recommended with vLLM):
+
+```bash
+ISPEC_ASSISTANT_TOOL_PROTOCOL=openai
+```
+
 ## Prompt customization (optional)
 
 Prefer appending small tweaks (keeps the built-in tool list + response format rules intact):
@@ -51,6 +63,13 @@ For a full system prompt replacement:
 ```bash
 ISPEC_ASSISTANT_SYSTEM_PROMPT_PATH=docs/prompts/ispec-system.txt
 ```
+
+## API discovery
+
+The assistant can use the `search_api` tool to search the OpenAPI schema. Humans can also browse:
+
+- `/docs` (Swagger UI)
+- `/openapi.json`
 
 If your vLLM server requires an API key, set:
 

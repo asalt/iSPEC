@@ -18,10 +18,9 @@ def test_support_chat_versions_context_and_budgets_history(tmp_path, db_session,
 
     captured: dict[str, Any] = {}
 
-    def fake_generate_reply(*, message: str, history=None, context=None) -> AssistantReply:
-        captured["message"] = message
-        captured["history"] = history
-        captured["context"] = context
+    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
+        captured["messages"] = messages
+        captured["tools"] = tools
         return AssistantReply(content="OK", provider="test", model="test-model", meta=None)
 
     monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
@@ -66,9 +65,18 @@ def test_support_chat_versions_context_and_budgets_history(tmp_path, db_session,
         assert response.sessionId == "session-1"
         assert response.message == "OK"
 
-        context_message = captured.get("context")
+        messages = captured.get("messages")
+        assert isinstance(messages, list)
+
+        context_message = next(
+            (
+                msg.get("content")
+                for msg in messages
+                if msg.get("role") == "system" and str(msg.get("content") or "").startswith("CONTEXT v1")
+            ),
+            None,
+        )
         assert isinstance(context_message, str)
-        assert context_message.startswith("CONTEXT v1")
         context_payload = json.loads(context_message.split("\n", 1)[1])
 
         assert context_payload["schema_version"] == 1
@@ -77,8 +85,13 @@ def test_support_chat_versions_context_and_budgets_history(tmp_path, db_session,
         assert isinstance(state.get("conversation_summary"), str)
         assert state["conversation_summary"]
 
-        history_payload = captured.get("history")
-        assert isinstance(history_payload, list)
+        new_message_index = next(
+            idx
+            for idx, msg in enumerate(messages)
+            if msg.get("role") == "user" and msg.get("content") == "New message"
+        )
+        assert new_message_index >= 2
+        history_payload = messages[2:new_message_index]
         assert len(history_payload) < 8
 
         assistant_db.refresh(support_session)

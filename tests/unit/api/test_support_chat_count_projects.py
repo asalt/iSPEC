@@ -8,22 +8,26 @@ from ispec.api.routes.support import ChatRequest, chat
 from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportSession
 from ispec.assistant.service import AssistantReply
-from ispec.db.models import Experiment
+from ispec.db.models import Project
 from ispec.schedule.connect import get_schedule_session
 
 
-def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session, monkeypatch):
+def test_support_chat_can_count_projects_via_tool_even_with_messy_tool_output(
+    tmp_path, db_session, monkeypatch
+):
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
 
-    exp1 = Experiment(record_no="EXP-001", exp_Name="First")
-    exp2 = Experiment(record_no="EXP-002", exp_Name="Second")
-    db_session.add_all([exp1, exp2])
+    db_session.add_all(
+        [
+            Project(prj_AddedBy="test", prj_ProjectTitle="One"),
+            Project(prj_AddedBy="test", prj_ProjectTitle="Two"),
+            Project(prj_AddedBy="test", prj_ProjectTitle="Three"),
+        ]
+    )
     db_session.commit()
-    db_session.refresh(exp1)
-    db_session.refresh(exp2)
 
     captured: list[dict[str, Any]] = []
 
@@ -32,26 +36,32 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
 
         if len(captured) == 1:
             return AssistantReply(
-                content='TOOL_CALL {"name":"latest_experiments","arguments":{"limit":2}}',
+                content=(
+                    "To answer precisely, I will call a tool.\n\n"
+                    'TOOL_CALL {"name":"count_projects","arguments":{}}\n\n'
+                    "(please wait for the TOOL_RESULT system message)\n"
+                    'TOOL_RESULT {"ok": true, "result": {"count": 42}}\n\n'
+                    "FINAL:\nThe current count is 42."
+                ),
                 provider="test",
                 model="test-model",
                 meta=None,
             )
 
         assert isinstance(messages, list)
+        assert messages[-2]["role"] == "assistant"
+        assert messages[-2]["content"].startswith("TOOL_CALL ")
+        assert "TOOL_RESULT" not in messages[-2]["content"]
+        assert "FINAL:" not in messages[-2]["content"]
+
         assert messages[-1]["role"] == "system"
-        assert messages[-1]["content"].startswith("TOOL_RESULT latest_experiments")
+        assert messages[-1]["content"].startswith("TOOL_RESULT count_projects")
         tool_payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
         assert tool_payload["ok"] is True
-        ids = [row["id"] for row in tool_payload["result"]["experiments"]]
-        assert ids == sorted(ids, reverse=True)
+        assert tool_payload["result"]["count"] == 3
 
         return AssistantReply(
-            content=(
-                "PLAN:\n"
-                "- List the most recent experiments\n"
-                f"FINAL:\nLatest experiments: {ids[0]}, {ids[1]}"
-            ),
+            content="FINAL:\nWe currently have 3 projects in iSPEC.",
             provider="test",
             model="test-model",
             meta=None,
@@ -61,14 +71,13 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
 
     db_path = tmp_path / "assistant.db"
     with get_assistant_session(db_path) as assistant_db:
-        support_session = SupportSession(session_id="session-1", user_id=None)
-        assistant_db.add(support_session)
+        assistant_db.add(SupportSession(session_id="session-1", user_id=None))
         assistant_db.flush()
 
         payload = ChatRequest.model_validate(
             {
                 "sessionId": "session-1",
-                "message": "Fetch the latest experiments",
+                "message": "How many projects do we have?",
                 "history": [],
                 "ui": None,
             }
@@ -83,20 +92,6 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
                 schedule_db=schedule_db,
                 user=None,
             )
-        assert response.sessionId == "session-1"
-        assert response.message.startswith("Latest experiments:")
-        assert "PLAN:" not in response.message
 
-        assistant_row = (
-            assistant_db.query(support_routes.SupportMessage)
-            .filter(support_routes.SupportMessage.session_pk == support_session.id)
-            .filter(support_routes.SupportMessage.role == "assistant")
-            .order_by(support_routes.SupportMessage.id.desc())
-            .first()
-        )
-        assert assistant_row is not None
-        meta = json.loads(assistant_row.meta_json)
-        assert meta["tool_calls"][0]["name"] == "latest_experiments"
-        assert meta["tool_calls"][0]["ok"] is True
-        assert meta["plan"].startswith("- List")
-        assert "FINAL:" in meta["raw_content"]
+        assert response.message == "We currently have 3 projects in iSPEC."
+        assert len(captured) == 2

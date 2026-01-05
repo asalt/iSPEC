@@ -1,6 +1,7 @@
 """CRUD helper classes and utilities for working with SQLAlchemy models."""
 
 # crud.py
+import json
 from typing import Any, Iterable, List, Optional, Sequence
 
 from sqlalchemy import select, func, cast, and_, or_
@@ -448,7 +449,181 @@ class LetterOfSupportCRUD(CRUDBase):
 
 class E2GCRUD(CRUDBase):
     def __init__(self):
-        super().__init__(E2G)
+        super().__init__(
+            E2G,
+            req_cols=[
+                "experiment_run_id",
+                "gene",
+                "geneidtype",
+            ],
+        )
+        self._normalizer = None  # lazy-load to avoid heavy import costs
+        self._validated_run_ids: set[int] = set()
+
+    def _equivalent_pairs(self, gene: str, geneidtype: str) -> list[tuple[str, str]]:
+        pairs = [(geneidtype, gene)]
+        norm = self._normalizer or _get_gene_normalizer()
+        self._normalizer = norm
+        if norm is None:
+            return pairs
+        try:
+            equivalents = norm.equivalents(gene, geneidtype) or []
+            combined = pairs + list(equivalents)
+            seen: set[tuple[str, str]] = set()
+            out: list[tuple[str, str]] = []
+            for pair in combined:
+                try:
+                    key = (str(pair[0]), str(pair[1]))
+                except Exception:
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(key)
+            return out or pairs
+        except Exception:
+            return pairs
+
+    def validate_input(
+        self,
+        session: Session,
+        record: dict | None,
+        *,
+        allow_existing: bool = False,
+    ) -> dict | None:
+        if session is None:
+            raise ValueError("A database session is required for validation.")
+        if record is None:
+            return None
+
+        cleaned = super().validate_input(session, record)
+        exp_run_id = cleaned.get("experiment_run_id")
+        if exp_run_id is None:
+            raise ValueError("experiment_run_id is required for E2G")
+        if exp_run_id not in self._validated_run_ids:
+            exists = session.query(ExperimentRun).filter_by(id=exp_run_id).first()
+            if not exists:
+                raise ValueError(f"Invalid experiment_run_id: {exp_run_id}")
+            self._validated_run_ids.add(int(exp_run_id))
+
+        gene = (cleaned.get("gene") or "").strip()
+        geneidtype = (cleaned.get("geneidtype") or "").strip()
+        if not gene or not geneidtype:
+            return None
+
+        label = cleaned.get("label")
+        if label is None:
+            label = "0"
+        cleaned["label"] = str(label).strip() or "0"
+        cleaned["gene"] = gene
+        cleaned["geneidtype"] = geneidtype
+
+        if allow_existing:
+            return cleaned
+
+        # Best-effort duplicate check (per run, identifier, label).
+        pairs = self._equivalent_pairs(gene, geneidtype)
+        conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
+        dup = (
+            session.query(E2G)
+            .filter(E2G.experiment_run_id == exp_run_id, E2G.label == cleaned["label"], or_(*conds))
+            .first()
+        )
+        if dup:
+            return None
+
+        return cleaned
+
+    def label_expr(self):
+        cols = self.model.__table__.columns.keys()
+        if "gene_symbol" in cols:
+            return func.coalesce(getattr(self.model, "gene_symbol"), getattr(self.model, "gene"))
+        return getattr(self.model, "gene")
+
+    def bulk_upsert(
+        self,
+        session: Session,
+        records: list[dict],
+        *,
+        update_fields: tuple[str, ...] = (
+            "gene_symbol",
+            "description",
+            "taxon_id",
+            "sra",
+            "psms",
+            "psms_u2g",
+            "peptide_count",
+            "peptide_count_u2g",
+            "coverage",
+            "coverage_u2g",
+            "area_sum_u2g_0",
+            "area_sum_u2g_all",
+            "area_sum_max",
+            "area_sum_dstrAdj",
+            "iBAQ_dstrAdj",
+            "peptideprint",
+            "metadata_json",
+        ),
+    ) -> dict[str, int]:
+        inserted = 0
+        updated = 0
+
+        def merge_metadata_json(existing_json: str | None, new_json: str) -> str:
+            try:
+                left = json.loads(existing_json) if existing_json else {}
+            except Exception:
+                left = {}
+            try:
+                right = json.loads(new_json)
+            except Exception:
+                return new_json
+            if not isinstance(left, dict) or not isinstance(right, dict):
+                return new_json
+            merged = dict(left)
+            merged.update(right)
+            return json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
+
+        for rec in records:
+            rec = dict(rec)
+            rec.setdefault("label", "0")
+            validated = self.validate_input(session, rec, allow_existing=True)
+            if validated is None:
+                continue
+
+            exp_run_id = validated.get("experiment_run_id")
+            gene = (validated.get("gene") or "").strip()
+            geneidtype = (validated.get("geneidtype") or "").strip()
+            label = (validated.get("label") or "0").strip()
+
+            pairs = self._equivalent_pairs(gene, geneidtype)
+            conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
+            existing = (
+                session.query(E2G)
+                .filter(E2G.experiment_run_id == exp_run_id, E2G.label == label, or_(*conds))
+                .first()
+            )
+            if existing:
+                changed = False
+                for field in update_fields:
+                    if field not in validated:
+                        continue
+                    if not hasattr(existing, field):
+                        continue
+                    value = validated[field]
+                    if field == "metadata_json" and value is not None:
+                        value = merge_metadata_json(getattr(existing, field, None), str(value))
+                    if getattr(existing, field) != value:
+                        setattr(existing, field, value)
+                        changed = True
+                if changed:
+                    session.add(existing)
+                    updated += 1
+            else:
+                session.add(self.model(**validated))
+                inserted += 1
+
+        session.commit()
+        return {"inserted": inserted, "updated": updated}
 
 
 class PSMCRUD(CRUDBase):
@@ -478,118 +653,16 @@ class MSRawFileCRUD(CRUDBase):
         if "uri" in cols:
             return getattr(self.model, "uri")
         return super().label_expr()
-        self._normalizer = None  # lazy-load to avoid heavy import costs
-
-    def validate_input(self, session: Session, record: dict | None) -> dict:
-        if session is None:
-            raise ValueError("A database session is required for validation.")
-        if record is None:
-            raise ValueError("Record cannot be None")
-
-        exp_run_id = record.get("experiment_run_id")
-        if exp_run_id is None:
-            raise ValueError("experiment_run_id is required for E2G")
-        exists = session.query(ExperimentRun).filter_by(id=exp_run_id).first()
-        if not exists:
-            raise ValueError(f"Invalid experiment_run_id: {exp_run_id}")
-
-        # basic duplicate check (per run, gene, type, label)
-        gene = (record.get("gene") or "").strip()
-        geneidtype = (record.get("geneidtype") or "").strip()
-        label = (record.get("label") or "0").strip()
-        if gene and geneidtype:
-            # consider equivalent identifiers if a normalizer is configured
-            pairs = [(geneidtype, gene)]
-            norm = self._normalizer or _get_gene_normalizer()
-            self._normalizer = norm
-            if norm is not None:
-                try:
-                    pairs = norm.equivalents(gene, geneidtype) or pairs
-                except Exception:
-                    pairs = pairs
-            conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
-            dup = (
-                session.query(E2G)
-                .filter(
-                    E2G.experiment_run_id == exp_run_id,
-                    E2G.label == label,
-                    or_(*conds),
-                )
-                .first()
-            )
-            if dup:
-                return None
-
-        return super().validate_input(session, record)
-
-    def label_expr(self):
-        # show gene string for options and listings
-        return getattr(self.model, "gene")
-
-    def bulk_upsert(
-        self,
-        session: Session,
-        records: list[dict],
-        *,
-        match_keys: tuple[str, ...] = ("experiment_run_id", "gene", "geneidtype", "label"),
-        update_fields: tuple[str, ...] = ("iBAQ_dstrAdj", "peptideprint"),
-    ) -> dict:
-        inserted = 0
-        updated = 0
-
-        for rec in records:
-            # Ensure defaults
-            rec = dict(rec)
-            rec.setdefault("label", "0")
-            validated = self.validate_input(session, rec)
-            if validated is None:
-                continue
-
-            exp_run_id = validated.get("experiment_run_id")
-            gene = (validated.get("gene") or "").strip()
-            geneidtype = (validated.get("geneidtype") or "").strip()
-            label = (validated.get("label") or "0").strip()
-
-            # Try to find existing row considering identifier equivalents
-            pairs = [(geneidtype, gene)]
-            norm = self._normalizer or _get_gene_normalizer()
-            self._normalizer = norm
-            if norm is not None:
-                try:
-                    pairs = norm.equivalents(gene, geneidtype) or pairs
-                except Exception:
-                    pairs = pairs
-            conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
-            existing = (
-                session.query(self.model)
-                .filter(
-                    E2G.experiment_run_id == exp_run_id,
-                    E2G.label == label,
-                    or_(*conds),
-                )
-                .first()
-            )
-            if existing:
-                changed = False
-                for f in update_fields:
-                    if f in validated and getattr(existing, f) != validated[f]:
-                        setattr(existing, f, validated[f])
-                        changed = True
-                if changed:
-                    session.add(existing)
-                    updated += 1
-            else:
-                obj = self.model(**validated)
-                session.add(obj)
-                inserted += 1
-
-        session.commit()
-        return {"inserted": inserted, "updated": updated}
 
 
 class ExperimentCRUD(CRUDBase):
     def __init__(self):
         super().__init__(Experiment)
+
+    def readonly_fields(self) -> set[str]:
+        readonly = super().readonly_fields()
+        readonly.update({"project_id", "record_no", "exp_Data_FLAG", "exp_exp2gene_FLAG"})
+        return readonly
 
     def label_expr(self):
         cols = self.model.__table__.columns.keys()

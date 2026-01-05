@@ -544,3 +544,85 @@ def import_legacy_dump(
             skipped_people,
             placeholder_projects,
         )
+
+
+def import_e2g(
+    *,
+    data_dir: str | None = None,
+    qual_paths: list[str] | None = None,
+    quant_paths: list[str] | None = None,
+    db_file_path: str | None = None,
+    create_missing_runs: bool = False,
+    store_metadata: bool = False,
+) -> dict[str, Any]:
+    """Import gpgrouper experiment-to-gene tables (QUAL/QUANT TSVs).
+
+    Parameters
+    ----------
+    data_dir:
+        Directory containing ``*_e2g_QUAL.tsv`` and/or ``*_e2g_QUANT.tsv`` files.
+    qual_paths:
+        Explicit QUAL TSV paths (repeatable).
+    quant_paths:
+        Explicit QUANT TSV paths (repeatable).
+    db_file_path:
+        SQLite database URL or filesystem path to write to.
+    create_missing_runs:
+        When True, create missing ExperimentRun rows (experiment must exist).
+    store_metadata:
+        When True, store a small subset of extra columns in ``metadata_json``.
+    """
+
+    from pathlib import Path
+
+    from ispec.omics.e2g_import import discover_e2g_tsvs, import_e2g_files
+
+    sources = [bool(data_dir), bool(qual_paths), bool(quant_paths)]
+    if not any(sources):
+        raise ValueError("Provide data_dir, qual_paths, or quant_paths.")
+
+    resolved_qual: list[Path] = []
+    resolved_quant: list[Path] = []
+
+    if data_dir:
+        qual_found, quant_found = discover_e2g_tsvs(data_dir)
+        resolved_qual.extend(qual_found)
+        resolved_quant.extend(quant_found)
+
+    if qual_paths:
+        resolved_qual.extend(Path(p).expanduser().resolve() for p in qual_paths if str(p).strip())
+
+    if quant_paths:
+        resolved_quant.extend(Path(p).expanduser().resolve() for p in quant_paths if str(p).strip())
+
+    # De-dupe while keeping a stable order.
+    def uniq(paths: list[Path]) -> list[Path]:
+        seen: set[str] = set()
+        out: list[Path] = []
+        for p in paths:
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(p)
+        return out
+
+    resolved_qual = uniq(resolved_qual)
+    resolved_quant = uniq(resolved_quant)
+
+    _log_info(
+        "importing E2G TSVs: qual=%d, quant=%d, create_missing_runs=%s, store_metadata=%s",
+        len(resolved_qual),
+        len(resolved_quant),
+        bool(create_missing_runs),
+        bool(store_metadata),
+    )
+
+    with get_session(file_path=db_file_path) as session:
+        return import_e2g_files(
+            session,
+            qual_paths=resolved_qual,
+            quant_paths=resolved_quant,
+            create_missing_runs=create_missing_runs,
+            store_metadata=store_metadata,
+        )

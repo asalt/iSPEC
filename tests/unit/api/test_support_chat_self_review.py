@@ -8,50 +8,42 @@ from ispec.api.routes.support import ChatRequest, chat
 from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportSession
 from ispec.assistant.service import AssistantReply
-from ispec.db.models import Experiment
 from ispec.schedule.connect import get_schedule_session
 
 
-def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session, monkeypatch):
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
+def test_support_chat_self_review_can_rewrite_final_answer(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SELF_REVIEW", "1")
 
-    exp1 = Experiment(record_no="EXP-001", exp_Name="First")
-    exp2 = Experiment(record_no="EXP-002", exp_Name="Second")
-    db_session.add_all([exp1, exp2])
-    db_session.commit()
-    db_session.refresh(exp1)
-    db_session.refresh(exp2)
-
-    captured: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
 
     def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
-        captured.append({"messages": messages, "tools": tools})
+        calls.append({"messages": messages, "tools": tools})
 
-        if len(captured) == 1:
+        assert isinstance(messages, list)
+        last_user = next(
+            (msg for msg in reversed(messages) if msg.get("role") == "user"),
+            None,
+        )
+        assert isinstance(last_user, dict)
+        last_user_content = str(last_user.get("content") or "")
+
+        if last_user_content == "Hello":
             return AssistantReply(
-                content='TOOL_CALL {"name":"latest_experiments","arguments":{"limit":2}}',
+                content="PLAN:\n- Draft\nFINAL:\nDraft answer.",
                 provider="test",
                 model="test-model",
                 meta=None,
             )
 
-        assert isinstance(messages, list)
-        assert messages[-1]["role"] == "system"
-        assert messages[-1]["content"].startswith("TOOL_RESULT latest_experiments")
-        tool_payload = json.loads(messages[-1]["content"].split("\n", 1)[1])
-        assert tool_payload["ok"] is True
-        ids = [row["id"] for row in tool_payload["result"]["experiments"]]
-        assert ids == sorted(ids, reverse=True)
-
+        assert last_user_content.startswith("Review the assistant answer above")
+        assert any(msg.get("role") == "user" and msg.get("content") == "Hello" for msg in messages)
+        assert messages[-2] == {"role": "assistant", "content": "Draft answer."}
         return AssistantReply(
-            content=(
-                "PLAN:\n"
-                "- List the most recent experiments\n"
-                f"FINAL:\nLatest experiments: {ids[0]}, {ids[1]}"
-            ),
+            content="FINAL:\nRevised answer.",
             provider="test",
             model="test-model",
             meta=None,
@@ -68,7 +60,7 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
         payload = ChatRequest.model_validate(
             {
                 "sessionId": "session-1",
-                "message": "Fetch the latest experiments",
+                "message": "Hello",
                 "history": [],
                 "ui": None,
             }
@@ -83,9 +75,9 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
                 schedule_db=schedule_db,
                 user=None,
             )
-        assert response.sessionId == "session-1"
-        assert response.message.startswith("Latest experiments:")
-        assert "PLAN:" not in response.message
+
+        assert response.message == "Revised answer."
+        assert len(calls) == 2
 
         assistant_row = (
             assistant_db.query(support_routes.SupportMessage)
@@ -95,8 +87,9 @@ def test_support_chat_can_fetch_latest_experiments_via_tool(tmp_path, db_session
             .first()
         )
         assert assistant_row is not None
+        assert assistant_row.content == "Revised answer."
+
         meta = json.loads(assistant_row.meta_json)
-        assert meta["tool_calls"][0]["name"] == "latest_experiments"
-        assert meta["tool_calls"][0]["ok"] is True
-        assert meta["plan"].startswith("- List")
-        assert "FINAL:" in meta["raw_content"]
+        assert meta["self_review"]["changed"] is True
+        assert "draft_raw_content" in meta
+        assert meta["plan"].startswith("- Draft")

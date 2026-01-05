@@ -50,8 +50,22 @@ class Experiment(ExperimentTimestamp, Base):
         info={"ui": {"label": "EXPRecNo"}},
     )
 
-    exp_LabelFLAG: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, info={"ui": {"label": "LabelFLAG"}}
+    exp_LabelFLAG: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        info={
+            "ui": {
+                "label": "Label",
+                "component": "Select",
+                "options": [
+                    {"value": 0, "label": "None (0)"},
+                    {"value": 1, "label": "TMT6"},
+                    {"value": 2, "label": "TMTPro"},
+                    {"value": 3, "label": "SILAC"},
+                ],
+            }
+        },
     )
     exp_Type = mapped_column(
         SAEnum(ExperimentType, native_enum=True, validate_strings=True),
@@ -147,10 +161,16 @@ class Experiment(ExperimentTimestamp, Base):
         Text, nullable=True, info={"ui": {"label": "Batch #"}}
     )
     exp_Data_FLAG: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, info={"ui": {"label": "data"}}
+        Boolean,
+        nullable=False,
+        default=False,
+        info={"ui": {"label": "data", "readOnly": True}},
     )
     exp_exp2gene_FLAG: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False, info={"ui": {"label": "exp2gene"}}
+        Boolean,
+        nullable=False,
+        default=False,
+        info={"ui": {"label": "exp2gene", "readOnly": True}},
     )
     exp_Description: Mapped[str | None] = mapped_column(
         Text,
@@ -235,8 +255,29 @@ class E2G(E2GTimestamp, Base):
     gene: Mapped[str] = mapped_column(Text, nullable=False)
     geneidtype: Mapped[str] = mapped_column(Text, nullable=False)
     label: Mapped[str] = mapped_column(Text, nullable=False, default="0")
+
+    # Convenience columns (GeneID is canonical; the others help search/display).
+    gene_symbol: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    taxon_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sra: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # QUAL metrics
+    psms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    psms_u2g: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    peptide_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    peptide_count_u2g: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
+    coverage_u2g: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+    # QUANT metrics
+    area_sum_u2g_0: Mapped[float | None] = mapped_column(Float, nullable=True)
+    area_sum_u2g_all: Mapped[float | None] = mapped_column(Float, nullable=True)
+    area_sum_max: Mapped[float | None] = mapped_column(Float, nullable=True)
+    area_sum_dstrAdj: Mapped[float | None] = mapped_column(Float, nullable=True)
     iBAQ_dstrAdj: Mapped[float | None] = mapped_column(Float, nullable=True)
     peptideprint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     experiment_run: Mapped["ExperimentRun"] = relationship(
         back_populates="gene_mappings"
