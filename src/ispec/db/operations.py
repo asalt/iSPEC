@@ -552,8 +552,11 @@ def import_e2g(
     qual_paths: list[str] | None = None,
     quant_paths: list[str] | None = None,
     db_file_path: str | None = None,
-    create_missing_runs: bool = False,
+    create_missing_runs: bool = True,
+    create_missing_experiments: bool = True,
     store_metadata: bool = False,
+    skip_imported: bool = True,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Import gpgrouper experiment-to-gene tables (QUAL/QUANT TSVs).
 
@@ -568,9 +571,15 @@ def import_e2g(
     db_file_path:
         SQLite database URL or filesystem path to write to.
     create_missing_runs:
-        When True, create missing ExperimentRun rows (experiment must exist).
+        When True, create missing ExperimentRun rows (requires experiment; see create_missing_experiments).
+    create_missing_experiments:
+        When True, create missing Experiment rows (project_id may be NULL until backfilled).
     store_metadata:
         When True, store a small subset of extra columns in ``metadata_json``.
+    skip_imported:
+        When True, skip importing a file if that run already has QUAL/QUANT fields populated.
+    force:
+        When True, delete existing E2G rows for affected ExperimentRuns and re-import.
     """
 
     from pathlib import Path
@@ -611,10 +620,13 @@ def import_e2g(
     resolved_quant = uniq(resolved_quant)
 
     _log_info(
-        "importing E2G TSVs: qual=%d, quant=%d, create_missing_runs=%s, store_metadata=%s",
+        "importing E2G TSVs: qual=%d, quant=%d, create_missing_runs=%s, create_missing_experiments=%s, skip_imported=%s, force=%s, store_metadata=%s",
         len(resolved_qual),
         len(resolved_quant),
         bool(create_missing_runs),
+        bool(create_missing_experiments),
+        bool(skip_imported),
+        bool(force),
         bool(store_metadata),
     )
 
@@ -624,5 +636,8 @@ def import_e2g(
             qual_paths=resolved_qual,
             quant_paths=resolved_quant,
             create_missing_runs=create_missing_runs,
+            create_missing_experiments=create_missing_experiments,
             store_metadata=store_metadata,
+            skip_imported=skip_imported,
+            force=force,
         )

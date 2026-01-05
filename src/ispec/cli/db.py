@@ -86,13 +86,52 @@ def register_subcommands(subparsers):
     )
     import_e2g_parser.add_argument(
         "--create-missing-runs",
+        dest="create_missing_runs",
         action="store_true",
-        help="Create missing ExperimentRun rows when needed (experiment must exist).",
+        default=True,
+        help="Create missing ExperimentRun rows when needed (default: enabled).",
+    )
+    import_e2g_parser.add_argument(
+        "--no-create-missing-runs",
+        dest="create_missing_runs",
+        action="store_false",
+        help="Disable creating missing ExperimentRun rows.",
+    )
+    import_e2g_parser.add_argument(
+        "--create-missing-experiments",
+        dest="create_missing_experiments",
+        action="store_true",
+        default=True,
+        help="Create missing Experiment rows when needed (default: enabled).",
+    )
+    import_e2g_parser.add_argument(
+        "--no-create-missing-experiments",
+        dest="create_missing_experiments",
+        action="store_false",
+        help="Disable creating missing Experiment rows.",
     )
     import_e2g_parser.add_argument(
         "--store-metadata",
         action="store_true",
         help="Store a small subset of extra columns in metadata_json.",
+    )
+    import_e2g_parser.add_argument(
+        "--skip-imported",
+        dest="skip_imported",
+        action="store_true",
+        default=True,
+        help="Skip importing files when that run already has QUAL/QUANT fields populated (default: enabled).",
+    )
+    import_e2g_parser.add_argument(
+        "--no-skip-imported",
+        dest="skip_imported",
+        action="store_false",
+        help="Do not skip; upsert into existing E2G rows.",
+    )
+    import_e2g_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Delete existing E2G rows for affected ExperimentRuns and re-import.",
     )
 
     export_parser = subparsers.add_parser("export", help="Export table to CSV or JSON")
@@ -351,8 +390,11 @@ def dispatch(args):
             qual_paths=list(getattr(args, "qual_paths", []) or []),
             quant_paths=list(getattr(args, "quant_paths", []) or []),
             db_file_path=getattr(args, "database", None),
-            create_missing_runs=bool(getattr(args, "create_missing_runs", False)),
+            create_missing_runs=bool(getattr(args, "create_missing_runs", True)),
+            create_missing_experiments=bool(getattr(args, "create_missing_experiments", True)),
             store_metadata=bool(getattr(args, "store_metadata", False)),
+            skip_imported=bool(getattr(args, "skip_imported", True)),
+            force=bool(getattr(args, "force", False)),
         )
         logger.info("E2G import summary: %s", summary)
     elif args.subcommand == "export":
