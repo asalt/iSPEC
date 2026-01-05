@@ -16,6 +16,7 @@ class UserRole(str, enum.Enum):
     admin = "admin"
     editor = "editor"
     viewer = "viewer"
+    client = "client"
 
 
 class AuthUser(AuthTimestamp, Base):
@@ -34,8 +35,14 @@ class AuthUser(AuthTimestamp, Base):
         default=UserRole.editor,
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     sessions: Mapped[list["AuthSession"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    project_access: Mapped[list["AuthUserProject"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
 
@@ -53,3 +60,20 @@ class AuthSession(Base):
 
     user: Mapped["AuthUser"] = relationship(back_populates="sessions")
 
+
+class AuthUserProject(Base):
+    __tablename__ = "auth_user_project"
+
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_user.id"),
+        primary_key=True,
+        index=True,
+    )
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("project.id"),
+        primary_key=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
+
+    user: Mapped["AuthUser"] = relationship(back_populates="project_access")

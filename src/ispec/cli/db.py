@@ -179,6 +179,96 @@ def register_subcommands(subparsers):
         action="store_true",
         help="When a row is conflicted, still fill NULL/blank fields from legacy without overwriting existing values.",
     )
+    sync_projects_parser.add_argument(
+        "--dump-json",
+        dest="dump_json",
+        help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
+    )
+
+    sync_experiments_parser = subparsers.add_parser(
+        "sync-legacy-experiments",
+        help="Sync legacy iSPEC Experiments via the legacy API",
+    )
+    sync_experiments_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    sync_experiments_parser.add_argument(
+        "--legacy-url",
+        dest="legacy_url",
+        help="Legacy API base URL (defaults to ISPEC_LEGACY_API_URL or iSPEC/data/ispec-legacy-schema.json base_url)",
+    )
+    sync_experiments_parser.add_argument(
+        "--id",
+        dest="experiment_id",
+        type=int,
+        help="Sync a single legacy experiment by EXPRecNo (debug/verification)",
+    )
+    sync_experiments_parser.add_argument(
+        "--mapping",
+        dest="mapping",
+        help="Path to legacy-mapping.json (default: iSPEC/data/legacy-mapping.json)",
+    )
+    sync_experiments_parser.add_argument(
+        "--schema",
+        dest="schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
+    )
+    sync_experiments_parser.add_argument("--limit", type=int, default=1000)
+    sync_experiments_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch + compute changes without writing to the DB",
+    )
+    sync_experiments_parser.add_argument(
+        "--dump-json",
+        dest="dump_json",
+        help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
+    )
+
+    sync_runs_parser = subparsers.add_parser(
+        "sync-legacy-experiment-runs",
+        help="Sync legacy iSPEC ExperimentRuns for a specific experiment",
+    )
+    sync_runs_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    sync_runs_parser.add_argument(
+        "--legacy-url",
+        dest="legacy_url",
+        help="Legacy API base URL (defaults to ISPEC_LEGACY_API_URL or iSPEC/data/ispec-legacy-schema.json base_url)",
+    )
+    sync_runs_parser.add_argument(
+        "--experiment-id",
+        dest="experiment_id",
+        type=int,
+        required=True,
+        help="Experiment EXPRecNo to sync runs for",
+    )
+    sync_runs_parser.add_argument(
+        "--mapping",
+        dest="mapping",
+        help="Path to legacy-mapping.json (default: iSPEC/data/legacy-mapping.json)",
+    )
+    sync_runs_parser.add_argument(
+        "--schema",
+        dest="schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
+    )
+    sync_runs_parser.add_argument("--limit", type=int, default=5000)
+    sync_runs_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch + compute changes without writing to the DB",
+    )
+    sync_runs_parser.add_argument(
+        "--dump-json",
+        dest="dump_json",
+        help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
+    )
 
 
 def dispatch(args):
@@ -253,8 +343,37 @@ def dispatch(args):
             since_pk=getattr(args, "since_pk", None),
             dry_run=bool(getattr(args, "dry_run", False)),
             backfill_missing=bool(getattr(args, "backfill_missing", False)),
+            dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy projects sync summary: %s", summary)
+    elif args.subcommand == "sync-legacy-experiments":
+        from ispec.db.legacy_sync import sync_legacy_experiments
+
+        summary = sync_legacy_experiments(
+            legacy_url=getattr(args, "legacy_url", None),
+            mapping_path=getattr(args, "mapping", None),
+            schema_path=getattr(args, "schema", None),
+            db_file_path=getattr(args, "database", None),
+            experiment_id=getattr(args, "experiment_id", None),
+            limit=int(getattr(args, "limit", 1000)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            dump_json=getattr(args, "dump_json", None),
+        )
+        logger.info("legacy experiments sync summary: %s", summary)
+    elif args.subcommand == "sync-legacy-experiment-runs":
+        from ispec.db.legacy_sync import sync_legacy_experiment_runs
+
+        summary = sync_legacy_experiment_runs(
+            legacy_url=getattr(args, "legacy_url", None),
+            mapping_path=getattr(args, "mapping", None),
+            schema_path=getattr(args, "schema", None),
+            db_file_path=getattr(args, "database", None),
+            experiment_id=int(getattr(args, "experiment_id")),
+            limit=int(getattr(args, "limit", 5000)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            dump_json=getattr(args, "dump_json", None),
+        )
+        logger.info("legacy experiment runs sync summary: %s", summary)
     else:
         logger.info("no dispatched function provided for %s", args.subcommand)
 

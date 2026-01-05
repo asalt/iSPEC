@@ -106,6 +106,16 @@ def ui_from_column(
     ui: dict[str, Any] = dict((col.info or {}).get("ui", {}))
     t = col.type
 
+    name_lower = col.name.lower()
+    readonly_suffixes = ("_creationts", "_modificationts", "_legacyimportts")
+    if (
+        any(name_lower.endswith(suffix) for suffix in readonly_suffixes)
+        or name_lower.endswith("displayid")
+        or name_lower.endswith("displaytitle")
+        or "foundcount" in name_lower
+    ):
+        ui.setdefault("readOnly", True)
+
 
     is_enum = _is_enum_type(t)
 
@@ -171,4 +181,3 @@ def ui_from_column(
 # col = Project.__table__.c.prj_ProjectType
 # print("TYPE:", type(col.type), "enum_class:", getattr(col.type, "enum_class", None), "enums:", getattr(col.type, "enums", None))
 # # on SA 2.x you want TYPE to be sqlalchemy.sql.sqltypes.Enum
-

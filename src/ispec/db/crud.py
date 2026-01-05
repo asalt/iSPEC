@@ -70,6 +70,25 @@ class CRUDBase:
         """Return the list of column names defined on the mapped table."""
         return [col.name for col in self.model.__table__.columns]
 
+    def clean_input(self, record: dict | None) -> dict:
+        # Only keep known columns
+        allowed_keys = self.get_columns()
+        prefix = self.prefix or ""
+        cleaned_record = {}
+        for k, v in (record or {}).items():
+            if k in allowed_keys:
+                cleaned_record[k] = v
+                continue
+            candidate = f"{prefix}{k}"
+            if prefix and candidate in allowed_keys:
+                cleaned_record[candidate] = v
+                continue
+            logger.warning(f"Key '{k}' not in model columns, removing from record.")
+
+        # cleaned_record = {k: v for k, v in record.items() if k in allowed_keys}
+        logger.debug(f"Cleaned record keys: {cleaned_record.keys()}")
+        return cleaned_record
+
     def validate_input(self, session: Session, record: dict = None) -> dict:
         """Validate and normalize user supplied data before persistence.
 
@@ -83,19 +102,7 @@ class CRUDBase:
         if session is None:
             raise ValueError("A database session is required for validation.")
 
-        # Only keep known columns
-        allowed_keys = self.get_columns()
-        cleaned_record = {}
-        for k, v in record.items():
-            if k not in allowed_keys and f"{self.prefix}{k}" in allowed_keys:
-                cleaned_record[f"{self.prefix}{k}"] = v
-            elif k not in allowed_keys and f"{self.prefix}{k}" not in allowed_keys:
-                logger.warning(f"Key '{k}' not in model columns, removing from record.")
-            else:
-                cleaned_record[k] = v
-
-        # cleaned_record = {k: v for k, v in record.items() if k in allowed_keys}
-        logger.debug(f"Cleaned record keys: {cleaned_record.keys()}")
+        cleaned_record = self.clean_input(record)
 
         # Check required columns
         if self.req_cols is not None:
@@ -141,6 +148,37 @@ class CRUDBase:
             session.commit()
             return True
         return False
+
+    def readonly_fields(self) -> set[str]:
+        columns = self.get_columns()
+        readonly_suffixes = ("_CreationTS", "_ModificationTS", "_LegacyImportTS")
+        readonly: set[str] = {"id"}
+        for name in columns:
+            lowered = name.lower()
+            if any(lowered.endswith(suffix.lower()) for suffix in readonly_suffixes):
+                readonly.add(name)
+            if lowered.endswith("displayid") or lowered.endswith("displaytitle"):
+                readonly.add(name)
+            if "foundcount" in lowered:
+                readonly.add(name)
+        return readonly
+
+    def after_update(self, session: Session, obj: Any, updates: dict[str, Any]) -> None:
+        return None
+
+    def update(self, session: Session, obj: Any, record: dict) -> Any:
+        updates = self.clean_input(record)
+        readonly = self.readonly_fields()
+        for field, value in updates.items():
+            if field in readonly:
+                continue
+            setattr(obj, field, value)
+
+        self.after_update(session, obj, updates)
+
+        session.commit()
+        session.refresh(obj)
+        return obj
 
 
 
@@ -336,6 +374,12 @@ class ProjectCRUD(CRUDBase):
         session.refresh(obj)
         logger.info(f"Inserted into {self.model.__tablename__}: {validated}")
         return obj
+
+    def after_update(self, session: Session, project: Project, updates: dict[str, Any]) -> None:
+        self._ensure_display_fields(project)
+        if "prj_ProjectTitle" in updates:
+            title = getattr(project, "prj_ProjectTitle", "") or ""
+            project.prj_PRJ_DisplayTitle = f"{project.prj_PRJ_DisplayID} - {title}".strip()
 
 
 class ProjectCommentCRUD(CRUDBase):
@@ -584,16 +628,23 @@ class ExperimentRunCRUD(CRUDBase):
     def __init__(self):
         super().__init__(ExperimentRun)
 
+    def readonly_fields(self) -> set[str]:
+        readonly = super().readonly_fields()
+        readonly.update({"experiment_id", "run_no", "search_no"})
+        return readonly
+
     def label_expr(self):
         M = self.model
         cols = M.__table__.columns.keys()
-        if {"experiment_id", "run_no", "search_no"}.issubset(cols):
+        if {"experiment_id", "run_no", "search_no", "label"}.issubset(cols):
             return func.trim(
                 cast(getattr(M, "experiment_id"), T.String())
                 + "-"
                 + cast(getattr(M, "run_no"), T.String())
                 + "-"
                 + cast(getattr(M, "search_no"), T.String())
+                + "-"
+                + func.coalesce(cast(getattr(M, "label"), T.String()), "")
             )
         return super().label_expr()
 
@@ -613,9 +664,19 @@ class ExperimentRunCRUD(CRUDBase):
         # avoid unique constraint violation by pre-checking
         run_no = record.get("run_no", 1)
         search_no = record.get("search_no", 1)
+        label = record.get("label")
+        if label is None:
+            label = "0"
+        if isinstance(label, str):
+            label = label.strip() or "0"
+        else:
+            label = str(label)
+        record["label"] = label
         dup = (
             session.query(ExperimentRun)
-            .filter_by(experiment_id=experiment_id, run_no=run_no, search_no=search_no)
+            .filter_by(
+                experiment_id=experiment_id, run_no=run_no, search_no=search_no, label=label
+            )
             .first()
         )
         if dup:

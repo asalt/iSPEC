@@ -55,6 +55,7 @@ def initialize_db(engine: Engine):
     _ensure_project_comment_columns(engine)
     _ensure_legacy_import_tracking_columns(engine)
     _ensure_experiment_columns(engine)
+    _ensure_auth_user_columns(engine)
 
 
 def _ensure_project_type_column(engine: Engine) -> None:
@@ -165,4 +166,31 @@ def _ensure_experiment_columns(engine: Engine) -> None:
 
     logger.info(
         "Added missing columns experiment.%s", ", ".join(name for name, _ in missing)
+    )
+
+
+def _ensure_auth_user_columns(engine: Engine) -> None:
+    """Ensure legacy SQLite schemas include newer auth_user columns."""
+
+    desired: list[tuple[str, str]] = [
+        ("must_change_password", "BOOLEAN NOT NULL DEFAULT 0"),
+        ("last_login_at", "DATETIME"),
+        ("password_changed_at", "DATETIME"),
+    ]
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("auth_user")}
+    except Exception:
+        return
+
+    missing = [(name, ddl) for (name, ddl) in desired if name not in columns]
+    if not missing:
+        return
+
+    with engine.begin() as conn:
+        for name, ddl in missing:
+            conn.execute(text(f'ALTER TABLE auth_user ADD COLUMN "{name}" {ddl}'))
+
+    logger.info(
+        "Added missing columns auth_user.%s", ", ".join(name for name, _ in missing)
     )

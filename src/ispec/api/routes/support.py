@@ -13,11 +13,20 @@ from sqlalchemy.orm import Session
 from ispec.api.security import require_access, require_assistant_access
 from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.assistant.connect import get_assistant_session_dep
+from ispec.assistant.formatting import split_plan_final
 from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
-from ispec.assistant.service import generate_reply
+from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
+from ispec.assistant.service import _system_prompt, generate_reply
+from ispec.assistant.tools import (
+    TOOL_CALL_PREFIX,
+    format_tool_result_message,
+    parse_tool_call,
+    run_tool,
+)
 from ispec.db.connect import get_session_dep
 from ispec.db.models import AuthUser, UserRole
+from ispec.schedule.connect import get_schedule_session_dep
 
 
 router = APIRouter(prefix="/support", tags=["Support"])
@@ -25,6 +34,7 @@ router = APIRouter(prefix="/support", tags=["Support"])
 _PROJECT_ROUTE_RE = re.compile(r"/project/(\d+)", re.IGNORECASE)
 _EXPERIMENT_ROUTE_RE = re.compile(r"/experiment/(\d+)", re.IGNORECASE)
 _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
+_CONTEXT_SCHEMA_VERSION = 1
 
 
 def utcnow() -> datetime:
@@ -95,6 +105,36 @@ def _history_limit() -> int:
         return 20
 
 
+def _max_prompt_tokens() -> int:
+    raw = (os.getenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS") or "").strip()
+    if not raw:
+        return 6000
+    try:
+        return max(256, int(raw))
+    except ValueError:
+        return 6000
+
+
+def _summary_max_chars() -> int:
+    raw = (os.getenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS") or "").strip()
+    if not raw:
+        return 2000
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 2000
+
+
+def _max_tool_calls() -> int:
+    raw = (os.getenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS") or "").strip()
+    if not raw:
+        return 2
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 2
+
+
 def _load_state(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
@@ -110,7 +150,73 @@ def _dump_state(state: dict[str, Any]) -> str:
 
 
 def _context_message(*, payload: dict[str, Any]) -> str:
-    return "CONTEXT (read-only JSON):\n" + json.dumps(payload, ensure_ascii=False)
+    version = payload.get("schema_version") or _CONTEXT_SCHEMA_VERSION
+    return f"CONTEXT v{version} (read-only JSON):\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _safe_int_from_state(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            parsed = int(stripped)
+            return parsed if parsed >= 0 else None
+    return None
+
+
+def _update_conversation_summary(
+    *,
+    assistant_db: Session,
+    session_pk: int,
+    state: dict[str, Any],
+    summarize_through_id: int,
+) -> tuple[dict[str, Any], bool]:
+    """Update `state['conversation_summary']` up to `summarize_through_id` (inclusive)."""
+
+    max_chars = _summary_max_chars()
+    if max_chars <= 0 or summarize_through_id <= 0:
+        return state, False
+
+    last_done = _safe_int_from_state(state.get("conversation_summary_up_to_id")) or 0
+    if summarize_through_id <= last_done:
+        return state, False
+
+    rows = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session_pk)
+        .filter(SupportMessage.id > last_done)
+        .filter(SupportMessage.id <= summarize_through_id)
+        .order_by(SupportMessage.id.asc())
+        .all()
+    )
+    if not rows:
+        state["conversation_summary_up_to_id"] = summarize_through_id
+        return state, True
+
+    chunk = summarize_messages(
+        (
+            {"role": row.role, "content": row.content}
+            for row in rows
+            if row.role in {"user", "assistant", "system"} and row.content
+        ),
+        max_chars=max_chars,
+    )
+    if not chunk:
+        state["conversation_summary_up_to_id"] = summarize_through_id
+        return state, True
+
+    existing = state.get("conversation_summary")
+    summary = existing.strip() if isinstance(existing, str) else ""
+    summary = (summary + "\n" + chunk).strip() if summary else chunk
+    if len(summary) > max_chars:
+        summary = "…" + summary[-(max_chars - 1) :]
+
+    state["conversation_summary"] = summary
+    state["conversation_summary_up_to_id"] = summarize_through_id
+    state["conversation_summary_updated_at"] = utcnow().isoformat()
+    state["conversation_summary_version"] = 1
+    return state, True
 
 
 def _safe_int(value: Any) -> int | None:
@@ -140,6 +246,7 @@ def chat(
     payload: ChatRequest,
     assistant_db: Session = Depends(get_assistant_session_dep),
     core_db: Session = Depends(get_session_dep),
+    schedule_db: Session = Depends(get_schedule_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ):
     session = (
@@ -211,53 +318,176 @@ def chat(
         if isinstance(candidate, int) and candidate >= 0:
             focused_project_id = candidate
 
-    if state_changed:
-        session.state_json = _dump_state(state)
-
-    assistant_db.add(
-        SupportMessage(
-            session_pk=session.id,
-            role="user",
-            content=payload.message,
-            provider="frontend",
-        )
+    user_message = SupportMessage(
+        session_pk=session.id,
+        role="user",
+        content=payload.message,
+        provider="frontend",
     )
+    assistant_db.add(user_message)
     session.updated_at = utcnow()
     assistant_db.flush()
 
     history_limit = _history_limit()
-    history_rows = (
-        assistant_db.query(SupportMessage)
-        .filter(SupportMessage.session_pk == session.id)
-        .order_by(SupportMessage.id.desc())
-        .limit(history_limit if history_limit else 0)
-        .all()
-    )
-    history_rows.reverse()
+    max_tokens = _max_prompt_tokens()
+
+    selected_history: list[SupportMessage] = []
+    context_message = ""
+
+    # Iterate twice to account for summary growth impacting the budget.
+    for _ in range(2):
+        summary_up_to_id = _safe_int_from_state(state.get("conversation_summary_up_to_id")) or 0
+
+        candidate_rows = (
+            assistant_db.query(SupportMessage)
+            .filter(SupportMessage.session_pk == session.id)
+            .order_by(SupportMessage.id.desc())
+            .limit((history_limit + 1) if history_limit else 0)
+            .all()
+        )
+        candidate_rows.reverse()
+        history_rows = [
+            row
+            for row in candidate_rows
+            if row.id != user_message.id
+            and row.id > summary_up_to_id
+            and row.role in {"user", "assistant", "system"}
+            and row.content
+        ]
+
+        ispec_context = build_ispec_context(core_db, message=payload.message, state=state)
+        context_payload: dict[str, Any] = {
+            "schema_version": _CONTEXT_SCHEMA_VERSION,
+            "session": {"id": session.session_id, "state": state},
+            "user": {
+                "username": user.username,
+                "role": str(user.role),
+            }
+            if user is not None
+            else None,
+            "ui": ui_payload,
+            "ispec": ispec_context,
+        }
+        context_message = _context_message(payload=context_payload)
+
+        base_messages = [
+            {"role": "system", "content": _system_prompt()},
+            {"role": "system", "content": context_message},
+            {"role": "user", "content": payload.message},
+        ]
+        tokens = estimate_tokens_for_messages(base_messages)
+
+        selected_rev: list[SupportMessage] = []
+        for row in reversed(history_rows):
+            message_tokens = estimate_tokens_for_messages([{"role": row.role, "content": row.content}])
+            if tokens + message_tokens > max_tokens:
+                break
+            tokens += message_tokens
+            selected_rev.append(row)
+        selected_history = list(reversed(selected_rev))
+
+        summarize_through_id = (
+            int(selected_history[0].id) - 1 if selected_history else (int(user_message.id) - 1)
+        )
+        if summarize_through_id < 0:
+            summarize_through_id = 0
+
+        state, summary_changed = _update_conversation_summary(
+            assistant_db=assistant_db,
+            session_pk=session.id,
+            state=state,
+            summarize_through_id=summarize_through_id,
+        )
+        if summary_changed:
+            state_changed = True
+            continue
+        break
+
+    if state_changed:
+        session.state_json = _dump_state(state)
+
     history_payload = [
         {"role": row.role, "content": row.content}
-        for row in history_rows
+        for row in selected_history
         if row.role in {"user", "assistant", "system"} and row.content
     ]
 
-    ispec_context = build_ispec_context(core_db, message=payload.message, state=state)
-    context_payload: dict[str, Any] = {
-        "session": {"id": session.session_id, "state": state},
-        "user": {
-            "username": user.username,
-            "role": str(user.role),
-        }
-        if user is not None
-        else None,
-        "ui": ui_payload,
-        "ispec": ispec_context,
-    }
+    tool_calls: list[dict[str, Any]] = []
+    tool_messages: list[dict[str, str]] = []
+    reply = None
 
-    reply = generate_reply(
-        message=payload.message,
-        history=history_payload,
-        context=_context_message(payload=context_payload),
-    )
+    max_tool_calls = _max_tool_calls()
+    used_tool_calls = 0
+    while True:
+        if tool_messages:
+            base_messages = [
+                {"role": "system", "content": _system_prompt()},
+                {"role": "system", "content": context_message},
+                *tool_messages,
+                {"role": "user", "content": payload.message},
+            ]
+            tokens = estimate_tokens_for_messages(base_messages)
+            trimmed_rev: list[dict[str, str]] = []
+            for item in reversed(history_payload):
+                message_tokens = estimate_tokens_for_messages([item])
+                if tokens + message_tokens > max_tokens:
+                    break
+                tokens += message_tokens
+                trimmed_rev.append(item)
+            history_for_llm = list(reversed(trimmed_rev)) + tool_messages
+        else:
+            history_for_llm = history_payload
+
+        reply = generate_reply(
+            message=payload.message,
+            history=history_for_llm,
+            context=context_message,
+        )
+
+        tool_call = parse_tool_call(reply.content)
+        if tool_call is None:
+            break
+
+        if used_tool_calls >= max_tool_calls:
+            reply = None
+            break
+
+        used_tool_calls += 1
+        tool_name, tool_args = tool_call
+        tool_payload = run_tool(
+            name=tool_name,
+            args=tool_args,
+            core_db=core_db,
+            schedule_db=schedule_db,
+            user=user,
+        )
+        tool_calls.append(
+            {
+                "name": tool_name,
+                "arguments": tool_args,
+                "ok": bool(tool_payload.get("ok")),
+                "error": tool_payload.get("error"),
+            }
+        )
+        tool_messages.extend(
+            [
+                {"role": "assistant", "content": reply.content.strip()},
+                {"role": "system", "content": format_tool_result_message(tool_name, tool_payload)},
+            ]
+        )
+
+    if reply is None:
+        reply = generate_reply(
+            message=payload.message,
+            history=history_payload
+            + [{"role": "system", "content": f"{TOOL_CALL_PREFIX} limit exceeded; answer without tools."}],
+            context=context_message,
+        )
+
+    raw_reply_content = reply.content or ""
+    plan_text, assistant_content = split_plan_final(raw_reply_content)
+    if not assistant_content.strip():
+        assistant_content = raw_reply_content.strip()
 
     meta: dict[str, Any] = {
         "provider": reply.provider,
@@ -270,11 +500,17 @@ def chat(
     }
     if reply.meta:
         meta["provider_meta"] = reply.meta
+    if tool_calls:
+        meta["tool_calls"] = tool_calls
+    if plan_text:
+        meta["plan"] = plan_text
+    if raw_reply_content.strip() and raw_reply_content.strip() != assistant_content.strip():
+        meta["raw_content"] = raw_reply_content.strip()
 
     assistant_message = SupportMessage(
         session_pk=session.id,
         role="assistant",
-        content=reply.content,
+        content=assistant_content,
         provider=reply.provider,
         model=reply.model,
         meta_json=json.dumps(meta, ensure_ascii=False),

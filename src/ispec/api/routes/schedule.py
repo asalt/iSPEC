@@ -5,9 +5,10 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ispec.api.security import require_access
+from ispec.api.security import require_access, require_admin
 from ispec.schedule.connect import get_schedule_session_dep
 from ispec.schedule.models import ScheduleRequest, ScheduleRequestSlot, ScheduleSlot
 
@@ -160,27 +161,40 @@ def list_slots(
     return {"items": [_serialize_slot(row) for row in rows]}
 
 
-@router.post("/slots", response_model=SlotResponse, dependencies=[Depends(require_access)])
+@router.post(
+    "/slots",
+    response_model=SlotResponse,
+    dependencies=[Depends(require_access), Depends(require_admin)],
+)
 def create_slot(payload: SlotCreate, db: Session = Depends(get_schedule_session_dep)):
     try:
         status = _normalize_status(payload.status, allowed=SLOT_STATUSES)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    start_at = _as_utc_naive(payload.start_at)
+    end_at = _as_utc_naive(payload.end_at)
+    if end_at <= start_at:
+        raise HTTPException(status_code=400, detail="end_at must be after start_at")
+
     slot = ScheduleSlot(
-        start_at=_as_utc_naive(payload.start_at),
-        end_at=_as_utc_naive(payload.end_at),
+        start_at=start_at,
+        end_at=end_at,
         status=status,
     )
     db.add(slot)
     try:
         db.flush()
-    except Exception as exc:
+    except IntegrityError as exc:
         raise HTTPException(status_code=409, detail="slot already exists") from exc
     return _serialize_slot(slot)
 
 
-@router.put("/slots/{slot_id}", response_model=SlotResponse, dependencies=[Depends(require_access)])
+@router.put(
+    "/slots/{slot_id}",
+    response_model=SlotResponse,
+    dependencies=[Depends(require_access), Depends(require_admin)],
+)
 def update_slot(
     slot_id: int,
     payload: SlotUpdate,
@@ -190,6 +204,9 @@ def update_slot(
     if slot is None:
         raise HTTPException(status_code=404, detail="slot not found")
 
+    updated_start_at = slot.start_at
+    updated_end_at = slot.end_at
+
     if payload.status is not None:
         try:
             slot.status = _normalize_status(payload.status, allowed=SLOT_STATUSES)
@@ -197,19 +214,28 @@ def update_slot(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if payload.start_at is not None:
-        slot.start_at = _as_utc_naive(payload.start_at)
+        updated_start_at = _as_utc_naive(payload.start_at)
     if payload.end_at is not None:
-        slot.end_at = _as_utc_naive(payload.end_at)
+        updated_end_at = _as_utc_naive(payload.end_at)
+
+    if updated_end_at <= updated_start_at:
+        raise HTTPException(status_code=400, detail="end_at must be after start_at")
+
+    slot.start_at = updated_start_at
+    slot.end_at = updated_end_at
 
     db.add(slot)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="slot time conflicts with existing slot") from exc
     return _serialize_slot(slot)
 
 
 @router.post(
     "/slots/bulk",
     response_model=SlotBulkResponse,
-    dependencies=[Depends(require_access)],
+    dependencies=[Depends(require_access), Depends(require_admin)],
 )
 def bulk_create_slots(
     payload: SlotBulkCreate,
@@ -332,7 +358,13 @@ def create_request(
         slot.status = "booked"
         db.add(slot)
 
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="one or more slots were already booked; refresh and try again",
+        ) from exc
     return ScheduleRequestResponse(
         id=request.id,
         status=request.status,
@@ -341,7 +373,11 @@ def create_request(
     )
 
 
-@router.get("/requests", response_model=list[ScheduleRequestListResponse], dependencies=[Depends(require_access)])
+@router.get(
+    "/requests",
+    response_model=list[ScheduleRequestListResponse],
+    dependencies=[Depends(require_access), Depends(require_admin)],
+)
 def list_requests(db: Session = Depends(get_schedule_session_dep)):
     rows = db.query(ScheduleRequest).order_by(ScheduleRequest.created_at.desc()).all()
     payload = []
@@ -358,3 +394,27 @@ def list_requests(db: Session = Depends(get_schedule_session_dep)):
             )
         )
     return payload
+
+
+@router.delete(
+    "/slots/{slot_id}",
+    status_code=204,
+    dependencies=[Depends(require_access), Depends(require_admin)],
+)
+def delete_slot(slot_id: int, db: Session = Depends(get_schedule_session_dep)):
+    slot = db.query(ScheduleSlot).filter(ScheduleSlot.id == slot_id).first()
+    if slot is None:
+        raise HTTPException(status_code=404, detail="slot not found")
+
+    if slot.status == "booked":
+        raise HTTPException(status_code=409, detail="booked slots cannot be deleted")
+
+    linked = db.query(ScheduleRequestSlot).filter(ScheduleRequestSlot.slot_id == slot_id).first()
+    if linked is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="slot is linked to a request and cannot be deleted",
+        )
+
+    db.delete(slot)
+    db.flush()

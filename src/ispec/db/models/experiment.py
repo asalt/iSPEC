@@ -16,6 +16,14 @@ class ExperimentType(str, enum.Enum):
     affinity = "Affinity"
     affinity_xl = "Affinity-XL"
     profiling = "Profiling"
+    prof = "prof"
+    IP = "IP"
+    IPXL = "IP-XL"
+    Other = "Other"
+    DPD = "DPD"  # dna pulldown
+    cIP = "cIP" 
+    tagIP = "tagIP"
+    x = "x"
 
 
 class LysisMethod(str, enum.Enum):
@@ -26,14 +34,15 @@ class LysisMethod(str, enum.Enum):
     mu8 = "8MU"
     netn = "NETN"
     sds = "SDS"
+    other2 = "Tris-EDTA-sucrose + lysozyme + mutanolysin"  
 
 
 class Experiment(ExperimentTimestamp, Base):
     __tablename__ = "experiment"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    project_id: Mapped[int] = mapped_column(
-        ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+    project_id: Mapped[int | None] = mapped_column(
+        ForeignKey("project.id", ondelete="CASCADE"), nullable=True
     )
     record_no: Mapped[str] = mapped_column(
         Text,
@@ -46,7 +55,7 @@ class Experiment(ExperimentTimestamp, Base):
     )
     exp_Type = mapped_column(
         SAEnum(ExperimentType, native_enum=True, validate_strings=True),
-        nullable=True,
+        nullable=True, # options need to be updated dynamically from ExperimentType enum
         info={
             "ui": {
                 "label": "Type",
@@ -162,7 +171,8 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
             "experiment_id",
             "run_no",
             "search_no",
-            name="uq_experiment_run_search",
+            "label",
+            name="uq_experiment_run_search_label",
         ),
     )
 
@@ -172,6 +182,33 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
     )
     run_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     search_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    label: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="0",
+        info={"ui": {"label": "Label"}},
+    )
+    label_type: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={
+            "ui": {
+                "label": "Label Type",
+                "component": "Select",
+                "allowClear": True,
+                "tag": True,
+                "options": [
+                    {"label": "Label-free", "value": "LabelFree"},
+                    {"label": "TMT 10", "value": "TMT10"},
+                    {"label": "TMT 11", "value": "TMT11"},
+                    {"label": "TMT 16", "value": "TMT16"},
+                    {"label": "TMT 18", "value": "TMT18"},
+                    {"label": "SILAC", "value": "SILAC"},
+                    {"label": "Other", "value": "Other"},
+                ],
+            }
+        },
+    )
 
     db_search_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     gpgrouper_flag: Mapped[bool] = mapped_column(Boolean, default=False)

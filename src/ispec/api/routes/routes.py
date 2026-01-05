@@ -1,6 +1,8 @@
 import os
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from ispec.db.connect import get_session_dep
 from typing import Type, Callable
@@ -168,7 +170,16 @@ def _add_schema_endpoint(
     """Register the ``/schema`` endpoint on ``router``."""
 
     @router.get("/schema")
-    def get_schema():  # pragma: no cover - trivial wrapper
+    def get_schema(request: Request):  # pragma: no cover - trivial wrapper
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            from ispec.db.models import UserRole
+
+            if user.role == UserRole.client and model is not Project:
+                raise HTTPException(
+                    status_code=403, detail="Client accounts can only access projects."
+                )
+
         return build_form_schema(
             model, create_model, route_prefix_for_table=route_prefix_for_table
         )
@@ -184,9 +195,22 @@ def _add_crud_endpoints(
 ) -> None:
     """Attach basic CRUD endpoints to ``router``."""
 
+    def _duplicate_detail() -> str:
+        model = crud.model
+        if model is ExperimentRun:
+            return "ExperimentRun with this (experiment_id, run_no, search_no, label) already exists."
+        return f"{tag} already exists"
+
+    def _integrity_error(exc: IntegrityError) -> HTTPException:
+        message = str(getattr(exc, "orig", exc)).lower()
+        if "unique" in message or "duplicate" in message:
+            return HTTPException(status_code=409, detail=_duplicate_detail())
+        return HTTPException(status_code=400, detail=f"{tag} violates database constraints.")
+
     @router.get("")
     @router.get("/")
     def list_items(
+        request: Request,
         response: Response,
         q: str | None = None,
         limit: int = Query(default=50, ge=1, le=1000),
@@ -199,6 +223,20 @@ def _add_crud_endpoints(
     ):
         model = crud.model
         query = db.query(model)
+
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            from ispec.db.models import AuthUserProject, UserRole
+
+            if user.role == UserRole.client:
+                if model is not Project:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Client accounts can only access projects.",
+                    )
+                query = query.join(
+                    AuthUserProject, AuthUserProject.project_id == Project.id
+                ).filter(AuthUserProject.user_id == user.id)
 
         if ids:
             query = query.filter(getattr(model, "id").in_(ids))
@@ -244,10 +282,35 @@ def _add_crud_endpoints(
         return payload
 
     @router.get("/{item_id}", response_model=read_model, response_model_exclude_none=True)
-    def get_item(item_id: int, db: Session = Depends(get_session_dep)):
+    def get_item(item_id: int, request: Request, db: Session = Depends(get_session_dep)):
+        model = crud.model
         obj = crud.get(db, item_id)
         if obj is None:
             raise HTTPException(status_code=404, detail=f"{tag} not found")
+
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            from ispec.db.models import AuthUserProject, UserRole
+
+            if user.role == UserRole.client:
+                if model is not Project:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Client accounts can only access projects.",
+                    )
+                allowed = bool(
+                    (
+                        db.query(AuthUserProject.project_id)
+                        .filter(
+                            AuthUserProject.user_id == user.id,
+                            AuthUserProject.project_id == int(item_id),
+                        )
+                        .first()
+                    )
+                )
+                if not allowed:
+                    raise HTTPException(status_code=404, detail=f"{tag} not found")
+
         return read_model.model_validate(obj).model_dump()
 
     @router.post(
@@ -269,9 +332,13 @@ def _add_crud_endpoints(
     def create_item(payload: create_model, db: Session = Depends(get_session_dep)):
         # Use exclude_unset so SQLAlchemy/Python defaults can still apply when
         # the client omits optional fields (instead of forcing NULL).
-        obj = crud.create(db, payload.model_dump(exclude_unset=True))
+        try:
+            obj = crud.create(db, payload.model_dump(exclude_unset=True))
+        except IntegrityError as exc:
+            db.rollback()
+            raise _integrity_error(exc)
         if obj is None:
-            raise HTTPException(status_code=409, detail=f"{tag} already exists")
+            raise HTTPException(status_code=409, detail=_duplicate_detail())
         return read_model.model_validate(obj).model_dump()
 
     @router.put("/{item_id}", response_model=read_model, response_model_exclude_none=True)
@@ -279,10 +346,11 @@ def _add_crud_endpoints(
         obj = crud.get(db, item_id)
         if obj is None:
             raise HTTPException(status_code=404, detail=f"{tag} not found")
-        for field, value in payload.model_dump(exclude_unset=True).items():
-            setattr(obj, field, value)
-        db.commit()
-        db.refresh(obj)
+        try:
+            obj = crud.update(db, obj, payload.model_dump(exclude_unset=True))
+        except IntegrityError as exc:
+            db.rollback()
+            raise _integrity_error(exc)
         return read_model.model_validate(obj).model_dump()
 
     @router.delete("/{item_id}")
@@ -298,23 +366,43 @@ def _add_options_endpoints(router: APIRouter, crud, *, model) -> None:
 
     @router.get("/options")
     def options(
+        request: Request,
         q: str | None = None,
         limit: int = Query(default=20, ge=1, le=100),
         ids: list[int] | None = Query(default=None),
         exclude_ids: list[int] | None = Query(default=None),
         db: Session = Depends(get_session_dep),
     ):
-        return crud.list_options(
-            db, q=q, limit=limit, ids=ids, exclude_ids=exclude_ids
-        )
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            from ispec.db.models import UserRole
+
+            if user.role == UserRole.client:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Client accounts cannot access options endpoints.",
+                )
+
+        return crud.list_options(db, q=q, limit=limit, ids=ids, exclude_ids=exclude_ids)
 
     @router.get("/options/{field}")
     def options_for_field(
         field: str,
+        request: Request,
         q: str | None = None,
         limit: int = 20,
         db: Session = Depends(get_session_dep),
     ):
+        user = getattr(request.state, "user", None)
+        if user is not None:
+            from ispec.db.models import UserRole
+
+            if user.role == UserRole.client:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Client accounts cannot access options endpoints.",
+                )
+
         from sqlalchemy import inspect as sa_inspect
 
         mapper = sa_inspect(model)
@@ -555,35 +643,164 @@ if _enabled("people"):
 
 # ========================= Project ==============================
 if _enabled("projects"):
-    @router.get("/projects/stats")
-    def project_stats(db: Session = Depends(get_session_dep)):
-        from sqlalchemy import func
+    class ProjectNav(BaseModel):
+        scope: str = Field(description="Navigation scope: all | current | to-bill")
+        exists: bool
+        in_scope: bool
+        first_id: int | None
+        last_id: int | None
+        prev_id: int | None
+        next_id: int | None
+        prev_count: int
+        next_count: int
+        total_count: int
 
-        total = db.query(func.count(Project.id)).scalar() or 0
-        current = (
-            db.query(func.count(Project.id))
-            .filter(Project.prj_Current_FLAG.is_(True))
-            .scalar()
-            or 0
+    @router.get("/projects/stats")
+    def project_stats(request: Request, db: Session = Depends(get_session_dep)):
+        from sqlalchemy import func
+        from ispec.db.models import AuthUserProject, UserRole
+
+        user = getattr(request.state, "user", None)
+        join_access = bool(user is not None and user.role == UserRole.client)
+
+        total_query = db.query(func.count(Project.id))
+        if join_access:
+            total_query = total_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        total = total_query.scalar() or 0
+
+        current_query = db.query(func.count(Project.id)).filter(
+            Project.prj_Current_FLAG.is_(True)
         )
-        to_bill = (
-            db.query(func.count(Project.id))
-            .filter(Project.prj_Billing_ReadyToBill.is_(True))
-            .scalar()
-            or 0
+        if join_access:
+            current_query = current_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        current = current_query.scalar() or 0
+
+        to_bill_query = db.query(func.count(Project.id)).filter(
+            Project.prj_Billing_ReadyToBill.is_(True)
         )
-        paid = (
-            db.query(func.count(Project.id))
-            .filter(Project.prj_PaymentReceived.is_(True))
-            .scalar()
-            or 0
+        if join_access:
+            to_bill_query = to_bill_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        to_bill = to_bill_query.scalar() or 0
+
+        paid_query = db.query(func.count(Project.id)).filter(
+            Project.prj_PaymentReceived.is_(True)
         )
+        if join_access:
+            paid_query = paid_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        paid = paid_query.scalar() or 0
+
         return {
             "projects_total": int(total),
             "projects_current": int(current),
             "projects_to_bill": int(to_bill),
             "projects_paid": int(paid),
         }
+
+    @router.get("/projects/{project_id}/nav", response_model=ProjectNav)
+    def project_nav(
+        project_id: int,
+        request: Request,
+        scope: str | None = Query(default="all", description="all | current | to-bill"),
+        db: Session = Depends(get_session_dep),
+    ):
+        from sqlalchemy import func
+        from ispec.db.models import AuthUserProject, UserRole
+
+        user = getattr(request.state, "user", None)
+        join_access = bool(user is not None and user.role == UserRole.client)
+
+        scope_raw = (scope or "all").strip().lower()
+        if scope_raw in {"", "all"}:
+            scope_norm = "all"
+        elif scope_raw in {"current"}:
+            scope_norm = "current"
+        elif scope_raw in {"to-bill", "to_bill", "tobill"}:
+            scope_norm = "to-bill"
+        else:
+            raise HTTPException(status_code=400, detail=f"Invalid scope: {scope_raw}")
+
+        filters = []
+        if scope_norm == "current":
+            filters.append(Project.prj_Current_FLAG.is_(True))
+        elif scope_norm == "to-bill":
+            filters.append(Project.prj_Billing_ReadyToBill.is_(True))
+
+        exists_query = db.query(func.count(Project.id)).filter(Project.id == project_id)
+        if join_access:
+            exists_query = exists_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        exists = bool(exists_query.scalar() or 0)
+
+        in_scope_query = db.query(func.count(Project.id)).filter(Project.id == project_id, *filters)
+        if join_access:
+            in_scope_query = in_scope_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        in_scope = bool(in_scope_query.scalar() or 0)
+
+        total_count_query = db.query(func.count(Project.id)).filter(*filters)
+        first_id_query = db.query(func.min(Project.id)).filter(*filters)
+        last_id_query = db.query(func.max(Project.id)).filter(*filters)
+        if join_access:
+            total_count_query = total_count_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+            first_id_query = first_id_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+            last_id_query = last_id_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+
+        total_count = int(total_count_query.scalar() or 0)
+        first_id = first_id_query.scalar()
+        last_id = last_id_query.scalar()
+
+        prev_query = db.query(func.max(Project.id)).filter(Project.id < project_id, *filters)
+        next_query = db.query(func.min(Project.id)).filter(Project.id > project_id, *filters)
+        if join_access:
+            prev_query = prev_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+            next_query = next_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        prev_id = prev_query.scalar()
+        next_id = next_query.scalar()
+
+        prev_count_query = db.query(func.count(Project.id)).filter(Project.id < project_id, *filters)
+        next_count_query = db.query(func.count(Project.id)).filter(Project.id > project_id, *filters)
+        if join_access:
+            prev_count_query = prev_count_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+            next_count_query = next_count_query.join(
+                AuthUserProject, AuthUserProject.project_id == Project.id
+            ).filter(AuthUserProject.user_id == user.id)
+        prev_count = int(prev_count_query.scalar() or 0)
+        next_count = int(next_count_query.scalar() or 0)
+
+        return ProjectNav(
+            scope=scope_norm,
+            exists=exists,
+            in_scope=in_scope if scope_norm != "all" else exists,
+            first_id=first_id,
+            last_id=last_id,
+            prev_id=prev_id,
+            next_id=next_id,
+            prev_count=prev_count,
+            next_count=next_count,
+            total_count=total_count,
+        )
 
     router.include_router(
         generate_crud_router(

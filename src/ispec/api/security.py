@@ -258,11 +258,25 @@ def get_current_user(
     return row.user
 
 
-def require_user(user: AuthUser | None = Depends(get_current_user)) -> AuthUser:
+_PASSWORD_CHANGE_ALLOWED_PATHS = {
+    "/api/auth/me",
+    "/api/auth/logout",
+    "/api/auth/change-password",
+}
+
+
+def require_user(
+    request: Request,
+    user: AuthUser | None = Depends(get_current_user),
+) -> AuthUser:
     if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated.")
+
+    if getattr(user, "must_change_password", False):
+        path = (request.url.path or "").rstrip("/")
+        if path not in _PASSWORD_CHANGE_ALLOWED_PATHS:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Password change required.")
+
     return user
 
 
@@ -302,6 +316,7 @@ def require_access(
         )
 
     if not _require_login():
+        request.state.user = None
         return None
 
     user = get_current_user(request, db)
@@ -310,10 +325,13 @@ def require_access(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
         )
 
-    if request.method in {"POST", "PUT", "DELETE"} and user.role == UserRole.viewer:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail="Read-only account."
-        )
+    request.state.user = user
+
+    if getattr(user, "must_change_password", False):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Password change required.")
+
+    if request.method in {"POST", "PUT", "DELETE"} and user.role in {UserRole.viewer, UserRole.client}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Read-only account.")
 
     return user
 
@@ -339,6 +357,7 @@ def require_assistant_access(
         )
 
     if not _require_login():
+        request.state.user = None
         return None
 
     user = get_current_user(request, db)
@@ -346,5 +365,10 @@ def require_assistant_access(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
         )
+
+    request.state.user = user
+
+    if getattr(user, "must_change_password", False):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Password change required.")
 
     return user

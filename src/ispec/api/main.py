@@ -86,6 +86,7 @@ def _bootstrap_dev_admin_user() -> None:
 
     username = (os.getenv("ISPEC_DEV_ADMIN_USERNAME") or "admin").strip()
     password = os.getenv("ISPEC_DEV_ADMIN_PASSWORD") or "admin"
+    reset_password = _is_truthy(os.getenv("ISPEC_DEV_ADMIN_RESET_PASSWORD"))
     if not username:
         logger.warning("ISPEC_DEV_DEFAULT_ADMIN is enabled but username is empty; skipping.")
         return
@@ -96,8 +97,34 @@ def _bootstrap_dev_admin_user() -> None:
         from ispec.db.models import AuthUser, UserRole
 
         with get_session() as db:
-            if db.query(AuthUser).count() > 0:
+            existing = db.query(AuthUser).filter(AuthUser.username == username).first()
+            if existing is not None:
+                changed = False
+
+                if existing.role != UserRole.admin:
+                    existing.role = UserRole.admin
+                    changed = True
+
+                if not existing.is_active:
+                    existing.is_active = True
+                    changed = True
+
+                if reset_password:
+                    salt_b64, hash_b64, iterations = hash_password(password)
+                    existing.password_hash = hash_b64
+                    existing.password_salt = salt_b64
+                    existing.password_iterations = iterations
+                    changed = True
+
+                if changed:
+                    db.commit()
+                    logger.warning(
+                        "Dev admin user updated (username=%r, reset_password=%s). Change this for non-dev use.",
+                        username,
+                        reset_password,
+                    )
                 return
+
             salt_b64, hash_b64, iterations = hash_password(password)
             user = AuthUser(
                 username=username,

@@ -5,7 +5,7 @@ import numpy as np
 
 try:  # pragma: no cover - exercised via tests
     from sentence_transformers import SentenceTransformer, util
-except ImportError:  # pragma: no cover - handled in tests
+except Exception:  # pragma: no cover - handled in tests
     SentenceTransformer = None  # type: ignore
     util = None  # type: ignore
 

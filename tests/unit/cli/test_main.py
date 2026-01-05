@@ -65,6 +65,7 @@ def test_api_start(monkeypatch):
     fake_api_main.app = object()
     monkeypatch.setitem(sys.modules, "uvicorn", fake_uvicorn)
     monkeypatch.setitem(sys.modules, "ispec.api.main", fake_api_main)
+    monkeypatch.setenv("ISPEC_API_KEY", "test-key")
 
     monkeypatch.setattr(
         sys,

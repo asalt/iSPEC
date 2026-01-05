@@ -1,7 +1,7 @@
 import pytest
 
-from ispec.db.models import Person, Project, ProjectType
-from ispec.db.models import Person, Project, ProjectType, ProjectComment
+from ispec.db.models import Person, Project, ProjectComment, ProjectType
+from ispec.db.models.support import LetterOfSupport
 from ispec.api.models.modelmaker import make_pydantic_model_from_sqlalchemy
 from ispec.api.routes.schema import build_form_schema
 from ispec.api.routes.utils.ui_meta import ui_from_column
@@ -70,3 +70,14 @@ def test_foreign_key_field_uses_route_prefix_mapping():
     project_ui = schema["properties"]["project_id"]["ui"]
     assert project_ui["component"] == "SelectAsync"
     assert project_ui["optionsEndpoint"] == "/projects/options"
+
+
+def test_system_fields_are_marked_read_only():
+    project_import_ui = ui_from_column(Project.__table__.columns["prj_LegacyImportTS"])
+    assert project_import_ui.get("readOnly") is True
+
+    project_display_ui = ui_from_column(Project.__table__.columns["prj_PRJ_DisplayID"])
+    assert project_display_ui.get("readOnly") is True
+
+    foundcount_ui = ui_from_column(LetterOfSupport.__table__.columns["los_FoundCount"])
+    assert foundcount_ui.get("readOnly") is True

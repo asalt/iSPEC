@@ -1,6 +1,7 @@
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from datetime import datetime
 
 from ispec.api.routes.routes import generate_crud_router
 from ispec.db.crud import ProjectCRUD
@@ -90,3 +91,41 @@ def test_project_router_crud_and_route_prefix(client):
     # ensure project is gone
     resp = client.get(f"/projects/{project_id}")
     assert resp.status_code == 404
+
+
+def test_project_update_ignores_readonly_fields(client):
+    payload = {
+        "prj_AddedBy": "tester",
+        "prj_ProjectTitle": "Editable Title",
+        "prj_ProjectBackground": "Background info",
+    }
+
+    resp = client.post("/projects", json=payload)
+    assert resp.status_code == 201
+    created = resp.json()
+    project_id = created["id"]
+    original_display_id = created.get("prj_PRJ_DisplayID")
+    assert original_display_id
+
+    update_payload = {
+        "prj_AddedBy": "tester",
+        "prj_ProjectTitle": "Renamed Title",
+        "prj_ProjectBackground": "Updated background",
+        "prj_LegacyImportTS": datetime(2000, 1, 1, 0, 0, 0).isoformat(),
+        "prj_PRJ_DisplayID": "HACKED",
+        "prj_PRJ_DisplayTitle": "HACKED TITLE",
+    }
+
+    resp = client.put(f"/projects/{project_id}", json=update_payload)
+    assert resp.status_code == 200
+    updated = resp.json()
+
+    assert updated["prj_ProjectTitle"] == "Renamed Title"
+    assert updated["prj_PRJ_DisplayID"] == original_display_id
+    assert updated["prj_PRJ_DisplayTitle"].endswith("Renamed Title")
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        project = db.get(Project, project_id)
+        assert project is not None
+        assert project.prj_LegacyImportTS is None
+        assert project.prj_PRJ_DisplayID == original_display_id

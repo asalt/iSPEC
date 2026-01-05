@@ -7,7 +7,7 @@ from .experiment import Experiment, ExperimentRun, E2G, Job, JobType, JobStatus
 from .omics import PSM
 from .files import MSRawFile, ProjectFile, RawFileType, RawFileState, StorageBackend
 from .support import LetterOfSupport
-from .auth import AuthUser, AuthSession, UserRole
+from .auth import AuthUser, AuthSession, AuthUserProject, UserRole
 from .sync import LegacySyncState
 from .engine import sqlite_engine, initialize_db
 
@@ -37,6 +37,7 @@ __all__ = [
     "LetterOfSupport",
     "AuthUser",
     "AuthSession",
+    "AuthUserProject",
     "UserRole",
     "LegacySyncState",
     "sqlite_engine",
