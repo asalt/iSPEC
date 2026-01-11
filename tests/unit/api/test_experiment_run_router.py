@@ -7,6 +7,8 @@ from ispec.db.crud import ExperimentRunCRUD, ExperimentCRUD
 from ispec.db.models import Project, Experiment, ExperimentRun
 from ispec.db.connect import get_session_dep, make_session_factory, sqlite_engine, initialize_db
 
+pytestmark = pytest.mark.testclient
+
 
 @pytest.fixture
 def client(tmp_path):

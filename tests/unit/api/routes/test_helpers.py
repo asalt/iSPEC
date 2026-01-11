@@ -12,6 +12,8 @@ from ispec.db.models import Person
 from ispec.db.crud import PersonCRUD
 from ispec.db.connect import get_session_dep, make_session_factory, sqlite_engine, initialize_db
 
+pytestmark = pytest.mark.testclient
+
 
 def test_add_schema_endpoint_exposes_schema():
     router = APIRouter(prefix="/people", tags=["Person"])

@@ -1,22 +1,38 @@
+import inspect
+from types import SimpleNamespace
+
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
+from sqlalchemy.orm import sessionmaker
 
 from ispec.api.routes.routes import generate_crud_router
+from ispec.db.connect import sqlite_engine
 from ispec.db.crud import E2GCRUD
-from ispec.db.models import Project, Experiment, ExperimentRun, E2G
-from ispec.db.connect import get_session_dep, make_session_factory, sqlite_engine, initialize_db
+from ispec.omics.models import E2G, OmicsBase
+
+
+def _find_endpoint(router, *, path: str, method: str):
+    for route in router.routes:
+        if getattr(route, "path", None) != path:
+            continue
+        methods = getattr(route, "methods", set()) or set()
+        if method in methods:
+            return route.endpoint
+    raise AssertionError(f"Route not found: {method} {path}")
+
+
+class _DummyRequest:
+    def __init__(self):
+        self.state = SimpleNamespace()
 
 
 @pytest.fixture
-def client(tmp_path):
+def e2g_router_env(tmp_path):
     db_url = f"sqlite:///{tmp_path}/e2g.db"
     engine = sqlite_engine(db_url)
-    initialize_db(engine)
-    test_session = make_session_factory(engine)
+    OmicsBase.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(bind=engine)
 
-    app = FastAPI()
-    route_prefix_map: dict[str, str] = {}
     router = generate_crud_router(
         model=E2G,
         crud_class=E2GCRUD,
@@ -24,67 +40,42 @@ def client(tmp_path):
         tag="E2G",
         exclude_fields=set(),
         create_exclude_fields={"id", "E2G_CreationTS", "E2G_ModificationTS"},
-        route_prefix_by_table=route_prefix_map,
+        route_prefix_by_table={},
     )
-    app.include_router(router)
-
-    def override_get_session():
-        with test_session() as session:
-            yield session
-
-    app.dependency_overrides[get_session_dep] = override_get_session
-
-    with TestClient(app) as client:
-        client.session_factory = test_session  # type: ignore[attr-defined]
-        client.route_prefix_map = route_prefix_map  # type: ignore[attr-defined]
-        yield client
+    return router, SessionLocal
 
 
-def test_e2g_router_exposes_by_run_endpoint(client):
-    # Endpoint should exist even with no rows present
-    resp = client.get("/experiment_to_gene/by_run/1")
-    assert resp.status_code == 200
-    assert resp.json() == []
+def test_e2g_router_exposes_by_run_endpoint(e2g_router_env):
+    router, SessionLocal = e2g_router_env
+    endpoint = _find_endpoint(router, path="/experiment_to_gene/by_run/{run_id}", method="GET")
+    with SessionLocal() as db:
+        assert endpoint(run_id=1, q=None, geneidtype=None, limit=100, offset=0, db=db) == []
 
 
-def test_e2g_crud(client):
-    # seed project -> experiment -> run
-    with client.session_factory() as db:  # type: ignore[attr-defined]
-        project = Project(prj_AddedBy="tester", prj_ProjectTitle="X")
-        db.add(project)
-        db.flush()
+def test_e2g_crud(e2g_router_env):
+    router, SessionLocal = e2g_router_env
+    create = _find_endpoint(router, path="/experiment_to_gene", method="POST")
+    get_item = _find_endpoint(router, path="/experiment_to_gene/{item_id}", method="GET")
+    list_by_run = _find_endpoint(router, path="/experiment_to_gene/by_run/{run_id}", method="GET")
+    delete = _find_endpoint(router, path="/experiment_to_gene/{item_id}", method="DELETE")
 
-        experiment = Experiment(project_id=project.id, record_no=f"{project.id:05d}-01")
-        db.add(experiment)
-        db.flush()
+    payload_model = inspect.signature(create).parameters["payload"].annotation
+    payload = payload_model(experiment_run_id=1, gene="TP53", geneidtype="symbol")
 
-        run = ExperimentRun(experiment_id=experiment.id, run_no=1, search_no=1)
-        db.add(run)
-        db.commit()
-        db.refresh(run)
+    with SessionLocal() as db:
+        created = create(payload, db=db)
+        e2g_id = created["id"]
 
-        run_id = run.id
+        got = get_item(e2g_id, request=_DummyRequest(), db=db)
+        assert got["experiment_run_id"] == 1
+        assert got["gene"] == "TP53"
 
-    payload = {"experiment_run_id": run_id, "gene": "TP53", "geneidtype": "symbol"}
-    resp = client.post("/experiment_to_gene/", json=payload)
-    assert resp.status_code == 201
-    e2g_id = resp.json()["id"]
+        items = list_by_run(run_id=1, q=None, geneidtype=None, limit=100, offset=0, db=db)
+        assert any(row["id"] == e2g_id for row in items)
 
-    resp = client.get(f"/experiment_to_gene/{e2g_id}")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["experiment_run_id"] == run_id
-    assert data["gene"] == "TP53"
+        resp = delete(e2g_id, db=db)
+        assert resp["status"] == "deleted"
 
-    # convenience listing by run
-    resp = client.get(f"/experiment_to_gene/by_run/{run_id}")
-    assert resp.status_code == 200
-    items = resp.json()
-    assert any(row["id"] == e2g_id for row in items)
-
-    resp = client.delete(f"/experiment_to_gene/{e2g_id}")
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "deleted"
-
-    resp = client.get(f"/experiment_to_gene/{e2g_id}")
-    assert resp.status_code == 404
+        with pytest.raises(HTTPException) as exc:
+            get_item(e2g_id, request=_DummyRequest(), db=db)
+        assert exc.value.status_code == 404

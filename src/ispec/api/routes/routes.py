@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from ispec.db.connect import get_session_dep
 from typing import Type, Callable
+from ispec.omics.connect import get_omics_session_dep
 from ispec.db.models import (
     Person,
     Project,
@@ -192,6 +193,7 @@ def _add_crud_endpoints(
     create_model,
     *,
     tag: str,
+    session_dep: Callable[..., Session],
 ) -> None:
     """Attach basic CRUD endpoints to ``router``."""
 
@@ -219,7 +221,7 @@ def _add_crud_endpoints(
         ids: list[int] | None = Query(default=None),
         exclude_ids: list[int] | None = Query(default=None),
         wrap: bool = Query(default=False, description="Wrap response as {items,total}"),
-        db: Session = Depends(get_session_dep),
+        db: Session = Depends(session_dep),
     ):
         model = crud.model
         query = db.query(model)
@@ -282,7 +284,7 @@ def _add_crud_endpoints(
         return payload
 
     @router.get("/{item_id}", response_model=read_model, response_model_exclude_none=True)
-    def get_item(item_id: int, request: Request, db: Session = Depends(get_session_dep)):
+    def get_item(item_id: int, request: Request, db: Session = Depends(session_dep)):
         model = crud.model
         obj = crud.get(db, item_id)
         if obj is None:
@@ -329,7 +331,7 @@ def _add_crud_endpoints(
         description="Create a new item. Required fields are marked with * in the request body below.",
         status_code=201,
     )
-    def create_item(payload: create_model, db: Session = Depends(get_session_dep)):
+    def create_item(payload: create_model, db: Session = Depends(session_dep)):
         # Use exclude_unset so SQLAlchemy/Python defaults can still apply when
         # the client omits optional fields (instead of forcing NULL).
         try:
@@ -342,7 +344,7 @@ def _add_crud_endpoints(
         return read_model.model_validate(obj).model_dump()
 
     @router.put("/{item_id}", response_model=read_model, response_model_exclude_none=True)
-    def update_item(item_id: int, payload: create_model, db: Session = Depends(get_session_dep)):
+    def update_item(item_id: int, payload: create_model, db: Session = Depends(session_dep)):
         obj = crud.get(db, item_id)
         if obj is None:
             raise HTTPException(status_code=404, detail=f"{tag} not found")
@@ -354,14 +356,20 @@ def _add_crud_endpoints(
         return read_model.model_validate(obj).model_dump()
 
     @router.delete("/{item_id}")
-    def delete_item(item_id: int, db: Session = Depends(get_session_dep)):
+    def delete_item(item_id: int, db: Session = Depends(session_dep)):
         success = crud.delete(db, item_id)
         if not success:
             raise HTTPException(status_code=404, detail=f"{tag} not found")
         return {"status": "deleted", "id": item_id}
 
 
-def _add_options_endpoints(router: APIRouter, crud, *, model) -> None:
+def _add_options_endpoints(
+    router: APIRouter,
+    crud,
+    *,
+    model,
+    session_dep: Callable[..., Session],
+) -> None:
     """Attach ``/options`` endpoints for async select components."""
 
     @router.get("/options")
@@ -371,7 +379,7 @@ def _add_options_endpoints(router: APIRouter, crud, *, model) -> None:
         limit: int = Query(default=20, ge=1, le=100),
         ids: list[int] | None = Query(default=None),
         exclude_ids: list[int] | None = Query(default=None),
-        db: Session = Depends(get_session_dep),
+        db: Session = Depends(session_dep),
     ):
         user = getattr(request.state, "user", None)
         if user is not None:
@@ -391,7 +399,7 @@ def _add_options_endpoints(router: APIRouter, crud, *, model) -> None:
         request: Request,
         q: str | None = None,
         limit: int = 20,
-        db: Session = Depends(get_session_dep),
+        db: Session = Depends(session_dep),
     ):
         user = getattr(request.state, "user", None)
         if user is not None:
@@ -437,6 +445,7 @@ def generate_crud_router(
     create_exclude_fields: set[str] | None = None,
     optional_all: bool = False,
     route_prefix_by_table: dict[str, str] | None = None,
+    session_dep: Callable[..., Session] = get_session_dep,
 ) -> APIRouter:
     """
     Create a FastAPI router providing CRUD and metadata endpoints for a SQLAlchemy model.
@@ -550,7 +559,7 @@ def generate_crud_router(
             geneidtype: str | None = None,
             limit: int = Query(default=100, ge=1, le=1000),
             offset: int = Query(default=0, ge=0),
-            db: Session = Depends(get_session_dep),
+            db: Session = Depends(session_dep),
         ):
             query = db.query(E2G).filter(E2G.experiment_run_id == run_id)
             if q:
@@ -567,7 +576,7 @@ def generate_crud_router(
             q: str | None = None,
             limit: int = Query(default=200, ge=1, le=5000),
             offset: int = Query(default=0, ge=0),
-            db: Session = Depends(get_session_dep),
+            db: Session = Depends(session_dep),
         ):
             query = db.query(PSM).filter(PSM.experiment_run_id == run_id)
             if q:
@@ -585,7 +594,7 @@ def generate_crud_router(
             q: str | None = None,
             limit: int = Query(default=200, ge=1, le=5000),
             offset: int = Query(default=0, ge=0),
-            db: Session = Depends(get_session_dep),
+            db: Session = Depends(session_dep),
         ):
             query = db.query(MSRawFile).filter(MSRawFile.experiment_run_id == run_id)
             if q:
@@ -599,9 +608,9 @@ def generate_crud_router(
     # order and would otherwise treat ``/options`` as a candidate for
     # ``/{item_id}``, resulting in a ``422`` response when the path parameter
     # fails integer validation.
-    _add_options_endpoints(router, crud, model=model)
+    _add_options_endpoints(router, crud, model=model, session_dep=session_dep)
     _add_crud_endpoints(
-        router, crud, ReadModel, CreateModel, tag=tag
+        router, crud, ReadModel, CreateModel, tag=tag, session_dep=session_dep
     )
 
     return router
@@ -856,6 +865,7 @@ if _enabled("psms"):
             exclude_fields={"id"},
             create_exclude_fields={"psm_CreationTS", "psm_ModificationTS"},
             route_prefix_by_table=_ROUTE_PREFIX_MAP,
+            session_dep=get_omics_session_dep,
         )
     )
 
@@ -1030,6 +1040,7 @@ if _enabled("experiment_to_gene"):
             exclude_fields={"id"},
             create_exclude_fields={"E2G_CreationTS", "E2G_ModificationTS"},
             route_prefix_by_table=_ROUTE_PREFIX_MAP,
+            session_dep=get_omics_session_dep,
         )
     )
 
@@ -1059,7 +1070,7 @@ if _enabled("experiment_to_gene"):
     def bulk_e2g(
         payload: list[dict],
         upsert: bool = Query(default=True),
-        db: Session = Depends(get_session_dep),
+        db: Session = Depends(get_omics_session_dep),
     ):
         """Bulk insert or upsert E2G rows.
 
@@ -1084,7 +1095,7 @@ if _enabled("experiment_to_gene") and _enabled("experiment_runs"):
         run_id: int,
         payload: list[dict],
         upsert: bool = Query(default=True),
-        db: Session = Depends(get_session_dep),
+        db: Session = Depends(get_omics_session_dep),
     ):
         crud = E2GCRUD()
         rows = [dict(r, experiment_run_id=run_id) for r in payload]
@@ -1239,13 +1250,19 @@ if _enabled("experiment_to_gene"):
         geneidtype: str | None = None,
         limit: int = Query(default=200, ge=1, le=2000),
         offset: int = Query(default=0, ge=0),
-        db: Session = Depends(get_session_dep),
+        core_db: Session = Depends(get_session_dep),
+        omics_db: Session = Depends(get_omics_session_dep),
     ):
-        from ispec.db.models import ExperimentRun as _Run
+        run_ids = [
+            int(row[0])
+            for row in core_db.query(ExperimentRun.id)
+            .filter(ExperimentRun.experiment_id == experiment_id)
+            .all()
+        ]
+        if not run_ids:
+            return []
 
-        query = db.query(E2G).join(_Run, E2G.experiment_run_id == _Run.id).filter(
-            _Run.experiment_id == experiment_id
-        )
+        query = omics_db.query(E2G).filter(E2G.experiment_run_id.in_(run_ids))
         if q:
             query = query.filter(E2G.gene.ilike(f"%{q}%"))
         if geneidtype:
@@ -1263,16 +1280,20 @@ if _enabled("experiment_to_gene"):
         geneidtype: str | None = None,
         limit: int = Query(default=500, ge=1, le=5000),
         offset: int = Query(default=0, ge=0),
-        db: Session = Depends(get_session_dep),
+        core_db: Session = Depends(get_session_dep),
+        omics_db: Session = Depends(get_omics_session_dep),
     ):
-        from ispec.db.models import ExperimentRun as _Run, Experiment as _Exp
+        run_ids = [
+            int(row[0])
+            for row in core_db.query(ExperimentRun.id)
+            .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
+            .filter(Experiment.project_id == project_id)
+            .all()
+        ]
+        if not run_ids:
+            return []
 
-        query = (
-            db.query(E2G)
-            .join(_Run, E2G.experiment_run_id == _Run.id)
-            .join(_Exp, _Run.experiment_id == _Exp.id)
-            .filter(_Exp.project_id == project_id)
-        )
+        query = omics_db.query(E2G).filter(E2G.experiment_run_id.in_(run_ids))
         if q:
             query = query.filter(E2G.gene.ilike(f"%{q}%"))
         if geneidtype:

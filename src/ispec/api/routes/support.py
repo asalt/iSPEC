@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from ispec.api.security import require_access, require_assistant_access
 from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.assistant.connect import get_assistant_session_dep
-from ispec.assistant.formatting import split_plan_final
+from ispec.assistant.formatting import split_compare_finals, split_plan_final
 from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
@@ -22,6 +22,7 @@ from ispec.assistant.service import (
     _system_prompt_answer,
     _system_prompt_planner,
     _system_prompt_review,
+    _system_prompt_review_decider,
     generate_reply,
 )
 from ispec.assistant.tools import (
@@ -34,6 +35,7 @@ from ispec.assistant.tools import (
 )
 from ispec.db.connect import get_session_dep
 from ispec.db.models import AuthUser, UserRole
+from ispec.omics.connect import get_omics_session_dep
 from ispec.schedule.connect import get_schedule_session_dep
 
 
@@ -43,6 +45,11 @@ _PROJECT_ROUTE_RE = re.compile(r"/project/(\d+)", re.IGNORECASE)
 _EXPERIMENT_ROUTE_RE = re.compile(r"/experiment/(\d+)", re.IGNORECASE)
 _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
 _CONTEXT_SCHEMA_VERSION = 1
+_EXPLICIT_TOOL_REQUEST_RE = re.compile(r"\b(use|call|run)\s+(a\s+)?tool\b", re.IGNORECASE)
+_COUNT_PROJECTS_RE = re.compile(
+    r"\bhow\s+many\s+projects?\b|\bnumber\s+of\s+projects?\b|\bcount\s+projects?\b",
+    re.IGNORECASE,
+)
 
 
 def utcnow() -> datetime:
@@ -68,10 +75,32 @@ class ChatRequest(BaseModel):
     ui: UIContext | None = None
 
 
+class ChatCompareChoice(BaseModel):
+    index: int = Field(ge=0, le=1)
+    message: str
+
+
+class ChatComparePayload(BaseModel):
+    userMessageId: int = Field(ge=1)
+    choices: list[ChatCompareChoice] = Field(min_length=2, max_length=2)
+
+
 class ChatResponse(BaseModel):
     sessionId: str
-    messageId: int
-    message: str
+    messageId: int | None = None
+    message: str | None = None
+    compare: ChatComparePayload | None = None
+
+
+class ChooseResponse(ChatResponse):
+    pass
+
+
+class ChooseRequest(BaseModel):
+    sessionId: str = Field(min_length=1, max_length=256)
+    userMessageId: int = Field(ge=1)
+    choiceIndex: int = Field(ge=0, le=1)
+    ui: UIContext | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -153,9 +182,40 @@ def _self_review_enabled() -> bool:
     return _is_truthy(os.getenv("ISPEC_ASSISTANT_SELF_REVIEW"))
 
 
+def _self_review_decider_enabled() -> bool:
+    return _is_truthy(os.getenv("ISPEC_ASSISTANT_SELF_REVIEW_DECIDER"))
+
+
+def _compare_mode_enabled() -> bool:
+    return _is_truthy(os.getenv("ISPEC_ASSISTANT_COMPARE_MODE"))
+
+
+def _decide_if_dualchoice(*, payload: ChatRequest) -> bool:
+    # TODO: Implement heuristics for when compare mode is actually helpful.
+    return True
+
+
+def _assistant_provider() -> str:
+    return (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub").strip().lower()
+
+
 def _tool_protocol() -> str:
     raw = (os.getenv("ISPEC_ASSISTANT_TOOL_PROTOCOL") or "").strip().lower()
     return raw if raw in {"line", "openai"} else "line"
+
+
+def _openai_tool_choice_for_message(message: str) -> dict[str, Any] | None:
+    if not _EXPLICIT_TOOL_REQUEST_RE.search(message or ""):
+        return None
+
+    project_ids = extract_project_ids(message)
+    if project_ids:
+        return {"type": "function", "function": {"name": "get_project"}}
+
+    if _COUNT_PROJECTS_RE.search(message or ""):
+        return {"type": "function", "function": {"name": "count_projects"}}
+
+    return None
 
 
 def _load_state(raw: str | None) -> dict[str, Any]:
@@ -175,6 +235,19 @@ def _dump_state(state: dict[str, Any]) -> str:
 def _context_message(*, payload: dict[str, Any]) -> str:
     version = payload.get("schema_version") or _CONTEXT_SCHEMA_VERSION
     return f"CONTEXT v{version} (read-only JSON):\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _tool_result_preview(payload: dict[str, Any], *, max_chars: int = 2000) -> str | None:
+    result = payload.get("result")
+    if result is None:
+        return None
+    try:
+        rendered = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return None
+    if max_chars > 0 and len(rendered) > max_chars:
+        return rendered[:max_chars] + "…"
+    return rendered
 
 
 def _safe_int_from_state(value: Any) -> int | None:
@@ -264,12 +337,29 @@ def _extract_id_from_path(regex: re.Pattern[str], path: str | None) -> int | Non
     return _safe_int(match.group(1))
 
 
+def _enforce_session_access(session: SupportSession, user: AuthUser | None) -> None:
+    """Ensure the authenticated user is allowed to access this assistant session."""
+
+    if user is None:
+        if session.user_id is not None:
+            raise HTTPException(status_code=403, detail="Session requires authentication.")
+        return
+
+    if session.user_id is None:
+        session.user_id = user.id
+        return
+
+    if session.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Session belongs to another user.")
+
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     payload: ChatRequest,
     request: Request = None,
     assistant_db: Session = Depends(get_assistant_session_dep),
     core_db: Session = Depends(get_session_dep),
+    omics_db: Session = Depends(get_omics_session_dep),
     schedule_db: Session = Depends(get_schedule_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ):
@@ -292,8 +382,8 @@ def chat(
         )
         assistant_db.add(session)
         assistant_db.flush()
-    elif user is not None and session.user_id is None:
-        session.user_id = user.id
+    else:
+        _enforce_session_access(session, user)
 
     state = _load_state(getattr(session, "state_json", None))
     state, state_changed = update_state_from_message(state, payload.message)
@@ -366,11 +456,16 @@ def chat(
     max_tool_calls = _max_tool_calls()
     used_tool_calls = 0
     tools_enabled = max_tool_calls > 0
+    tools_enabled_initial = tools_enabled
     tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
+    tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
 
-    tools_available = bool(tool_schemas) and tools_enabled
-    planner_prompt = _system_prompt_planner(tools_available=tools_available)
-    answer_prompt = _system_prompt_answer()
+    compare_mode_requested = _compare_mode_enabled() and _decide_if_dualchoice(payload=payload)
+    response_format = "compare" if compare_mode_requested else "single"
+
+    tools_available = tool_schemas_count > 0 and tools_enabled
+    planner_prompt = _system_prompt_planner(tools_available=tools_available, response_format=response_format)
+    answer_prompt = _system_prompt_answer(response_format=response_format)
     review_prompt = _system_prompt_review()
     prompt_for_budget = planner_prompt if tools_enabled else answer_prompt
 
@@ -403,6 +498,7 @@ def chat(
             "schema_version": _CONTEXT_SCHEMA_VERSION,
             "session": {"id": session.session_id, "state": state},
             "user": {
+                "id": int(user.id),
                 "username": user.username,
                 "role": str(user.role),
             }
@@ -457,7 +553,9 @@ def chat(
 
     tool_calls: list[dict[str, Any]] = []
     tool_messages: list[dict[str, Any]] = []
+    tool_result_messages: list[dict[str, Any]] = []
     reply = None
+    forced_tool_choice = _openai_tool_choice_for_message(payload.message) if tool_protocol == "openai" else None
 
     while True:
         system_prompt = planner_prompt if tools_enabled else answer_prompt
@@ -485,9 +583,11 @@ def chat(
             *tool_messages,
         ]
 
+        tool_choice = forced_tool_choice if tool_schemas is not None and not tool_calls and used_tool_calls == 0 else None
         reply = generate_reply(
             messages=messages_for_llm,
             tools=tool_schemas if tools_enabled else None,
+            tool_choice=tool_choice,
         )
 
         if reply.tool_calls:
@@ -531,8 +631,10 @@ def chat(
                         args=parsed_args if isinstance(parsed_args, dict) else {},
                         core_db=core_db,
                         schedule_db=schedule_db,
+                        omics_db=omics_db,
                         user=user,
                         api_schema=api_schema,
+                        user_message=payload.message,
                     )
                     if used_tool_calls >= max_tool_calls:
                         tools_enabled = False
@@ -543,9 +645,12 @@ def chat(
                         "arguments": parsed_args if isinstance(parsed_args, dict) else {},
                         "ok": bool(tool_payload.get("ok")),
                         "error": tool_payload.get("error"),
+                        "result_preview": _tool_result_preview(tool_payload),
                         "protocol": "openai",
                     }
                 )
+                tool_result_text = format_tool_result_message(tool_name, tool_payload)
+                tool_result_messages.append({"role": "system", "content": tool_result_text})
                 tool_messages.append(
                     {
                         "role": "tool",
@@ -553,6 +658,7 @@ def chat(
                         "content": json.dumps(tool_payload, ensure_ascii=False),
                     }
                 )
+                tool_messages.append({"role": "system", "content": tool_result_text})
             continue
 
         tool_call = parse_tool_call(reply.content)
@@ -570,8 +676,10 @@ def chat(
             args=tool_args,
             core_db=core_db,
             schedule_db=schedule_db,
+            omics_db=omics_db,
             user=user,
             api_schema=api_schema,
+            user_message=payload.message,
         )
         tool_calls.append(
             {
@@ -579,10 +687,14 @@ def chat(
                 "arguments": tool_args,
                 "ok": bool(tool_payload.get("ok")),
                 "error": tool_payload.get("error"),
+                "result_preview": _tool_result_preview(tool_payload),
                 "protocol": "line",
             }
         )
         tool_call_line = extract_tool_call_line(reply.content) or reply.content.strip()
+        tool_result_messages.append(
+            {"role": "system", "content": format_tool_result_message(tool_name, tool_payload)}
+        )
         tool_messages.extend(
             [
                 {"role": "assistant", "content": tool_call_line},
@@ -603,11 +715,20 @@ def chat(
             tools=None,
         )
 
+    compare_choices: tuple[str, str] | None = None
+
     # First-pass reply (after any tool calls).
     draft_raw_reply_content = reply.content or ""
-    draft_plan_text, draft_assistant_content = split_plan_final(draft_raw_reply_content)
-    if not draft_assistant_content.strip():
-        draft_assistant_content = draft_raw_reply_content.strip()
+    if compare_mode_requested:
+        compare_choices = split_compare_finals(draft_raw_reply_content)
+
+    if compare_choices is not None:
+        draft_plan_text = None
+        draft_assistant_content = compare_choices[0]
+    else:
+        draft_plan_text, draft_assistant_content = split_plan_final(draft_raw_reply_content)
+        if not draft_assistant_content.strip():
+            draft_assistant_content = draft_raw_reply_content.strip()
 
     plan_text = draft_plan_text
     assistant_content = draft_assistant_content
@@ -616,44 +737,82 @@ def chat(
 
     self_review_changed = False
     self_review_error: str | None = None
-    if _self_review_enabled() and assistant_content.strip():
-        review_instruction = (
-            "Review the assistant answer above for correctness (grounded in CONTEXT/TOOL_RESULT), "
-            "clarity, and iSPEC tone. If it's already good, repeat it verbatim. "
-            "If it needs changes, rewrite it. Do not call tools.\n"
-            "Output only:\nFINAL:\n<answer>"
-        )
-        review_reply = generate_reply(
-            messages=[
-                {"role": "system", "content": review_prompt},
-                {"role": "system", "content": context_message},
-                {"role": "user", "content": payload.message},
-                *tool_messages,
-                {"role": "assistant", "content": assistant_content},
-                {"role": "user", "content": review_instruction},
-            ],
-            tools=None,
-        )
+    self_review_mode: str | None = None
+    self_review_decision: str | None = None
+    if _self_review_enabled() and compare_choices is None and final_reply.ok and assistant_content.strip():
+        self_review_mode = "rewrite"
 
-        review_tool_call = parse_tool_call(review_reply.content)
-        if review_tool_call is not None or review_reply.tool_calls:
-            self_review_error = "review_requested_tool_call"
-        else:
-            review_raw = (review_reply.content or "").strip()
-            review_plan_text, review_final_content = split_plan_final(review_raw)
-            reviewed_content = (review_final_content or review_raw).strip()
-            if reviewed_content:
-                final_reply = reply
-                final_raw_reply_content = draft_raw_reply_content
-                assistant_content = draft_assistant_content
-
-                if reviewed_content != assistant_content.strip():
-                    self_review_changed = True
-                    assistant_content = reviewed_content
-                    final_reply = review_reply
-                    final_raw_reply_content = review_raw
+        if _assistant_provider() == "vllm" and _self_review_decider_enabled():
+            self_review_mode = "guided_choice"
+            decider_instruction = (
+                "Decide if the draft answer needs changes. "
+                "Output only KEEP (no changes) or REWRITE (needs changes)."
+            )
+            decider_reply = generate_reply(
+                messages=[
+                    {"role": "system", "content": _system_prompt_review_decider()},
+                    {"role": "system", "content": context_message},
+                    {"role": "user", "content": payload.message},
+                    *tool_messages,
+                    {"role": "assistant", "content": assistant_content},
+                    {"role": "user", "content": decider_instruction},
+                ],
+                tools=None,
+                vllm_extra_body={"guided_choice": ["KEEP", "REWRITE"], "max_tokens": 1, "temperature": 0},
+            )
+            if not decider_reply.ok:
+                self_review_error = "review_decider_error"
+                self_review_decision = "keep"
             else:
-                self_review_error = "empty_review_output"
+                decider_text = (decider_reply.content or "").strip().upper()
+                if decider_text.startswith("KEEP"):
+                    self_review_decision = "keep"
+                elif decider_text.startswith("REWRITE"):
+                    self_review_decision = "rewrite"
+                else:
+                    self_review_error = "review_decider_invalid_output"
+
+        if self_review_decision != "keep":
+            review_instruction = (
+                "Review the assistant answer above for correctness (grounded in CONTEXT/TOOL_RESULT), "
+                "clarity, and iSPEC tone. If it's already good, repeat it verbatim. "
+                "If it needs changes, rewrite it. Do not call tools.\n"
+                "Output only:\nFINAL:\n<answer>"
+            )
+            review_reply = generate_reply(
+                messages=[
+                    {"role": "system", "content": review_prompt},
+                    {"role": "system", "content": context_message},
+                    {"role": "user", "content": payload.message},
+                    *tool_messages,
+                    {"role": "assistant", "content": assistant_content},
+                    {"role": "user", "content": review_instruction},
+                ],
+                tools=None,
+            )
+
+            if not review_reply.ok:
+                self_review_error = "review_error"
+            else:
+                review_tool_call = parse_tool_call(review_reply.content)
+                if review_tool_call is not None or review_reply.tool_calls:
+                    self_review_error = "review_requested_tool_call"
+                else:
+                    review_raw = (review_reply.content or "").strip()
+                    review_plan_text, review_final_content = split_plan_final(review_raw)
+                    reviewed_content = (review_final_content or review_raw).strip()
+                    if reviewed_content:
+                        final_reply = reply
+                        final_raw_reply_content = draft_raw_reply_content
+                        assistant_content = draft_assistant_content
+
+                        if reviewed_content != assistant_content.strip():
+                            self_review_changed = True
+                            assistant_content = reviewed_content
+                            final_reply = review_reply
+                            final_raw_reply_content = review_raw
+                    else:
+                        self_review_error = "empty_review_output"
 
     meta: dict[str, Any] = {
         "provider": final_reply.provider,
@@ -664,10 +823,18 @@ def chat(
             else ([focused_project_id] if focused_project_id is not None else []),
         },
     }
+    meta["tooling"] = {
+        "enabled": bool(tools_enabled_initial),
+        "protocol_config": tool_protocol,
+        "schemas_provided": tool_schemas_count > 0,
+        "schemas_count": tool_schemas_count,
+        "max_tool_calls": max_tool_calls,
+        "used_tool_calls": used_tool_calls,
+        "forced_tool_choice": forced_tool_choice,
+    }
     if final_reply.meta:
         meta["provider_meta"] = final_reply.meta
-    if tool_calls:
-        meta["tool_calls"] = tool_calls
+    meta["tool_calls"] = tool_calls
     if plan_text:
         meta["plan"] = plan_text
     raw_final = final_raw_reply_content.strip()
@@ -677,11 +844,60 @@ def chat(
         meta["self_review"] = {
             "changed": self_review_changed,
             "error": self_review_error,
+            "mode": self_review_mode,
+            "decision": self_review_decision,
         }
         if self_review_changed:
             draft_raw = draft_raw_reply_content.strip()
             if draft_raw and draft_raw != raw_final:
                 meta["draft_raw_content"] = draft_raw
+
+    if compare_choices is not None and final_reply.ok and assistant_content.strip():
+        answer_a, answer_b = compare_choices
+        meta_a = {**meta, "compare_choice": {"index": 0}}
+        meta_b = {**meta, "compare_choice": {"index": 1}}
+        compare_record: dict[str, Any] = {
+            "schema_version": 1,
+            "created_at": utcnow().isoformat(),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": answer_a,
+                    "provider": final_reply.provider,
+                    "model": final_reply.model,
+                    "meta": meta_a,
+                },
+                {
+                    "index": 1,
+                    "message": answer_b,
+                    "provider": final_reply.provider,
+                    "model": final_reply.model,
+                    "meta": meta_b,
+                },
+            ],
+            "selected_index": None,
+            "selected_message_id": None,
+        }
+
+        user_meta: dict[str, Any] = {"compare": compare_record}
+        if ui_payload is not None:
+            user_meta["ui"] = ui_payload
+        if user is not None:
+            user_meta["user"] = {"id": int(user.id), "username": user.username, "role": str(user.role)}
+        user_message.meta_json = json.dumps(user_meta, ensure_ascii=False)
+        session.updated_at = utcnow()
+        assistant_db.flush()
+
+        return ChatResponse(
+            sessionId=session.session_id,
+            compare=ChatComparePayload(
+                userMessageId=int(user_message.id),
+                choices=[
+                    ChatCompareChoice(index=0, message=answer_a),
+                    ChatCompareChoice(index=1, message=answer_b),
+                ],
+            ),
+        )
 
     assistant_message = SupportMessage(
         session_pk=session.id,
@@ -702,6 +918,108 @@ def chat(
     )
 
 
+@router.post("/choose", response_model=ChooseResponse)
+def choose(
+    payload: ChooseRequest,
+    assistant_db: Session = Depends(get_assistant_session_dep),
+    user: AuthUser | None = Depends(require_assistant_access),
+):
+    session = (
+        assistant_db.query(SupportSession)
+        .filter(SupportSession.session_id == payload.sessionId)
+        .first()
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    _enforce_session_access(session, user)
+
+    user_message = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session.id)
+        .filter(SupportMessage.id == int(payload.userMessageId))
+        .first()
+    )
+    if user_message is None:
+        raise HTTPException(status_code=404, detail="Message not found.")
+    if user_message.role != "user":
+        raise HTTPException(status_code=400, detail="Only user messages can be chosen.")
+
+    meta_raw = getattr(user_message, "meta_json", None)
+    compare_meta = _load_state(meta_raw).get("compare")
+    if not isinstance(compare_meta, dict):
+        raise HTTPException(status_code=400, detail="No compare choices found for this message.")
+
+    selected_message_id = compare_meta.get("selected_message_id")
+    if isinstance(selected_message_id, int) and selected_message_id > 0:
+        assistant_message = (
+            assistant_db.query(SupportMessage)
+            .filter(SupportMessage.session_pk == session.id)
+            .filter(SupportMessage.id == selected_message_id)
+            .first()
+        )
+        if assistant_message is not None:
+            return ChooseResponse(
+                sessionId=session.session_id,
+                messageId=int(assistant_message.id),
+                message=assistant_message.content,
+            )
+
+    raw_choices = compare_meta.get("choices")
+    if not isinstance(raw_choices, list) or not raw_choices:
+        raise HTTPException(status_code=400, detail="Compare choices are missing.")
+
+    chosen: dict[str, Any] | None = None
+    for item in raw_choices:
+        if not isinstance(item, dict):
+            continue
+        if item.get("index") == payload.choiceIndex:
+            chosen = item
+            break
+    if chosen is None:
+        raise HTTPException(status_code=400, detail="Invalid choiceIndex.")
+
+    chosen_message = str(chosen.get("message") or "").strip()
+    if not chosen_message:
+        raise HTTPException(status_code=400, detail="Chosen message is empty.")
+
+    assistant_meta = chosen.get("meta") if isinstance(chosen.get("meta"), dict) else {}
+    if not isinstance(assistant_meta, dict):
+        assistant_meta = {}
+    compare_selection: dict[str, Any] = {
+        "user_message_id": int(user_message.id),
+        "choice_index": int(payload.choiceIndex),
+    }
+    if payload.ui is not None:
+        compare_selection["ui"] = payload.ui.model_dump()
+    if user is not None:
+        compare_selection["user"] = {"id": int(user.id), "username": user.username, "role": str(user.role)}
+    assistant_meta = {**assistant_meta, "compare_selection": compare_selection}
+
+    assistant_message = SupportMessage(
+        session_pk=session.id,
+        role="assistant",
+        content=chosen_message,
+        provider=str(chosen.get("provider") or "") or None,
+        model=str(chosen.get("model") or "") or None,
+        meta_json=json.dumps(assistant_meta, ensure_ascii=False) if assistant_meta else None,
+    )
+    assistant_db.add(assistant_message)
+    session.updated_at = utcnow()
+    assistant_db.flush()
+
+    compare_meta["selected_index"] = int(payload.choiceIndex)
+    compare_meta["selected_message_id"] = int(assistant_message.id)
+    compare_meta["selected_at"] = utcnow().isoformat()
+    user_message.meta_json = json.dumps({**_load_state(meta_raw), "compare": compare_meta}, ensure_ascii=False)
+    assistant_db.flush()
+
+    return ChooseResponse(
+        sessionId=session.session_id,
+        messageId=int(assistant_message.id),
+        message=assistant_message.content,
+    )
+
+
 @router.post("/feedback")
 def feedback(
     payload: FeedbackRequest,
@@ -715,6 +1033,7 @@ def feedback(
     )
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found.")
+    _enforce_session_access(session, user)
 
     message_id = payload.messageId
 

@@ -7,6 +7,7 @@ from ispec.api.security import (
     delete_session,
     get_current_user,
     hash_password,
+    require_user,
     require_access,
     session_cookie_name,
     verify_password,
@@ -14,7 +15,7 @@ from ispec.api.security import (
 from ispec.db.models import AuthSession, AuthUser, UserRole
 
 
-def _make_request(*, method: str, cookie: str | None = None) -> Request:
+def _make_request(*, method: str, path: str = "/", cookie: str | None = None) -> Request:
     headers: list[tuple[bytes, bytes]] = []
     if cookie:
         headers.append((b"cookie", cookie.encode("latin-1")))
@@ -23,7 +24,7 @@ def _make_request(*, method: str, cookie: str | None = None) -> Request:
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
-        "path": "/",
+        "path": path,
         "query_string": b"",
         "headers": headers,
         "client": ("testclient", 50000),
@@ -96,6 +97,52 @@ def test_require_access_enforces_viewer_is_read_only(db_session, monkeypatch):
     token = create_session(db_session, user=user)
     cookie = f"{session_cookie_name()}={token}"
     request = _make_request(method="POST", cookie=cookie)
+
+    with pytest.raises(HTTPException) as exc:
+        require_access(request, db_session, provided_api_key=None)
+    assert exc.value.status_code == 403
+
+
+def test_require_user_enforces_password_change_required():
+    user = AuthUser(
+        username="editor",
+        password_hash="x",
+        password_salt="y",
+        password_iterations=1,
+        role=UserRole.editor,
+        is_active=True,
+        must_change_password=True,
+    )
+
+    assert require_user(_make_request(method="GET", path="/api/auth/me"), user=user) is user
+    assert (
+        require_user(_make_request(method="POST", path="/api/auth/change-password"), user=user) is user
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        require_user(_make_request(method="GET", path="/api/projects"), user=user)
+    assert exc.value.status_code == 403
+
+
+def test_require_access_blocks_when_password_change_required(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_REQUIRE_LOGIN", "1")
+
+    user = AuthUser(
+        username="editor",
+        password_hash="x",
+        password_salt="y",
+        password_iterations=1,
+        role=UserRole.editor,
+        is_active=True,
+        must_change_password=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    token = create_session(db_session, user=user)
+    cookie = f"{session_cookie_name()}={token}"
+    request = _make_request(method="GET", path="/api/projects", cookie=cookie)
 
     with pytest.raises(HTTPException) as exc:
         require_access(request, db_session, provided_api_key=None)

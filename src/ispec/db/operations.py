@@ -552,6 +552,7 @@ def import_e2g(
     qual_paths: list[str] | None = None,
     quant_paths: list[str] | None = None,
     db_file_path: str | None = None,
+    omics_db_file_path: str | None = None,
     create_missing_runs: bool = True,
     create_missing_experiments: bool = True,
     store_metadata: bool = False,
@@ -584,6 +585,7 @@ def import_e2g(
 
     from pathlib import Path
 
+    from ispec.omics.connect import get_omics_session
     from ispec.omics.e2g_import import discover_e2g_tsvs, import_e2g_files
 
     sources = [bool(data_dir), bool(qual_paths), bool(quant_paths)]
@@ -630,9 +632,12 @@ def import_e2g(
         bool(store_metadata),
     )
 
-    with get_session(file_path=db_file_path) as session:
+    with get_session(file_path=db_file_path) as core_session, get_omics_session(
+        file_path=omics_db_file_path
+    ) as omics_session:
         return import_e2g_files(
-            session,
+            core_session=core_session,
+            omics_session=omics_session,
             qual_paths=resolved_qual,
             quant_paths=resolved_quant,
             create_missing_runs=create_missing_runs,
@@ -641,3 +646,139 @@ def import_e2g(
             skip_imported=skip_imported,
             force=force,
         )
+
+
+def import_gene_contrasts(
+    *,
+    project_id: int,
+    paths: list[str],
+    db_file_path: str | None = None,
+    omics_db_file_path: str | None = None,
+    name: str | None = None,
+    contrast: str | None = None,
+    kind: str | None = "volcano",
+    store_metadata: bool = True,
+    skip_imported: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Import gene-level contrast stats TSVs (e.g. a volcano table per contrast)."""
+
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from ispec.omics.connect import get_omics_session
+    from ispec.omics.gene_contrast_import import import_gene_contrast_file
+
+    if not paths:
+        raise ValueError("Provide one or more TSV paths.")
+    if name and len(paths) != 1:
+        raise ValueError("--name is only supported when importing a single file.")
+
+    resolved = [Path(p).expanduser().resolve() for p in paths if str(p).strip()]
+    if not resolved:
+        raise ValueError("Provide one or more TSV paths.")
+
+    _log_info(
+        "importing gene-contrast TSVs: project_id=%d, files=%d, skip_imported=%s, force=%s, store_metadata=%s",
+        int(project_id),
+        len(resolved),
+        bool(skip_imported),
+        bool(force),
+        bool(store_metadata),
+    )
+
+    results: list[dict[str, Any]] = []
+    with get_session(file_path=db_file_path) as core_session, get_omics_session(
+        file_path=omics_db_file_path
+    ) as omics_session:
+        for path in resolved:
+            result = import_gene_contrast_file(
+                core_session=core_session,
+                omics_session=omics_session,
+                path=path,
+                project_id=int(project_id),
+                name=name,
+                contrast=contrast,
+                kind=kind,
+                store_metadata=bool(store_metadata),
+                skip_imported=bool(skip_imported),
+                force=bool(force),
+            )
+            results.append(asdict(result))
+
+    inserted_total = sum(int(item.get("inserted") or 0) for item in results)
+    skipped = sum(1 for item in results if item.get("skipped"))
+    return {
+        "project_id": int(project_id),
+        "files": results,
+        "inserted_total": inserted_total,
+        "skipped": skipped,
+    }
+
+
+def import_gsea(
+    *,
+    project_id: int,
+    paths: list[str],
+    db_file_path: str | None = None,
+    omics_db_file_path: str | None = None,
+    name: str | None = None,
+    contrast: str | None = None,
+    collection: str | None = None,
+    store_metadata: bool = True,
+    skip_imported: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Import GSEA TSV tables (one file per project/contrast/collection)."""
+
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from ispec.omics.connect import get_omics_session
+    from ispec.omics.gsea_import import import_gsea_file
+
+    if not paths:
+        raise ValueError("Provide one or more TSV paths.")
+    if name and len(paths) != 1:
+        raise ValueError("--name is only supported when importing a single file.")
+
+    resolved = [Path(p).expanduser().resolve() for p in paths if str(p).strip()]
+    if not resolved:
+        raise ValueError("Provide one or more TSV paths.")
+
+    _log_info(
+        "importing GSEA TSVs: project_id=%d, files=%d, skip_imported=%s, force=%s, store_metadata=%s",
+        int(project_id),
+        len(resolved),
+        bool(skip_imported),
+        bool(force),
+        bool(store_metadata),
+    )
+
+    results: list[dict[str, Any]] = []
+    with get_session(file_path=db_file_path) as core_session, get_omics_session(
+        file_path=omics_db_file_path
+    ) as omics_session:
+        for path in resolved:
+            result = import_gsea_file(
+                core_session=core_session,
+                omics_session=omics_session,
+                path=path,
+                project_id=int(project_id),
+                name=name,
+                contrast=contrast,
+                collection=collection,
+                store_metadata=bool(store_metadata),
+                skip_imported=bool(skip_imported),
+                force=bool(force),
+            )
+            results.append(asdict(result))
+
+    inserted_total = sum(int(item.get("inserted") or 0) for item in results)
+    skipped = sum(1 for item in results if item.get("skipped"))
+    return {
+        "project_id": int(project_id),
+        "files": results,
+        "inserted_total": inserted_total,
+        "skipped": skipped,
+    }

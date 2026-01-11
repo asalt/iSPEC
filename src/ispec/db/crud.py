@@ -45,14 +45,13 @@ from ispec.db.models import (
     ProjectPerson,
     LetterOfSupport,
     ProjectComment,
-    E2G,
     ExperimentRun,
     Experiment,
     Job,
     JobStatus,
-    PSM,
     MSRawFile,
 )
+from ispec.omics.models import E2G, PSM
 
 
 logger = get_logger(__file__)
@@ -87,7 +86,6 @@ class CRUDBase:
             logger.warning(f"Key '{k}' not in model columns, removing from record.")
 
         # cleaned_record = {k: v for k, v in record.items() if k in allowed_keys}
-        logger.debug(f"Cleaned record keys: {cleaned_record.keys()}")
         return cleaned_record
 
     def validate_input(self, session: Session, record: dict = None) -> dict:
@@ -458,7 +456,6 @@ class E2GCRUD(CRUDBase):
             ],
         )
         self._normalizer = None  # lazy-load to avoid heavy import costs
-        self._validated_run_ids: set[int] = set()
 
     def _equivalent_pairs(self, gene: str, geneidtype: str) -> list[tuple[str, str]]:
         pairs = [(geneidtype, gene)]
@@ -500,11 +497,13 @@ class E2GCRUD(CRUDBase):
         exp_run_id = cleaned.get("experiment_run_id")
         if exp_run_id is None:
             raise ValueError("experiment_run_id is required for E2G")
-        if exp_run_id not in self._validated_run_ids:
-            exists = session.query(ExperimentRun).filter_by(id=exp_run_id).first()
-            if not exists:
-                raise ValueError(f"Invalid experiment_run_id: {exp_run_id}")
-            self._validated_run_ids.add(int(exp_run_id))
+        try:
+            exp_run_int = int(exp_run_id)
+        except Exception as exc:
+            raise ValueError(f"Invalid experiment_run_id: {exp_run_id}") from exc
+        if exp_run_int <= 0:
+            raise ValueError(f"Invalid experiment_run_id: {exp_run_id}")
+        cleaned["experiment_run_id"] = exp_run_int
 
         gene = (cleaned.get("gene") or "").strip()
         geneidtype = (cleaned.get("geneidtype") or "").strip()

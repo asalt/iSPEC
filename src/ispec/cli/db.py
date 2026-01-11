@@ -85,6 +85,11 @@ def register_subcommands(subparsers):
         help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
     )
     import_e2g_parser.add_argument(
+        "--omics-database",
+        dest="omics_database",
+        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
+    )
+    import_e2g_parser.add_argument(
         "--create-missing-runs",
         dest="create_missing_runs",
         action="store_true",
@@ -132,6 +137,135 @@ def register_subcommands(subparsers):
         "--force",
         action="store_true",
         help="Delete existing E2G rows for affected ExperimentRuns and re-import.",
+    )
+
+    import_volcano_parser = subparsers.add_parser(
+        "import-volcano", help="Import a gene-level volcano TSV (contrast stats)"
+    )
+    import_volcano_parser.add_argument(
+        "--project-id",
+        dest="project_id",
+        type=int,
+        required=True,
+        help="Project id the volcano/contrast belongs to",
+    )
+    import_volcano_parser.add_argument(
+        "--file",
+        dest="paths",
+        action="append",
+        default=[],
+        required=True,
+        help="Path to a volcano TSV file (repeatable)",
+    )
+    import_volcano_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    import_volcano_parser.add_argument(
+        "--omics-database",
+        dest="omics_database",
+        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
+    )
+    import_volcano_parser.add_argument(
+        "--name",
+        help="Optional analysis name (only supported for a single --file; defaults to the file stem).",
+    )
+    import_volcano_parser.add_argument(
+        "--contrast",
+        help="Optional contrast label override (defaults to inferred from filename).",
+    )
+    import_volcano_parser.add_argument(
+        "--kind",
+        default="volcano",
+        help="Optional analysis kind label (default: volcano).",
+    )
+    import_volcano_parser.add_argument(
+        "--store-metadata",
+        action="store_true",
+        help="Store a small subset of extra columns in metadata_json.",
+    )
+    import_volcano_parser.add_argument(
+        "--skip-imported",
+        dest="skip_imported",
+        action="store_true",
+        default=True,
+        help="Skip importing when that analysis already has gene stats populated (default: enabled).",
+    )
+    import_volcano_parser.add_argument(
+        "--no-skip-imported",
+        dest="skip_imported",
+        action="store_false",
+        help="Do not skip; overwrite existing rows (clears and re-imports).",
+    )
+    import_volcano_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Alias for overwrite; clears existing rows before import.",
+    )
+
+    import_gsea_parser = subparsers.add_parser(
+        "import-gsea", help="Import a GSEA TSV (pathway enrichment results)"
+    )
+    import_gsea_parser.add_argument(
+        "--project-id",
+        dest="project_id",
+        type=int,
+        required=True,
+        help="Project id the GSEA analysis belongs to",
+    )
+    import_gsea_parser.add_argument(
+        "--file",
+        dest="paths",
+        action="append",
+        default=[],
+        required=True,
+        help="Path to a GSEA TSV file (repeatable)",
+    )
+    import_gsea_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    import_gsea_parser.add_argument(
+        "--omics-database",
+        dest="omics_database",
+        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
+    )
+    import_gsea_parser.add_argument(
+        "--name",
+        help="Optional analysis name (only supported for a single --file; defaults to the file stem).",
+    )
+    import_gsea_parser.add_argument(
+        "--contrast",
+        help="Optional contrast label override (defaults to inferred from filename).",
+    )
+    import_gsea_parser.add_argument(
+        "--collection",
+        help="Optional gene set collection override (e.g. H, C2, C5).",
+    )
+    import_gsea_parser.add_argument(
+        "--store-metadata",
+        action="store_true",
+        help="Store a small subset of extra columns in metadata_json.",
+    )
+    import_gsea_parser.add_argument(
+        "--skip-imported",
+        dest="skip_imported",
+        action="store_true",
+        default=True,
+        help="Skip importing when that analysis already has results populated (default: enabled).",
+    )
+    import_gsea_parser.add_argument(
+        "--no-skip-imported",
+        dest="skip_imported",
+        action="store_false",
+        help="Do not skip; overwrite existing rows (clears and re-imports).",
+    )
+    import_gsea_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Alias for overwrite; clears existing rows before import.",
     )
 
     export_parser = subparsers.add_parser("export", help="Export table to CSV or JSON")
@@ -390,6 +524,7 @@ def dispatch(args):
             qual_paths=list(getattr(args, "qual_paths", []) or []),
             quant_paths=list(getattr(args, "quant_paths", []) or []),
             db_file_path=getattr(args, "database", None),
+            omics_db_file_path=getattr(args, "omics_database", None),
             create_missing_runs=bool(getattr(args, "create_missing_runs", True)),
             create_missing_experiments=bool(getattr(args, "create_missing_experiments", True)),
             store_metadata=bool(getattr(args, "store_metadata", False)),
@@ -397,6 +532,34 @@ def dispatch(args):
             force=bool(getattr(args, "force", False)),
         )
         logger.info("E2G import summary: %s", summary)
+    elif args.subcommand == "import-volcano":
+        summary = operations.import_gene_contrasts(
+            project_id=int(getattr(args, "project_id")),
+            paths=list(getattr(args, "paths", []) or []),
+            db_file_path=getattr(args, "database", None),
+            omics_db_file_path=getattr(args, "omics_database", None),
+            name=getattr(args, "name", None),
+            contrast=getattr(args, "contrast", None),
+            kind=getattr(args, "kind", None),
+            store_metadata=bool(getattr(args, "store_metadata", False)),
+            skip_imported=bool(getattr(args, "skip_imported", True)),
+            force=bool(getattr(args, "force", False)),
+        )
+        logger.info("Gene contrast import summary: %s", summary)
+    elif args.subcommand == "import-gsea":
+        summary = operations.import_gsea(
+            project_id=int(getattr(args, "project_id")),
+            paths=list(getattr(args, "paths", []) or []),
+            db_file_path=getattr(args, "database", None),
+            omics_db_file_path=getattr(args, "omics_database", None),
+            name=getattr(args, "name", None),
+            contrast=getattr(args, "contrast", None),
+            collection=getattr(args, "collection", None),
+            store_metadata=bool(getattr(args, "store_metadata", False)),
+            skip_imported=bool(getattr(args, "skip_imported", True)),
+            force=bool(getattr(args, "force", False)),
+        )
+        logger.info("GSEA import summary: %s", summary)
     elif args.subcommand == "export":
         operations.export_table(args.table_name, args.file)
     elif args.subcommand == "init":
