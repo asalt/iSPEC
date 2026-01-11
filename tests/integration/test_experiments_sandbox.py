@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ispec.api.main import app
@@ -9,6 +10,8 @@ from ispec.db import operations
 from ispec.db.connect import get_session, get_session_dep
 from ispec.db.models import E2G, Experiment, ExperimentRun, Project
 from tests.integration.sandbox_builder import build_sandbox_db
+
+pytestmark = pytest.mark.testclient
 
 
 def test_experiment_run_gene_relationships(tmp_path: Path):

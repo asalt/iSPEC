@@ -6,6 +6,8 @@ from ispec.api.main import app
 from ispec.db.connect import get_session as db_get_session, get_session_dep
 from ispec.db.models import Person, Project, ProjectComment, logger as db_logger
 
+pytestmark = pytest.mark.testclient
+
 
 def _create_person(client: TestClient, *, first: str, last: str, added_by: str = "tester") -> int:
     payload = {

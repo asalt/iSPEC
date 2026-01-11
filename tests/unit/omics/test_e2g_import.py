@@ -4,7 +4,8 @@ import csv
 import json
 from pathlib import Path
 
-from ispec.db.models import E2G, Experiment, ExperimentRun, Project
+from ispec.db.models import Experiment, ExperimentRun, Project
+from ispec.omics.models import E2G
 from ispec.omics.e2g_import import import_e2g_files, import_e2g_tsv
 
 
@@ -16,7 +17,7 @@ def _write_tsv(path: Path, *, fieldnames: list[str], rows: list[dict[str, str]])
             writer.writerow(row)
 
 
-def test_import_e2g_qual_then_quant(db_session, tmp_path):
+def test_import_e2g_qual_then_quant(db_session, omics_session, tmp_path):
     project = Project(id=1, prj_AddedBy="test", prj_ProjectTitle="Project 1")
     experiment = Experiment(id=100, project_id=1, record_no="100", exp_Name="Experiment 100")
     run = ExperimentRun(experiment_id=100, run_no=1, search_no=4, label="0")
@@ -75,12 +76,22 @@ def test_import_e2g_qual_then_quant(db_session, tmp_path):
         ],
     )
 
-    res_qual = import_e2g_tsv(db_session, path=qual_path, kind="qual", store_metadata=True)
+    res_qual = import_e2g_tsv(
+        core_session=db_session,
+        omics_session=omics_session,
+        path=qual_path,
+        kind="qual",
+        store_metadata=True,
+    )
     assert res_qual.inserted == 1
     assert res_qual.updated == 0
     assert res_qual.experiment_run_id == run.id
 
-    row = db_session.query(E2G).filter_by(experiment_run_id=run.id, gene="123", geneidtype="GeneID").one()
+    row = (
+        omics_session.query(E2G)
+        .filter_by(experiment_run_id=run.id, gene="123", geneidtype="GeneID")
+        .one()
+    )
     assert row.gene_symbol == "KRAS"
     assert row.psms == 10
     assert row.psms_u2g == 9
@@ -121,11 +132,21 @@ def test_import_e2g_qual_then_quant(db_session, tmp_path):
         ],
     )
 
-    res_quant = import_e2g_tsv(db_session, path=quant_path, kind="quant", store_metadata=True)
+    res_quant = import_e2g_tsv(
+        core_session=db_session,
+        omics_session=omics_session,
+        path=quant_path,
+        kind="quant",
+        store_metadata=True,
+    )
     assert res_quant.inserted == 0
     assert res_quant.updated == 1
 
-    row = db_session.query(E2G).filter_by(experiment_run_id=run.id, gene="123", geneidtype="GeneID").one()
+    row = (
+        omics_session.query(E2G)
+        .filter_by(experiment_run_id=run.id, gene="123", geneidtype="GeneID")
+        .one()
+    )
     assert row.area_sum_u2g_all == 123.4
     assert row.iBAQ_dstrAdj == 0.5
 
@@ -134,7 +155,7 @@ def test_import_e2g_qual_then_quant(db_session, tmp_path):
     assert meta.get("quant", {}).get("source") == "QUANT"
 
 
-def test_import_e2g_creates_missing_experiment_and_run(db_session, tmp_path):
+def test_import_e2g_creates_missing_experiment_and_run(db_session, omics_session, tmp_path):
     qual_path = tmp_path / "200_2_1_labelnone_e2g_QUAL.tsv"
     _write_tsv(
         qual_path,
@@ -160,7 +181,12 @@ def test_import_e2g_creates_missing_experiment_and_run(db_session, tmp_path):
         ],
     )
 
-    res = import_e2g_tsv(db_session, path=qual_path, kind="qual")
+    res = import_e2g_tsv(
+        core_session=db_session,
+        omics_session=omics_session,
+        path=qual_path,
+        kind="qual",
+    )
     assert res.created_experiment is True
     assert res.created_run is True
     assert res.inserted == 1
@@ -175,9 +201,15 @@ def test_import_e2g_creates_missing_experiment_and_run(db_session, tmp_path):
         .one()
     )
     assert run.gpgrouper_flag is True
+    assert (
+        omics_session.query(E2G)
+        .filter_by(experiment_run_id=run.id, gene="123", geneidtype="GeneID")
+        .first()
+        is not None
+    )
 
 
-def test_import_e2g_skips_when_already_imported(db_session, tmp_path):
+def test_import_e2g_skips_when_already_imported(db_session, omics_session, tmp_path):
     experiment = Experiment(id=300, project_id=None, record_no="300")
     run = ExperimentRun(experiment_id=300, run_no=1, search_no=1, label="0")
     db_session.add_all([experiment, run])
@@ -200,26 +232,36 @@ def test_import_e2g_skips_when_already_imported(db_session, tmp_path):
         ],
     )
 
-    first = import_e2g_tsv(db_session, path=qual_path, kind="qual")
+    first = import_e2g_tsv(
+        core_session=db_session,
+        omics_session=omics_session,
+        path=qual_path,
+        kind="qual",
+    )
     assert first.skipped is False
     assert first.inserted == 1
 
-    second = import_e2g_tsv(db_session, path=qual_path, kind="qual")
+    second = import_e2g_tsv(
+        core_session=db_session,
+        omics_session=omics_session,
+        path=qual_path,
+        kind="qual",
+    )
     assert second.skipped is True
     assert second.inserted == 0
     assert second.updated == 0
 
 
-def test_import_e2g_force_reimport_clears_once_per_run(db_session, tmp_path):
+def test_import_e2g_force_reimport_clears_once_per_run(db_session, omics_session, tmp_path):
     experiment = Experiment(id=400, project_id=None, record_no="400")
     run = ExperimentRun(experiment_id=400, run_no=1, search_no=1, label="0")
     db_session.add_all([experiment, run])
     db_session.flush()
 
-    db_session.add(
+    omics_session.add(
         E2G(experiment_run_id=run.id, gene="999", geneidtype="GeneID", label="0", psms=99)
     )
-    db_session.commit()
+    omics_session.commit()
 
     qual_path = tmp_path / "400_1_1_labelnone_e2g_QUAL.tsv"
     _write_tsv(
@@ -254,7 +296,8 @@ def test_import_e2g_force_reimport_clears_once_per_run(db_session, tmp_path):
     )
 
     summary = import_e2g_files(
-        db_session,
+        core_session=db_session,
+        omics_session=omics_session,
         qual_paths=[qual_path],
         quant_paths=[quant_path],
         force=True,
@@ -264,12 +307,18 @@ def test_import_e2g_force_reimport_clears_once_per_run(db_session, tmp_path):
 
     # Old placeholder gene cleared.
     assert (
-        db_session.query(E2G).filter_by(experiment_run_id=run.id, gene="999", geneidtype="GeneID").first()
+        omics_session.query(E2G)
+        .filter_by(experiment_run_id=run.id, gene="999", geneidtype="GeneID")
+        .first()
         is None
     )
 
     # New gene has both QUAL and QUANT fields populated (de-duped clear).
-    row = db_session.query(E2G).filter_by(experiment_run_id=run.id, gene="123", geneidtype="GeneID").one()
+    row = (
+        omics_session.query(E2G)
+        .filter_by(experiment_run_id=run.id, gene="123", geneidtype="GeneID")
+        .one()
+    )
     assert row.psms == 10
     assert row.iBAQ_dstrAdj == 0.5
 

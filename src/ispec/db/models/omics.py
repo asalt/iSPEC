@@ -1,37 +1,24 @@
-from sqlalchemy import Float, ForeignKey, Integer, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+"""Backwards-compatible omics model exports.
 
-from .base import Base, make_timestamp_mixin
+The omics tables (E2G/PSM/contrast/GSEA) live in a separate SQLite database and
+are modeled under :mod:`ispec.omics.models`. This module remains as a thin shim
+so older imports like ``from ispec.db.models.omics import PSM`` keep working.
+"""
 
-PSMTimestamp = make_timestamp_mixin("psm")
+from ispec.omics.models import (
+    E2G,
+    GeneContrast,
+    GeneContrastStat,
+    GSEAAnalysis,
+    GSEAResult,
+    PSM,
+)
 
-
-class PSM(PSMTimestamp, Base):
-    """
-    Peptide Spectrum Match linked to an ExperimentRun.
-
-    This is a scaffold model for future build-out; fields may expand.
-    """
-
-    __tablename__ = "psm"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    experiment_run_id: Mapped[int] = mapped_column(
-        ForeignKey("experiment_run.id", ondelete="CASCADE"), nullable=False
-    )
-    scan_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    peptide: Mapped[str] = mapped_column(Text, nullable=False)
-    charge: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    score_type: Mapped[str | None] = mapped_column(Text, nullable=True)  # e.g., XCorr, Percolator PEP
-    q_value: Mapped[float | None] = mapped_column(Float, nullable=True)
-    protein: Mapped[str | None] = mapped_column(Text, nullable=True)
-    mods: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON-serialized modifications
-    precursor_mz: Mapped[float | None] = mapped_column(Float, nullable=True)
-    retention_time: Mapped[float | None] = mapped_column(Float, nullable=True)  # minutes
-    intensity: Mapped[float | None] = mapped_column(Float, nullable=True)
-    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    experiment_run: Mapped["ExperimentRun"] = relationship(
-        "ExperimentRun", back_populates="psms"
-    )
+__all__ = [
+    "E2G",
+    "GeneContrast",
+    "GeneContrastStat",
+    "GSEAAnalysis",
+    "GSEAResult",
+    "PSM",
+]

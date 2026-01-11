@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import inspect
 
 # revision identifiers, used by Alembic.
 revision = "0004_experiment_run_label"
@@ -20,35 +21,71 @@ depends_on: tuple[str, ...] | None = None
 
 
 def upgrade() -> None:
+    bind = op.get_bind()
+    inspector = inspect(bind)
+    columns = {col["name"] for col in inspector.get_columns("experiment_run")}
+    uniques = inspector.get_unique_constraints("experiment_run")
+    desired_unique_cols = {"experiment_id", "run_no", "search_no", "label"}
+    legacy_unique_cols = {"experiment_id", "run_no", "search_no"}
+
+    has_desired_unique = any(
+        set((uc.get("column_names") or [])) == desired_unique_cols for uc in uniques
+    )
+    if {"label", "label_type"}.issubset(columns) and has_desired_unique:
+        return
+
     with op.batch_alter_table("experiment_run") as batch:
-        batch.add_column(
-            sa.Column("label", sa.Text(), nullable=False, server_default=sa.text("'0'"))
-        )
-        batch.add_column(sa.Column("label_type", sa.Text(), nullable=True))
+        if "label" not in columns:
+            batch.add_column(
+                sa.Column("label", sa.Text(), nullable=False, server_default=sa.text("'0'"))
+            )
+        if "label_type" not in columns:
+            batch.add_column(sa.Column("label_type", sa.Text(), nullable=True))
 
-        try:
-            batch.drop_constraint("uq_experiment_run_search", type_="unique")
-        except Exception:
-            pass
+        if not has_desired_unique:
+            for uc in uniques:
+                name = uc.get("name")
+                cols = set((uc.get("column_names") or []))
+                if name and cols == legacy_unique_cols:
+                    batch.drop_constraint(name, type_="unique")
+                    break
 
-        batch.create_unique_constraint(
-            "uq_experiment_run_search_label",
-            ["experiment_id", "run_no", "search_no", "label"],
-        )
+            batch.create_unique_constraint(
+                "uq_experiment_run_search_label",
+                ["experiment_id", "run_no", "search_no", "label"],
+            )
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    inspector = inspect(bind)
+    columns = {col["name"] for col in inspector.get_columns("experiment_run")}
+    uniques = inspector.get_unique_constraints("experiment_run")
+    desired_unique_cols = {"experiment_id", "run_no", "search_no", "label"}
+    legacy_unique_cols = {"experiment_id", "run_no", "search_no"}
+
+    desired_unique_name = None
+    has_legacy_unique = False
+    for uc in uniques:
+        cols = set((uc.get("column_names") or []))
+        name = uc.get("name")
+        if cols == legacy_unique_cols:
+            has_legacy_unique = True
+            legacy_unique_name = name
+        if cols == desired_unique_cols:
+            desired_unique_name = name
+
     with op.batch_alter_table("experiment_run") as batch:
-        try:
-            batch.drop_constraint("uq_experiment_run_search_label", type_="unique")
-        except Exception:
-            pass
+        if desired_unique_name:
+            batch.drop_constraint(desired_unique_name, type_="unique")
 
-        batch.create_unique_constraint(
-            "uq_experiment_run_search",
-            ["experiment_id", "run_no", "search_no"],
-        )
+        if not has_legacy_unique:
+            batch.create_unique_constraint(
+                "uq_experiment_run_search",
+                ["experiment_id", "run_no", "search_no"],
+            )
 
-        batch.drop_column("label_type")
-        batch.drop_column("label")
-
+        if "label_type" in columns:
+            batch.drop_column("label_type")
+        if "label" in columns:
+            batch.drop_column("label")

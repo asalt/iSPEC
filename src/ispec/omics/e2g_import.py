@@ -9,8 +9,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ispec.db.crud import E2GCRUD
-from ispec.db.models import E2G, Experiment, ExperimentRun
+from ispec.db.models import Experiment, ExperimentRun
 from ispec.logging import get_logger
+from ispec.omics.models import E2G
 
 
 logger = get_logger(__file__)
@@ -86,26 +87,26 @@ def _safe_str(value: Any, *, max_len: int) -> str | None:
 
 
 def _resolve_experiment(
-    session: Session,
+    core_session: Session,
     *,
     experiment_id: int,
     create_missing_experiments: bool,
 ) -> tuple[Experiment, bool]:
-    experiment = session.get(Experiment, experiment_id)
+    experiment = core_session.get(Experiment, experiment_id)
     if experiment is not None:
         return experiment, False
     if not create_missing_experiments:
         raise ValueError(f"Experiment {experiment_id} not found (import experiments first).")
 
     experiment = Experiment(id=experiment_id, record_no=str(experiment_id))
-    session.add(experiment)
-    session.commit()
-    session.refresh(experiment)
+    core_session.add(experiment)
+    core_session.commit()
+    core_session.refresh(experiment)
     return experiment, True
 
 
 def _resolve_experiment_run(
-    session: Session,
+    core_session: Session,
     *,
     experiment_id: int,
     run_no: int,
@@ -115,13 +116,13 @@ def _resolve_experiment_run(
     create_missing_experiments: bool,
 ) -> tuple[ExperimentRun, bool, bool]:
     _, created_experiment = _resolve_experiment(
-        session,
+        core_session,
         experiment_id=experiment_id,
         create_missing_experiments=create_missing_experiments,
     )
 
     run = (
-        session.query(ExperimentRun)
+        core_session.query(ExperimentRun)
         .filter_by(experiment_id=experiment_id, run_no=run_no, search_no=search_no, label=label)
         .one_or_none()
     )
@@ -140,9 +141,9 @@ def _resolve_experiment_run(
         search_no=search_no,
         label=label,
     )
-    session.add(run)
-    session.commit()
-    session.refresh(run)
+    core_session.add(run)
+    core_session.commit()
+    core_session.refresh(run)
     return run, created_experiment, True
 
 
@@ -230,8 +231,8 @@ def _row_to_e2g_record(
     return record
 
 
-def _run_has_kind_data(session: Session, *, run_id: int, kind: str) -> bool:
-    query = session.query(E2G.id).filter(E2G.experiment_run_id == run_id)
+def _run_has_kind_data(omics_session: Session, *, run_id: int, kind: str) -> bool:
+    query = omics_session.query(E2G.id).filter(E2G.experiment_run_id == run_id)
     if kind == "qual":
         query = query.filter(
             (E2G.psms.is_not(None))
@@ -256,8 +257,9 @@ def _run_has_kind_data(session: Session, *, run_id: int, kind: str) -> bool:
 
 
 def import_e2g_tsv(
-    session: Session,
     *,
+    core_session: Session,
+    omics_session: Session,
     path: str | Path,
     kind: str,
     create_missing_runs: bool = True,
@@ -273,7 +275,7 @@ def import_e2g_tsv(
 
     experiment_id, run_no, search_no, label, rows = _extract_file_run_info(tsv_path)
     run, created_experiment, created_run = _resolve_experiment_run(
-        session,
+        core_session,
         experiment_id=experiment_id,
         run_no=run_no,
         search_no=search_no,
@@ -286,7 +288,7 @@ def import_e2g_tsv(
     if force:
         if cleared_run_ids is None or int(run.id) not in cleared_run_ids:
             deleted = (
-                session.query(E2G)
+                omics_session.query(E2G)
                 .filter(E2G.experiment_run_id == int(run.id))
                 .delete(synchronize_session=False)
             )
@@ -295,10 +297,10 @@ def import_e2g_tsv(
             cleared_existing = True
             if cleared_run_ids is not None:
                 cleared_run_ids.add(int(run.id))
-            session.commit()
+            omics_session.commit()
 
     if skip_imported and not force:
-        if _run_has_kind_data(session, run_id=int(run.id), kind=kind):
+        if _run_has_kind_data(omics_session, run_id=int(run.id), kind=kind):
             return E2GImportFileResult(
                 path=str(tsv_path),
                 kind=kind,
@@ -329,15 +331,15 @@ def import_e2g_tsv(
             records.append(rec)
 
     crud = E2GCRUD()
-    result = crud.bulk_upsert(session, records)
+    result = crud.bulk_upsert(omics_session, records)
 
     # Mark flags for discoverability in the UI.
-    experiment = session.get(Experiment, experiment_id)
+    experiment = core_session.get(Experiment, experiment_id)
     if experiment is not None and hasattr(experiment, "exp_exp2gene_FLAG"):
         experiment.exp_exp2gene_FLAG = True
     if hasattr(run, "gpgrouper_flag"):
         run.gpgrouper_flag = True
-    session.commit()
+    core_session.commit()
 
     return E2GImportFileResult(
         path=str(tsv_path),
@@ -359,8 +361,9 @@ def import_e2g_tsv(
 
 
 def import_e2g_files(
-    session: Session,
     *,
+    core_session: Session,
+    omics_session: Session,
     qual_paths: list[Path] | None = None,
     quant_paths: list[Path] | None = None,
     create_missing_runs: bool = True,
@@ -382,7 +385,8 @@ def import_e2g_files(
     for path in qual_paths:
         try:
             res = import_e2g_tsv(
-                session,
+                core_session=core_session,
+                omics_session=omics_session,
                 path=path,
                 kind="qual",
                 create_missing_runs=create_missing_runs,
@@ -403,7 +407,8 @@ def import_e2g_files(
     for path in quant_paths:
         try:
             res = import_e2g_tsv(
-                session,
+                core_session=core_session,
+                omics_session=omics_session,
                 path=path,
                 kind="quant",
                 create_missing_runs=create_missing_runs,

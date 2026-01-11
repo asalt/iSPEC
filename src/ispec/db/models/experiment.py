@@ -8,7 +8,6 @@ from .base import Base, make_timestamp_mixin
 
 ExperimentTimestamp = make_timestamp_mixin("Experiment")
 ExperimentRunTimestamp = make_timestamp_mixin("ExperimentRun")
-E2GTimestamp = make_timestamp_mixin("E2G")
 JobTimestamp = make_timestamp_mixin("job")
 
 
@@ -234,53 +233,8 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
     gpgrouper_flag: Mapped[bool] = mapped_column(Boolean, default=False)
 
     experiment: Mapped["Experiment"] = relationship(back_populates="runs")
-    gene_mappings: Mapped[list["E2G"]] = relationship(
-        back_populates="experiment_run", cascade="all, delete-orphan"
-    )
-    psms: Mapped[list["PSM"]] = relationship(
-        "PSM", back_populates="experiment_run", cascade="all, delete-orphan"
-    )
     raw_files: Mapped[list["MSRawFile"]] = relationship(
         "MSRawFile", back_populates="experiment_run", cascade="all, delete-orphan"
-    )
-
-
-class E2G(E2GTimestamp, Base):
-    __tablename__ = "experiment_to_gene"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    experiment_run_id: Mapped[int] = mapped_column(
-        ForeignKey("experiment_run.id", ondelete="CASCADE"), nullable=False
-    )
-    gene: Mapped[str] = mapped_column(Text, nullable=False)
-    geneidtype: Mapped[str] = mapped_column(Text, nullable=False)
-    label: Mapped[str] = mapped_column(Text, nullable=False, default="0")
-
-    # Convenience columns (GeneID is canonical; the others help search/display).
-    gene_symbol: Mapped[str | None] = mapped_column(Text, nullable=True)
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
-    taxon_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    sra: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    # QUAL metrics
-    psms: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    psms_u2g: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    peptide_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    peptide_count_u2g: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    coverage: Mapped[float | None] = mapped_column(Float, nullable=True)
-    coverage_u2g: Mapped[float | None] = mapped_column(Float, nullable=True)
-
-    # QUANT metrics
-    area_sum_u2g_0: Mapped[float | None] = mapped_column(Float, nullable=True)
-    area_sum_u2g_all: Mapped[float | None] = mapped_column(Float, nullable=True)
-    area_sum_max: Mapped[float | None] = mapped_column(Float, nullable=True)
-    area_sum_dstrAdj: Mapped[float | None] = mapped_column(Float, nullable=True)
-    iBAQ_dstrAdj: Mapped[float | None] = mapped_column(Float, nullable=True)
-    peptideprint: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    experiment_run: Mapped["ExperimentRun"] = relationship(
-        back_populates="gene_mappings"
     )
 
 

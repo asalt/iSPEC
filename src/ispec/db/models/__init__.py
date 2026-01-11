@@ -3,8 +3,8 @@ from ispec.logging import get_logger
 
 from .base import Base, make_timestamp_mixin
 from .core import Person, ProjectType, Project, ProjectComment, ProjectPerson
-from .experiment import Experiment, ExperimentRun, E2G, Job, JobType, JobStatus
-from .omics import PSM
+from .experiment import Experiment, ExperimentRun, Job, JobType, JobStatus
+from .omics import E2G, GeneContrast, GeneContrastStat, GSEAAnalysis, GSEAResult, PSM
 from .files import MSRawFile, ProjectFile, RawFileType, RawFileState, StorageBackend
 from .support import LetterOfSupport
 from .auth import AuthUser, AuthSession, AuthUserProject, UserRole
@@ -25,6 +25,10 @@ __all__ = [
     "Experiment",
     "ExperimentRun",
     "E2G",
+    "GeneContrast",
+    "GeneContrastStat",
+    "GSEAAnalysis",
+    "GSEAResult",
     "PSM",
     "Job",
     "JobType",
