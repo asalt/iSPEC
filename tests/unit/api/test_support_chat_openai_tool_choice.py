@@ -12,7 +12,7 @@ from ispec.db.models import Project
 from ispec.schedule.connect import get_schedule_session
 
 
-def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeypatch):
+def test_support_chat_forces_openai_tool_choice_when_user_requests_tool(tmp_path, db_session, monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
@@ -29,17 +29,12 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
     db_session.commit()
 
     calls: list[dict[str, Any]] = []
+    expected_choice = {"type": "function", "function": {"name": "count_projects"}}
 
-    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
-        calls.append({"messages": messages, "tools": tools})
+    def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
+        calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
         if len(calls) == 1:
-            assert isinstance(tools, list)
-            assert any(
-                isinstance(tool, dict)
-                and isinstance(tool.get("function"), dict)
-                and tool["function"].get("name") == "count_projects"
-                for tool in tools
-            )
+            assert tool_choice == expected_choice
             return AssistantReply(
                 content="",
                 provider="test",
@@ -54,20 +49,7 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
                 ],
             )
 
-        assert isinstance(messages, list)
-        tool_message = next(
-            msg for msg in messages if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_1"
-        )
-        tool_payload = json.loads(str(tool_message.get("content") or "{}"))
-        assert tool_payload["ok"] is True
-        assert tool_payload["result"]["count"] == 3
-        assert any(
-            msg.get("role") == "system"
-            and isinstance(msg.get("content"), str)
-            and msg["content"].startswith("TOOL_RESULT count_projects")
-            for msg in messages
-        )
-
+        assert tool_choice is None
         return AssistantReply(
             content="FINAL:\nWe have 3 projects.",
             provider="test",
@@ -86,7 +68,7 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
         payload = ChatRequest.model_validate(
             {
                 "sessionId": "session-1",
-                "message": "How many projects do we have?",
+                "message": "Tell me how many projects we have; use a tool.",
                 "history": [],
                 "ui": None,
             }
@@ -103,6 +85,7 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
             )
 
         assert response.message == "We have 3 projects."
+        assert len(calls) == 2
 
         assistant_row = (
             assistant_db.query(support_routes.SupportMessage)
@@ -114,8 +97,5 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
         assert meta["tool_calls"][0]["name"] == "count_projects"
-        assert meta["tool_calls"][0]["protocol"] == "openai"
-        assert meta["tooling"]["enabled"] is True
-        assert meta["tooling"]["protocol_config"] == "openai"
-        assert meta["tooling"]["schemas_provided"] is True
-        assert meta["tooling"]["used_tool_calls"] == 1
+        assert meta["tooling"]["forced_tool_choice"] == expected_choice
+

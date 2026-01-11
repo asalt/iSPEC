@@ -1,15 +1,62 @@
 # ispec/api/models/modelmaker.py
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import Any, Dict, Optional, Type, get_args, get_origin, get_type_hints
+
 from pydantic import BaseModel, ConfigDict, create_model
-from typing import get_args, get_origin, Optional, Type, Dict, Any
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapper,
+    Mapped,
     ColumnProperty,
     RelationshipProperty,
     class_mapper,
 )
 from sqlalchemy.sql.schema import Column
 from sqlalchemy.sql import sqltypes as T
+
+
+_NONE_TYPE = type(None)
+
+
+@lru_cache(maxsize=None)
+def _model_type_hints(model_cls: Type[DeclarativeBase]) -> dict[str, Any]:
+    try:
+        return get_type_hints(model_cls, include_extras=True)  # type: ignore[call-arg]
+    except TypeError:
+        try:
+            return get_type_hints(model_cls)
+        except Exception:
+            return {}
+    except Exception:
+        return {}
+
+
+def _mapped_annotation_type(model_cls: Type[DeclarativeBase], field_name: str) -> Any | None:
+    hints = _model_type_hints(model_cls)
+    annotation = hints.get(field_name)
+    if annotation is None or get_origin(annotation) is not Mapped:
+        return None
+    args = get_args(annotation)
+    return args[0] if args else None
+
+
+def _type_allows_none(tp: Any) -> bool:
+    return _NONE_TYPE in get_args(tp)
+
+
+def _ensure_optional(tp: Any) -> Any:
+    if _type_allows_none(tp):
+        return tp
+    return Optional[tp]
+
+
+def _strip_optional(tp: Any) -> Any:
+    args = get_args(tp)
+    if args and len(args) == 2 and _NONE_TYPE in args:
+        return args[0] if args[1] is _NONE_TYPE else args[1]
+    return tp
 
 
 
@@ -41,8 +88,11 @@ def make_pydantic_model_from_sqlalchemy(
                 continue
 
             try:
-                if isinstance(col.type, T.Enum) and getattr(col.type, "enum_class", None):
-                    python_type = col.type.enum_class    # <- prefer the enum class
+                mapped_type = _mapped_annotation_type(model_cls, field_name)
+                if mapped_type is not None:
+                    python_type = mapped_type
+                elif isinstance(col.type, T.Enum) and getattr(col.type, "enum_class", None):
+                    python_type = col.type.enum_class
                 else:
                     python_type = col.type.python_type
             except NotImplementedError:
@@ -61,9 +111,10 @@ def make_pydantic_model_from_sqlalchemy(
             )
 
             if is_optional:
-                python_type = Optional[python_type]
+                python_type = _ensure_optional(python_type)
                 default = None
             else:
+                python_type = _strip_optional(python_type)
                 default = ...
 
             fields[field_name_out] = (python_type, default)

@@ -10,7 +10,12 @@ from typing import Any, Literal
 import requests
 
 from ispec.assistant.tools import TOOL_CALL_PREFIX, TOOL_RESULT_PREFIX, tool_prompt
+from ispec.logging import get_logger
 
+
+logger = get_logger(__name__)
+
+ResponseFormat = Literal["single", "compare"]
 
 @dataclass(frozen=True)
 class AssistantReply:
@@ -19,9 +24,43 @@ class AssistantReply:
     model: str | None = None
     meta: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    ok: bool = True
+    error: str | None = None
 
 
 _PROMPT_FILE_MAX_CHARS = 80_000
+
+
+def _normalize_openai_base_url(value: str) -> str:
+    """Normalize OpenAI-style base URLs.
+
+    Accepts values like:
+      - http://host:8000
+      - http://host:8000/v1
+      - http://host:8000/v1/chat/completions
+
+    Returns the base URL without the /v1 suffix or endpoint path.
+    """
+
+    raw = (value or "").strip().rstrip("/")
+    if not raw:
+        return ""
+
+    for suffix in ("/v1/chat/completions", "/v1/models", "/v1"):
+        if raw.endswith(suffix):
+            raw = raw[: -len(suffix)].rstrip("/")
+            break
+
+    return raw
+
+
+def _truncate_text(value: str, *, limit: int = 2000) -> str:
+    if limit <= 0:
+        return ""
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit]
 
 
 def _read_text_file(path: str, *, max_chars: int = _PROMPT_FILE_MAX_CHARS) -> str | None:
@@ -72,6 +111,8 @@ def _default_prompt_base() -> str:
         "- Ask a single clarifying question when needed.\n"
         "- Never invent database values, IDs, or outcomes.\n"
         "- If you reference a record, include its id and title when available.\n"
+        "- CONTEXT is a partial snapshot; do not assume lists are exhaustive or infer global counts from them.\n"
+        "- When tool calling is available, use tools for database lookups; do not claim you can't access iSPEC data.\n"
         "- If users share product feedback or feature requests, thank them and ask for specifics (page/route, what they expected).\n"
         "- Do not reveal secrets (API keys, env vars, credentials) or internal paths.\n"
         "\n"
@@ -82,14 +123,24 @@ def _default_prompt_base() -> str:
         "of older turns that may be omitted from the message history.\n"
     )
 
-def _system_prompt_answer() -> str:
+def _final_template(*, response_format: ResponseFormat) -> str:
+    if response_format == "compare":
+        return (
+            "  FINAL_A:\n"
+            "  <draft answer A (concise)>\n"
+            "  FINAL_B:\n"
+            "  <draft answer B (alternative phrasing/structure; can be slightly more detailed)>\n"
+        )
+    return "  FINAL:\n  <your user-facing answer>\n"
+
+
+def _system_prompt_answer(*, response_format: ResponseFormat = "single") -> str:
     prompt = (
         _default_prompt_base().rstrip()
         + "\n\n"
         + "Response format:\n"
         + "- Output only:\n"
-        + "  FINAL:\n"
-        + "  <your user-facing answer>\n"
+        + _final_template(response_format=response_format)
         + "- Do not include PLAN.\n"
         + "\n"
         + "UI routes (common): /projects, /project/<id>, /people, /experiments,\n"
@@ -113,16 +164,23 @@ def _system_prompt_answer() -> str:
     return prompt.strip()
 
 
-def _system_prompt_planner(*, tools_available: bool) -> str:
+def _system_prompt_planner(
+    *,
+    tools_available: bool,
+    response_format: ResponseFormat = "single",
+) -> str:
     prompt = (
         _default_prompt_base().rstrip()
         + "\n\n"
         + "Tool use (optional):\n"
         + "- If you need more iSPEC DB info than CONTEXT provides, request a tool.\n"
         + "- Never invent database values, IDs, or outcomes.\n"
-        + "- For count questions like 'how many projects', prefer count_projects.\n"
+        + "- For global count/list questions (e.g. 'how many projects'), do not infer from CONTEXT; use count_projects.\n"
         + "- For 'latest projects' / 'recent changes', use latest_projects and latest_project_comments.\n"
         + "- For experiments in a specific project, use experiments_for_project.\n"
+        + "- For collaborative project work, draft notes first; only write to project history if the user explicitly asks you to save.\n"
+        + "- For code searches in the iSPEC repo (dev-only), use repo_search/repo_list_files/repo_read_file.\n"
+        + "- If the user explicitly asks you to use a tool, call the appropriate tool.\n"
     )
 
     if tools_available:
@@ -131,6 +189,8 @@ def _system_prompt_planner(*, tools_available: bool) -> str:
             "Tool calling protocol:\n"
             "- Use OpenAI-style tool_calls (tools/tool_choice are provided).\n"
             "- When calling tools, do not include PLAN/FINAL in the content.\n"
+            f"- If structured tool_calls are not supported, fallback to one line starting with {TOOL_CALL_PREFIX}:\n"
+            f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
             f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative.\n"
         )
     else:
@@ -149,8 +209,7 @@ def _system_prompt_planner(*, tools_available: bool) -> str:
         "Response format:\n"
         "- If you call a tool: output only the tool call (or tool_calls), with no extra text.\n"
         "- Otherwise, output only:\n"
-        "  FINAL:\n"
-        "  <your user-facing answer>\n"
+        + _final_template(response_format=response_format)
     )
 
     extras = _prompt_extras()
@@ -174,6 +233,23 @@ def _system_prompt_review() -> str:
         + "- Output only:\n"
         + "  FINAL:\n"
         + "  <answer>\n"
+    )
+
+    extras = _prompt_extras()
+    if extras:
+        prompt = prompt.rstrip() + "\n\n" + extras
+
+    return prompt.strip()
+
+
+def _system_prompt_review_decider() -> str:
+    prompt = (
+        _default_prompt_base().rstrip()
+        + "\n\n"
+        + "You are in review decision mode.\n"
+        + "- Decide if the draft answer needs changes.\n"
+        + "- Do not call tools.\n"
+        + "- Output exactly one token: KEEP or REWRITE.\n"
     )
 
     extras = _prompt_extras()
@@ -208,7 +284,9 @@ def _ollama_timeout_seconds() -> float:
 
 
 def _vllm_url() -> str:
-    return (os.getenv("ISPEC_VLLM_URL") or "http://127.0.0.1:8000").rstrip("/")
+    raw = os.getenv("ISPEC_VLLM_URL") or "http://127.0.0.1:8000"
+    normalized = _normalize_openai_base_url(raw)
+    return (normalized or raw).rstrip("/")
 
 
 def _vllm_model() -> str | None:
@@ -292,7 +370,9 @@ def generate_reply(
     context: str | None = None,
     messages: list[dict[str, Any]] | None = None,
     tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
     stage: Literal["planner", "answer", "review"] = "answer",
+    vllm_extra_body: dict[str, Any] | None = None,
 ) -> AssistantReply:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub").strip().lower()
     if messages is None:
@@ -308,7 +388,12 @@ def generate_reply(
     if provider == "ollama":
         return _generate_ollama_reply(messages=messages, tools=tools)
     if provider == "vllm":
-        return _generate_vllm_reply(messages=messages, tools=tools)
+        return _generate_vllm_reply(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            extra_body=vllm_extra_body,
+        )
     return AssistantReply(
         content=(
             "Support assistant is running in stub mode. "
@@ -403,15 +488,20 @@ def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[s
         response.raise_for_status()
         data = response.json()
     except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.warning("Ollama request failed (%s): %s", url, error)
         return AssistantReply(
-            content=f"Assistant error: {type(exc).__name__}: {exc}",
+            content=f"Assistant error: {error}",
             provider="ollama",
             model=model,
             meta={"url": url, "error": repr(exc)},
+            ok=False,
+            error=error,
         )
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
     content = ""
+    tool_calls = None
     if isinstance(data, dict):
         message_obj = data.get("message") or {}
         if isinstance(message_obj, dict):
@@ -428,7 +518,25 @@ def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[s
     )
 
 
-def _generate_vllm_reply(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> AssistantReply:
+def _sanitize_vllm_extra_body(extra_body: dict[str, Any]) -> dict[str, Any]:
+    forbidden = {"model", "messages", "stream", "tools", "tool_choice"}
+    cleaned: dict[str, Any] = {}
+    for key, value in extra_body.items():
+        if not isinstance(key, str):
+            continue
+        if key in forbidden:
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def _generate_vllm_reply(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    tool_choice: str | dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
+) -> AssistantReply:
     base_url = _vllm_url()
     url = f"{base_url}/v1/chat/completions"
     timeout = _vllm_timeout_seconds()
@@ -438,34 +546,130 @@ def _generate_vllm_reply(*, messages: list[dict[str, Any]], tools: list[dict[str
         model = _resolve_vllm_model(base_url=base_url, headers=headers, timeout=timeout)
     except Exception as exc:
         model = _vllm_model()
+        error = f"{type(exc).__name__}: {exc}"
+        logger.warning("vLLM model resolution failed (%s): %s", base_url, error)
         return AssistantReply(
-            content=f"Assistant error: {type(exc).__name__}: {exc}",
+            content=f"Assistant error: {error}",
             provider="vllm",
             model=model,
             meta={"url": base_url, "error": repr(exc)},
             tool_calls=None,
+            ok=False,
+            error=error,
         )
     model = model or "unknown"
 
-    payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+    payload_base: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
     temperature = _assistant_temperature()
     if temperature is not None:
-        payload["temperature"] = temperature
+        payload_base["temperature"] = temperature
     if tools is not None:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
+        payload_base["tools"] = tools
+        payload_base["tool_choice"] = tool_choice if tool_choice is not None else "auto"
+    cleaned_extra_body: dict[str, Any] | None = None
+    payload = dict(payload_base)
+    if extra_body:
+        cleaned_extra_body = _sanitize_vllm_extra_body(extra_body)
+        payload.update(cleaned_extra_body)
     started = time.monotonic()
+    fallback: dict[str, Any] = {}
+    rejections: list[dict[str, Any]] = []
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=timeout)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
+        response = None
+        data = None
+        candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = [("full", payload, {})]
+        if cleaned_extra_body:
+            candidates.append(("drop_extra_body", payload_base, {"dropped_extra_body": True}))
+        if tools is not None:
+            payload_no_tools = dict(payload_base)
+            payload_no_tools.pop("tools", None)
+            payload_no_tools.pop("tool_choice", None)
+            candidates.append(
+                (
+                    "drop_tools",
+                    payload_no_tools,
+                    {"dropped_tools": True, "dropped_extra_body": bool(cleaned_extra_body)},
+                )
+            )
+
+        last_exc: Exception | None = None
+        for label, candidate, candidate_fallback in candidates:
+            try:
+                response = requests.post(url, json=candidate, headers=headers, timeout=timeout)
+                response.raise_for_status()
+                data = response.json()
+                fallback = candidate_fallback
+                last_exc = None
+                break
+            except requests.exceptions.HTTPError as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code in {400, 422}:
+                    response_text = ""
+                    response_obj = getattr(exc, "response", None)
+                    if response_obj is not None:
+                        try:
+                            response_text = str(getattr(response_obj, "text", "") or "")
+                        except Exception:
+                            response_text = ""
+                    response_text = _truncate_text(response_text)
+                    rejections.append(
+                        {
+                            "attempt": label,
+                            "status_code": status_code,
+                            "response_text": response_text or None,
+                        }
+                    )
+                    last_exc = exc
+                    continue
+                raise
+
+        if last_exc is not None or data is None:
+            raise last_exc or RuntimeError("No response data from vLLM.")
+    except requests.exceptions.HTTPError as exc:
+        response_obj = getattr(exc, "response", None)
+        status_code = getattr(response_obj, "status_code", None)
+        response_text = ""
+        if response_obj is not None:
+            try:
+                response_text = str(getattr(response_obj, "text", "") or "")
+            except Exception:
+                response_text = ""
+
+        error = f"{type(exc).__name__}: {exc}"
+        meta: dict[str, Any] = {"url": url, "error": repr(exc)}
+        if status_code is not None:
+            meta["status_code"] = status_code
+        response_text = _truncate_text(response_text)
+        if response_text:
+            meta["response_text"] = response_text
+        if rejections:
+            meta["attempts"] = rejections[-3:]
+        logger.warning(
+            "vLLM request failed (%s, status=%s): %s",
+            url,
+            meta.get("status_code"),
+            meta.get("response_text") or error,
+        )
         return AssistantReply(
-            content=f"Assistant error: {type(exc).__name__}: {exc}",
+            content=f"Assistant error: {error}",
+            provider="vllm",
+            model=model,
+            meta=meta,
+            tool_calls=None,
+            ok=False,
+            error=error,
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.warning("vLLM request failed (%s): %s", url, error)
+        return AssistantReply(
+            content=f"Assistant error: {error}",
             provider="vllm",
             model=model,
             meta={"url": url, "error": repr(exc)},
             tool_calls=None,
+            ok=False,
+            error=error,
         )
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
@@ -495,6 +699,11 @@ def _generate_vllm_reply(*, messages: list[dict[str, Any]], tools: list[dict[str
     meta: dict[str, Any] = {"url": url, "elapsed_ms": elapsed_ms}
     if usage is not None:
         meta["usage"] = usage
+    if fallback:
+        meta["fallback"] = dict(fallback)
+        if rejections:
+            meta["fallback"]["rejected"] = rejections[-3:]
+        logger.info("vLLM request succeeded with fallback %s", meta["fallback"])
 
     return AssistantReply(
         content=content,

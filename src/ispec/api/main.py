@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ispec.api.routes.auth import router as auth_router
+from ispec.api.routes.agents import router as agents_router
 from ispec.api.routes.project_files import router as project_files_router
 from ispec.api.routes.routes import router as crud_router
 from ispec.api.routes.schedule import router as schedule_router
@@ -57,6 +58,9 @@ def status():
 
 # Auth endpoints live under /api/auth.
 app.include_router(auth_router, prefix="/api", dependencies=[Depends(require_api_key)])
+
+# Agent telemetry endpoints (/api/agents/*).
+app.include_router(agents_router, prefix="/api", dependencies=[Depends(require_api_key)])
 
 # Protected CRUD routes (both legacy root routes and /api/*).
 if legacy_root_routes:

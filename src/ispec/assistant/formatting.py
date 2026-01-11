@@ -5,6 +5,8 @@ import re
 
 _PLAN_MARKER_RE = re.compile(r"(?im)^[ \t]*PLAN:\s*")
 _FINAL_MARKER_RE = re.compile(r"(?im)^[ \t]*FINAL:\s*")
+_FINAL_A_MARKER_RE = re.compile(r"(?im)^[ \t]*FINAL_A:\s*")
+_FINAL_B_MARKER_RE = re.compile(r"(?im)^[ \t]*FINAL_B:\s*")
 
 
 def split_plan_final(text: str) -> tuple[str | None, str]:
@@ -36,3 +38,34 @@ def split_plan_final(text: str) -> tuple[str | None, str]:
         plan_text = extracted or None
 
     return plan_text, final_text
+
+
+def split_compare_finals(text: str) -> tuple[str, str] | None:
+    """Split a compare-mode response into (answer_a, answer_b).
+
+    Expected format:
+      FINAL_A:
+      ...
+      FINAL_B:
+      ...
+    """
+
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    matches_a = list(_FINAL_A_MARKER_RE.finditer(raw))
+    matches_b = list(_FINAL_B_MARKER_RE.finditer(raw))
+    if not matches_a or not matches_b:
+        return None
+
+    for match_a in reversed(matches_a):
+        match_b = next((m for m in matches_b if m.start() > match_a.end()), None)
+        if match_b is None:
+            continue
+        answer_a = raw[match_a.end() : match_b.start()].strip()
+        answer_b = raw[match_b.end() :].strip()
+        if answer_a and answer_b:
+            return answer_a, answer_b
+
+    return None

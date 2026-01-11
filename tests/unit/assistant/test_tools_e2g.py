@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from ispec.assistant.tools import run_tool
-from ispec.db.models import E2G, Experiment, ExperimentRun, Project
+from ispec.db.models import Experiment, ExperimentRun, Project
+from ispec.omics.models import E2G
 
 
-def test_e2g_tools_can_search_and_fetch_hits(db_session):
+def test_e2g_tools_can_search_and_fetch_hits(db_session, omics_session):
     project = Project(id=1, prj_AddedBy="test", prj_ProjectTitle="Project 1")
     experiment = Experiment(id=100, project_id=1, record_no="100", exp_Name="Experiment 100")
     run = ExperimentRun(experiment_id=100, run_no=1, search_no=1, label="0")
@@ -20,14 +21,15 @@ def test_e2g_tools_can_search_and_fetch_hits(db_session):
         psms_u2g=9,
         peptideprint="PEP_A__PEP_B",
     )
-    db_session.add(e2g)
-    db_session.commit()
+    omics_session.add(e2g)
+    omics_session.commit()
 
     search_payload = run_tool(
         name="e2g_search_genes_in_project",
         args={"project_id": 1, "query": "kras", "limit": 5},
         core_db=db_session,
         schedule_db=None,
+        omics_db=omics_session,
         user=None,
         api_schema=None,
     )
@@ -40,6 +42,7 @@ def test_e2g_tools_can_search_and_fetch_hits(db_session):
         args={"project_id": 1, "gene_id": 123, "limit": 10},
         core_db=db_session,
         schedule_db=None,
+        omics_db=omics_session,
         user=None,
         api_schema=None,
     )

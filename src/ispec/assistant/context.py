@@ -12,6 +12,9 @@ from ispec.db.models import Person, Project, ProjectComment
 _PROJECT_ID_RE = re.compile(r"\b(?:project|prj)\s*#?\s*(\d{1,9})\b", re.IGNORECASE)
 _PRJ_RE = re.compile(r"\bPRJ\s*#?\s*(\d{1,9})\b", re.IGNORECASE)
 _PERSON_ID_RE = re.compile(r"\b(?:person|ppl)\s*#?\s*(\d{1,9})\b", re.IGNORECASE)
+_SINGULAR_PROJECT_RE = re.compile(r"\bproject\b", re.IGNORECASE)
+_PLURAL_PROJECTS_RE = re.compile(r"\bprojects\b", re.IGNORECASE)
+_THIS_PROJECT_RE = re.compile(r"\b(this|current|that|the)\s+project\b", re.IGNORECASE)
 
 _PROJECT_STATUSES = [
     "inquiry",
@@ -140,10 +143,9 @@ def build_ispec_context(
     state = state or {}
 
     project_ids = extract_project_ids(message)
-    if not project_ids:
-        focused = state.get("current_project_id")
-        if isinstance(focused, int) and focused >= 0:
-            project_ids = [focused]
+    focused_project_id = state.get("current_project_id")
+    if not isinstance(focused_project_id, int) or focused_project_id < 0:
+        focused_project_id = None
 
     resolved_projects: list[dict[str, Any]] = []
     missing_project_ids: list[int] = []
@@ -157,6 +159,18 @@ def build_ispec_context(
         context["projects"] = resolved_projects
     if missing_project_ids:
         context["missing_projects"] = missing_project_ids
+
+    if not project_ids and focused_project_id is not None:
+        wants_this_project = bool(_THIS_PROJECT_RE.search(message or ""))
+        mentions_singular = bool(_SINGULAR_PROJECT_RE.search(message or "")) and not bool(
+            _PLURAL_PROJECTS_RE.search(message or "")
+        )
+        if wants_this_project or mentions_singular:
+            project = db.get(Project, focused_project_id)
+            if project is None:
+                context["missing_current_project"] = focused_project_id
+            else:
+                context["current_project"] = project_summary(db, project)
 
     if "current" in lowered and "project" in lowered:
         rows = (
@@ -215,4 +229,3 @@ def build_ispec_context(
             context["missing_people"] = missing_people
 
     return context
-

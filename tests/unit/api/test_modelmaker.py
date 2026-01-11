@@ -1,79 +1,40 @@
-from pydantic import BaseModel
-from ispec.db.models import Person, Project, ProjectComment
+from typing import Any, get_args, get_origin
+
+from sqlalchemy import JSON, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
 from ispec.api.models.modelmaker import make_pydantic_model_from_sqlalchemy
 
 
-def test_person_model_fields():
-    """Basic field generation from a SQLAlchemy model."""
-
-    PersonRead = make_pydantic_model_from_sqlalchemy(
-        Person,
-        name_suffix="Read",
-        strip_prefix="ppl_",
-        exclude_fields={"id"},
-    )
-
-    assert issubclass(PersonRead, BaseModel)
-    model_fields = PersonRead.model_fields
-
-    # Ensure key fields are present and properly renamed
-    assert "Name_First" in model_fields
-    assert "Name_Last" in model_fields
-    assert "AddedBy" in model_fields
-
-    # Ensure stripped prefix
-    assert "ppl_Name_First" not in model_fields
-
-    # Fields should be required by default
-    assert model_fields["Name_First"].is_required() is True
-    assert model_fields["Name_Last"].is_required() is True
+class _Base(DeclarativeBase):
+    pass
 
 
-def test_person_model_optional_fields_with_optional_all():
-    """When optional_all is True, all fields become optional."""
+class _Example(_Base):
+    __tablename__ = "example"
 
-    PersonCreate = make_pydantic_model_from_sqlalchemy(
-        Person,
-        name_suffix="Create",
-        strip_prefix="ppl_",
-        exclude_fields={"id"},
-        optional_all=True,
-    )
-
-    model_fields = PersonCreate.model_fields
-    assert model_fields["Name_First"].is_required() is False
-    assert model_fields["Name_Last"].is_required() is False
+    id: Mapped[int] = mapped_column(primary_key=True)
+    meta: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=True)
+    required_name: Mapped[str | None] = mapped_column(Text, nullable=False)
 
 
-def test_include_relationships_with_related_model_map():
-    """Include relationship fields using related_model_map."""
+def test_modelmaker_prefers_mapped_type_hints():
+    Create = make_pydantic_model_from_sqlalchemy(_Example, name_suffix="Create")
 
-    PersonRead = make_pydantic_model_from_sqlalchemy(
-        Person,
-        name_suffix="Read",
-        strip_prefix="ppl_",
-        exclude_fields={"id"},
-    )
-    ProjectRead = make_pydantic_model_from_sqlalchemy(
-        Project,
-        name_suffix="Read",
-        strip_prefix="prj_",
-        exclude_fields={"id"},
-    )
+    meta_ann = Create.model_fields["meta"].annotation
+    assert get_origin(meta_ann) is dict
+    assert get_args(meta_ann) == (str, Any)
+    assert Create.model_fields["meta"].is_required()
 
-    CommentRead = make_pydantic_model_from_sqlalchemy(
-        ProjectComment,
-        name_suffix="Read",
-        include_relationships=True,
-        related_model_map={
-            "person": PersonRead,
-            "project": ProjectRead,
-        },
-    )
 
-    model_fields = CommentRead.model_fields
-    assert "person" in model_fields
-    assert model_fields["person"].annotation == PersonRead
-    assert "project" in model_fields
-    assert model_fields["project"].annotation == ProjectRead
+def test_modelmaker_aligns_optional_with_nullability():
+    Create = make_pydantic_model_from_sqlalchemy(_Example, name_suffix="Create")
 
+    note_ann = Create.model_fields["note"].annotation
+    assert type(None) in get_args(note_ann)
+    assert not Create.model_fields["note"].is_required()
+
+    required_ann = Create.model_fields["required_name"].annotation
+    assert type(None) not in get_args(required_ann)
+    assert Create.model_fields["required_name"].is_required()

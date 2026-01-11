@@ -15,6 +15,7 @@ from ispec.schedule.models import ScheduleSlot
 
 
 def test_support_chat_can_call_tools(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "line")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
@@ -88,9 +89,13 @@ def test_support_chat_can_call_tools(tmp_path, db_session, monkeypatch):
             meta = json.loads(assistant_row.meta_json)
             assert meta["tool_calls"][0]["name"] == "get_project"
             assert meta["tool_calls"][0]["ok"] is True
+            assert meta["tooling"]["enabled"] is True
+            assert meta["tooling"]["max_tool_calls"] == 2
+            assert meta["tooling"]["used_tool_calls"] == 1
 
 
 def test_support_chat_can_call_schedule_tools(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "line")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")

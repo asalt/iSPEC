@@ -11,6 +11,7 @@ from ispec.schedule.connect import get_schedule_session
 
 
 def test_support_chat_strips_plan_section_from_user_message(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "line")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
@@ -65,9 +66,14 @@ def test_support_chat_strips_plan_section_from_user_message(tmp_path, db_session
         meta = json.loads(assistant_row.meta_json)
         assert meta["plan"].startswith("- Look up")
         assert "PLAN:" in meta["raw_content"]
+        assert meta["tool_calls"] == []
+        assert meta["tooling"]["enabled"] is False
+        assert meta["tooling"]["max_tool_calls"] == 0
+        assert meta["tooling"]["used_tool_calls"] == 0
 
 
 def test_support_chat_strips_plan_even_with_preamble(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "line")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
@@ -128,3 +134,7 @@ def test_support_chat_strips_plan_even_with_preamble(tmp_path, db_session, monke
         meta = json.loads(assistant_row.meta_json)
         assert meta["plan"].startswith("- Keep it short")
         assert "Based on the most recent tool result" in meta["raw_content"]
+        assert meta["tool_calls"] == []
+        assert meta["tooling"]["enabled"] is False
+        assert meta["tooling"]["max_tool_calls"] == 0
+        assert meta["tooling"]["used_tool_calls"] == 0

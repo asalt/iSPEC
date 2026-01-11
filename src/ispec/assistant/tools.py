@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 import enum
 import json
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -33,6 +36,7 @@ UTC_TZ = ZoneInfo("UTC")
 
 SCHEDULE_SLOT_STATUSES = {"available", "booked", "closed"}
 SCHEDULE_REQUEST_STATUSES = {"requested", "confirmed", "declined", "cancelled"}
+PROJECT_STATUSES = {"inquiry", "consultation", "waiting", "processing", "analysis", "summary", "closed", "hibernate"}
 
 
 class ToolScope(str, enum.Enum):
@@ -52,6 +56,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "latest_projects": ToolScope.staff,
     "latest_project_comments": ToolScope.staff,
     "search_projects": ToolScope.staff,
+    "projects": ToolScope.staff,
     "get_project": ToolScope.staff,
     "search_api": ToolScope.user,
     "experiments_for_project": ToolScope.staff,
@@ -66,7 +71,379 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "list_schedule_slots": ToolScope.user,
     "list_schedule_requests": ToolScope.admin,
     "get_schedule_request": ToolScope.admin,
+    "repo_list_files": ToolScope.staff,
+    "repo_search": ToolScope.staff,
+    "repo_read_file": ToolScope.staff,
+    "create_project_comment": ToolScope.staff,
 }
+
+_WRITE_TOOL_NAMES: set[str] = {"create_project_comment"}
+
+
+_REPO_TOOLS_ENV = "ISPEC_ASSISTANT_ENABLE_REPO_TOOLS"
+_REPO_ROOT_ENV = "ISPEC_ASSISTANT_REPO_ROOT"
+_REPO_TOOL_DEFAULT_PATH = "iSPEC/src"
+_REPO_TOOL_DEFAULT_PATH_STANDALONE = "src"
+_REPO_MAX_FILE_BYTES = 250_000
+_REPO_DENY_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", ".venv", "venv"}
+_REPO_DENY_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".tgz",
+    ".sqlite",
+    ".db",
+    ".pkl",
+    ".parquet",
+    ".pem",
+    ".key",
+}
+
+
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _repo_tools_enabled() -> bool:
+    return _is_truthy(os.getenv(_REPO_TOOLS_ENV))
+
+
+def _assistant_repo_root() -> Path | None:
+    env = (os.getenv(_REPO_ROOT_ENV) or "").strip()
+    if env:
+        try:
+            return Path(env).expanduser().resolve()
+        except Exception:
+            return None
+
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / "iSPEC" / "src" / "ispec").is_dir():
+            return parent
+        if (parent / "src" / "ispec").is_dir():
+            return parent
+    return None
+
+
+def _repo_default_path(repo_root: Path) -> str:
+    if (repo_root / "iSPEC" / "src" / "ispec").is_dir():
+        return _REPO_TOOL_DEFAULT_PATH
+    if (repo_root / "src" / "ispec").is_dir():
+        return _REPO_TOOL_DEFAULT_PATH_STANDALONE
+    return _REPO_TOOL_DEFAULT_PATH
+
+
+def _safe_repo_rel_path(repo_root: Path, raw: str | None) -> Path | None:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if not value:
+        return None
+    if value.startswith(("~", "/")):
+        return None
+    candidate = (repo_root / value).resolve()
+    try:
+        if not candidate.is_relative_to(repo_root):
+            return None
+    except Exception:
+        return None
+    return candidate
+
+
+def _repo_path_denied(path: Path) -> bool:
+    parts = set(path.parts)
+    if parts.intersection(_REPO_DENY_DIRS):
+        return True
+    name = path.name
+    if name.startswith(".env"):
+        return True
+    suffix = path.suffix.lower()
+    if suffix in _REPO_DENY_SUFFIXES:
+        return True
+    return False
+
+
+def _iter_repo_files(base: Path, *, limit: int) -> list[Path]:
+    if limit <= 0:
+        return []
+    files: list[Path] = []
+    for root, dirnames, filenames in os.walk(base, topdown=True):
+        dirnames[:] = [d for d in dirnames if d not in _REPO_DENY_DIRS]
+        for filename in filenames:
+            candidate = Path(root) / filename
+            if _repo_path_denied(candidate):
+                continue
+            files.append(candidate)
+            if len(files) >= limit:
+                return files
+    return files
+
+
+def _repo_list_files(*, repo_root: Path, query: str | None, path: str | None, limit: int) -> dict[str, Any]:
+    default_path = _repo_default_path(repo_root)
+    base = _safe_repo_rel_path(repo_root, path) if path else repo_root / default_path
+    if base is None:
+        return {"ok": False, "tool": "repo_list_files", "error": "Invalid path."}
+    if not base.exists():
+        return {"ok": False, "tool": "repo_list_files", "error": "Path not found."}
+
+    limit = _clamp_int(_safe_int(limit), default=200, min_value=1, max_value=2000)
+    needle = (query or "").strip().lower() or None
+
+    results: list[str] = []
+    candidates = _iter_repo_files(base, limit=5000)
+    for candidate in candidates:
+        try:
+            rel = candidate.resolve().relative_to(repo_root).as_posix()
+        except Exception:
+            continue
+        if needle and needle not in rel.lower():
+            continue
+        results.append(rel)
+        if len(results) >= limit:
+            break
+
+    results.sort()
+    return {
+        "ok": True,
+        "tool": "repo_list_files",
+        "result": {"repo_root": repo_root.name, "path": (path or default_path), "files": results},
+    }
+
+
+def _repo_search_python(
+    *, repo_root: Path, query: str, base: Path, limit: int, regex: bool, ignore_case: bool
+) -> dict[str, Any]:
+    limit = _clamp_int(_safe_int(limit), default=50, min_value=1, max_value=500)
+
+    pattern = None
+    lowered_query = query.lower()
+    if regex:
+        try:
+            flags = re.IGNORECASE if ignore_case else 0
+            pattern = re.compile(query, flags=flags)
+        except re.error as exc:
+            return {"ok": False, "tool": "repo_search", "error": f"Invalid regex: {exc}"}
+
+    matches: list[dict[str, Any]] = []
+    scanned = 0
+    candidates = _iter_repo_files(base, limit=10_000)
+    for file_path in sorted(candidates):
+        scanned += 1
+        try:
+            stat = file_path.stat()
+        except Exception:
+            continue
+        if stat.st_size > _REPO_MAX_FILE_BYTES:
+            continue
+
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            haystack = line
+            hit = False
+            if pattern is not None:
+                hit = pattern.search(haystack) is not None
+            else:
+                if ignore_case:
+                    hit = lowered_query in haystack.lower()
+                else:
+                    hit = query in haystack
+            if not hit:
+                continue
+            try:
+                rel = file_path.resolve().relative_to(repo_root).as_posix()
+            except Exception:
+                rel = file_path.as_posix()
+            matches.append({"path": rel, "line": line_no, "text": line[:300]})
+            if len(matches) >= limit:
+                return {
+                    "ok": True,
+                    "tool": "repo_search",
+                    "result": {
+                        "query": query,
+                        "path": base.resolve().relative_to(repo_root).as_posix(),
+                        "matches": matches,
+                        "truncated": True,
+                        "scanned_files": scanned,
+                        "backend": "python",
+                    },
+                }
+
+    return {
+        "ok": True,
+        "tool": "repo_search",
+        "result": {
+            "query": query,
+            "path": base.resolve().relative_to(repo_root).as_posix(),
+            "matches": matches,
+            "truncated": False,
+            "scanned_files": scanned,
+            "backend": "python",
+        },
+    }
+
+
+def _repo_search_rg(
+    *, repo_root: Path, query: str, path: str, limit: int, regex: bool, ignore_case: bool
+) -> dict[str, Any] | None:
+    if shutil.which("rg") is None:
+        return None
+    limit = _clamp_int(_safe_int(limit), default=50, min_value=1, max_value=500)
+
+    cmd = [
+        "rg",
+        "--line-number",
+        "--no-heading",
+        "--color=never",
+        "--max-columns=300",
+        "--max-columns-preview",
+        "--max-filesize",
+        f"{_REPO_MAX_FILE_BYTES}",
+    ]
+    for denied in _REPO_DENY_DIRS:
+        cmd.extend(["--glob", f"!**/{denied}/**"])
+    cmd.extend(["--glob", "!**/.env*"])
+    if ignore_case:
+        cmd.append("--ignore-case")
+    if not regex:
+        cmd.append("--fixed-strings")
+    cmd.extend(["--", query, path])
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if completed.returncode not in {0, 1}:
+        return None
+
+    matches: list[dict[str, Any]] = []
+    for raw_line in (completed.stdout or "").splitlines():
+        line = raw_line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        file_part, line_part, text_part = parts[0], parts[1], parts[2]
+        try:
+            line_no = int(line_part)
+        except ValueError:
+            continue
+        matches.append({"path": file_part, "line": line_no, "text": text_part[:300]})
+        if len(matches) >= limit:
+            break
+
+    truncated = len(matches) >= limit and bool(completed.stdout)
+    return {
+        "ok": True,
+        "tool": "repo_search",
+        "result": {
+            "query": query,
+            "path": path,
+            "matches": matches,
+            "truncated": truncated,
+            "backend": "rg",
+        },
+    }
+
+
+def _repo_search(
+    *, repo_root: Path, query: str, path: str | None, limit: int, regex: bool, ignore_case: bool
+) -> dict[str, Any]:
+    query_clean = (query or "").strip()
+    if not query_clean:
+        return {"ok": False, "tool": "repo_search", "error": "query is required."}
+
+    base_path_raw = (path or "").strip() or _repo_default_path(repo_root)
+    base = _safe_repo_rel_path(repo_root, base_path_raw)
+    if base is None:
+        return {"ok": False, "tool": "repo_search", "error": "Invalid path."}
+    if not base.exists():
+        return {"ok": False, "tool": "repo_search", "error": "Path not found."}
+    if _repo_path_denied(base):
+        return {"ok": False, "tool": "repo_search", "error": "Path not allowed."}
+
+    rg_result = _repo_search_rg(
+        repo_root=repo_root,
+        query=query_clean,
+        path=base_path_raw,
+        limit=limit,
+        regex=regex,
+        ignore_case=ignore_case,
+    )
+    if rg_result is not None:
+        return rg_result
+    return _repo_search_python(
+        repo_root=repo_root,
+        query=query_clean,
+        base=base,
+        limit=limit,
+        regex=regex,
+        ignore_case=ignore_case,
+    )
+
+
+def _repo_read_file(*, repo_root: Path, path: str, start_line: int, max_lines: int) -> dict[str, Any]:
+    candidate = _safe_repo_rel_path(repo_root, path)
+    if candidate is None:
+        return {"ok": False, "tool": "repo_read_file", "error": "Invalid path."}
+    if _repo_path_denied(candidate):
+        return {"ok": False, "tool": "repo_read_file", "error": "Path not allowed."}
+    if not candidate.exists() or not candidate.is_file():
+        return {"ok": False, "tool": "repo_read_file", "error": "File not found."}
+
+    try:
+        stat = candidate.stat()
+    except Exception:
+        stat = None
+    if stat is not None and int(stat.st_size) > _REPO_MAX_FILE_BYTES:
+        return {"ok": False, "tool": "repo_read_file", "error": "File too large."}
+
+    start_line = _clamp_int(_safe_int(start_line), default=1, min_value=1, max_value=1_000_000)
+    max_lines = _clamp_int(_safe_int(max_lines), default=200, min_value=1, max_value=500)
+
+    try:
+        raw = candidate.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return {"ok": False, "tool": "repo_read_file", "error": f"{type(exc).__name__}: {exc}"}
+
+    lines = raw.splitlines()
+    start_index = start_line - 1
+    end_index = min(len(lines), start_index + max_lines)
+    snippet_lines = lines[start_index:end_index] if start_index < len(lines) else []
+    snippet = "\n".join(snippet_lines)
+    rel = candidate.resolve().relative_to(repo_root).as_posix()
+    return {
+        "ok": True,
+        "tool": "repo_read_file",
+        "result": {
+            "path": rel,
+            "start_line": start_line,
+            "end_line": (start_line + len(snippet_lines) - 1) if snippet_lines else start_line,
+            "total_lines": len(lines),
+            "content": snippet,
+        },
+    }
 
 
 def _scope_error(scope: ToolScope, user: AuthUser | None) -> str | None:
@@ -90,32 +467,51 @@ def _scope_error(scope: ToolScope, user: AuthUser | None) -> str | None:
 def tool_prompt() -> str:
     """Short tool list for the system prompt."""
 
-    return (
-        "Available tools (read-only):\n"
-        "- project_counts_snapshot(max_categories: int = 20)\n"
-        "- latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)\n"
-        "- billing_category_counts(current_only: bool = false, limit: int = 20)\n"
-        "- db_file_stats()  # show sqlite DB file sizes\n"
-        "- count_projects(current_only: bool = false, status: str | None = None)  # counts projects\n"
-        "- project_status_counts(current_only: bool = false)\n"
-        "- latest_projects(sort: str = 'modified', limit: int = 10, current_only: bool = false)\n"
-        "- latest_project_comments(limit: int = 10, project_id: int | None = None)\n"
-        "- search_projects(query: str, limit: int = 5)\n"
-        "- get_project(id: int)\n"
-        "- search_api(query: str, limit: int = 10)  # search FastAPI/OpenAPI endpoints\n"
-        "- experiments_for_project(project_id: int, limit: int = 20)\n"
-        "- latest_experiments(limit: int = 5)\n"
-        "- get_experiment(id: int)\n"
-        "- latest_experiment_runs(limit: int = 5)\n"
-        "- get_experiment_run(id: int)\n"
-        "- e2g_search_genes_in_project(project_id: int, query: str, limit: int = 10)\n"
-        "- e2g_gene_in_project(project_id: int, gene_id: int, limit: int = 50)\n"
-        "- search_people(query: str, limit: int = 5)\n"
-        "- get_person(id: int)\n"
-        "- list_schedule_slots(start: YYYY-MM-DD, end: YYYY-MM-DD, status: str | None = None, limit: int = 50)\n"
-        "- list_schedule_requests(limit: int = 20, status: str | None = None)  # admin-only\n"
-        "- get_schedule_request(id: int)  # admin-only\n"
+    lines = [
+        "Available tools:",
+        "- (Most tools are read-only; create_project_comment writes project history.)",
+        "- project_counts_snapshot(max_categories: int = 20)",
+        "- latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)",
+        "- billing_category_counts(current_only: bool = false, limit: int = 20)",
+        "- db_file_stats()  # show sqlite DB file sizes",
+        "- count_projects(current_only: bool = false, status: str | None = None)  # counts projects",
+        "- project_status_counts(current_only: bool = false)",
+        "- latest_projects(sort: str = 'modified', limit: int = 10, current_only: bool = false)",
+        "- latest_project_comments(limit: int = 10, project_id: int | None = None)",
+        "- search_projects(query: str, limit: int = 5)",
+        "- projects(project_id: int)  # alias for get_project",
+        "- get_project(id: int)",
+        "- search_api(query: str, limit: int = 10)  # search FastAPI/OpenAPI endpoints",
+        "- create_project_comment(project_id: int, comment: str, comment_type: str | None = None, confirm: bool = true)  # write: requires explicit user request",
+    ]
+
+    if _repo_tools_enabled():
+        lines.extend(
+            [
+                f"- repo_list_files(query: str | None = None, path: str | None = None, limit: int = 200)  # dev-only; set {_REPO_TOOLS_ENV}=1",
+                f"- repo_search(query: str, path: str | None = None, limit: int = 50, regex: bool = false, ignore_case: bool = true)  # dev-only; set {_REPO_TOOLS_ENV}=1",
+                f"- repo_read_file(path: str, start_line: int = 1, max_lines: int = 200)  # dev-only; set {_REPO_TOOLS_ENV}=1",
+            ]
+        )
+
+    lines.extend(
+        [
+            "- experiments_for_project(project_id: int, limit: int = 20)",
+            "- latest_experiments(limit: int = 5)",
+            "- get_experiment(id: int)",
+            "- latest_experiment_runs(limit: int = 5)",
+            "- get_experiment_run(id: int)",
+            "- e2g_search_genes_in_project(project_id: int, query: str, limit: int = 10)",
+            "- e2g_gene_in_project(project_id: int, gene_id: int, limit: int = 50)",
+            "- search_people(query: str, limit: int = 5)",
+            "- get_person(id: int)",
+            "- list_schedule_slots(start: YYYY-MM-DD, end: YYYY-MM-DD, status: str | None = None, limit: int = 50)",
+            "- list_schedule_requests(limit: int = 20, status: str | None = None)  # admin-only",
+            "- get_schedule_request(id: int)  # admin-only",
+        ]
     )
+
+    return "\n".join(lines) + "\n"
 
 
 def _safe_int(value: Any) -> int | None:
@@ -256,6 +652,135 @@ def _coerce_str_list(value: Any, *, max_items: int) -> list[str] | None:
     return None
 
 
+def _extract_fenced_block(text: str, *, label: str) -> str | None:
+    """Return the first fenced code block matching ``label`` (without the fences)."""
+
+    if not text:
+        return None
+
+    start_marker = f"```{label}"
+    in_block = False
+    buffer: list[str] = []
+    for raw_line in str(text).splitlines():
+        line = raw_line.rstrip("\n")
+        stripped = line.strip()
+        if not in_block:
+            if stripped.startswith(start_marker):
+                in_block = True
+                continue
+            continue
+        if stripped.startswith("```"):
+            break
+        buffer.append(line)
+
+    content = "\n".join(buffer).strip()
+    return content or None
+
+
+_TOOL_CALL_FUNC_RE = re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\((.*)\)\s*$")
+
+
+def _parse_tool_call_func_args(raw: str) -> dict[str, Any] | None:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    args: dict[str, Any] = {}
+    for chunk in text.split(","):
+        part = chunk.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            return None
+        key, value_raw = part.split("=", 1)
+        key = key.strip()
+        value_raw = value_raw.strip()
+        if not key:
+            return None
+
+        value: Any
+        lower = value_raw.lower()
+        if lower in {"true", "false"}:
+            value = lower == "true"
+        elif lower in {"none", "null"}:
+            value = None
+        else:
+            if (value_raw.startswith('"') and value_raw.endswith('"')) or (
+                value_raw.startswith("'") and value_raw.endswith("'")
+            ):
+                value = value_raw[1:-1]
+            else:
+                try:
+                    value = int(value_raw)
+                except ValueError:
+                    try:
+                        value = float(value_raw)
+                    except ValueError:
+                        value = value_raw
+
+        args[key] = value
+
+    return args
+
+
+def _parse_tool_call_fenced(text: str) -> tuple[str, dict[str, Any]] | None:
+    """Parse common model outputs like:
+
+      ```tool_calls
+      search_projects(query="example")
+      ```
+    """
+
+    block = _extract_fenced_block(text, label="tool_calls") or _extract_fenced_block(text, label="tool_call")
+    if not block:
+        return None
+
+    stripped = block.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            payload = json.loads(stripped)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            name = payload.get("name") or payload.get("tool")
+            args = payload.get("arguments") or payload.get("args") or {}
+            if isinstance(name, str) and name.strip() and isinstance(args, dict):
+                return name.strip(), args
+
+        if isinstance(payload, list) and payload:
+            first = payload[0]
+            if isinstance(first, dict):
+                name = first.get("name") or first.get("tool")
+                args = first.get("arguments") or first.get("args") or {}
+                if isinstance(name, str) and name.strip() and isinstance(args, dict):
+                    return name.strip(), args
+
+    for raw_line in block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower().strip().rstrip(":")
+        if lowered in {"tool_calls", "tool_call"}:
+            continue
+        match = _TOOL_CALL_FUNC_RE.match(line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        args_raw = match.group(2).strip()
+        args = _parse_tool_call_func_args(args_raw)
+        if args is None:
+            return None
+        return name, args
+
+    return None
+
+
 def parse_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
     """Parse a TOOL_CALL request from assistant output.
 
@@ -265,7 +790,7 @@ def parse_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
 
     line = extract_tool_call_line(text)
     if not line:
-        return None
+        return _parse_tool_call_fenced(text)
 
     raw = line[len(TOOL_CALL_PREFIX) :].strip()
     if not raw:
@@ -315,14 +840,70 @@ def run_tool(
     args: dict[str, Any],
     core_db: Session,
     schedule_db: Session | None = None,
+    omics_db: Session | None = None,
     user: AuthUser | None = None,
     api_schema: dict[str, Any] | None = None,
+    user_message: str | None = None,
 ) -> dict[str, Any]:
+    # the large try block is not great - but these if statements for
+    # resolving tool call results is probably fine
+    # also not great to define closure inside as that makes it more difficult to test
     try:
+        if name == "projects":
+            project_id = _safe_int(args.get("id"))
+            if project_id is None:
+                project_id = _safe_int(args.get("project_id"))
+            if project_id is None:
+                return {"ok": False, "tool": name, "error": "Missing integer argument: id (or project_id)"}
+            name = "get_project"
+            args = {"id": project_id}
+
         scope = _TOOL_SCOPES.get(name, ToolScope.staff)
         scope_error = _scope_error(scope, user)
         if scope_error:
             return {"ok": False, "tool": name, "error": scope_error}
+
+        if name in {"repo_list_files", "repo_search", "repo_read_file"}:
+            if not _repo_tools_enabled():
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": f"Repo tools are disabled. Set {_REPO_TOOLS_ENV}=1 to enable them.",
+                }
+            repo_root = _assistant_repo_root()
+            if repo_root is None:
+                return {"ok": False, "tool": name, "error": "Repo root not found."}
+
+            if name == "repo_list_files":
+                query = _safe_str(args.get("query"), max_len=256)
+                path = _safe_str(args.get("path"), max_len=256)
+                limit = _safe_int(args.get("limit")) or 200
+                return _repo_list_files(repo_root=repo_root, query=query, path=path, limit=limit)
+
+            if name == "repo_search":
+                query_raw = _safe_str(args.get("query"), max_len=2048) or ""
+                path = _safe_str(args.get("path"), max_len=256)
+                limit = _safe_int(args.get("limit")) or 50
+                regex = bool(args.get("regex"))
+                ignore_case = True if args.get("ignore_case") is None else bool(args.get("ignore_case"))
+                return _repo_search(
+                    repo_root=repo_root,
+                    query=query_raw,
+                    path=path,
+                    limit=limit,
+                    regex=regex,
+                    ignore_case=ignore_case,
+                )
+
+            file_path = _safe_str(args.get("path"), max_len=512) or ""
+            start_line = _safe_int(args.get("start_line")) or 1
+            max_lines = _safe_int(args.get("max_lines")) or 200
+            return _repo_read_file(
+                repo_root=repo_root,
+                path=file_path,
+                start_line=start_line,
+                max_lines=max_lines,
+            )
 
         if name == "project_counts_snapshot":
             max_categories = _clamp_int(
@@ -427,6 +1008,95 @@ def run_tool(
                             "items": price_levels,
                         },
                     },
+                },
+            }
+
+        if name == "create_project_comment":
+            if user is None:
+                return {"ok": False, "tool": name, "error": "Not authenticated."}
+            if user.role in {UserRole.viewer, UserRole.client}:
+                return {"ok": False, "tool": name, "error": "Write access required."}
+
+            confirm = args.get("confirm")
+            if confirm is not True:
+                return {"ok": False, "tool": name, "error": "confirm=true is required to write project history."}
+
+            user_msg = (user_message or "").strip().lower()
+            explicit = False
+            if user_msg:
+                if re.search(r"\b(save|log|record|add)\b", user_msg) and re.search(
+                    r"\b(history|comment|note|meeting)\b", user_msg
+                ):
+                    explicit = True
+            if not explicit:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "User did not explicitly request saving to project history.",
+                }
+
+            project_id = _safe_int(args.get("project_id"))
+            if project_id is None or project_id <= 0:
+                return {"ok": False, "tool": name, "error": "project_id is required."}
+
+            comment_text = _safe_str(args.get("comment"), max_len=20_000)
+            if comment_text is None or not comment_text.strip():
+                return {"ok": False, "tool": name, "error": "comment text is required."}
+
+            comment_type = _safe_str(args.get("comment_type"), max_len=64) or "assistant_note"
+
+            project = core_db.get(Project, int(project_id))
+            if project is None:
+                return {"ok": False, "tool": name, "error": f"Project {project_id} not found."}
+
+            person_id = _safe_int(args.get("person_id"))
+            if person_id is not None and person_id > 0:
+                person = core_db.get(Person, int(person_id))
+                if person is None:
+                    return {"ok": False, "tool": name, "error": f"Person {person_id} not found."}
+            else:
+                assistant_person = (
+                    core_db.query(Person)
+                    .filter(Person.ppl_Name_First == "iSPEC")
+                    .filter(Person.ppl_Name_Last == "Assistant")
+                    .first()
+                )
+                if assistant_person is None:
+                    assistant_person = Person(
+                        ppl_AddedBy=user.username,
+                        ppl_Name_First="iSPEC",
+                        ppl_Name_Last="Assistant",
+                    )
+                    core_db.add(assistant_person)
+                    core_db.flush()
+                person_id = int(assistant_person.id)
+
+            comment = ProjectComment(
+                project_id=int(project_id),
+                person_id=int(person_id),
+                com_Comment=comment_text,
+                com_CommentType=comment_type,
+                com_AddedBy=user.username,
+            )
+            core_db.add(comment)
+            core_db.flush()
+            core_db.commit()
+
+            snippet = comment_text.strip().replace("\n", " ")
+            if len(snippet) > 240:
+                snippet = snippet[:239] + "…"
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "project_id": int(project_id),
+                    "comment_id": int(comment.id),
+                    "person_id": int(person_id),
+                    "comment_type": comment_type,
+                    "added_by": user.username,
+                    "snippet": snippet,
+                    "links": {"project_ui": f"/project/{project_id}"},
                 },
             }
 
@@ -646,6 +1316,8 @@ def run_tool(
         if name == "count_projects":
             current_only = bool(args.get("current_only"))
             status = _safe_str(args.get("status"), max_len=64)
+            if status and status not in PROJECT_STATUSES:
+                status = None
 
             query = core_db.query(func.count(Project.id))
             if current_only:
@@ -969,6 +1641,8 @@ def run_tool(
             project_id = _safe_int(args.get("project_id"))
             if project_id is None:
                 return {"ok": False, "tool": name, "error": "Missing integer argument: project_id"}
+            if omics_db is None:
+                return {"ok": False, "tool": name, "error": "Omics database session is not available."}
 
             query_text = _safe_str(args.get("query"), max_len=200)
             if not query_text:
@@ -983,16 +1657,33 @@ def run_tool(
             limit = _clamp_int(_safe_int(args.get("limit")), default=10, min_value=1, max_value=50)
             pattern = f"%{query_text}%"
 
+            run_ids = [
+                int(row[0])
+                for row in core_db.query(ExperimentRun.id)
+                .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
+                .filter(Experiment.project_id == project_id)
+                .all()
+            ]
+            if not run_ids:
+                return {
+                    "ok": True,
+                    "tool": name,
+                    "result": {
+                        "project_id": project_id,
+                        "query": query_text,
+                        "count": 0,
+                        "matches": [],
+                    },
+                }
+
             rows = (
-                core_db.query(
+                omics_db.query(
                     E2G.gene,
                     E2G.gene_symbol,
                     E2G.description,
                     func.count(E2G.id).label("hits"),
                 )
-                .join(ExperimentRun, E2G.experiment_run_id == ExperimentRun.id)
-                .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
-                .filter(Experiment.project_id == project_id)
+                .filter(E2G.experiment_run_id.in_(run_ids))
                 .filter(
                     or_(
                         E2G.gene.ilike(pattern),
@@ -1039,20 +1730,42 @@ def run_tool(
                 return {"ok": False, "tool": name, "error": "Missing integer argument: project_id"}
             if gene_id is None:
                 return {"ok": False, "tool": name, "error": "Missing integer argument: gene_id"}
+            if omics_db is None:
+                return {"ok": False, "tool": name, "error": "Omics database session is not available."}
             limit = _clamp_int(_safe_int(args.get("limit")), default=50, min_value=1, max_value=200)
 
-            rows = (
-                core_db.query(E2G, ExperimentRun, Experiment)
-                .join(ExperimentRun, E2G.experiment_run_id == ExperimentRun.id)
+            run_rows = (
+                core_db.query(ExperimentRun, Experiment)
                 .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
                 .filter(Experiment.project_id == project_id)
+                .order_by(Experiment.id.desc(), ExperimentRun.id.desc())
+                .all()
+            )
+            run_lookup: dict[int, tuple[Any, Any]] = {
+                int(run.id): (run, experiment) for run, experiment in run_rows
+            }
+            run_ids = list(run_lookup.keys())
+            if not run_ids:
+                return {
+                    "ok": True,
+                    "tool": name,
+                    "result": {
+                        "project_id": project_id,
+                        "gene_id": gene_id,
+                        "count": 0,
+                        "hits": [],
+                    },
+                }
+
+            rows = (
+                omics_db.query(E2G)
+                .filter(E2G.experiment_run_id.in_(run_ids))
                 .filter(E2G.geneidtype == "GeneID")
                 .filter(E2G.gene == str(gene_id))
                 .order_by(
                     func.coalesce(E2G.psms_u2g, E2G.psms, 0).desc(),
                     func.coalesce(E2G.iBAQ_dstrAdj, 0.0).desc(),
-                    Experiment.id.desc(),
-                    ExperimentRun.id.desc(),
+                    E2G.experiment_run_id.desc(),
                     E2G.id.asc(),
                 )
                 .limit(limit)
@@ -1060,7 +1773,11 @@ def run_tool(
             )
 
             hits: list[dict[str, Any]] = []
-            for e2g, run, experiment in rows:
+            for e2g in rows:
+                run_id = int(getattr(e2g, "experiment_run_id"))
+                run_obj, experiment_obj = run_lookup.get(run_id, (None, None))
+                if run_obj is None or experiment_obj is None:
+                    continue
                 peptideprint = getattr(e2g, "peptideprint", None)
                 peptideprint_len = len(peptideprint) if isinstance(peptideprint, str) else None
                 peptideprint_preview = None
@@ -1071,13 +1788,13 @@ def run_tool(
 
                 hits.append(
                     {
-                        "experiment_id": int(experiment.id),
-                        "experiment_record_no": experiment.record_no,
-                        "experiment_name": experiment.exp_Name,
-                        "experiment_run_id": int(run.id),
-                        "run_no": int(run.run_no),
-                        "search_no": int(run.search_no),
-                        "label": run.label,
+                        "experiment_id": int(experiment_obj.id),
+                        "experiment_record_no": experiment_obj.record_no,
+                        "experiment_name": experiment_obj.exp_Name,
+                        "experiment_run_id": int(run_obj.id),
+                        "run_no": int(run_obj.run_no),
+                        "search_no": int(run_obj.search_no),
+                        "label": run_obj.label,
                         "gene_id": gene_id,
                         "gene_symbol": getattr(e2g, "gene_symbol", None),
                         "taxon_id": getattr(e2g, "taxon_id", None),
@@ -1094,8 +1811,8 @@ def run_tool(
                         "peptideprint_preview": peptideprint_preview,
                         "links": {
                             "project_ui": f"/project/{project_id}",
-                            "experiment_ui": f"/experiment/{experiment.id}",
-                            "experiment_run_ui": f"/experiment-run/{run.id}",
+                            "experiment_ui": f"/experiment/{experiment_obj.id}",
+                            "experiment_run_ui": f"/experiment-run/{run_obj.id}",
                         },
                     }
                 )
@@ -1114,7 +1831,9 @@ def run_tool(
         if name == "get_project":
             project_id = _safe_int(args.get("id"))
             if project_id is None:
-                return {"ok": False, "tool": name, "error": "Missing integer argument: id"}
+                project_id = _safe_int(args.get("project_id"))
+            if project_id is None:
+                return {"ok": False, "tool": name, "error": "Missing integer argument: id (or project_id)"}
             project = core_db.get(Project, project_id)
             if project is None:
                 return {"ok": False, "tool": name, "error": f"Project {project_id} not found."}
@@ -1366,23 +2085,26 @@ def run_tool(
             "ok": False,
             "tool": name,
             "error": f"Unknown tool '{name}'.",
-            "available": [
-                "project_counts_snapshot",
-                "latest_activity",
-                "billing_category_counts",
-                "db_file_stats",
-                "count_projects",
-                "project_status_counts",
-                "latest_projects",
-                "latest_project_comments",
-                "search_projects",
-                "get_project",
-                "search_api",
-                "experiments_for_project",
-                "latest_experiments",
-                "get_experiment",
-                "latest_experiment_runs",
-                "get_experiment_run",
+	            "available": [
+	                "project_counts_snapshot",
+	                "latest_activity",
+	                "billing_category_counts",
+	                "db_file_stats",
+	                "count_projects",
+	                "project_status_counts",
+	                "latest_projects",
+	                "latest_project_comments",
+	                "search_projects",
+	                "get_project",
+	                "search_api",
+	                "repo_list_files",
+	                "repo_search",
+	                "repo_read_file",
+	                "experiments_for_project",
+	                "latest_experiments",
+	                "get_experiment",
+	                "latest_experiment_runs",
+	                "get_experiment_run",
                 "e2g_search_genes_in_project",
                 "e2g_gene_in_project",
                 "search_people",
@@ -1464,26 +2186,27 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "parameters": {"type": "object", "properties": {}},
         },
     },
-    "count_projects": {
-        "type": "function",
-        "function": {
-            "name": "count_projects",
-            "description": "Count projects in the iSPEC database.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "current_only": {
-                        "type": "boolean",
-                        "description": "If true, count only current projects.",
-                    },
-                    "status": {
-                        "type": "string",
-                        "description": "Optional status filter (e.g. inquiry, closed).",
-                    },
-                },
-            },
-        },
-    },
+	    "count_projects": {
+	        "type": "function",
+	        "function": {
+	            "name": "count_projects",
+	            "description": "Count projects in the iSPEC database.",
+	            "parameters": {
+	                "type": "object",
+	                "properties": {
+	                    "current_only": {
+	                        "type": "boolean",
+	                        "description": "If true, count only current projects.",
+	                    },
+	                    "status": {
+	                        "type": "string",
+	                        "description": "Optional status filter (omit for total).",
+	                        "enum": sorted(PROJECT_STATUSES),
+	                    },
+	                },
+	            },
+	        },
+	    },
     "project_status_counts": {
         "type": "function",
         "function": {
@@ -1547,6 +2270,21 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "projects": {
+        "type": "function",
+        "function": {
+            "name": "projects",
+            "description": "Alias for get_project: fetch a project by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "integer", "description": "Project id."},
+                    "id": {"type": "integer", "description": "Alias for project_id."},
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
     "get_project": {
         "type": "function",
         "function": {
@@ -1556,6 +2294,33 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "type": "object",
                 "properties": {"id": {"type": "integer", "description": "Project id."}},
                 "required": ["id"],
+            },
+        },
+    },
+    "create_project_comment": {
+        "type": "function",
+        "function": {
+            "name": "create_project_comment",
+            "description": "Create a new project comment in project history (write). Use only when the user explicitly asks to save/log a note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "integer", "description": "Project id to attach the comment to."},
+                    "comment": {"type": "string", "description": "Comment text to store."},
+                    "comment_type": {
+                        "type": "string",
+                        "description": "Optional comment type label (e.g. meeting_note, assistant_note).",
+                    },
+                    "person_id": {
+                        "type": "integer",
+                        "description": "Optional person id for the FK; defaults to an 'iSPEC Assistant' person record.",
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true; only call when user explicitly requests saving to project history.",
+                    },
+                },
+                "required": ["project_id", "comment", "confirm"],
             },
         },
     },
@@ -1571,6 +2336,61 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "limit": {"type": "integer", "description": "Max matches to return."},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    "repo_list_files": {
+        "type": "function",
+        "function": {
+            "name": "repo_list_files",
+            "description": "Dev-only: list repo files (relative paths) to help locate code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Optional substring filter on the file path."},
+                    "path": {
+                        "type": "string",
+                        "description": "Optional repo-relative directory (defaults to iSPEC/src).",
+                    },
+                    "limit": {"type": "integer", "description": "Max files to return."},
+                },
+            },
+        },
+    },
+    "repo_search": {
+        "type": "function",
+        "function": {
+            "name": "repo_search",
+            "description": "Dev-only: grep the repo for a string (or regex) and return line matches.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search text (or regex if regex=true)."},
+                    "path": {
+                        "type": "string",
+                        "description": "Optional repo-relative directory (defaults to iSPEC/src).",
+                    },
+                    "limit": {"type": "integer", "description": "Max matches to return."},
+                    "regex": {"type": "boolean", "description": "If true, treat query as regex."},
+                    "ignore_case": {"type": "boolean", "description": "If true, case-insensitive search."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    "repo_read_file": {
+        "type": "function",
+        "function": {
+            "name": "repo_read_file",
+            "description": "Dev-only: read a snippet from a repo file (use repo-relative paths).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Repo-relative file path."},
+                    "start_line": {"type": "integer", "description": "1-based start line."},
+                    "max_lines": {"type": "integer", "description": "Max lines to return."},
+                },
+                "required": ["path"],
             },
         },
     },
@@ -1746,7 +2566,15 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
     """Return OpenAI-compatible tool schemas, filtered by tool scope."""
 
     tools: list[dict[str, Any]] = []
+    repo_enabled = _repo_tools_enabled()
     for name, spec in _OPENAI_TOOL_SPECS.items():
+        if name.startswith("repo_") and not repo_enabled:
+            continue
+        if name in _WRITE_TOOL_NAMES:
+            if user is None:
+                continue
+            if user.role in {UserRole.viewer, UserRole.client}:
+                continue
         scope = _TOOL_SCOPES.get(name, ToolScope.staff)
         if _scope_error(scope, user) is None:
             tools.append(spec)
