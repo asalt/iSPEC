@@ -37,7 +37,7 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
             assert any(
                 isinstance(tool, dict)
                 and isinstance(tool.get("function"), dict)
-                and tool["function"].get("name") == "count_projects"
+                and tool["function"].get("name") == "count_all_projects"
                 for tool in tools
             )
             return AssistantReply(
@@ -49,7 +49,7 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
                     {
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "count_projects", "arguments": "{}"},
+                        "function": {"name": "count_all_projects", "arguments": "{}"},
                     }
                 ],
             )
@@ -64,7 +64,7 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
         assert any(
             msg.get("role") == "system"
             and isinstance(msg.get("content"), str)
-            and msg["content"].startswith("TOOL_RESULT count_projects")
+            and msg["content"].startswith("TOOL_RESULT count_all_projects")
             for msg in messages
         )
 
@@ -113,7 +113,7 @@ def test_support_chat_can_handle_openai_tool_calls(tmp_path, db_session, monkeyp
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert meta["tool_calls"][0]["name"] == "count_projects"
+        assert meta["tool_calls"][0]["name"] == "count_all_projects"
         assert meta["tool_calls"][0]["protocol"] == "openai"
         assert meta["tooling"]["enabled"] is True
         assert meta["tooling"]["protocol_config"] == "openai"

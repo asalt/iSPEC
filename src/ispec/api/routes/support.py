@@ -47,9 +47,103 @@ _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
 _CONTEXT_SCHEMA_VERSION = 1
 _EXPLICIT_TOOL_REQUEST_RE = re.compile(r"\b(use|call|run)\s+(a\s+)?tool\b", re.IGNORECASE)
 _COUNT_PROJECTS_RE = re.compile(
-    r"\bhow\s+many\s+projects?\b|\bnumber\s+of\s+projects?\b|\bcount\s+projects?\b",
+    r"\bhow\s+many\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b"
+    r"|\bnumber\s+of\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b"
+    r"|\bcount\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b",
     re.IGNORECASE,
 )
+_COUNT_CURRENT_PROJECTS_RE = re.compile(
+    r"\b(current|active|ongoing)\s+(?:projects?|prjs?|projs?)\b"
+    r"|\b(?:projects?|prjs?|projs?)\s+(current|active|ongoing)\b",
+    re.IGNORECASE,
+)
+
+
+def _policy_tool_for_message(message: str) -> str | None:
+    if _COUNT_PROJECTS_RE.search(message or ""):
+        return (
+            "count_current_projects"
+            if _COUNT_CURRENT_PROJECTS_RE.search(message or "")
+            else "count_all_projects"
+        )
+    return None
+
+
+def _truncate(value: str | None, limit: int = 400) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _openai_tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
+    names: set[str] = set()
+    if not tools:
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func_obj = tool.get("function")
+        if not isinstance(func_obj, dict):
+            continue
+        name = func_obj.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _openai_tool_required_keys(tool: dict[str, Any]) -> set[str]:
+    func_obj = tool.get("function")
+    if not isinstance(func_obj, dict):
+        return set()
+    params = func_obj.get("parameters")
+    if not isinstance(params, dict):
+        return set()
+    required = params.get("required")
+    if not isinstance(required, list):
+        return set()
+    required_keys: set[str] = set()
+    for item in required:
+        if isinstance(item, str) and item.strip():
+            required_keys.add(item.strip())
+    return required_keys
+
+
+def _openai_no_arg_tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
+    names: set[str] = set()
+    if not tools:
+        return names
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        func_obj = tool.get("function")
+        if not isinstance(func_obj, dict):
+            continue
+        name = func_obj.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if _openai_tool_required_keys(tool):
+            continue
+        names.add(name.strip())
+    return names
+
+
+def _suggested_tool_from_text(text: str | None, *, candidates: set[str]) -> str | None:
+    if not text or not candidates:
+        return None
+    found: list[str] = []
+    for name in sorted(candidates):
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            found.append(name)
+            if len(found) > 2:
+                break
+    if len(found) == 1:
+        return found[0]
+    return None
 
 
 def utcnow() -> datetime:
@@ -204,18 +298,10 @@ def _tool_protocol() -> str:
     return raw if raw in {"line", "openai"} else "line"
 
 
-def _openai_tool_choice_for_message(message: str) -> dict[str, Any] | None:
+def _openai_tool_choice_for_message(message: str) -> str | dict[str, Any] | None:
     if not _EXPLICIT_TOOL_REQUEST_RE.search(message or ""):
         return None
-
-    project_ids = extract_project_ids(message)
-    if project_ids:
-        return {"type": "function", "function": {"name": "get_project"}}
-
-    if _COUNT_PROJECTS_RE.search(message or ""):
-        return {"type": "function", "function": {"name": "count_projects"}}
-
-    return None
+    return "required"
 
 
 def _load_state(raw: str | None) -> dict[str, Any]:
@@ -234,7 +320,9 @@ def _dump_state(state: dict[str, Any]) -> str:
 
 def _context_message(*, payload: dict[str, Any]) -> str:
     version = payload.get("schema_version") or _CONTEXT_SCHEMA_VERSION
-    return f"CONTEXT v{version} (read-only JSON):\n" + json.dumps(payload, ensure_ascii=False)
+    round_value = payload.get("agent", {}).get("round") if isinstance(payload.get("agent"), dict) else None
+    suffix = f" - round {round_value}" if isinstance(round_value, int) and round_value > 0 else ""
+    return f"CONTEXT v{version} (read-only JSON){suffix}:\n" + json.dumps(payload, ensure_ascii=False)
 
 
 def _tool_result_preview(payload: dict[str, Any], *, max_chars: int = 2000) -> str | None:
@@ -459,6 +547,8 @@ def chat(
     tools_enabled_initial = tools_enabled
     tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
+    openai_tool_names = _openai_tool_names(tool_schemas)
+    openai_no_arg_tool_names = _openai_no_arg_tool_names(tool_schemas)
 
     compare_mode_requested = _compare_mode_enabled() and _decide_if_dualchoice(payload=payload)
     response_format = "compare" if compare_mode_requested else "single"
@@ -494,8 +584,12 @@ def chat(
         ]
 
         ispec_context = build_ispec_context(core_db, message=payload.message, state=state)
+        state_for_context = dict(state)
+        for key in ("ui_route", "ui_project_id", "ui_experiment_id", "ui_experiment_run_id"):
+            state_for_context.pop(key, None)
         context_payload: dict[str, Any] = {
             "schema_version": _CONTEXT_SCHEMA_VERSION,
+            "agent": {"multi_round": True, "round": 0},
             "session": {"id": session.session_id, "state": state},
             "user": {
                 "id": int(user.id),
@@ -504,9 +598,9 @@ def chat(
             }
             if user is not None
             else None,
-            "ui": ui_payload,
             "ispec": ispec_context,
         }
+        context_payload["session"]["state"] = state_for_context
         context_message = _context_message(payload=context_payload)
 
         base_messages = [
@@ -554,10 +648,20 @@ def chat(
     tool_calls: list[dict[str, Any]] = []
     tool_messages: list[dict[str, Any]] = []
     tool_result_messages: list[dict[str, Any]] = []
+    llm_trace: list[dict[str, Any]] = []
     reply = None
+    history_for_llm: list[dict[str, Any]] = []
     forced_tool_choice = _openai_tool_choice_for_message(payload.message) if tool_protocol == "openai" else None
+    policy_tool_name = _policy_tool_for_message(payload.message)
+    llm_round = 0
 
     while True:
+        llm_round += 1
+        agent_state = context_payload.get("agent") if isinstance(context_payload.get("agent"), dict) else None
+        if agent_state is not None:
+            agent_state["round"] = llm_round
+        context_message = _context_message(payload=context_payload)
+
         system_prompt = planner_prompt if tools_enabled else answer_prompt
         base_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -574,6 +678,7 @@ def chat(
             tokens += message_tokens
             trimmed_rev.append(item)
         trimmed_history = list(reversed(trimmed_rev))
+        history_for_llm = trimmed_history
 
         messages_for_llm: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -583,14 +688,56 @@ def chat(
             *tool_messages,
         ]
 
-        tool_choice = forced_tool_choice if tool_schemas is not None and not tool_calls and used_tool_calls == 0 else None
+        tool_choice = (
+            forced_tool_choice
+            if tool_schemas is not None and not tool_calls and used_tool_calls == 0
+            else None
+        )
+        tools_for_call = tool_schemas if tools_enabled else None
+        effective_tool_choice: str | dict[str, Any] | None = None
+        if tools_for_call is not None:
+            effective_tool_choice = tool_choice if tool_choice is not None else "auto"
+
+        trace_step: dict[str, Any] = {
+            "round": llm_round,
+            "prompt": "planner" if tools_enabled else "answer",
+            "tools_provided": tools_for_call is not None,
+            "tools_count": tool_schemas_count if tools_for_call is not None else 0,
+            "tool_choice": effective_tool_choice,
+            "history_messages": len(trimmed_history),
+            "tool_messages": len(tool_messages),
+        }
         reply = generate_reply(
             messages=messages_for_llm,
-            tools=tool_schemas if tools_enabled else None,
+            tools=tools_for_call,
             tool_choice=tool_choice,
         )
+        trace_step["provider"] = reply.provider
+        trace_step["model"] = reply.model
+        if reply.meta and isinstance(reply.meta, dict):
+            trace_step["provider_meta"] = {
+                "elapsed_ms": reply.meta.get("elapsed_ms"),
+                "usage": reply.meta.get("usage"),
+                "fallback": reply.meta.get("fallback"),
+            }
+        trace_step["reply_preview"] = _truncate(reply.content, 320)
+        if reply.tool_calls:
+            tool_call_names: list[str] = []
+            for tool_call_item in reply.tool_calls:
+                if not isinstance(tool_call_item, dict):
+                    continue
+                func_obj = tool_call_item.get("function")
+                name_obj: Any = tool_call_item.get("name")
+                if isinstance(func_obj, dict):
+                    name_obj = func_obj.get("name")
+                if isinstance(name_obj, str) and name_obj.strip():
+                    tool_call_names.append(name_obj.strip())
+            if tool_call_names:
+                trace_step["reply_tool_calls"] = tool_call_names
+        llm_trace.append(trace_step)
 
         if reply.tool_calls:
+            trace_step["action"] = "openai_tool_calls"
             tool_messages.append(
                 {
                     "role": "assistant",
@@ -598,6 +745,7 @@ def chat(
                     "tool_calls": reply.tool_calls,
                 }
             )
+            executed_openai_tools: list[str] = []
             for tool_call in reply.tool_calls:
                 if not isinstance(tool_call, dict):
                     continue
@@ -606,6 +754,8 @@ def chat(
                     call_id = f"call_{used_tool_calls + 1}"
                 func_obj = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
                 tool_name = str(func_obj.get("name") or "").strip()
+                if tool_name:
+                    executed_openai_tools.append(tool_name)
                 args_raw = func_obj.get("arguments")
                 try:
                     if isinstance(args_raw, str):
@@ -659,10 +809,114 @@ def chat(
                     }
                 )
                 tool_messages.append({"role": "system", "content": tool_result_text})
+            if executed_openai_tools:
+                trace_step["executed_tools"] = executed_openai_tools
             continue
 
         tool_call = parse_tool_call(reply.content)
         if tool_call is None:
+            suggested_tool_name = _suggested_tool_from_text(reply.content, candidates=openai_no_arg_tool_names)
+            executed_tools = {
+                str(call.get("name") or "").strip()
+                for call in tool_calls
+                if isinstance(call, dict) and call.get("name")
+            }
+            if (
+                tools_enabled
+                and used_tool_calls < max_tool_calls
+                and suggested_tool_name
+                and suggested_tool_name not in executed_tools
+            ):
+                used_tool_calls += 1
+                tool_name = suggested_tool_name
+                tool_args: dict[str, Any] = {}
+                tool_payload = run_tool(
+                    name=tool_name,
+                    args=tool_args,
+                    core_db=core_db,
+                    schedule_db=schedule_db,
+                    omics_db=omics_db,
+                    user=user,
+                    api_schema=api_schema,
+                    user_message=payload.message,
+                )
+                tool_calls.append(
+                    {
+                        "name": tool_name,
+                        "arguments": tool_args,
+                        "ok": bool(tool_payload.get("ok")),
+                        "error": tool_payload.get("error"),
+                        "result_preview": _tool_result_preview(tool_payload),
+                        "protocol": "suggested",
+                    }
+                )
+                tool_call_line = TOOL_CALL_PREFIX + " " + json.dumps(
+                    {"name": tool_name, "arguments": tool_args},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                tool_result_text = format_tool_result_message(tool_name, tool_payload)
+                tool_result_messages.append({"role": "system", "content": tool_result_text})
+                tool_messages.extend(
+                    [
+                        {"role": "assistant", "content": tool_call_line},
+                        {"role": "system", "content": tool_result_text},
+                    ]
+                )
+                trace_step["action"] = "suggested_tool"
+                trace_step["executed_tools"] = [tool_name]
+                if used_tool_calls >= max_tool_calls:
+                    tools_enabled = False
+                continue
+
+            if (
+                tools_enabled
+                and used_tool_calls == 0
+                and policy_tool_name
+                and used_tool_calls < max_tool_calls
+            ):
+                used_tool_calls += 1
+                tool_name = policy_tool_name
+                tool_args: dict[str, Any] = {}
+                tool_payload = run_tool(
+                    name=tool_name,
+                    args=tool_args,
+                    core_db=core_db,
+                    schedule_db=schedule_db,
+                    omics_db=omics_db,
+                    user=user,
+                    api_schema=api_schema,
+                    user_message=payload.message,
+                )
+                tool_calls.append(
+                    {
+                        "name": tool_name,
+                        "arguments": tool_args,
+                        "ok": bool(tool_payload.get("ok")),
+                        "error": tool_payload.get("error"),
+                        "result_preview": _tool_result_preview(tool_payload),
+                        "protocol": "policy",
+                    }
+                )
+                tool_call_line = TOOL_CALL_PREFIX + " " + json.dumps(
+                    {"name": tool_name, "arguments": tool_args},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                tool_result_text = format_tool_result_message(tool_name, tool_payload)
+                tool_result_messages.append({"role": "system", "content": tool_result_text})
+                tool_messages.extend(
+                    [
+                        {"role": "assistant", "content": tool_call_line},
+                        {"role": "system", "content": tool_result_text},
+                    ]
+                )
+                trace_step["action"] = "policy_tool"
+                trace_step["executed_tools"] = [tool_name]
+                if used_tool_calls >= max_tool_calls:
+                    tools_enabled = False
+                continue
+            trace_step["action"] = "final_no_tool"
             break
 
         if used_tool_calls >= max_tool_calls:
@@ -701,8 +955,11 @@ def chat(
                 {"role": "system", "content": format_tool_result_message(tool_name, tool_payload)},
             ]
         )
+        trace_step["action"] = "line_tool_call"
+        trace_step["executed_tools"] = [tool_name]
 
     if reply is None:
+        history_for_llm = history_payload
         reply = generate_reply(
             messages=[
                 {"role": "system", "content": answer_prompt},
@@ -752,13 +1009,19 @@ def chat(
                 messages=[
                     {"role": "system", "content": _system_prompt_review_decider()},
                     {"role": "system", "content": context_message},
+                    *history_for_llm,
                     {"role": "user", "content": payload.message},
                     *tool_messages,
                     {"role": "assistant", "content": assistant_content},
                     {"role": "user", "content": decider_instruction},
                 ],
                 tools=None,
-                vllm_extra_body={"guided_choice": ["KEEP", "REWRITE"], "max_tokens": 1, "temperature": 0},
+                vllm_extra_body={
+                    "guided_choice": ["KEEP", "REWRITE"],
+                    "max_tokens": 3,
+                    "stop": ["\n"],
+                    "temperature": 0,
+                },
             )
             if not decider_reply.ok:
                 self_review_error = "review_decider_error"
@@ -783,6 +1046,7 @@ def chat(
                 messages=[
                     {"role": "system", "content": review_prompt},
                     {"role": "system", "content": context_message},
+                    *history_for_llm,
                     {"role": "user", "content": payload.message},
                     *tool_messages,
                     {"role": "assistant", "content": assistant_content},
@@ -835,6 +1099,8 @@ def chat(
     if final_reply.meta:
         meta["provider_meta"] = final_reply.meta
     meta["tool_calls"] = tool_calls
+    if llm_trace:
+        meta["llm_trace"] = llm_trace
     if plan_text:
         meta["plan"] = plan_text
     raw_final = final_raw_reply_content.strip()

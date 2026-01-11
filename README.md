@@ -110,6 +110,9 @@ control where the data lives with environment variables:
 
 - `ISPEC_DB_DIR` – root directory for databases (defaults to `~/ispec`).
 - `ISPEC_DB_PATH` – full SQLite path/URI used by session helpers and tests.
+- `ISPEC_ASSISTANT_DB_PATH` – SQLite path/URI for assistant chat history (defaults to `ispec-assistant.db` alongside `ISPEC_DB_PATH`).
+- `ISPEC_SCHEDULE_DB_PATH` – SQLite path/URI for scheduling (defaults to `ispec-schedule.db` alongside `ISPEC_DB_PATH`).
+- `ISPEC_AGENT_DB_PATH` – SQLite path/URI for agent telemetry/events (defaults to `ispec-agent.db` alongside `ISPEC_DB_PATH`).
 
 Both variables are respected by the connection utilities, which ensure the
 folders exist and wire up SQLAlchemy session factories for you.【F:src/ispec/db/connect.py†L17-L94】
@@ -240,6 +243,17 @@ Tests cover CLI flows, API endpoints, and IO utilities to ensure the core
 workflows behave as expected.【F:tests/integration/test_cli_db.py†L1-L129】【F:tests/integration/test_api_endpoints.py†L1-L121】
 Alembic migrations are validated by executing ``alembic upgrade head`` against a
 temporary database as part of the unit test suite.【F:tests/unit/db/test_migrations.py†L1-L39】
+
+### Optional live LLM smoke tests
+
+There are opt-in integration tests that talk to a running local LLM server (skipped by default):
+
+- Ollama: `tests/integration/test_llm_ollama_smoke.py`
+  - Run with: `ISPEC_RUN_LLM_TESTS=1 pytest tests/integration/test_llm_ollama_smoke.py`
+- vLLM: `tests/integration/test_llm_vllm_smoke.py`
+  - Run with: `ISPEC_RUN_VLLM_TESTS=1 pytest tests/integration/test_llm_vllm_smoke.py`
+
+These tests assume the corresponding server is already running and the model is available locally.
 
 ## Documentation utilities
 

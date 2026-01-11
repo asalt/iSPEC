@@ -51,7 +51,8 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "latest_activity": ToolScope.staff,
     "billing_category_counts": ToolScope.staff,
     "db_file_stats": ToolScope.staff,
-    "count_projects": ToolScope.staff,
+    "count_all_projects": ToolScope.staff,
+    "count_current_projects": ToolScope.staff,
     "project_status_counts": ToolScope.staff,
     "latest_projects": ToolScope.staff,
     "latest_project_comments": ToolScope.staff,
@@ -474,7 +475,8 @@ def tool_prompt() -> str:
         "- latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)",
         "- billing_category_counts(current_only: bool = false, limit: int = 20)",
         "- db_file_stats()  # show sqlite DB file sizes",
-        "- count_projects(current_only: bool = false, status: str | None = None)  # counts projects",
+        "- count_all_projects()  # total projects across all statuses/flags",
+        "- count_current_projects()  # current projects only",
         "- project_status_counts(current_only: bool = false)",
         "- latest_projects(sort: str = 'modified', limit: int = 10, current_only: bool = false)",
         "- latest_project_comments(limit: int = 10, project_id: int | None = None)",
@@ -1313,26 +1315,25 @@ def run_tool(
                 },
             }
 
-        if name == "count_projects":
-            current_only = bool(args.get("current_only"))
-            status = _safe_str(args.get("status"), max_len=64)
-            if status and status not in PROJECT_STATUSES:
-                status = None
-
-            query = core_db.query(func.count(Project.id))
-            if current_only:
-                query = query.filter(Project.prj_Current_FLAG.is_(True))
-            if status:
-                query = query.filter(Project.prj_Status == status)
-            count = int(query.scalar() or 0)
+        if name == "count_all_projects":
+            count = int(core_db.query(func.count(Project.id)).scalar() or 0)
             return {
                 "ok": True,
                 "tool": name,
-                "result": {
-                    "count": count,
-                    "current_only": current_only,
-                    "status": status,
-                },
+                "result": {"count": count, "scope": "all"},
+            }
+
+        if name == "count_current_projects":
+            count = int(
+                core_db.query(func.count(Project.id))
+                .filter(Project.prj_Current_FLAG.is_(True))
+                .scalar()
+                or 0
+            )
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {"count": count, "scope": "current"},
             }
 
         if name == "project_status_counts":
@@ -1848,7 +1849,7 @@ def run_tool(
                 return {
                     "ok": False,
                     "tool": name,
-                    "error": "Use count_projects to answer 'how many projects'. search_projects expects a keyword (title/PI/contact) or an id.",
+                    "error": "Use count_all_projects or count_current_projects to answer 'how many projects'. search_projects expects a keyword (title/PI/contact) or an id.",
                 }
 
             matches: list[dict[str, Any]] = []
@@ -2085,26 +2086,27 @@ def run_tool(
             "ok": False,
             "tool": name,
             "error": f"Unknown tool '{name}'.",
-	            "available": [
-	                "project_counts_snapshot",
-	                "latest_activity",
-	                "billing_category_counts",
-	                "db_file_stats",
-	                "count_projects",
-	                "project_status_counts",
-	                "latest_projects",
-	                "latest_project_comments",
-	                "search_projects",
-	                "get_project",
-	                "search_api",
-	                "repo_list_files",
-	                "repo_search",
-	                "repo_read_file",
-	                "experiments_for_project",
-	                "latest_experiments",
-	                "get_experiment",
-	                "latest_experiment_runs",
-	                "get_experiment_run",
+            "available": [
+                "project_counts_snapshot",
+                "latest_activity",
+                "billing_category_counts",
+                "db_file_stats",
+                "count_all_projects",
+                "count_current_projects",
+                "project_status_counts",
+                "latest_projects",
+                "latest_project_comments",
+                "search_projects",
+                "get_project",
+                "search_api",
+                "repo_list_files",
+                "repo_search",
+                "repo_read_file",
+                "experiments_for_project",
+                "latest_experiments",
+                "get_experiment",
+                "latest_experiment_runs",
+                "get_experiment_run",
                 "e2g_search_genes_in_project",
                 "e2g_gene_in_project",
                 "search_people",
@@ -2186,27 +2188,22 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "parameters": {"type": "object", "properties": {}},
         },
     },
-	    "count_projects": {
-	        "type": "function",
-	        "function": {
-	            "name": "count_projects",
-	            "description": "Count projects in the iSPEC database.",
-	            "parameters": {
-	                "type": "object",
-	                "properties": {
-	                    "current_only": {
-	                        "type": "boolean",
-	                        "description": "If true, count only current projects.",
-	                    },
-	                    "status": {
-	                        "type": "string",
-	                        "description": "Optional status filter (omit for total).",
-	                        "enum": sorted(PROJECT_STATUSES),
-	                    },
-	                },
-	            },
-	        },
-	    },
+    "count_all_projects": {
+        "type": "function",
+        "function": {
+            "name": "count_all_projects",
+            "description": "Count total projects across all statuses/flags.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    "count_current_projects": {
+        "type": "function",
+        "function": {
+            "name": "count_current_projects",
+            "description": "Count current projects only.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
     "project_status_counts": {
         "type": "function",
         "function": {

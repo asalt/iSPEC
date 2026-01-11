@@ -29,7 +29,7 @@ def test_support_chat_forces_openai_tool_choice_when_user_requests_tool(tmp_path
     db_session.commit()
 
     calls: list[dict[str, Any]] = []
-    expected_choice = {"type": "function", "function": {"name": "count_projects"}}
+    expected_choice = "required"
 
     def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
         calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
@@ -44,7 +44,7 @@ def test_support_chat_forces_openai_tool_choice_when_user_requests_tool(tmp_path
                     {
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "count_projects", "arguments": "{}"},
+                        "function": {"name": "count_all_projects", "arguments": "{}"},
                     }
                 ],
             )
@@ -96,6 +96,5 @@ def test_support_chat_forces_openai_tool_choice_when_user_requests_tool(tmp_path
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert meta["tool_calls"][0]["name"] == "count_projects"
+        assert meta["tool_calls"][0]["name"] == "count_all_projects"
         assert meta["tooling"]["forced_tool_choice"] == expected_choice
-

@@ -11,7 +11,15 @@ def main():
     if env_files:
         load_env_files(env_files, override=True)
 
-    from ispec.cli import agent, api, auth, config as config_cli, db, logging as logging_cli
+    from ispec.cli import (
+        agent,
+        api,
+        auth,
+        config as config_cli,
+        db,
+        logging as logging_cli,
+        supervisor,
+    )
 
     parser = argparse.ArgumentParser(prog="ispec", description="iSPEC CLI toolkit")
     parser.add_argument(
@@ -53,6 +61,10 @@ def main():
     config_subparsers = config_parser.add_subparsers(dest="subcommand", required=True)
     config_cli.register_subcommands(config_subparsers)
 
+    supervisor_parser = subparsers.add_parser("supervisor", help="Supervisor loop helpers")
+    supervisor_subparsers = supervisor_parser.add_subparsers(dest="subcommand", required=True)
+    supervisor.register_subcommands(supervisor_subparsers)
+
 
     args = parser.parse_args(argv)
 
@@ -69,3 +81,5 @@ def main():
         agent.dispatch(args)
     elif args.command == "config":
         config_cli.dispatch(args)
+    elif args.command == "supervisor":
+        supervisor.dispatch(args)

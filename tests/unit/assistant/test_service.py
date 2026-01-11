@@ -135,7 +135,7 @@ def test_generate_reply_vllm_can_send_and_parse_openai_tool_calls(monkeypatch):
                                 {
                                     "id": "call_1",
                                     "type": "function",
-                                    "function": {"name": "count_projects", "arguments": "{}"},
+                                    "function": {"name": "count_all_projects", "arguments": "{}"},
                                 }
                             ],
                         }
@@ -151,7 +151,7 @@ def test_generate_reply_vllm_can_send_and_parse_openai_tool_calls(monkeypatch):
         {
             "type": "function",
             "function": {
-                "name": "count_projects",
+                "name": "count_all_projects",
                 "description": "Count projects.",
                 "parameters": {"type": "object", "properties": {}},
             },
@@ -196,13 +196,13 @@ def test_generate_reply_vllm_can_override_tool_choice(monkeypatch):
         {
             "type": "function",
             "function": {
-                "name": "count_projects",
+                "name": "count_all_projects",
                 "description": "Count projects.",
                 "parameters": {"type": "object", "properties": {}},
             },
         }
     ]
-    tool_choice = {"type": "function", "function": {"name": "count_projects"}}
+    tool_choice = {"type": "function", "function": {"name": "count_all_projects"}}
 
     reply = service.generate_reply(message="Ping", history=None, context=None, tools=tools, tool_choice=tool_choice)
     assert reply.provider == "vllm"
@@ -336,7 +336,7 @@ def test_generate_reply_vllm_drops_tools_on_400(monkeypatch):
         {
             "type": "function",
             "function": {
-                "name": "count_projects",
+                "name": "count_all_projects",
                 "description": "Count projects.",
                 "parameters": {"type": "object", "properties": {}},
             },
@@ -395,7 +395,7 @@ def test_system_prompt_can_load_from_files(tmp_path, monkeypatch):
     assert "EXTRA PROMPT FROM FILE" in prompt
 
 
-def test_build_messages_planner_prompt_omits_tool_list_when_tools_available(monkeypatch):
+def test_build_messages_planner_prompt_includes_tool_list_when_tools_available(monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_NAME", "iSPEC")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
 
@@ -407,8 +407,7 @@ def test_build_messages_planner_prompt_omits_tool_list_when_tools_available(monk
         tools_available=True,
     )
     system_prompt = messages[0]["content"]
-    assert "Available tools (read-only)" not in system_prompt
-    assert "Available tools:" not in system_prompt
+    assert "Available tools:" in system_prompt
     assert "TOOL_CALL" in system_prompt
 
 

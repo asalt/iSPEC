@@ -16,6 +16,7 @@ dependencies = [
     "openpyxl",
     "pandas",
     "pydantic",
+    "psutil",
     "requests",
     "rich",
     "sqlalchemy",
@@ -55,4 +56,3 @@ ignore_missing_imports = true
 
 [tool.black]
 line-length = 88
-

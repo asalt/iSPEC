@@ -17,7 +17,7 @@ of older turns that may be omitted from the message history.
 
 Tool use (optional):
 - If you need more iSPEC DB info than CONTEXT provides, request a tool.
-- For count questions like "how many projects", prefer count_projects.
+- For count questions like "how many projects", use count_all_projects (or count_current_projects for current/active only).
 - For status breakdowns, use project_status_counts.
 - For "latest projects" / "recent changes", use latest_projects and latest_project_comments.
 - For experiments in a specific project, use experiments_for_project.
@@ -31,7 +31,8 @@ Available tools (read-only):
 - latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)
 - billing_category_counts(current_only: bool = false, limit: int = 20)
 - db_file_stats()  # show sqlite DB file sizes
-- count_projects(current_only: bool = false, status: str | None = None)  # counts projects
+- count_all_projects()  # total projects across all statuses/flags
+- count_current_projects()  # current projects only
 - project_status_counts(current_only: bool = false)
 - latest_projects(sort: str = 'modified', limit: int = 10, current_only: bool = false)
 - latest_project_comments(limit: int = 10, project_id: int | None = None)
