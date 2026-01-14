@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_
+from sqlalchemy import Text, cast, func, or_
 from sqlalchemy.orm import Session
 
 from ispec.assistant.context import person_summary, project_summary
@@ -21,7 +21,7 @@ from ispec.assistant.models import (
     SupportSession,
     SupportSessionReview,
 )
-from ispec.agent.models import AgentCommand, AgentRun
+from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.db.models import (
     AuthUser,
     E2G,
@@ -61,6 +61,13 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_stats": ToolScope.staff,
     "assistant_recent_sessions": ToolScope.staff,
     "assistant_get_session_review": ToolScope.staff,
+    "assistant_search_messages": ToolScope.admin,
+    "assistant_get_message_context": ToolScope.admin,
+    "assistant_search_internal_logs": ToolScope.admin,
+    "assistant_get_agent_step": ToolScope.admin,
+    "assistant_get_agent_command": ToolScope.admin,
+    "assistant_get_agent_run": ToolScope.admin,
+    "assistant_list_users": ToolScope.admin,
     "count_all_projects": ToolScope.staff,
     "count_current_projects": ToolScope.staff,
     "project_status_counts": ToolScope.staff,
@@ -505,6 +512,22 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add("assistant_stats", "- assistant_stats()  # assistant DB stats and review backlog")
     add("assistant_recent_sessions", "- assistant_recent_sessions(limit: int = 10)")
     add("assistant_get_session_review", "- assistant_get_session_review(session_id: str)")
+    add(
+        "assistant_search_messages",
+        "- assistant_search_messages(query: str, limit: int = 20, role: str | None = None, session_id: str | None = None, user_id: int | None = None)  # admin-only",
+    )
+    add(
+        "assistant_get_message_context",
+        "- assistant_get_message_context(message_id: int, before: int = 3, after: int = 3, max_chars: int = 800)  # admin-only",
+    )
+    add(
+        "assistant_search_internal_logs",
+        "- assistant_search_internal_logs(query: str, limit: int = 20)  # admin-only; searches agent runs/steps/commands/events",
+    )
+    add("assistant_get_agent_step", "- assistant_get_agent_step(step_id: int)  # admin-only")
+    add("assistant_get_agent_command", "- assistant_get_agent_command(command_id: int)  # admin-only")
+    add("assistant_get_agent_run", "- assistant_get_agent_run(run_id: str)  # admin-only")
+    add("assistant_list_users", "- assistant_list_users(limit: int = 50, include_anonymous: bool = true)  # admin-only")
     add("count_all_projects", "- count_all_projects()  # total projects across all statuses/flags")
     add("count_current_projects", "- count_current_projects()  # current projects only")
     add("project_status_counts", "- project_status_counts(current_only: bool = false)")
@@ -582,6 +605,30 @@ def _clamp_int(value: int | None, *, default: int, min_value: int, max_value: in
     if value is None:
         return default
     return max(min_value, min(max_value, value))
+
+
+def _snippet_for_query(text: str | None, query: str, *, window: int = 80, max_len: int = 320) -> str:
+    haystack = (text or "").strip()
+    needle = (query or "").strip()
+    if not haystack or not needle:
+        return _safe_str(haystack, max_len=max_len) or ""
+
+    lower_haystack = haystack.lower()
+    lower_needle = needle.lower()
+    idx = lower_haystack.find(lower_needle)
+    if idx < 0:
+        return _safe_str(haystack, max_len=max_len) or ""
+
+    start = max(0, idx - max(0, int(window)))
+    end = min(len(haystack), idx + len(needle) + max(0, int(window)))
+    snippet = haystack[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(haystack):
+        snippet = snippet + "…"
+    if len(snippet) > max_len:
+        snippet = snippet[: max_len - 1] + "…"
+    return snippet
 
 
 def _safe_date(value: Any) -> date | None:
@@ -1609,6 +1656,558 @@ def run_tool(
                 },
             }
 
+        if name == "assistant_search_messages":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            query_text = _safe_str(args.get("query"), max_len=512) or _safe_str(args.get("q"), max_len=512)
+            if not query_text:
+                return {"ok": False, "tool": name, "error": "Missing argument: query"}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=100)
+            role = _safe_str(args.get("role"), max_len=16)
+            session_id = _safe_str(args.get("session_id"), max_len=256)
+            user_id = _safe_int(args.get("user_id"))
+
+            pattern = f"%{query_text}%"
+            query = (
+                assistant_db.query(
+                    AssistantSupportMessage,
+                    SupportSession.session_id,
+                    SupportSession.user_id,
+                )
+                .join(SupportSession, AssistantSupportMessage.session_pk == SupportSession.id)
+                .filter(AssistantSupportMessage.content.ilike(pattern))
+            )
+            if role:
+                query = query.filter(AssistantSupportMessage.role == role)
+            if session_id:
+                query = query.filter(SupportSession.session_id == session_id)
+            if user_id is not None:
+                query = query.filter(SupportSession.user_id == int(user_id))
+
+            rows = (
+                query.order_by(AssistantSupportMessage.id.desc())
+                .limit(limit)
+                .all()
+            )
+            matches: list[dict[str, Any]] = []
+            for message, sess_id, sess_user_id in rows:
+                content = getattr(message, "content", "") or ""
+                matches.append(
+                    {
+                        "message_id": int(message.id),
+                        "session_id": sess_id,
+                        "user_id": int(sess_user_id) if sess_user_id is not None else None,
+                        "role": getattr(message, "role", None),
+                        "created_at": message.created_at.isoformat() if getattr(message, "created_at", None) else None,
+                        "snippet": _snippet_for_query(content, query_text, window=80, max_len=320),
+                    }
+                )
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "query": query_text,
+                    "limit": limit,
+                    "role": role,
+                    "session_id": session_id,
+                    "user_id": int(user_id) if user_id is not None else None,
+                    "count": len(matches),
+                    "matches": matches,
+                },
+            }
+
+        if name == "assistant_get_message_context":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            message_id = _safe_int(args.get("message_id"))
+            if message_id is None:
+                message_id = _safe_int(args.get("id"))
+            if message_id is None:
+                return {"ok": False, "tool": name, "error": "Missing integer argument: message_id (or id)"}
+
+            before = _clamp_int(_safe_int(args.get("before")), default=3, min_value=0, max_value=20)
+            after = _clamp_int(_safe_int(args.get("after")), default=3, min_value=0, max_value=20)
+            max_chars = _clamp_int(_safe_int(args.get("max_chars")), default=800, min_value=50, max_value=5000)
+
+            anchor = assistant_db.query(AssistantSupportMessage).filter(AssistantSupportMessage.id == int(message_id)).first()
+            if anchor is None:
+                return {"ok": False, "tool": name, "error": "Message not found.", "message_id": int(message_id)}
+
+            session = assistant_db.query(SupportSession).filter(SupportSession.id == int(anchor.session_pk)).first()
+            session_id = session.session_id if session is not None else None
+            session_user_id = int(session.user_id) if session is not None and session.user_id is not None else None
+
+            previous_rows = (
+                assistant_db.query(AssistantSupportMessage)
+                .filter(AssistantSupportMessage.session_pk == int(anchor.session_pk))
+                .filter(AssistantSupportMessage.id < int(anchor.id))
+                .order_by(AssistantSupportMessage.id.desc())
+                .limit(before)
+                .all()
+            )
+            previous_rows.reverse()
+            next_rows = (
+                assistant_db.query(AssistantSupportMessage)
+                .filter(AssistantSupportMessage.session_pk == int(anchor.session_pk))
+                .filter(AssistantSupportMessage.id > int(anchor.id))
+                .order_by(AssistantSupportMessage.id.asc())
+                .limit(after)
+                .all()
+            )
+
+            rows = [*previous_rows, anchor, *next_rows]
+            messages = [
+                {
+                    "id": int(row.id),
+                    "role": row.role,
+                    "created_at": row.created_at.isoformat() if getattr(row, "created_at", None) else None,
+                    "content": _safe_str(getattr(row, "content", None), max_len=max_chars) or "",
+                }
+                for row in rows
+            ]
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "message_id": int(anchor.id),
+                    "session_id": session_id,
+                    "user_id": session_user_id,
+                    "before": before,
+                    "after": after,
+                    "count": len(messages),
+                    "messages": messages,
+                },
+            }
+
+        if name == "assistant_list_users":
+            include_anonymous = True if args.get("include_anonymous") is None else bool(args.get("include_anonymous"))
+            limit = _clamp_int(_safe_int(args.get("limit")), default=50, min_value=1, max_value=200)
+            linkage_session_limit = _clamp_int(
+                _safe_int(args.get("linkage_session_limit")),
+                default=50,
+                min_value=1,
+                max_value=500,
+            )
+
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            session_counts_query = (
+                assistant_db.query(
+                    SupportSession.user_id,
+                    func.count(SupportSession.id),
+                    func.max(SupportSession.updated_at),
+                )
+                .group_by(SupportSession.user_id)
+                .order_by(func.max(SupportSession.updated_at).desc())
+            )
+            if not include_anonymous:
+                session_counts_query = session_counts_query.filter(SupportSession.user_id.isnot(None))
+
+            session_counts_rows = session_counts_query.limit(limit).all()
+            user_ids: list[int] = [
+                int(user_id)
+                for user_id, _, _ in session_counts_rows
+                if user_id is not None
+            ]
+
+            user_rows = []
+            if user_ids:
+                user_rows = core_db.query(AuthUser).filter(AuthUser.id.in_(user_ids)).all()
+            user_by_id = {int(user.id): user for user in user_rows}
+
+            message_counts_query = (
+                assistant_db.query(
+                    SupportSession.user_id,
+                    AssistantSupportMessage.role,
+                    func.count(AssistantSupportMessage.id),
+                )
+                .join(SupportSession, AssistantSupportMessage.session_pk == SupportSession.id)
+                .group_by(SupportSession.user_id, AssistantSupportMessage.role)
+            )
+            if not include_anonymous:
+                message_counts_query = message_counts_query.filter(SupportSession.user_id.isnot(None))
+            message_counts_rows = message_counts_query.all()
+            message_counts: dict[int | None, dict[str, int]] = {}
+            for raw_user_id, role, count in message_counts_rows:
+                key = int(raw_user_id) if raw_user_id is not None else None
+                bucket = message_counts.get(key)
+                if bucket is None:
+                    bucket = {}
+                    message_counts[key] = bucket
+                bucket[str(role or "unknown")] = int(count or 0)
+
+            users: list[dict[str, Any]] = []
+            for raw_user_id, sessions_count, last_updated_at in session_counts_rows:
+                key = int(raw_user_id) if raw_user_id is not None else None
+                auth_user = user_by_id.get(int(raw_user_id)) if raw_user_id is not None else None
+
+                sample_sessions_query = (
+                    assistant_db.query(SupportSession)
+                    .filter(SupportSession.user_id == raw_user_id)
+                    .order_by(SupportSession.updated_at.desc(), SupportSession.id.desc())
+                    .limit(5)
+                )
+                if raw_user_id is None:
+                    sample_sessions_query = (
+                        assistant_db.query(SupportSession)
+                        .filter(SupportSession.user_id.is_(None))
+                        .order_by(SupportSession.updated_at.desc(), SupportSession.id.desc())
+                        .limit(5)
+                    )
+                sample_sessions = sample_sessions_query.all()
+                sample_session_ids = [str(s.session_id) for s in sample_sessions]
+
+                linkage_sessions_query = (
+                    assistant_db.query(SupportSession)
+                    .filter(SupportSession.user_id == raw_user_id)
+                    .order_by(SupportSession.updated_at.desc(), SupportSession.id.desc())
+                    .limit(linkage_session_limit)
+                )
+                if raw_user_id is None:
+                    linkage_sessions_query = (
+                        assistant_db.query(SupportSession)
+                        .filter(SupportSession.user_id.is_(None))
+                        .order_by(SupportSession.updated_at.desc(), SupportSession.id.desc())
+                        .limit(linkage_session_limit)
+                    )
+                linkage_sessions = linkage_sessions_query.all()
+
+                project_counts: dict[int, int] = {}
+                route_counts: dict[str, int] = {}
+                for session in linkage_sessions:
+                    raw_state = getattr(session, "state_json", None)
+                    if not raw_state:
+                        continue
+                    try:
+                        state = json.loads(raw_state)
+                    except Exception:
+                        continue
+                    if not isinstance(state, dict):
+                        continue
+
+                    for key_name in ("current_project_id", "ui_project_id"):
+                        project_id = state.get(key_name)
+                        if isinstance(project_id, int) and project_id > 0:
+                            project_counts[project_id] = project_counts.get(project_id, 0) + 1
+
+                    ui_route = state.get("ui_route")
+                    if isinstance(ui_route, dict):
+                        route_name = ui_route.get("name")
+                        if isinstance(route_name, str) and route_name.strip():
+                            cleaned = route_name.strip()
+                            route_counts[cleaned] = route_counts.get(cleaned, 0) + 1
+
+                project_items = [{"project_id": pid, "count": cnt} for pid, cnt in project_counts.items()]
+                project_items.sort(key=lambda item: (-int(item["count"]), int(item["project_id"])))
+                route_items = [{"route": route, "count": cnt} for route, cnt in route_counts.items()]
+                route_items.sort(key=lambda item: (-int(item["count"]), str(item["route"])))
+
+                users.append(
+                    {
+                        "user_id": key,
+                        "username": getattr(auth_user, "username", None) if auth_user is not None else None,
+                        "role": str(getattr(auth_user, "role", "")) if auth_user is not None else None,
+                        "sessions_count": int(sessions_count or 0),
+                        "messages_count": message_counts.get(key, {}),
+                        "last_session_updated_at": last_updated_at.isoformat() if last_updated_at else None,
+                        "sample_session_ids": sample_session_ids,
+                        "linkage": {
+                            "projects": project_items[:20],
+                            "ui_routes": route_items[:20],
+                            "sessions_scanned": len(linkage_sessions),
+                        },
+                    }
+                )
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "limit": limit,
+                    "include_anonymous": include_anonymous,
+                    "count": len(users),
+                    "users": users,
+                },
+            }
+
+        if name == "assistant_search_internal_logs":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            query_text = _safe_str(args.get("query"), max_len=512) or _safe_str(args.get("q"), max_len=512)
+            if not query_text:
+                return {"ok": False, "tool": name, "error": "Missing argument: query"}
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=100)
+
+            pattern = f"%{query_text}%"
+            step_rows = (
+                assistant_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
+                .join(AgentRun, AgentStep.run_pk == AgentRun.id)
+                .filter(
+                    or_(
+                        AgentStep.kind.ilike(pattern),
+                        AgentStep.error.ilike(pattern),
+                        cast(AgentStep.prompt_json, Text).ilike(pattern),
+                        cast(AgentStep.response_json, Text).ilike(pattern),
+                        cast(AgentStep.tool_results_json, Text).ilike(pattern),
+                        cast(AgentStep.state_before_json, Text).ilike(pattern),
+                        cast(AgentStep.state_after_json, Text).ilike(pattern),
+                        cast(AgentStep.summary_before_json, Text).ilike(pattern),
+                        cast(AgentStep.summary_after_json, Text).ilike(pattern),
+                    )
+                )
+                .order_by(AgentStep.id.desc())
+                .limit(limit)
+                .all()
+            )
+            steps: list[dict[str, Any]] = []
+            for step, run_id, agent_id in step_rows:
+                response_preview = ""
+                if isinstance(step.response_json, dict):
+                    response_preview = _snippet_for_query(json.dumps(step.response_json, ensure_ascii=False), query_text)
+                steps.append(
+                    {
+                        "step_id": int(step.id),
+                        "run_id": run_id,
+                        "agent_id": agent_id,
+                        "kind": step.kind,
+                        "step_index": int(step.step_index or 0),
+                        "ok": bool(step.ok),
+                        "severity": step.severity,
+                        "error": step.error,
+                        "started_at": step.started_at.isoformat() if getattr(step, "started_at", None) else None,
+                        "ended_at": step.ended_at.isoformat() if getattr(step, "ended_at", None) else None,
+                        "response_preview": response_preview,
+                    }
+                )
+
+            command_rows = (
+                assistant_db.query(AgentCommand)
+                .filter(
+                    or_(
+                        AgentCommand.command_type.ilike(pattern),
+                        AgentCommand.status.ilike(pattern),
+                        AgentCommand.error.ilike(pattern),
+                        cast(AgentCommand.payload_json, Text).ilike(pattern),
+                        cast(AgentCommand.result_json, Text).ilike(pattern),
+                    )
+                )
+                .order_by(AgentCommand.id.desc())
+                .limit(limit)
+                .all()
+            )
+            commands: list[dict[str, Any]] = []
+            for cmd in command_rows:
+                payload_preview = ""
+                if isinstance(cmd.payload_json, dict):
+                    payload_preview = _snippet_for_query(json.dumps(cmd.payload_json, ensure_ascii=False), query_text)
+                result_preview = ""
+                if isinstance(cmd.result_json, dict):
+                    result_preview = _snippet_for_query(json.dumps(cmd.result_json, ensure_ascii=False), query_text)
+                commands.append(
+                    {
+                        "command_id": int(cmd.id),
+                        "command_type": cmd.command_type,
+                        "status": cmd.status,
+                        "priority": int(cmd.priority or 0),
+                        "available_at": cmd.available_at.isoformat() if getattr(cmd, "available_at", None) else None,
+                        "claimed_by_run_id": cmd.claimed_by_run_id,
+                        "error": cmd.error,
+                        "payload_preview": payload_preview,
+                        "result_preview": result_preview,
+                    }
+                )
+
+            run_rows = (
+                assistant_db.query(AgentRun)
+                .filter(
+                    or_(
+                        AgentRun.run_id.ilike(pattern),
+                        AgentRun.agent_id.ilike(pattern),
+                        AgentRun.kind.ilike(pattern),
+                        AgentRun.status.ilike(pattern),
+                        AgentRun.last_error.ilike(pattern),
+                        AgentRun.status_bar.ilike(pattern),
+                        cast(AgentRun.summary_json, Text).ilike(pattern),
+                        cast(AgentRun.state_json, Text).ilike(pattern),
+                        cast(AgentRun.config_json, Text).ilike(pattern),
+                    )
+                )
+                .order_by(AgentRun.id.desc())
+                .limit(limit)
+                .all()
+            )
+            runs: list[dict[str, Any]] = []
+            for run in run_rows:
+                summary_preview = ""
+                if isinstance(run.summary_json, dict):
+                    summary_preview = _snippet_for_query(json.dumps(run.summary_json, ensure_ascii=False), query_text)
+                runs.append(
+                    {
+                        "run_id": run.run_id,
+                        "agent_id": run.agent_id,
+                        "kind": run.kind,
+                        "status": run.status,
+                        "updated_at": run.updated_at.isoformat() if getattr(run, "updated_at", None) else None,
+                        "status_bar": run.status_bar,
+                        "last_error": run.last_error,
+                        "summary_preview": summary_preview,
+                    }
+                )
+
+            event_rows = (
+                assistant_db.query(AgentEvent)
+                .filter(
+                    or_(
+                        AgentEvent.agent_id.ilike(pattern),
+                        AgentEvent.event_type.ilike(pattern),
+                        AgentEvent.name.ilike(pattern),
+                        AgentEvent.severity.ilike(pattern),
+                        AgentEvent.payload_json.ilike(pattern),
+                    )
+                )
+                .order_by(AgentEvent.id.desc())
+                .limit(limit)
+                .all()
+            )
+            events: list[dict[str, Any]] = []
+            for event in event_rows:
+                payload_preview = _snippet_for_query(event.payload_json, query_text)
+                events.append(
+                    {
+                        "event_id": int(event.id),
+                        "agent_id": event.agent_id,
+                        "event_type": event.event_type,
+                        "name": event.name,
+                        "severity": event.severity,
+                        "ts": event.ts.isoformat() if getattr(event, "ts", None) else None,
+                        "payload_preview": payload_preview,
+                    }
+                )
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "query": query_text,
+                    "limit": limit,
+                    "steps": steps,
+                    "commands": commands,
+                    "runs": runs,
+                    "events": events,
+                },
+            }
+
+        if name == "assistant_get_agent_step":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            step_id = _safe_int(args.get("step_id"))
+            if step_id is None:
+                step_id = _safe_int(args.get("id"))
+            if step_id is None:
+                return {"ok": False, "tool": name, "error": "Missing integer argument: step_id (or id)"}
+
+            row = (
+                assistant_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
+                .join(AgentRun, AgentStep.run_pk == AgentRun.id)
+                .filter(AgentStep.id == int(step_id))
+                .first()
+            )
+            if row is None:
+                return {"ok": False, "tool": name, "error": "Agent step not found.", "step_id": int(step_id)}
+            step, run_id, agent_id = row
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "step_id": int(step.id),
+                    "run_id": run_id,
+                    "agent_id": agent_id,
+                    "kind": step.kind,
+                    "step_index": int(step.step_index or 0),
+                    "started_at": step.started_at.isoformat() if getattr(step, "started_at", None) else None,
+                    "ended_at": step.ended_at.isoformat() if getattr(step, "ended_at", None) else None,
+                    "duration_ms": int(step.duration_ms) if step.duration_ms is not None else None,
+                    "ok": bool(step.ok),
+                    "severity": step.severity,
+                    "error": step.error,
+                    "prompt_json": step.prompt_json,
+                    "response_json": step.response_json,
+                    "tool_calls_json": step.tool_calls_json,
+                    "tool_results_json": step.tool_results_json,
+                    "state_before_json": step.state_before_json,
+                    "state_after_json": step.state_after_json,
+                },
+            }
+
+        if name == "assistant_get_agent_command":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            command_id = _safe_int(args.get("command_id"))
+            if command_id is None:
+                command_id = _safe_int(args.get("id"))
+            if command_id is None:
+                return {"ok": False, "tool": name, "error": "Missing integer argument: command_id (or id)"}
+
+            cmd = assistant_db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+            if cmd is None:
+                return {"ok": False, "tool": name, "error": "Agent command not found.", "command_id": int(command_id)}
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "command_id": int(cmd.id),
+                    "command_type": cmd.command_type,
+                    "status": cmd.status,
+                    "priority": int(cmd.priority or 0),
+                    "created_at": cmd.created_at.isoformat() if getattr(cmd, "created_at", None) else None,
+                    "updated_at": cmd.updated_at.isoformat() if getattr(cmd, "updated_at", None) else None,
+                    "available_at": cmd.available_at.isoformat() if getattr(cmd, "available_at", None) else None,
+                    "claimed_at": cmd.claimed_at.isoformat() if getattr(cmd, "claimed_at", None) else None,
+                    "claimed_by_agent_id": cmd.claimed_by_agent_id,
+                    "claimed_by_run_id": cmd.claimed_by_run_id,
+                    "started_at": cmd.started_at.isoformat() if getattr(cmd, "started_at", None) else None,
+                    "ended_at": cmd.ended_at.isoformat() if getattr(cmd, "ended_at", None) else None,
+                    "attempts": int(cmd.attempts or 0),
+                    "max_attempts": int(cmd.max_attempts or 0),
+                    "payload_json": cmd.payload_json,
+                    "result_json": cmd.result_json,
+                    "error": cmd.error,
+                },
+            }
+
+        if name == "assistant_get_agent_run":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            run_id = _safe_str(args.get("run_id"), max_len=128) or _safe_str(args.get("id"), max_len=128)
+            if not run_id:
+                return {"ok": False, "tool": name, "error": "Missing argument: run_id"}
+            run = assistant_db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
+            if run is None:
+                return {"ok": False, "tool": name, "error": "Agent run not found.", "run_id": run_id}
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "run_id": run.run_id,
+                    "agent_id": run.agent_id,
+                    "kind": run.kind,
+                    "status": run.status,
+                    "created_at": run.created_at.isoformat() if getattr(run, "created_at", None) else None,
+                    "updated_at": run.updated_at.isoformat() if getattr(run, "updated_at", None) else None,
+                    "ended_at": run.ended_at.isoformat() if getattr(run, "ended_at", None) else None,
+                    "step_index": int(run.step_index or 0),
+                    "status_bar": run.status_bar,
+                    "last_error": run.last_error,
+                    "config_json": run.config_json,
+                    "state_json": run.state_json,
+                    "summary_json": run.summary_json,
+                },
+            }
+
         if name == "db_file_stats":
             core_path = _sqlite_path_from_session(core_db)
             assistant_path = (core_path.parent / "ispec-assistant.db") if core_path is not None else None
@@ -2528,6 +3127,113 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "session_id": {"type": "string", "description": "Support session_id to fetch."},
                 },
                 "required": ["session_id"],
+            },
+        },
+    },
+    "assistant_search_messages": {
+        "type": "function",
+        "function": {
+            "name": "assistant_search_messages",
+            "description": "Search support chat logs (support_message.content) across sessions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Substring to search for."},
+                    "limit": {"type": "integer", "description": "Max matches to return (default 20)."},
+                    "role": {"type": "string", "description": "Optional role filter: user|assistant|system."},
+                    "session_id": {"type": "string", "description": "Optional session_id to restrict search."},
+                    "user_id": {"type": "integer", "description": "Optional user_id to restrict search."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    "assistant_get_message_context": {
+        "type": "function",
+        "function": {
+            "name": "assistant_get_message_context",
+            "description": "Fetch a support message plus nearby context messages in the same session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer", "description": "Support message id."},
+                    "before": {"type": "integer", "description": "Messages before (default 3)."},
+                    "after": {"type": "integer", "description": "Messages after (default 3)."},
+                    "max_chars": {"type": "integer", "description": "Max chars per message content (default 800)."},
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
+    "assistant_list_users": {
+        "type": "function",
+        "function": {
+            "name": "assistant_list_users",
+            "description": "List users who have support sessions, including basic linkage signals (projects/routes) from session state.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max users to return (default 50)."},
+                    "include_anonymous": {"type": "boolean", "description": "Include sessions with user_id=null (default true)."},
+                    "linkage_session_limit": {"type": "integer", "description": "Max sessions per user to scan for linkage (default 50)."},
+                },
+            },
+        },
+    },
+    "assistant_search_internal_logs": {
+        "type": "function",
+        "function": {
+            "name": "assistant_search_internal_logs",
+            "description": "Search internal agent/supervisor logs (agent_run/agent_step/agent_command/agent_event).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Substring to search for."},
+                    "limit": {"type": "integer", "description": "Max matches per table (default 20)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    "assistant_get_agent_step": {
+        "type": "function",
+        "function": {
+            "name": "assistant_get_agent_step",
+            "description": "Fetch an agent_step row (prompt/response/tool results/state) by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "step_id": {"type": "integer", "description": "agent_step.id"},
+                },
+                "required": ["step_id"],
+            },
+        },
+    },
+    "assistant_get_agent_command": {
+        "type": "function",
+        "function": {
+            "name": "assistant_get_agent_command",
+            "description": "Fetch an agent_command row (payload/result/status) by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command_id": {"type": "integer", "description": "agent_command.id"},
+                },
+                "required": ["command_id"],
+            },
+        },
+    },
+    "assistant_get_agent_run": {
+        "type": "function",
+        "function": {
+            "name": "assistant_get_agent_run",
+            "description": "Fetch an agent_run row (state/summary) by run_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string", "description": "agent_run.run_id"},
+                },
+                "required": ["run_id"],
             },
         },
     },

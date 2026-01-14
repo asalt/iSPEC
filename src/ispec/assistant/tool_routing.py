@@ -65,16 +65,25 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
         tool_names=("repo_list_files", "repo_search", "repo_read_file"),
     ),
     ToolGroup(
-        name="misc",
-        description="Other utilities (assistant DB stats, API schema search, DB file stats, recent activity).",
+        name="assistant",
+        description="Assistant retrieval tools (search support chat logs, internal agent logs, and review state).",
         tool_names=(
-            "search_api",
-            "db_file_stats",
-            "latest_activity",
             "assistant_stats",
             "assistant_recent_sessions",
             "assistant_get_session_review",
+            "assistant_search_messages",
+            "assistant_get_message_context",
+            "assistant_list_users",
+            "assistant_search_internal_logs",
+            "assistant_get_agent_step",
+            "assistant_get_agent_command",
+            "assistant_get_agent_run",
         ),
+    ),
+    ToolGroup(
+        name="misc",
+        description="Other utilities (API schema search, DB file stats, recent activity).",
+        tool_names=("search_api", "db_file_stats", "latest_activity"),
     ),
 )
 
