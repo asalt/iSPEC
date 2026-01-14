@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from contextlib import contextmanager
 from functools import lru_cache
@@ -7,13 +8,14 @@ from pathlib import Path
 from typing import Iterator
 
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from ispec.db.models import sqlite_engine
 from ispec.logging import get_logger
 
-from .models import AssistantBase
+from .models import AssistantBase, SupportSession, SupportSessionReview
 
 
 logger = get_logger(__file__)
@@ -74,6 +76,7 @@ def _get_engine(db_uri: str) -> Engine:
         AgentBase.metadata.create_all(bind=engine)
     _ensure_support_session_columns(engine)
     _ensure_support_message_columns(engine)
+    _migrate_support_session_reviews_from_state(engine)
     return engine
 
 
@@ -122,6 +125,69 @@ def _ensure_support_message_columns(engine: Engine) -> None:
         "Added missing columns support_message.%s",
         ", ".join(name for name, _ in missing),
     )
+
+
+def _migrate_support_session_reviews_from_state(engine: Engine) -> None:
+    """Best-effort migration of legacy conversation reviews stored in state_json."""
+
+    try:
+        tables = set(inspect(engine).get_table_names())
+    except Exception:
+        return
+    if "support_session_review" not in tables:
+        return
+
+    SessionLocal = sessionmaker(bind=engine)
+    db = SessionLocal()
+    try:
+        rows = db.query(SupportSession).filter(SupportSession.state_json.isnot(None)).all()
+        migrated = 0
+        for session in rows:
+            raw_state = getattr(session, "state_json", None)
+            if not raw_state:
+                continue
+            try:
+                state = json.loads(raw_state)
+            except Exception:
+                continue
+            if not isinstance(state, dict):
+                continue
+            review = state.get("conversation_review")
+            if not isinstance(review, dict):
+                continue
+
+            target_id = state.get("conversation_review_up_to_id")
+            if not isinstance(target_id, int):
+                target_id = review.get("target_message_id")
+            if not isinstance(target_id, int) or target_id <= 0:
+                continue
+
+            existing = (
+                db.query(SupportSessionReview)
+                .filter(SupportSessionReview.session_pk == int(session.id))
+                .filter(SupportSessionReview.target_message_id == int(target_id))
+                .first()
+            )
+            if existing is not None:
+                continue
+
+            record = SupportSessionReview(
+                session_pk=int(session.id),
+                target_message_id=int(target_id),
+                schema_version=int(review.get("schema_version") or 1),
+                review_json=review,
+            )
+            db.add(record)
+            try:
+                db.commit()
+                migrated += 1
+            except IntegrityError:
+                db.rollback()
+
+        if migrated:
+            logger.info("Migrated %s support session review(s) from support_session.state_json", migrated)
+    finally:
+        db.close()
 
 
 @contextmanager

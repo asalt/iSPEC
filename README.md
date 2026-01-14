@@ -112,7 +112,7 @@ control where the data lives with environment variables:
 - `ISPEC_DB_PATH` – full SQLite path/URI used by session helpers and tests.
 - `ISPEC_ASSISTANT_DB_PATH` – SQLite path/URI for assistant chat history (defaults to `ispec-assistant.db` alongside `ISPEC_DB_PATH`).
 - `ISPEC_SCHEDULE_DB_PATH` – SQLite path/URI for scheduling (defaults to `ispec-schedule.db` alongside `ISPEC_DB_PATH`).
-- `ISPEC_AGENT_DB_PATH` – SQLite path/URI for agent telemetry/events (defaults to `ispec-agent.db` alongside `ISPEC_DB_PATH`).
+- `ISPEC_AGENT_DB_PATH` – SQLite path/URI for agent telemetry/events (defaults to `ISPEC_ASSISTANT_DB_PATH`).
 
 Both variables are respected by the connection utilities, which ensure the
 folders exist and wire up SQLAlchemy session factories for you.【F:src/ispec/db/connect.py†L17-L94】

@@ -15,6 +15,13 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ispec.assistant.context import person_summary, project_summary
+from ispec.assistant.models import (
+    SupportMemory,
+    SupportMessage as AssistantSupportMessage,
+    SupportSession,
+    SupportSessionReview,
+)
+from ispec.agent.models import AgentCommand, AgentRun
 from ispec.db.models import (
     AuthUser,
     E2G,
@@ -51,6 +58,9 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "latest_activity": ToolScope.staff,
     "billing_category_counts": ToolScope.staff,
     "db_file_stats": ToolScope.staff,
+    "assistant_stats": ToolScope.staff,
+    "assistant_recent_sessions": ToolScope.staff,
+    "assistant_get_session_review": ToolScope.staff,
     "count_all_projects": ToolScope.staff,
     "count_current_projects": ToolScope.staff,
     "project_status_counts": ToolScope.staff,
@@ -492,6 +502,9 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add("latest_activity", "- latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)")
     add("billing_category_counts", "- billing_category_counts(current_only: bool = false, limit: int = 20)")
     add("db_file_stats", "- db_file_stats()  # show sqlite DB file sizes")
+    add("assistant_stats", "- assistant_stats()  # assistant DB stats and review backlog")
+    add("assistant_recent_sessions", "- assistant_recent_sessions(limit: int = 10)")
+    add("assistant_get_session_review", "- assistant_get_session_review(session_id: str)")
     add("count_all_projects", "- count_all_projects()  # total projects across all statuses/flags")
     add("count_current_projects", "- count_current_projects()  # current projects only")
     add("project_status_counts", "- project_status_counts(current_only: bool = false)")
@@ -866,6 +879,7 @@ def run_tool(
     name: str,
     args: dict[str, Any],
     core_db: Session,
+    assistant_db: Session | None = None,
     schedule_db: Session | None = None,
     omics_db: Session | None = None,
     user: AuthUser | None = None,
@@ -1323,6 +1337,275 @@ def run_tool(
                     "field": "prj_ProjectPriceLevel",
                     "count": len(items),
                     "items": items,
+                },
+            }
+
+        if name == "assistant_stats":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            sessions_total = int(assistant_db.query(func.count(SupportSession.id)).scalar() or 0)
+            messages_total = int(assistant_db.query(func.count(AssistantSupportMessage.id)).scalar() or 0)
+            memories_total = int(assistant_db.query(func.count(SupportMemory.id)).scalar() or 0)
+
+            session_rows = (
+                assistant_db.query(SupportSession)
+                .order_by(SupportSession.updated_at.desc(), SupportSession.id.desc())
+                .limit(250)
+                .all()
+            )
+            last_message_rows = (
+                assistant_db.query(AssistantSupportMessage.session_pk, func.max(AssistantSupportMessage.id))
+                .group_by(AssistantSupportMessage.session_pk)
+                .all()
+            )
+            last_message_by_session = {int(session_pk): int(last_id or 0) for session_pk, last_id in last_message_rows}
+            last_message_ids = [int(last_id or 0) for _, last_id in last_message_rows if last_id]
+            last_role_by_id = {}
+            if last_message_ids:
+                role_rows = (
+                    assistant_db.query(AssistantSupportMessage.id, AssistantSupportMessage.role)
+                    .filter(AssistantSupportMessage.id.in_(last_message_ids))
+                    .all()
+                )
+                last_role_by_id = {int(message_id): role for message_id, role in role_rows}
+            last_role_by_session = {
+                int(session_pk): last_role_by_id.get(int(last_id or 0))
+                for session_pk, last_id in last_message_rows
+            }
+            last_assistant_rows = (
+                assistant_db.query(AssistantSupportMessage.session_pk, func.max(AssistantSupportMessage.id))
+                .filter(AssistantSupportMessage.role == "assistant")
+                .group_by(AssistantSupportMessage.session_pk)
+                .all()
+            )
+            last_assistant_by_session = {int(session_pk): int(last_id or 0) for session_pk, last_id in last_assistant_rows}
+
+            session_pks = [int(session.id) for session in session_rows]
+            reviewed_up_to_by_session: dict[int, int] = {}
+            if session_pks:
+                review_rows = (
+                    assistant_db.query(SupportSessionReview.session_pk, func.max(SupportSessionReview.target_message_id))
+                    .filter(SupportSessionReview.session_pk.in_(session_pks))
+                    .group_by(SupportSessionReview.session_pk)
+                    .all()
+                )
+                reviewed_up_to_by_session = {int(session_pk): int(max_id or 0) for session_pk, max_id in review_rows}
+
+            needs_review = 0
+            reviewed = 0
+            pending_user_turn = 0
+            no_assistant_messages = 0
+            for session in session_rows:
+                session_pk = int(session.id)
+                last_id = int(last_message_by_session.get(session_pk, 0))
+                last_role = last_role_by_session.get(session_pk)
+                last_assistant_id = int(last_assistant_by_session.get(session_pk, 0))
+                if last_assistant_id <= 0:
+                    no_assistant_messages += 1
+                    continue
+                if last_role != "assistant":
+                    pending_user_turn += 1
+                    continue
+                reviewed_up_to = reviewed_up_to_by_session.get(session_pk)
+                if reviewed_up_to is None:
+                    state: dict[str, Any] = {}
+                    raw_state = getattr(session, "state_json", None)
+                    if raw_state:
+                        try:
+                            parsed_state = json.loads(raw_state)
+                            if isinstance(parsed_state, dict):
+                                state = parsed_state
+                        except Exception:
+                            state = {}
+                    reviewed_up_to = _safe_int(state.get("conversation_review_up_to_id")) or 0
+                if last_id > 0 and reviewed_up_to >= last_assistant_id:
+                    reviewed += 1
+                elif last_assistant_id > reviewed_up_to:
+                    needs_review += 1
+
+            queued_commands = int(assistant_db.query(func.count(AgentCommand.id)).filter(AgentCommand.status == "queued").scalar() or 0)
+            running_commands = int(
+                assistant_db.query(func.count(AgentCommand.id)).filter(AgentCommand.status == "running").scalar() or 0
+            )
+            last_run = (
+                assistant_db.query(AgentRun)
+                .filter(AgentRun.kind == "supervisor")
+                .order_by(AgentRun.id.desc())
+                .first()
+            )
+            orchestrator_state = None
+            if last_run is not None and isinstance(last_run.summary_json, dict):
+                orchestrator_state = last_run.summary_json.get("orchestrator")
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "sessions_total": sessions_total,
+                    "messages_total": messages_total,
+                    "memories_total": memories_total,
+                    "sessions_needing_review": needs_review,
+                    "sessions_reviewed": reviewed,
+                    "sessions_pending_user_turn": pending_user_turn,
+                    "sessions_without_assistant_messages": no_assistant_messages,
+                    "agent_commands": {"queued": queued_commands, "running": running_commands},
+                    "latest_supervisor_run": {
+                        "run_id": getattr(last_run, "run_id", None),
+                        "agent_id": getattr(last_run, "agent_id", None),
+                        "status": getattr(last_run, "status", None),
+                        "updated_at": getattr(last_run, "updated_at", None).isoformat() if getattr(last_run, "updated_at", None) else None,
+                        "orchestrator": orchestrator_state,
+                    }
+                    if last_run is not None
+                    else None,
+                },
+            }
+
+        if name == "assistant_recent_sessions":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=10, min_value=1, max_value=50)
+            sessions = (
+                assistant_db.query(SupportSession)
+                .order_by(SupportSession.updated_at.desc(), SupportSession.id.desc())
+                .limit(limit)
+                .all()
+            )
+            session_pks = [int(session.id) for session in sessions]
+            review_by_session_pk: dict[int, dict[str, Any]] = {}
+            if session_pks:
+                review_rows = (
+                    assistant_db.query(
+                        SupportSessionReview.session_pk,
+                        SupportSessionReview.target_message_id,
+                        SupportSessionReview.updated_at,
+                    )
+                    .filter(SupportSessionReview.session_pk.in_(session_pks))
+                    .order_by(
+                        SupportSessionReview.session_pk.asc(),
+                        SupportSessionReview.target_message_id.desc(),
+                        SupportSessionReview.updated_at.desc(),
+                        SupportSessionReview.id.desc(),
+                    )
+                    .all()
+                )
+                for session_pk, target_id, updated_at in review_rows:
+                    key = int(session_pk)
+                    if key in review_by_session_pk:
+                        continue
+                    review_by_session_pk[key] = {
+                        "reviewed_up_to_id": int(target_id or 0),
+                        "review_updated_at": updated_at.isoformat() if updated_at else None,
+                    }
+
+            items: list[dict[str, Any]] = []
+            for session in sessions:
+                msg_count = int(
+                    assistant_db.query(func.count(AssistantSupportMessage.id))
+                    .filter(AssistantSupportMessage.session_pk == session.id)
+                    .scalar()
+                    or 0
+                )
+                last_message = (
+                    assistant_db.query(AssistantSupportMessage)
+                    .filter(AssistantSupportMessage.session_pk == session.id)
+                    .order_by(AssistantSupportMessage.id.desc())
+                    .first()
+                )
+                last_user = (
+                    assistant_db.query(AssistantSupportMessage)
+                    .filter(AssistantSupportMessage.session_pk == session.id)
+                    .filter(AssistantSupportMessage.role == "user")
+                    .order_by(AssistantSupportMessage.id.desc())
+                    .first()
+                )
+                last_assistant = (
+                    assistant_db.query(AssistantSupportMessage)
+                    .filter(AssistantSupportMessage.session_pk == session.id)
+                    .filter(AssistantSupportMessage.role == "assistant")
+                    .order_by(AssistantSupportMessage.id.desc())
+                    .first()
+                )
+                state: dict[str, Any] = {}
+                raw_state = getattr(session, "state_json", None)
+                if raw_state:
+                    try:
+                        parsed_state = json.loads(raw_state)
+                        if isinstance(parsed_state, dict):
+                            state = parsed_state
+                    except Exception:
+                        state = {}
+                review_info = review_by_session_pk.get(int(session.id))
+                if isinstance(review_info, dict):
+                    reviewed_up_to_id = _safe_int(review_info.get("reviewed_up_to_id")) or 0
+                    review_updated_at = review_info.get("review_updated_at")
+                else:
+                    reviewed_up_to_id = _safe_int(state.get("conversation_review_up_to_id")) or 0
+                    review_updated_at = state.get("conversation_review_updated_at")
+                items.append(
+                    {
+                        "session_id": session.session_id,
+                        "user_id": int(session.user_id) if session.user_id is not None else None,
+                        "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+                        "message_count": msg_count,
+                        "last_message_id": int(last_message.id) if last_message is not None else 0,
+                        "last_message_role": getattr(last_message, "role", None),
+                        "last_assistant_message_id": int(last_assistant.id) if last_assistant is not None else 0,
+                        "last_user_message": _safe_str(getattr(last_user, "content", None), max_len=240),
+                        "reviewed_up_to_id": reviewed_up_to_id,
+                        "review_updated_at": review_updated_at,
+                        "memory_up_to_id": _safe_int(state.get("conversation_memory_up_to_id")) or 0,
+                    }
+                )
+
+            return {"ok": True, "tool": name, "result": {"limit": limit, "sessions": items}}
+
+        if name == "assistant_get_session_review":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            session_id = _safe_str(args.get("session_id"), max_len=256) or _safe_str(args.get("id"), max_len=256)
+            if not session_id:
+                return {"ok": False, "tool": name, "error": "Missing argument: session_id"}
+            session = assistant_db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+            if session is None:
+                return {"ok": False, "tool": name, "error": "Session not found.", "session_id": session_id}
+            review_row = (
+                assistant_db.query(SupportSessionReview)
+                .filter(SupportSessionReview.session_pk == int(session.id))
+                .order_by(
+                    SupportSessionReview.target_message_id.desc(),
+                    SupportSessionReview.updated_at.desc(),
+                    SupportSessionReview.id.desc(),
+                )
+                .first()
+            )
+            if review_row is not None:
+                review = review_row.review_json if isinstance(review_row.review_json, dict) else None
+                reviewed_up_to_id = int(review_row.target_message_id or 0)
+                review_updated_at = review_row.updated_at.isoformat() if review_row.updated_at else None
+            else:
+                state: dict[str, Any] = {}
+                raw_state = getattr(session, "state_json", None)
+                if raw_state:
+                    try:
+                        parsed_state = json.loads(raw_state)
+                        if isinstance(parsed_state, dict):
+                            state = parsed_state
+                    except Exception:
+                        state = {}
+                review = state.get("conversation_review") if isinstance(state.get("conversation_review"), dict) else None
+                reviewed_up_to_id = _safe_int(state.get("conversation_review_up_to_id")) or 0
+                review_updated_at = state.get("conversation_review_updated_at")
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "session_id": session.session_id,
+                    "reviewed_up_to_id": reviewed_up_to_id,
+                    "review_updated_at": review_updated_at,
+                    "review": review,
                 },
             }
 
@@ -2211,6 +2494,41 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "name": "db_file_stats",
             "description": "Return sqlite DB file sizes (core, assistant, and schedule DB).",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    "assistant_stats": {
+        "type": "function",
+        "function": {
+            "name": "assistant_stats",
+            "description": "Return internal assistant/support-session stats (sessions, messages, memory, review queue).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    "assistant_recent_sessions": {
+        "type": "function",
+        "function": {
+            "name": "assistant_recent_sessions",
+            "description": "List recent support sessions with message counts and review/memory progress.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max sessions to return (default 10)."},
+                },
+            },
+        },
+    },
+    "assistant_get_session_review": {
+        "type": "function",
+        "function": {
+            "name": "assistant_get_session_review",
+            "description": "Fetch the latest internal conversation review for a support session, if present.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Support session_id to fetch."},
+                },
+                "required": ["session_id"],
+            },
         },
     },
     "count_all_projects": {

@@ -211,6 +211,12 @@ def _can_update_imported(
 ) -> bool:
     from datetime import timedelta
 
+    # When writing via imports/sync, our local ``*_ModificationTS`` timestamps can
+    # drift slightly past the recorded import timestamp (e.g., defaults or
+    # onupdate firing during flush/commit). Treat small drifts as safe updates so
+    # we don't incorrectly mark fresh legacy imports as "conflicted".
+    drift_grace = timedelta(seconds=60)
+
     imported_at = _normalize_datetime(getattr(obj, import_ts_field, None))
     modified_at = _normalize_datetime(getattr(obj, modified_field, None))
     if imported_at is None:
@@ -224,7 +230,9 @@ def _can_update_imported(
         return (modified_at - created_at) <= timedelta(seconds=5)
     if modified_at is None:
         return True
-    return modified_at <= imported_at
+    if modified_at <= imported_at:
+        return True
+    return (modified_at - imported_at) <= drift_grace
 
 
 def _legacy_headers() -> dict[str, str]:
@@ -922,6 +930,10 @@ def _build_project_record(
     for legacy_field, local_field in plan.field_map.items():
         if legacy_field not in item:
             continue
+        # Local timestamp columns are managed by the app/DB; do not overwrite
+        # them with legacy values.
+        if local_field.endswith("_CreationTS") or local_field.endswith("_ModificationTS"):
+            continue
         record[local_field] = _coerce_model_field(Project, local_field, item.get(legacy_field))
 
     added_by = record.get("prj_AddedBy")
@@ -1216,10 +1228,6 @@ def sync_legacy_projects(
     if not db_file_path:
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
 
-    imported_at = _normalize_datetime(datetime.now(UTC))
-    if imported_at is None:  # pragma: no cover - defensive
-        imported_at = datetime.utcnow()
-
     inserted = updated = backfilled = conflicted = 0
     pages = 0
     total_items = 0
@@ -1332,6 +1340,7 @@ def sync_legacy_projects(
                 if not isinstance(item, dict):
                     continue
 
+                imported_at = _normalize_datetime(datetime.now(UTC)) or datetime.utcnow()
                 built = _build_project_record(item, plan=plan, imported_at=imported_at)
                 if built is None:
                     continue

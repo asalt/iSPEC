@@ -66,8 +66,15 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
     ),
     ToolGroup(
         name="misc",
-        description="Other utilities (API schema search, DB file stats, recent activity).",
-        tool_names=("search_api", "db_file_stats", "latest_activity"),
+        description="Other utilities (assistant DB stats, API schema search, DB file stats, recent activity).",
+        tool_names=(
+            "search_api",
+            "db_file_stats",
+            "latest_activity",
+            "assistant_stats",
+            "assistant_recent_sessions",
+            "assistant_get_session_review",
+        ),
     ),
 )
 
@@ -122,6 +129,7 @@ def _tool_router_system_prompt(groups: list[ToolGroup]) -> str:
     lines = [
         "Select the best tool group(s) for the user request.",
         "Return only a JSON object that matches the provided schema.",
+        'If you cannot follow the schema exactly, return: {"groups":["<primary>","<optional-secondary>",...]}',
         "",
         "Groups:",
     ]
@@ -155,26 +163,48 @@ def _parse_json_object(text: str | None) -> dict[str, Any] | None:
 
 def _validate_router_decision(decision: dict[str, Any], *, group_names: set[str]) -> dict[str, Any] | None:
     primary = decision.get("primary")
-    secondary = decision.get("secondary")
-    confidence = decision.get("confidence")
-    clarify = decision.get("clarify")
+    secondary: Any = decision.get("secondary")
+    confidence: Any = decision.get("confidence")
+    clarify: Any = decision.get("clarify")
+
+    if not isinstance(primary, str) or not primary.strip():
+        groups = decision.get("groups")
+        if isinstance(groups, list) and groups and isinstance(groups[0], str) and groups[0].strip():
+            primary = groups[0].strip()
+            if secondary is None:
+                secondary = [item for item in groups[1:] if isinstance(item, str) and item.strip()]
+        else:
+            group = decision.get("group")
+            if isinstance(group, str) and group.strip():
+                primary = group.strip()
 
     if not isinstance(primary, str) or primary not in group_names:
         return None
-    if not isinstance(secondary, list) or any((not isinstance(item, str)) for item in secondary):
+
+    secondary_list: list[str] = []
+    if secondary is None:
+        secondary_list = []
+    elif isinstance(secondary, str):
+        secondary_list = [secondary]
+    elif isinstance(secondary, list):
+        if any((not isinstance(item, str)) for item in secondary):
+            return None
+        secondary_list = list(secondary)
+    else:
         return None
-    secondary_clean = [item for item in secondary if item in group_names and item != primary]
+
+    secondary_clean = [item for item in secondary_list if item in group_names and item != primary]
     if len(secondary_clean) > 2:
         secondary_clean = secondary_clean[:2]
     try:
-        confidence_value = float(confidence)
+        confidence_value = float(confidence) if confidence is not None else 0.7
     except Exception:
-        confidence_value = 0.0
+        confidence_value = 0.7
     if confidence_value < 0:
         confidence_value = 0.0
     if confidence_value > 1:
         confidence_value = 1.0
-    clarify_value = bool(clarify)
+    clarify_value = bool(False if clarify is None else clarify)
     return {
         "primary": primary,
         "secondary": secondary_clean,

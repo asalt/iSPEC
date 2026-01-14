@@ -367,6 +367,12 @@ def import_legacy_dump(
     ) -> bool:
         from datetime import timedelta
 
+        # Writes during import can update the local ``*_ModificationTS`` fields
+        # slightly after we record the import timestamp (defaults/onupdate
+        # during flush/commit). Allow a small grace window so repeat imports can
+        # update previously-imported rows instead of marking them conflicted.
+        drift_grace = timedelta(seconds=60)
+
         imported_at = normalize_datetime(getattr(obj, import_ts_field, None))
         modified_at = normalize_datetime(getattr(obj, modified_field, None))
         if imported_at is None:
@@ -380,7 +386,9 @@ def import_legacy_dump(
             return (modified_at - created_at) <= timedelta(seconds=5)
         if modified_at is None:
             return True
-        return modified_at <= imported_at
+        if modified_at <= imported_at:
+            return True
+        return (modified_at - imported_at) <= drift_grace
 
     def can_update_imported_comment(comment: ProjectComment) -> bool:
         imported_at = normalize_datetime(getattr(comment, "com_LegacyImportTS", None))

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -26,6 +27,10 @@ class SupportSession(AssistantBase):
     state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     messages: Mapped[list["SupportMessage"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+    )
+    reviews: Mapped[list["SupportSessionReview"]] = relationship(
         back_populates="session",
         cascade="all, delete-orphan",
     )
@@ -110,3 +115,29 @@ class SupportMemoryEvidence(AssistantBase):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
     memory: Mapped[SupportMemory] = relationship(back_populates="evidence")
+
+
+class SupportSessionReview(AssistantBase):
+    __tablename__ = "support_session_review"
+    __table_args__ = (
+        UniqueConstraint("session_pk", "target_message_id", name="uq_support_session_review_session_target"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_pk: Mapped[int] = mapped_column(
+        ForeignKey("support_session.id", ondelete="CASCADE"),
+        index=True,
+    )
+    target_message_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    review_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    agent_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    run_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    command_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, index=True)
+
+    session: Mapped[SupportSession] = relationship(back_populates="reviews")
