@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ispec.api.security import require_access, require_assistant_access
+from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY
+from ispec.agent.models import AgentCommand
 from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.assistant.connect import get_assistant_session_dep
 from ispec.assistant.formatting import split_compare_finals, split_plan_final
@@ -24,6 +26,11 @@ from ispec.assistant.service import (
     _system_prompt_review,
     _system_prompt_review_decider,
     generate_reply,
+)
+from ispec.assistant.tool_routing import (
+    route_tool_groups_vllm,
+    tool_groups_for_available_tools,
+    tool_names_for_groups,
 )
 from ispec.assistant.tools import (
     TOOL_CALL_PREFIX,
@@ -284,6 +291,30 @@ def _compare_mode_enabled() -> bool:
     return _is_truthy(os.getenv("ISPEC_ASSISTANT_COMPARE_MODE"))
 
 
+def _compaction_enabled() -> bool:
+    return _is_truthy(os.getenv("ISPEC_ASSISTANT_COMPACTION_ENABLED") or "1")
+
+
+def _compaction_keep_last() -> int:
+    raw = (os.getenv("ISPEC_ASSISTANT_COMPACTION_KEEP_LAST") or "").strip()
+    if not raw:
+        return 6
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 6
+
+
+def _compaction_min_new_messages() -> int:
+    raw = (os.getenv("ISPEC_ASSISTANT_COMPACTION_MIN_NEW_MESSAGES") or "").strip()
+    if not raw:
+        return 8
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 8
+
+
 def _decide_if_dualchoice(*, payload: ChatRequest) -> bool:
     # TODO: Implement heuristics for when compare mode is actually helpful.
     return True
@@ -347,6 +378,79 @@ def _safe_int_from_state(value: Any) -> int | None:
             parsed = int(stripped)
             return parsed if parsed >= 0 else None
     return None
+
+
+def _maybe_enqueue_session_compaction(
+    *,
+    assistant_db: Session,
+    session: SupportSession,
+    state: dict[str, Any],
+    triggered_by_message_id: int | None,
+    reason: str,
+) -> tuple[dict[str, Any], bool]:
+    if not _compaction_enabled():
+        return state, False
+
+    provider = _assistant_provider()
+    if provider != "vllm":
+        return state, False
+
+    keep_last = _compaction_keep_last()
+    min_new_messages = _compaction_min_new_messages()
+
+    memory_up_to_id = _safe_int_from_state(state.get("conversation_memory_up_to_id")) or 0
+    requested_up_to_id = _safe_int_from_state(state.get("conversation_memory_requested_up_to_id")) or 0
+
+    boundary_rows = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session.id)
+        .order_by(SupportMessage.id.desc())
+        .limit(keep_last + 1)
+        .all()
+    )
+    if len(boundary_rows) <= keep_last:
+        return state, False
+
+    target_id = int(boundary_rows[keep_last].id)
+    if target_id <= 0:
+        return state, False
+    if target_id <= memory_up_to_id or target_id <= requested_up_to_id:
+        return state, False
+
+    new_count = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session.id)
+        .filter(SupportMessage.id > memory_up_to_id)
+        .filter(SupportMessage.id <= target_id)
+        .count()
+    )
+    if new_count < min_new_messages:
+        return state, False
+
+    assistant_db.add(
+        AgentCommand(
+            command_type=COMMAND_COMPACT_SESSION_MEMORY,
+            status="queued",
+            priority=0,
+            payload_json={
+                "session_id": session.session_id,
+                "session_pk": int(session.id),
+                "target_message_id": target_id,
+                "memory_up_to_id": memory_up_to_id,
+                "triggered_by_message_id": int(triggered_by_message_id)
+                if isinstance(triggered_by_message_id, int)
+                else None,
+                "requested_at": utcnow().isoformat(),
+                "reason": reason,
+                "keep_last": keep_last,
+                "min_new_messages": min_new_messages,
+            },
+        )
+    )
+    state["conversation_memory_requested_up_to_id"] = target_id
+    state["conversation_memory_requested_at"] = utcnow().isoformat()
+    state["conversation_memory_requested_reason"] = reason
+    return state, True
 
 
 def _update_conversation_summary(
@@ -536,6 +640,7 @@ def chat(
     assistant_db.add(user_message)
     session.updated_at = utcnow()
     assistant_db.flush()
+    assistant_db.commit()
 
     history_limit = _history_limit()
     max_tokens = _max_prompt_tokens()
@@ -545,7 +650,50 @@ def chat(
     used_tool_calls = 0
     tools_enabled = max_tool_calls > 0
     tools_enabled_initial = tools_enabled
+    tool_router: dict[str, Any] | None = None
     tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
+
+    if (
+        tool_protocol == "openai"
+        and tools_enabled
+        and isinstance(tool_schemas, list)
+        and tool_schemas
+        and _assistant_provider() == "vllm"
+    ):
+        available_tool_names = _openai_tool_names(tool_schemas)
+        groups = tool_groups_for_available_tools(available_tool_names)
+        decision, router_reply = route_tool_groups_vllm(
+            user_message=payload.message,
+            groups=groups,
+            generate_reply_fn=generate_reply,
+        )
+        tool_router = {
+            "ok": bool(router_reply.ok),
+            "provider": router_reply.provider,
+            "model": router_reply.model,
+            "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
+            "decision": decision,
+        }
+        if router_reply.meta:
+            tool_router["provider_meta"] = router_reply.meta
+
+        if decision:
+            selected_tool_names = tool_names_for_groups(
+                groups=groups,
+                primary=str(decision["primary"]),
+                secondary=list(decision["secondary"]),
+            )
+            if selected_tool_names:
+                filtered: list[dict[str, Any]] = []
+                for spec in tool_schemas:
+                    func_obj = spec.get("function") if isinstance(spec, dict) else None
+                    name = func_obj.get("name") if isinstance(func_obj, dict) else None
+                    if isinstance(name, str) and name.strip() in selected_tool_names:
+                        filtered.append(spec)
+                if filtered:
+                    tool_schemas = filtered
+                    tool_router["selected_tool_names"] = sorted(selected_tool_names)
+
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
     openai_tool_names = _openai_tool_names(tool_schemas)
     openai_no_arg_tool_names = _openai_no_arg_tool_names(tool_schemas)
@@ -554,7 +702,11 @@ def chat(
     response_format = "compare" if compare_mode_requested else "single"
 
     tools_available = tool_schemas_count > 0 and tools_enabled
-    planner_prompt = _system_prompt_planner(tools_available=tools_available, response_format=response_format)
+    planner_prompt = _system_prompt_planner(
+        tools_available=tools_available,
+        response_format=response_format,
+        tool_names=openai_tool_names if tool_protocol == "openai" else None,
+    )
     answer_prompt = _system_prompt_answer(response_format=response_format)
     review_prompt = _system_prompt_review()
     prompt_for_budget = planner_prompt if tools_enabled else answer_prompt
@@ -587,6 +739,20 @@ def chat(
         state_for_context = dict(state)
         for key in ("ui_route", "ui_project_id", "ui_experiment_id", "ui_experiment_run_id"):
             state_for_context.pop(key, None)
+        for key in (
+            "conversation_memory_requested_up_to_id",
+            "conversation_memory_requested_at",
+            "conversation_memory_requested_reason",
+            "conversation_memory_last_error",
+        ):
+            state_for_context.pop(key, None)
+        if isinstance(state_for_context.get("conversation_memory"), dict) and state_for_context.get(
+            "conversation_memory"
+        ):
+            memory_up_to_id = _safe_int_from_state(state_for_context.get("conversation_memory_up_to_id")) or 0
+            summary_up_to_id = _safe_int_from_state(state_for_context.get("conversation_summary_up_to_id")) or 0
+            if summary_up_to_id > 0 and memory_up_to_id >= summary_up_to_id:
+                state_for_context.pop("conversation_summary", None)
         context_payload: dict[str, Any] = {
             "schema_version": _CONTEXT_SCHEMA_VERSION,
             "agent": {"multi_round": True, "round": 0},
@@ -1096,6 +1262,8 @@ def chat(
         "used_tool_calls": used_tool_calls,
         "forced_tool_choice": forced_tool_choice,
     }
+    if tool_router:
+        meta["tool_router"] = tool_router
     if final_reply.meta:
         meta["provider_meta"] = final_reply.meta
     meta["tool_calls"] = tool_calls
@@ -1154,6 +1322,17 @@ def chat(
         session.updated_at = utcnow()
         assistant_db.flush()
 
+        state, enqueued = _maybe_enqueue_session_compaction(
+            assistant_db=assistant_db,
+            session=session,
+            state=state,
+            triggered_by_message_id=int(user_message.id),
+            reason="compare_choices",
+        )
+        if enqueued:
+            session.state_json = _dump_state(state)
+            assistant_db.flush()
+
         return ChatResponse(
             sessionId=session.session_id,
             compare=ChatComparePayload(
@@ -1176,6 +1355,17 @@ def chat(
     assistant_db.add(assistant_message)
     session.updated_at = utcnow()
     assistant_db.flush()
+
+    state, enqueued = _maybe_enqueue_session_compaction(
+        assistant_db=assistant_db,
+        session=session,
+        state=state,
+        triggered_by_message_id=int(assistant_message.id),
+        reason="chat_reply",
+    )
+    if enqueued:
+        session.state_json = _dump_state(state)
+        assistant_db.flush()
 
     return ChatResponse(
         sessionId=session.session_id,
@@ -1278,6 +1468,18 @@ def choose(
     compare_meta["selected_at"] = utcnow().isoformat()
     user_message.meta_json = json.dumps({**_load_state(meta_raw), "compare": compare_meta}, ensure_ascii=False)
     assistant_db.flush()
+
+    state = _load_state(getattr(session, "state_json", None))
+    state, enqueued = _maybe_enqueue_session_compaction(
+        assistant_db=assistant_db,
+        session=session,
+        state=state,
+        triggered_by_message_id=int(assistant_message.id),
+        reason="compare_choice_selected",
+    )
+    if enqueued:
+        session.state_json = _dump_state(state)
+        assistant_db.flush()
 
     return ChooseResponse(
         sessionId=session.session_id,

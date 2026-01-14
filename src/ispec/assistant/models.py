@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -56,3 +56,57 @@ class SupportMessage(AssistantBase):
     meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     session: Mapped["SupportSession"] = relationship(back_populates="messages")
+
+
+class SupportMemory(AssistantBase):
+    __tablename__ = "support_memory"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_pk: Mapped[int | None] = mapped_column(
+        ForeignKey("support_session.id"),
+        index=True,
+        nullable=True,
+    )
+    user_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+
+    kind: Mapped[str] = mapped_column(Text, index=True)
+    key: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    value_json: Mapped[str] = mapped_column(Text)
+
+    confidence: Mapped[float] = mapped_column(Float, default=0.7)
+    importance: Mapped[float] = mapped_column(Float, default=0.3)
+    salience: Mapped[float] = mapped_column(Float, index=True, default=0.3)
+    salience_floor: Mapped[float] = mapped_column(Float, default=0.0)
+    decay_lambda: Mapped[float] = mapped_column(Float, default=0.01)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    access_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    session: Mapped[SupportSession | None] = relationship()
+    evidence: Mapped[list["SupportMemoryEvidence"]] = relationship(
+        back_populates="memory",
+        cascade="all, delete-orphan",
+    )
+
+
+class SupportMemoryEvidence(AssistantBase):
+    __tablename__ = "support_memory_evidence"
+    __table_args__ = (
+        UniqueConstraint("memory_id", "message_id", name="uq_support_memory_evidence_memory_message"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    memory_id: Mapped[int] = mapped_column(
+        ForeignKey("support_memory.id", ondelete="CASCADE"),
+        index=True,
+    )
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("support_message.id", ondelete="CASCADE"),
+        index=True,
+    )
+    weight: Mapped[float] = mapped_column(Float, default=1.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    memory: Mapped[SupportMemory] = relationship(back_populates="evidence")

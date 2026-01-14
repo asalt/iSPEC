@@ -66,6 +66,12 @@ def get_assistant_db_uri(file: str | Path | None = None) -> str:
 def _get_engine(db_uri: str) -> Engine:
     engine = sqlite_engine(db_uri)
     AssistantBase.metadata.create_all(bind=engine)
+    try:
+        from ispec.agent.models import AgentBase
+    except Exception:
+        AgentBase = None
+    if AgentBase is not None:
+        AgentBase.metadata.create_all(bind=engine)
     _ensure_support_session_columns(engine)
     _ensure_support_message_columns(engine)
     return engine

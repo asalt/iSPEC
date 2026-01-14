@@ -15,8 +15,12 @@ import psutil
 import requests
 
 from ispec.agent.connect import get_agent_db_uri, get_agent_session
-from ispec.agent.models import AgentEvent, AgentRun, AgentStep
-from ispec.assistant.connect import get_assistant_db_uri
+from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY
+from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
+from ispec.assistant.compaction import distill_conversation_memory
+from ispec.assistant.connect import get_assistant_db_uri, get_assistant_session
+from ispec.assistant.models import SupportMemory, SupportMemoryEvidence, SupportMessage, SupportSession
+from ispec.assistant.service import generate_reply
 from ispec.db.connect import get_db_path
 from ispec.logging import get_logger
 from ispec.schedule.connect import get_schedule_db_uri
@@ -226,6 +230,356 @@ def _check_nvidia_smi() -> dict[str, Any]:
     return {"ok": True, "available": True, "gpus": gpus}
 
 
+def _load_json_dict(raw: str | None) -> dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _dump_json(value: dict[str, Any]) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _safe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            parsed = int(text)
+            return parsed if parsed >= 0 else None
+    return None
+
+
+def _scalar_row_int(row: Any) -> int:
+    if row is None:
+        return 0
+    if isinstance(row, int):
+        return row
+    value = getattr(row, "id", None)
+    if isinstance(value, int):
+        return value
+    if isinstance(row, (tuple, list)) and row:
+        head = row[0]
+        if isinstance(head, int):
+            return head
+        try:
+            return int(head)
+        except Exception:
+            return 0
+    try:
+        return int(row)
+    except Exception:
+        return 0
+
+
+@dataclass(frozen=True)
+class ClaimedCommand:
+    id: int
+    command_type: str
+    payload: dict[str, Any]
+    attempts: int
+    max_attempts: int
+
+
+def _claim_next_command(*, agent_id: str, run_id: str) -> ClaimedCommand | None:
+    now = utcnow()
+    with get_agent_session() as db:
+        cmd = (
+            db.query(AgentCommand)
+            .filter(AgentCommand.status == "queued")
+            .filter(AgentCommand.available_at <= now)
+            .order_by(AgentCommand.priority.desc(), AgentCommand.id.asc())
+            .first()
+        )
+        if cmd is None:
+            return None
+
+        cmd.status = "running"
+        cmd.claimed_at = now
+        cmd.claimed_by_agent_id = agent_id
+        cmd.claimed_by_run_id = run_id
+        cmd.started_at = now
+        cmd.updated_at = now
+        cmd.attempts = int(cmd.attempts or 0) + 1
+
+        db.commit()
+        db.refresh(cmd)
+
+        return ClaimedCommand(
+            id=int(cmd.id),
+            command_type=str(cmd.command_type or ""),
+            payload=dict(cmd.payload_json or {}),
+            attempts=int(cmd.attempts or 0),
+            max_attempts=int(cmd.max_attempts or 0),
+        )
+
+
+def _finish_command(
+    *,
+    command_id: int,
+    ok: bool,
+    result: dict[str, Any] | None,
+    error: str | None,
+) -> None:
+    now = utcnow()
+    with get_agent_session() as db:
+        cmd = db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+        if cmd is None:
+            return
+        cmd.status = "succeeded" if ok else "failed"
+        cmd.ended_at = now
+        cmd.updated_at = now
+        cmd.error = error
+        if result is not None:
+            cmd.result_json = dict(result)
+        db.commit()
+
+
+def _compact_session_memory(payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
+    provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
+    if provider != "vllm":
+        return (
+            False,
+            {"ok": False, "error": "Memory compaction requires ISPEC_ASSISTANT_PROVIDER=vllm."},
+            "provider_not_vllm",
+        )
+
+    session_id = str(payload.get("session_id") or "").strip()
+    session_pk = _safe_int(payload.get("session_pk"))
+    if not session_id and session_pk is None:
+        return False, {"ok": False, "error": "Missing session_id/session_pk."}, "missing_session"
+
+    requested_target = _safe_int(payload.get("target_message_id")) or 0
+    if requested_target <= 0:
+        return False, {"ok": False, "error": "Missing target_message_id."}, "missing_target"
+
+    keep_last = _safe_int(payload.get("keep_last")) or 6
+    if keep_last < 1:
+        keep_last = 1
+
+    batch_size = _safe_int(os.getenv("ISPEC_ASSISTANT_COMPACTION_BATCH_SIZE")) or 20
+    if batch_size < 1:
+        batch_size = 1
+    if batch_size > 50:
+        batch_size = 50
+
+    with get_assistant_session() as db:
+        session = None
+        if session_pk is not None:
+            session = db.query(SupportSession).filter(SupportSession.id == int(session_pk)).first()
+        if session is None and session_id:
+            session = db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+        if session is None:
+            return (
+                False,
+                {"ok": False, "error": "Support session not found.", "session_id": session_id},
+                "session_not_found",
+            )
+
+        state = _load_json_dict(getattr(session, "state_json", None))
+        memory_up_to_id = _safe_int(state.get("conversation_memory_up_to_id")) or 0
+
+        boundary_rows = (
+            db.query(SupportMessage.id)
+            .filter(SupportMessage.session_pk == session.id)
+            .order_by(SupportMessage.id.desc())
+            .limit(keep_last + 1)
+            .all()
+        )
+        current_target = 0
+        if len(boundary_rows) > keep_last:
+            current_target = _scalar_row_int(boundary_rows[keep_last])
+
+        target_id = max(requested_target, current_target) if current_target else requested_target
+        if target_id <= memory_up_to_id:
+            return True, {
+                "ok": True,
+                "noop": True,
+                "session_id": session.session_id,
+                "memory_up_to_id": memory_up_to_id,
+                "target_id": target_id,
+            }, None
+
+        rows = (
+            db.query(SupportMessage)
+            .filter(SupportMessage.session_pk == session.id)
+            .filter(SupportMessage.id > memory_up_to_id)
+            .filter(SupportMessage.id <= target_id)
+            .order_by(SupportMessage.id.asc())
+            .all()
+        )
+        previous_memory = state.get("conversation_memory") if isinstance(state.get("conversation_memory"), dict) else None
+        messages = [
+            {"id": int(row.id), "role": row.role, "content": row.content}
+            for row in rows
+            if row.role in {"user", "assistant", "system"} and row.content
+        ]
+
+    if not messages:
+        with get_assistant_session() as db:
+            session = None
+            if session_pk is not None:
+                session = db.query(SupportSession).filter(SupportSession.id == int(session_pk)).first()
+            if session is None and session_id:
+                session = db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+            if session is None:
+                return (
+                    False,
+                    {"ok": False, "error": "Support session not found.", "session_id": session_id},
+                    "session_not_found",
+                )
+
+            state = _load_json_dict(getattr(session, "state_json", None))
+            state["conversation_memory_up_to_id"] = int(target_id)
+            state["conversation_memory_updated_at"] = utcnow().isoformat()
+            state["conversation_memory_version"] = 1
+            requested = _safe_int(state.get("conversation_memory_requested_up_to_id")) or 0
+            if requested <= target_id:
+                state["conversation_memory_requested_up_to_id"] = int(target_id)
+            session.state_json = _dump_json(state)
+            session.updated_at = utcnow()
+        return True, {"ok": True, "noop": True, "target_id": target_id, "message_count": 0}, None
+
+    batches: list[dict[str, Any]] = []
+    mem = previous_memory
+    reply_meta: list[dict[str, Any]] = []
+    for idx in range(0, len(messages), batch_size):
+        batch = messages[idx : idx + batch_size]
+        distill = distill_conversation_memory(
+            previous_memory=mem,
+            new_messages=[{"role": item["role"], "content": item["content"]} for item in batch],
+            generate_reply_fn=generate_reply,
+        )
+        reply_meta.append(
+            {
+                "provider": distill.reply.provider,
+                "model": distill.reply.model,
+                "ok": bool(distill.reply.ok),
+                "meta": distill.reply.meta,
+                "error": distill.reply.error,
+            }
+        )
+        if distill.memory is None or not distill.reply.ok:
+            error = distill.reply.error or "Memory distillation failed."
+            with get_assistant_session() as db:
+                session = None
+                if session_pk is not None:
+                    session = db.query(SupportSession).filter(SupportSession.id == int(session_pk)).first()
+                if session is None and session_id:
+                    session = db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+                if session is not None:
+                    state = _load_json_dict(getattr(session, "state_json", None))
+                    state["conversation_memory_last_error"] = error
+                    state["conversation_memory_requested_up_to_id"] = int(
+                        _safe_int(state.get("conversation_memory_up_to_id")) or 0
+                    )
+                    state["conversation_memory_updated_at"] = utcnow().isoformat()
+                    session.state_json = _dump_json(state)
+                    session.updated_at = utcnow()
+            return False, {"ok": False, "error": error, "reply": reply_meta[-1]}, error
+
+        mem = distill.memory
+        batches.append({"start_id": int(batch[0]["id"]), "end_id": int(batch[-1]["id"]), "count": len(batch)})
+
+    with get_assistant_session() as db:
+        session = None
+        if session_pk is not None:
+            session = db.query(SupportSession).filter(SupportSession.id == int(session_pk)).first()
+        if session is None and session_id:
+            session = db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+        if session is None:
+            return (
+                False,
+                {"ok": False, "error": "Support session not found.", "session_id": session_id},
+                "session_not_found",
+            )
+
+        state = _load_json_dict(getattr(session, "state_json", None))
+        state["conversation_memory"] = mem or {}
+        state["conversation_memory_version"] = int((mem or {}).get("schema_version") or 1)
+        state["conversation_memory_up_to_id"] = int(target_id)
+        state["conversation_memory_updated_at"] = utcnow().isoformat()
+        state.pop("conversation_memory_last_error", None)
+
+        requested = _safe_int(state.get("conversation_memory_requested_up_to_id")) or 0
+        if requested <= target_id:
+            state["conversation_memory_requested_up_to_id"] = int(target_id)
+
+        memory_row = SupportMemory(
+            session_pk=int(session.id),
+            user_id=int(session.user_id) if session.user_id is not None else 0,
+            kind="summary",
+            key="conversation_memory",
+            value_json=_dump_json(mem or {}),
+        )
+        db.add(memory_row)
+        db.flush()
+
+        evidence_ids: set[int] = set()
+        evidence_weights: dict[int, float] = {}
+        for batch in batches:
+            end_id = _safe_int(batch.get("end_id"))
+            if end_id is None or end_id <= 0:
+                continue
+            evidence_ids.add(int(end_id))
+            weight = float(_safe_int(batch.get("count")) or 1)
+            evidence_weights[int(end_id)] = max(evidence_weights.get(int(end_id), 0.0), weight)
+        evidence_ids.add(int(target_id))
+
+        triggered_by = _safe_int(payload.get("triggered_by_message_id"))
+        if triggered_by is not None and triggered_by > 0:
+            evidence_ids.add(int(triggered_by))
+
+        for message_id in sorted(evidence_ids):
+            db.add(
+                SupportMemoryEvidence(
+                    memory_id=int(memory_row.id),
+                    message_id=int(message_id),
+                    weight=float(evidence_weights.get(int(message_id), 1.0)),
+                )
+            )
+
+        session.state_json = _dump_json(state)
+        session.updated_at = utcnow()
+
+    return True, {
+        "ok": True,
+        "session_id": session_id,
+        "target_id": target_id,
+        "message_count": len(messages),
+        "batch_size": batch_size,
+        "batches": batches,
+        "llm": reply_meta[-1] if reply_meta else None,
+        "llm_batches": reply_meta,
+    }, None
+
+
+def _process_one_command(*, agent_id: str, run_id: str) -> bool:
+    cmd = _claim_next_command(agent_id=agent_id, run_id=run_id)
+    if cmd is None:
+        return False
+
+    ok = False
+    result: dict[str, Any] = {"ok": False, "error": "Unhandled command."}
+    error: str | None = None
+
+    if cmd.command_type == COMMAND_COMPACT_SESSION_MEMORY:
+        ok, result, error = _compact_session_memory(cmd.payload)
+    else:
+        error = f"Unknown command_type: {cmd.command_type}"
+        result = {"ok": False, "error": error, "command_type": cmd.command_type}
+
+    _finish_command(command_id=cmd.id, ok=ok, result=result, error=error)
+    return True
+
+
 @dataclass(frozen=True)
 class SupervisorConfig:
     agent_id: str
@@ -332,6 +686,11 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
     logger.info("Supervisor run started (run_id=%s, agent_id=%s)", run_id, config.agent_id)
 
     while True:
+        if _process_one_command(agent_id=config.agent_id, run_id=run_id):
+            if once:
+                break
+            continue
+
         step_started = utcnow()
         step_monotonic = time.monotonic()
         with get_agent_session() as db:
@@ -434,4 +793,3 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
 
     logger.info("Supervisor run stopped (run_id=%s)", run_id)
     return run_id
-

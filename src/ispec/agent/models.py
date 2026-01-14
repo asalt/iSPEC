@@ -99,3 +99,30 @@ class AgentStep(AgentBase):
     state_after_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     run: Mapped[AgentRun] = relationship(back_populates="steps")
+
+
+class AgentCommand(AgentBase):
+    __tablename__ = "agent_command"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    command_type: Mapped[str] = mapped_column(Text, index=True)
+    status: Mapped[str] = mapped_column(Text, index=True, default="queued")
+    priority: Mapped[int] = mapped_column(Integer, index=True, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, index=True)
+
+    available_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    claimed_by_agent_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+    claimed_by_run_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
+
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)

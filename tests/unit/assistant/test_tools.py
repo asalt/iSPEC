@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ispec.db.models import Project
 
-from ispec.assistant.tools import run_tool
+from ispec.assistant.tools import run_tool, tool_prompt
 
 
 def test_search_projects_rejects_wildcard_query(db_session):
@@ -62,3 +62,10 @@ def test_count_current_projects_counts_only_current(db_session):
     assert payload["ok"] is True
     assert payload["result"]["count"] == 2
     assert payload["result"]["scope"] == "current"
+
+
+def test_tool_prompt_can_filter_to_subset():
+    prompt = tool_prompt(tool_names={"count_all_projects", "get_project"})
+    assert "count_all_projects" in prompt
+    assert "get_project" in prompt
+    assert "search_people" not in prompt

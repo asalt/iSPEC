@@ -137,8 +137,11 @@ def default_contract() -> tuple[VarSpec, ...]:
             key="ISPEC_AGENT_DB_PATH",
             kind="path",
             group="Database",
-            description="Agent telemetry SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
-            default_by_profile={"dev": "iSPEC/data/ispec-agent.db", "prod": "/var/lib/ispec/ispec-agent.db"},
+            description="Agent telemetry SQLite DB path or sqlite:/// URI (defaults to ISPEC_ASSISTANT_DB_PATH).",
+            default_by_profile={
+                "dev": "iSPEC/data/ispec-assistant.db",
+                "prod": "/var/lib/ispec/ispec-assistant.db",
+            },
         ),
         VarSpec(
             key="ISPEC_API_KEY",

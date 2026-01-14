@@ -465,53 +465,78 @@ def _scope_error(scope: ToolScope, user: AuthUser | None) -> str | None:
     return "Access denied."
 
 
-def tool_prompt() -> str:
-    """Short tool list for the system prompt."""
+def tool_prompt(*, tool_names: set[str] | None = None) -> str:
+    """Short tool list for the system prompt.
+
+    When ``tool_names`` is provided, only those tools are listed (in the normal
+    order). This is useful for multi-stage tool routing to keep prompts small.
+    """
+
+    allowed: set[str] | None = None
+    if tool_names:
+        allowed = {name.strip() for name in tool_names if isinstance(name, str) and name.strip()}
 
     lines = [
         "Available tools:",
         "- (Most tools are read-only; create_project_comment writes project history.)",
-        "- project_counts_snapshot(max_categories: int = 20)",
-        "- latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)",
-        "- billing_category_counts(current_only: bool = false, limit: int = 20)",
-        "- db_file_stats()  # show sqlite DB file sizes",
-        "- count_all_projects()  # total projects across all statuses/flags",
-        "- count_current_projects()  # current projects only",
-        "- project_status_counts(current_only: bool = false)",
-        "- latest_projects(sort: str = 'modified', limit: int = 10, current_only: bool = false)",
-        "- latest_project_comments(limit: int = 10, project_id: int | None = None)",
-        "- search_projects(query: str, limit: int = 5)",
-        "- projects(project_id: int)  # alias for get_project",
-        "- get_project(id: int)",
-        "- search_api(query: str, limit: int = 10)  # search FastAPI/OpenAPI endpoints",
-        "- create_project_comment(project_id: int, comment: str, comment_type: str | None = None, confirm: bool = true)  # write: requires explicit user request",
     ]
 
-    if _repo_tools_enabled():
-        lines.extend(
-            [
-                f"- repo_list_files(query: str | None = None, path: str | None = None, limit: int = 200)  # dev-only; set {_REPO_TOOLS_ENV}=1",
-                f"- repo_search(query: str, path: str | None = None, limit: int = 50, regex: bool = false, ignore_case: bool = true)  # dev-only; set {_REPO_TOOLS_ENV}=1",
-                f"- repo_read_file(path: str, start_line: int = 1, max_lines: int = 200)  # dev-only; set {_REPO_TOOLS_ENV}=1",
-            ]
-        )
+    def add(tool_name: str, line: str) -> None:
+        if allowed is not None and tool_name not in allowed:
+            return
+        if tool_name.startswith("repo_") and not _repo_tools_enabled():
+            return
+        lines.append(line)
 
-    lines.extend(
-        [
-            "- experiments_for_project(project_id: int, limit: int = 20)",
-            "- latest_experiments(limit: int = 5)",
-            "- get_experiment(id: int)",
-            "- latest_experiment_runs(limit: int = 5)",
-            "- get_experiment_run(id: int)",
-            "- e2g_search_genes_in_project(project_id: int, query: str, limit: int = 10)",
-            "- e2g_gene_in_project(project_id: int, gene_id: int, limit: int = 50)",
-            "- search_people(query: str, limit: int = 5)",
-            "- get_person(id: int)",
-            "- list_schedule_slots(start: YYYY-MM-DD, end: YYYY-MM-DD, status: str | None = None, limit: int = 50)",
-            "- list_schedule_requests(limit: int = 20, status: str | None = None)  # admin-only",
-            "- get_schedule_request(id: int)  # admin-only",
-        ]
+    add("project_counts_snapshot", "- project_counts_snapshot(max_categories: int = 20)")
+    add("latest_activity", "- latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)")
+    add("billing_category_counts", "- billing_category_counts(current_only: bool = false, limit: int = 20)")
+    add("db_file_stats", "- db_file_stats()  # show sqlite DB file sizes")
+    add("count_all_projects", "- count_all_projects()  # total projects across all statuses/flags")
+    add("count_current_projects", "- count_current_projects()  # current projects only")
+    add("project_status_counts", "- project_status_counts(current_only: bool = false)")
+    add("latest_projects", "- latest_projects(sort: str = 'modified', limit: int = 10, current_only: bool = false)")
+    add("latest_project_comments", "- latest_project_comments(limit: int = 10, project_id: int | None = None)")
+    add("search_projects", "- search_projects(query: str, limit: int = 5)")
+    add("projects", "- projects(project_id: int)  # alias for get_project")
+    add("get_project", "- get_project(id: int)")
+    add("search_api", "- search_api(query: str, limit: int = 10)  # search FastAPI/OpenAPI endpoints")
+    add(
+        "create_project_comment",
+        "- create_project_comment(project_id: int, comment: str, comment_type: str | None = None, confirm: bool = true)  # write: requires explicit user request",
     )
+
+    add(
+        "repo_list_files",
+        f"- repo_list_files(query: str | None = None, path: str | None = None, limit: int = 200)  # dev-only; set {_REPO_TOOLS_ENV}=1",
+    )
+    add(
+        "repo_search",
+        f"- repo_search(query: str, path: str | None = None, limit: int = 50, regex: bool = false, ignore_case: bool = true)  # dev-only; set {_REPO_TOOLS_ENV}=1",
+    )
+    add(
+        "repo_read_file",
+        f"- repo_read_file(path: str, start_line: int = 1, max_lines: int = 200)  # dev-only; set {_REPO_TOOLS_ENV}=1",
+    )
+
+    add("experiments_for_project", "- experiments_for_project(project_id: int, limit: int = 20)")
+    add("latest_experiments", "- latest_experiments(limit: int = 5)")
+    add("get_experiment", "- get_experiment(id: int)")
+    add("latest_experiment_runs", "- latest_experiment_runs(limit: int = 5)")
+    add("get_experiment_run", "- get_experiment_run(id: int)")
+    add("e2g_search_genes_in_project", "- e2g_search_genes_in_project(project_id: int, query: str, limit: int = 10)")
+    add("e2g_gene_in_project", "- e2g_gene_in_project(project_id: int, gene_id: int, limit: int = 50)")
+    add("search_people", "- search_people(query: str, limit: int = 5)")
+    add("get_person", "- get_person(id: int)")
+    add(
+        "list_schedule_slots",
+        "- list_schedule_slots(start: YYYY-MM-DD, end: YYYY-MM-DD, status: str | None = None, limit: int = 50)",
+    )
+    add(
+        "list_schedule_requests",
+        "- list_schedule_requests(limit: int = 20, status: str | None = None)  # admin-only",
+    )
+    add("get_schedule_request", "- get_schedule_request(id: int)  # admin-only")
 
     return "\n".join(lines) + "\n"
 

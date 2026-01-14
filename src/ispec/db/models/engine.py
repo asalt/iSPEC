@@ -13,6 +13,22 @@ from .base import Base
 logger = get_logger(__file__)
 
 
+def _sqlite_busy_timeout_ms() -> int:
+    raw = (os.getenv("ISPEC_SQLITE_BUSY_TIMEOUT_MS") or "").strip()
+    if not raw:
+        return 30_000
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 30_000
+
+
+def _sqlite_journal_mode() -> str:
+    raw = (os.getenv("ISPEC_SQLITE_JOURNAL_MODE") or "WAL").strip().upper()
+    allowed = {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}
+    return raw if raw in allowed else "WAL"
+
+
 def adapt_timestamp(ts: Any):
     """Adapter for pandas/py datetime objects when writing to SQLite."""
     return ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
@@ -42,6 +58,17 @@ def sqlite_engine(db_path: str = "sqlite:///./example.db") -> Engine:
     def set_sqlite_pragma(dbapi_connection, connection_record):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        try:
+            mode = _sqlite_journal_mode()
+            cursor.execute(f"PRAGMA journal_mode={mode}")
+            if mode == "WAL":
+                cursor.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        try:
+            cursor.execute(f"PRAGMA busy_timeout={_sqlite_busy_timeout_ms()}")
+        except Exception:
+            pass
         if trace_sql:
             dbapi_connection.set_trace_callback(lambda x: logger.info(x))
         cursor.close()

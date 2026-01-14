@@ -119,8 +119,10 @@ def _default_prompt_base() -> str:
         "You may be provided an additional system message called CONTEXT that contains\n"
         "read-only JSON from the iSPEC database and your chat session state. Treat that\n"
         "context as authoritative.\n"
-        "If CONTEXT.session.state.conversation_summary is present, it is a rolling summary\n"
+        "If CONTEXT.session.state.conversation_memory is present, it is distilled memory\n"
         "of older turns that may be omitted from the message history.\n"
+        "If CONTEXT.session.state.conversation_summary is present, it is a raw rolling\n"
+        "summary of older turns; prefer conversation_memory when both are present.\n"
     )
 
 def _final_template(*, response_format: ResponseFormat) -> str:
@@ -168,24 +170,49 @@ def _system_prompt_planner(
     *,
     tools_available: bool,
     response_format: ResponseFormat = "single",
+    tool_names: set[str] | None = None,
 ) -> str:
-    prompt = (
-        _default_prompt_base().rstrip()
-        + "\n\n"
-        + "Tool use (optional):\n"
-        + "- If you need more iSPEC DB info than CONTEXT provides, request a tool.\n"
-        + "- Never invent database values, IDs, or outcomes.\n"
-        + "- For global count/list questions (e.g. 'how many projects'), do not infer from CONTEXT; use count_all_projects.\n"
-        + "- For current/active project counts, use count_current_projects.\n"
-        + "- For a single snapshot that includes both total+current counts plus status breakdown, use project_counts_snapshot.\n"
-        + "- For 'latest projects' / 'recent changes', use latest_projects and latest_project_comments.\n"
-        + "- For experiments in a specific project, use experiments_for_project.\n"
-        + "- For collaborative project work, draft notes first; only write to project history if the user explicitly asks you to save.\n"
-        + "- For code searches in the iSPEC repo (dev-only), use repo_search/repo_list_files/repo_read_file.\n"
-        + "- If the user explicitly asks you to use a tool, call the appropriate tool.\n"
-        + "- Do not tell the user to run CLI commands or use the web app to run tools; you can call tools directly.\n"
-        + "- When answering from a TOOL_RESULT, restate the scope (e.g. total vs current). Do not call a subset count 'total'.\n"
+    def has(name: str) -> bool:
+        return tool_names is None or name in tool_names
+
+    tool_use_lines = [
+        "Tool use (optional):",
+        "- If you need more iSPEC DB info than CONTEXT provides, request a tool.",
+        "- Never invent database values, IDs, or outcomes.",
+    ]
+    if has("count_all_projects"):
+        tool_use_lines.append(
+            "- For global count/list questions (e.g. 'how many projects'), do not infer from CONTEXT; use count_all_projects."
+        )
+    if has("count_current_projects"):
+        tool_use_lines.append("- For current/active project counts, use count_current_projects.")
+    if has("project_counts_snapshot"):
+        tool_use_lines.append(
+            "- For a single snapshot that includes both total+current counts plus status breakdown, use project_counts_snapshot."
+        )
+    if has("latest_projects") or has("latest_project_comments"):
+        tool_use_lines.append(
+            "- For 'latest projects' / 'recent changes', use latest_projects and latest_project_comments."
+        )
+    if has("experiments_for_project"):
+        tool_use_lines.append("- For experiments in a specific project, use experiments_for_project.")
+    if has("create_project_comment"):
+        tool_use_lines.append(
+            "- For collaborative project work, draft notes first; only write to project history if the user explicitly asks you to save."
+        )
+    if has("repo_search") or has("repo_list_files") or has("repo_read_file"):
+        tool_use_lines.append(
+            "- For code searches in the iSPEC repo (dev-only), use repo_search/repo_list_files/repo_read_file."
+        )
+    tool_use_lines.extend(
+        [
+            "- If the user explicitly asks you to use a tool, call the appropriate tool.",
+            "- Do not tell the user to run CLI commands or use the web app to run tools; you can call tools directly.",
+            "- When answering from a TOOL_RESULT, restate the scope (e.g. total vs current). Do not call a subset count 'total'.",
+        ]
     )
+
+    prompt = _default_prompt_base().rstrip() + "\n\n" + "\n".join(tool_use_lines) + "\n"
 
     if tools_available:
         prompt += (
@@ -206,7 +233,7 @@ def _system_prompt_planner(
             f"- Tool results arrive as a {TOOL_RESULT_PREFIX} system message; treat them as authoritative.\n"
         )
 
-    prompt += "\n" + tool_prompt()
+    prompt += "\n" + tool_prompt(tool_names=tool_names)
 
     prompt += (
         "\n"
