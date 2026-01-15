@@ -94,6 +94,26 @@ def _enabled(resource: str) -> bool:
     return resource.lstrip("/").lower() in EXPOSED_RESOURCES
 
 
+_CLIENT_PROJECT_ONLY_DETAIL = "Client accounts can only access projects."
+
+
+def _reject_client(
+    request: Request | None,
+    *,
+    detail: str = _CLIENT_PROJECT_ONLY_DETAIL,
+) -> None:
+    if request is None:
+        return
+    user = getattr(request.state, "user", None)
+    if user is None:
+        return
+
+    from ispec.db.models import UserRole
+
+    if user.role == UserRole.client:
+        raise HTTPException(status_code=403, detail=detail)
+
+
 # ----- shared list helpers --------------------------------------------------
 
 
@@ -252,15 +272,20 @@ def _add_crud_endpoints(
                     q_int = int(q)
                 except Exception:
                     q_int = None
+            predicate = None
             try:
-                expr = crud.label_expr().ilike(f"%{q}%")
-                if q_int is not None:
-                    query = query.filter(or_(getattr(model, "id") == q_int, expr))
-                else:
-                    query = query.filter(expr)
+                predicate = crud.search_predicate(q)
             except Exception:
-                if q_int is not None:
-                    query = query.filter(getattr(model, "id") == q_int)
+                predicate = None
+
+            if q_int is not None:
+                id_match = getattr(model, "id") == q_int
+                if predicate is not None:
+                    query = query.filter(or_(id_match, predicate))
+                else:
+                    query = query.filter(id_match)
+            elif predicate is not None:
+                query = query.filter(predicate)
 
         query = _apply_ordering(query, model, order)
 
@@ -555,12 +580,14 @@ def generate_crud_router(
         @router.get("/by_run/{run_id}", response_model=list[ReadModel])
         def list_genes_by_run(
             run_id: int,
+            request: Request = None,  # type: ignore[assignment]
             q: str | None = None,
             geneidtype: str | None = None,
             limit: int = Query(default=100, ge=1, le=1000),
             offset: int = Query(default=0, ge=0),
             db: Session = Depends(session_dep),
         ):
+            _reject_client(request)
             query = db.query(E2G).filter(E2G.experiment_run_id == run_id)
             if q:
                 query = query.filter(E2G.gene.ilike(f"%{q}%"))
@@ -573,11 +600,13 @@ def generate_crud_router(
         @router.get("/by_run/{run_id}", response_model=list[ReadModel])
         def list_psms_by_run(
             run_id: int,
+            request: Request = None,  # type: ignore[assignment]
             q: str | None = None,
             limit: int = Query(default=200, ge=1, le=5000),
             offset: int = Query(default=0, ge=0),
             db: Session = Depends(session_dep),
         ):
+            _reject_client(request)
             query = db.query(PSM).filter(PSM.experiment_run_id == run_id)
             if q:
                 # lightweight search over common text fields
@@ -591,11 +620,13 @@ def generate_crud_router(
         @router.get("/by_run/{run_id}", response_model=list[ReadModel])
         def list_raw_files_by_run(
             run_id: int,
+            request: Request = None,  # type: ignore[assignment]
             q: str | None = None,
             limit: int = Query(default=200, ge=1, le=5000),
             offset: int = Query(default=0, ge=0),
             db: Session = Depends(session_dep),
         ):
+            _reject_client(request)
             query = db.query(MSRawFile).filter(MSRawFile.experiment_run_id == run_id)
             if q:
                 query = query.filter(MSRawFile.uri.ilike(f"%{q}%"))
@@ -1112,10 +1143,12 @@ if _enabled("experiments"):
     @router.get("/experiments/by_project/{project_id}")
     def list_experiments_by_project(
         project_id: int,
+        request: Request = None,  # type: ignore[assignment]
         limit: int = Query(default=200, ge=1, le=2000),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
+        _reject_client(request)
         rows = (
             db.query(Experiment)
             .filter(Experiment.project_id == project_id)
@@ -1133,10 +1166,12 @@ if _enabled("project_comment"):
     @router.get("/project_comment/by_project/{project_id}")
     def list_comments_by_project(
         project_id: int,
+        request: Request = None,  # type: ignore[assignment]
         limit: int = Query(default=200, ge=1, le=2000),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
+        _reject_client(request)
         from ispec.db.models import Person as _Person
 
         rows = (
@@ -1168,10 +1203,12 @@ if _enabled("project_person"):
     @router.get("/project_person/by_project/{project_id}")
     def list_project_people_by_project(
         project_id: int,
+        request: Request = None,  # type: ignore[assignment]
         limit: int = Query(default=200, ge=1, le=2000),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
+        _reject_client(request)
         from ispec.db.models import Person as _Person
 
         rows = (
@@ -1203,10 +1240,12 @@ if _enabled("experiment_runs"):
     @router.get("/experiment_runs/by_experiment/{experiment_id}")
     def list_runs_by_experiment(
         experiment_id: int,
+        request: Request = None,  # type: ignore[assignment]
         limit: int = Query(default=200, ge=1, le=2000),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
+        _reject_client(request)
         rows = (
             db.query(ExperimentRun)
             .filter(ExperimentRun.experiment_id == experiment_id)
@@ -1224,10 +1263,12 @@ if _enabled("experiment_runs") and _enabled("experiments"):
     @router.get("/experiment_runs/by_project/{project_id}")
     def list_runs_by_project(
         project_id: int,
+        request: Request = None,  # type: ignore[assignment]
         limit: int = Query(default=500, ge=1, le=5000),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
+        _reject_client(request)
         query = (
             db.query(ExperimentRun)
             .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
@@ -1246,6 +1287,7 @@ if _enabled("experiment_to_gene"):
     )
     def list_genes_by_experiment(
         experiment_id: int,
+        request: Request = None,  # type: ignore[assignment]
         q: str | None = None,
         geneidtype: str | None = None,
         limit: int = Query(default=200, ge=1, le=2000),
@@ -1253,6 +1295,7 @@ if _enabled("experiment_to_gene"):
         core_db: Session = Depends(get_session_dep),
         omics_db: Session = Depends(get_omics_session_dep),
     ):
+        _reject_client(request)
         run_ids = [
             int(row[0])
             for row in core_db.query(ExperimentRun.id)
@@ -1276,6 +1319,7 @@ if _enabled("experiment_to_gene"):
     )
     def list_genes_by_project(
         project_id: int,
+        request: Request = None,  # type: ignore[assignment]
         q: str | None = None,
         geneidtype: str | None = None,
         limit: int = Query(default=500, ge=1, le=5000),
@@ -1283,6 +1327,7 @@ if _enabled("experiment_to_gene"):
         core_db: Session = Depends(get_session_dep),
         omics_db: Session = Depends(get_omics_session_dep),
     ):
+        _reject_client(request)
         run_ids = [
             int(row[0])
             for row in core_db.query(ExperimentRun.id)
@@ -1308,10 +1353,12 @@ if _enabled("jobs"):
     @router.get("/jobs/by_run/{run_id}")
     def list_jobs_by_run(
         run_id: int,
+        request: Request = None,  # type: ignore[assignment]
         limit: int = Query(default=100, ge=1, le=1000),
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
+        _reject_client(request)
         from ispec.db.models import Job as _Job
         rows = (
             db.query(_Job)

@@ -35,6 +35,7 @@ class ProvisionedCredential:
     password: str
     role: str
     action: Literal["created", "reset"]
+    project_ids: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,8 @@ def _render_summary(
     if console is None:
         console = Console()
 
+    show_project_ids = any(cred.project_ids is not None for cred in credentials)
+
     created = sum(1 for c in credentials if c.action == "created")
     reset = sum(1 for c in credentials if c.action == "reset")
     console.print(
@@ -167,11 +170,20 @@ def _render_summary(
         table.add_column("password")
     table.add_column("role")
     table.add_column("action")
+    if show_project_ids:
+        table.add_column("project_ids")
     for cred in credentials:
         row = [cred.username]
         if print_passwords:
             row.append(cred.password)
         row.extend([cred.role, cred.action])
+        if show_project_ids:
+            if cred.project_ids is None:
+                row.append("")
+            elif not cred.project_ids:
+                row.append("(none)")
+            else:
+                row.append(",".join(str(pid) for pid in cred.project_ids))
         table.add_row(*row)
     console.print(table)
 
@@ -299,12 +311,15 @@ def provision_users(
     password_length: int,
     activate: bool,
     update_role: bool,
+    project_ids: Iterable[int] | None = None,
+    experiment_ids: Iterable[int] | None = None,
+    clear_project_access: bool = False,
 ) -> list[ProvisionedCredential]:
     """Create or reset users with generated passwords and forced password change."""
 
     from ispec.api.security import hash_password
     from ispec.db.connect import get_session
-    from ispec.db.models import AuthSession, AuthUser, UserRole
+    from ispec.db.models import AuthSession, AuthUser, AuthUserProject, Experiment, Project, UserRole
 
     try:
         role_enum = UserRole(role)
@@ -319,6 +334,57 @@ def provision_users(
     results: list[ProvisionedCredential] = []
 
     with get_session(database) as db:
+        selected_project_ids: list[int] = []
+        requested_projects = [int(pid) for pid in (project_ids or [])]
+        requested_experiments = [int(eid) for eid in (experiment_ids or [])]
+
+        def dedupe_ints(values: list[int]) -> list[int]:
+            seen: set[int] = set()
+            deduped: list[int] = []
+            for value in values:
+                try:
+                    value_int = int(value)
+                except Exception:
+                    continue
+                if value_int <= 0 or value_int in seen:
+                    continue
+                seen.add(value_int)
+                deduped.append(value_int)
+            return deduped
+
+        requested_projects = dedupe_ints(requested_projects)
+        requested_experiments = dedupe_ints(requested_experiments)
+
+        update_project_access = bool(clear_project_access or requested_projects or requested_experiments)
+        if update_project_access:
+            if requested_projects:
+                existing_projects = {
+                    int(row[0]) for row in db.query(Project.id).filter(Project.id.in_(requested_projects)).all()
+                }
+                missing = [pid for pid in requested_projects if pid not in existing_projects]
+                if missing:
+                    raise SystemExit(f"Unknown project ids: {', '.join(map(str, missing))}")
+                selected_project_ids.extend(pid for pid in requested_projects if pid in existing_projects)
+
+            if requested_experiments:
+                rows = (
+                    db.query(Experiment.id, Experiment.project_id)
+                    .filter(Experiment.id.in_(requested_experiments))
+                    .all()
+                )
+                found = {int(row[0]) for row in rows}
+                missing = [eid for eid in requested_experiments if eid not in found]
+                if missing:
+                    raise SystemExit(f"Unknown experiment ids: {', '.join(map(str, missing))}")
+                no_project = [int(row[0]) for row in rows if row[1] is None]
+                if no_project:
+                    raise SystemExit(
+                        "Experiment(s) missing project_id: " + ", ".join(map(str, sorted(no_project)))
+                    )
+                selected_project_ids.extend(int(row[1]) for row in rows if row[1] is not None)
+
+            selected_project_ids = sorted(set(dedupe_ints(selected_project_ids)))
+
         for username in normalized:
             existing = db.query(AuthUser).filter(AuthUser.username == username).first()
 
@@ -342,6 +408,10 @@ def provision_users(
                     existing.role = role_enum
 
                 db.query(AuthSession).filter(AuthSession.user_id == existing.id).delete()
+                if update_project_access:
+                    db.query(AuthUserProject).filter(AuthUserProject.user_id == existing.id).delete()
+                    for project_id in selected_project_ids:
+                        db.add(AuthUserProject(user_id=int(existing.id), project_id=int(project_id)))
                 results.append(
                     ProvisionedCredential(
                         user_id=int(existing.id),
@@ -349,6 +419,7 @@ def provision_users(
                         password=password,
                         role=str(existing.role.value if hasattr(existing.role, "value") else existing.role),
                         action="reset",
+                        project_ids=tuple(selected_project_ids) if update_project_access else None,
                     )
                 )
                 continue
@@ -365,6 +436,9 @@ def provision_users(
             )
             db.add(user)
             db.flush()
+            if update_project_access:
+                for project_id in selected_project_ids:
+                    db.add(AuthUserProject(user_id=int(user.id), project_id=int(project_id)))
             results.append(
                 ProvisionedCredential(
                     user_id=int(user.id),
@@ -372,6 +446,7 @@ def provision_users(
                     password=password,
                     role=str(user.role.value if hasattr(user.role, "value") else user.role),
                     action="created",
+                    project_ids=tuple(selected_project_ids) if update_project_access else None,
                 )
             )
 
@@ -440,6 +515,28 @@ def register_subcommands(subparsers) -> None:
         default=True,
         help="When resetting existing users, keep their current role.",
     )
+    provision_parser.add_argument(
+        "--project-id",
+        dest="project_ids",
+        action="append",
+        type=int,
+        default=[],
+        help="Grant access to a project id (repeatable). For client accounts, this limits visible projects.",
+    )
+    provision_parser.add_argument(
+        "--experiment-id",
+        dest="experiment_ids",
+        action="append",
+        type=int,
+        default=[],
+        help="Grant access based on experiment id(s) (repeatable). Adds the parent project(s) for these experiments.",
+    )
+    provision_parser.add_argument(
+        "--clear-project-access",
+        dest="clear_project_access",
+        action="store_true",
+        help="Clear auth_user_project entries for the provisioned user(s) (client accounts will see no projects).",
+    )
 
     check_parser = subparsers.add_parser(
         "check",
@@ -472,6 +569,9 @@ def dispatch(args) -> None:
             password_length=int(args.password_length),
             activate=bool(args.activate),
             update_role=bool(args.update_role),
+            project_ids=getattr(args, "project_ids", None),
+            experiment_ids=getattr(args, "experiment_ids", None),
+            clear_project_access=bool(getattr(args, "clear_project_access", False)),
         )
         output_format = _write_credentials(output, credentials)
         _render_summary(

@@ -204,6 +204,35 @@ class CRUDBase:
         # fallback: cast id to text
         return cast(getattr(M, 'id'), T.String())
 
+    def search_predicate(self, q: str):
+        """Return a SQLAlchemy predicate for ``q`` search.
+
+        The generic API routers use this hook to apply ``?q=...`` filtering.
+        By default it searches across every string-like column on the model,
+        which provides a FileMaker-style "find across fields" experience.
+        """
+
+        needle = (q or "").strip()
+        if not needle:
+            return None
+
+        M = self.model
+        predicates = []
+        for col in M.__table__.columns:
+            if col.name == "id":
+                continue
+            if not isinstance(col.type, (T.String, T.Enum)):
+                continue
+            predicates.append(cast(getattr(M, col.name), T.String()).ilike(f"%{needle}%"))
+
+        if predicates:
+            return or_(*predicates)
+
+        try:
+            return self.label_expr().ilike(f"%{needle}%")
+        except Exception:
+            return None
+
 
 
     def list_options(
