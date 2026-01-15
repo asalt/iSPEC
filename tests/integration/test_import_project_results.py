@@ -28,6 +28,14 @@ def test_import_project_results_attaches_files_and_imports_volcano(tmp_path):
         "\trunno\nControl-1\t1\n",
     )
     _write_bytes(results_dir / "distribution" / "2more.png", b"png")
+    _write_text(
+        results_dir / "export" / "expression.gct",
+        "#1.2\n"
+        "2\t2\n"
+        "Name\tDescription\tSample1\tSample2\n"
+        "Gene1\tG1\t1\t2\n"
+        "Gene2\tG2\t3\t4\n",
+    )
     _write_bytes(results_dir / "cluster2" / "cluster2.sqlite", b"sqlite-cache")
     _write_bytes(results_dir / "cluster2" / "cluster2_row_hclust.rds", b"rds-cache")
     _write_text(
@@ -63,9 +71,9 @@ def test_import_project_results_attaches_files_and_imports_volcano(tmp_path):
         import_volcano=True,
     )
 
-    assert summary["files_discovered"] == 6
-    assert summary["files_total"] == 4
-    assert summary["attachments_inserted"] == 4
+    assert summary["files_discovered"] == 7
+    assert summary["files_total"] == 5
+    assert summary["attachments_inserted"] == 5
     assert summary["volcano"] is not None
     assert summary["volcano"]["inserted_total"] == 2
 
@@ -79,6 +87,7 @@ def test_import_project_results_attaches_files_and_imports_volcano(tmp_path):
         names = [row[0] for row in rows]
         assert "Dec2025__context__2more.tab" in names
         assert "Dec2025__metadata__2more.tab" in names
+        assert "Dec2025__export__expression.gct" in names
         assert "Dec2025__volcano__limma__contrast.tsv" in names
         assert all(not name.endswith(".sqlite") for name in names)
         assert all(not name.endswith(".rds") for name in names)
@@ -103,8 +112,8 @@ def test_import_project_results_attaches_files_and_imports_volcano(tmp_path):
         import_volcano=True,
     )
     assert rerun["attachments_inserted"] == 0
-    assert rerun["attachments_skipped"] == 4
-    assert rerun["attachments_metadata_updated"] == 4
+    assert rerun["attachments_skipped"] == 5
+    assert rerun["attachments_metadata_updated"] == 5
 
     with get_session(file_path=str(core_db)) as session:
         assert (
@@ -112,5 +121,5 @@ def test_import_project_results_attaches_files_and_imports_volcano(tmp_path):
             .filter(ProjectFile.project_id == 1544)
             .filter(ProjectFile.prjfile_AddedBy == "tester")
             .count()
-            == 4
+            == 5
         )

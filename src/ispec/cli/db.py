@@ -338,7 +338,7 @@ def register_subcommands(subparsers):
         dest="include_exts",
         action="append",
         default=None,
-        help="File extension(s) to attach (repeatable or comma-separated). Default: png,pdf,tsv,tab",
+        help="File extension(s) to attach (repeatable or comma-separated). Default: png,pdf,tsv,tab,gct",
     )
     import_results_parser.add_argument(
         "--exclude-ext",

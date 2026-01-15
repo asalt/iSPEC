@@ -28,7 +28,7 @@ RESULTS_DIR="${RESULTS_DIR:-/home/alex/amms06/mnt/e/MSPC001544/results/MSPC1544/
 PREFIX="${PREFIX:-Jan2026}"
 
 # Keep cache files out of the DB by default.
-INCLUDE_EXTS="${INCLUDE_EXTS:-png,pdf,tsv,tab}"
+INCLUDE_EXTS="${INCLUDE_EXTS:-png,pdf,tsv,tab,gct}"
 EXCLUDE_EXTS="${EXCLUDE_EXTS:-sqlite,rds}"
 
 DATABASE=""

@@ -37,7 +37,7 @@ PREFIX_LMPP="${PREFIX_LMPP:-LMPP__Dec2025}"
 PREFIX_MPP="${PREFIX_MPP:-MPP__Dec2025}"
 
 # Keep cache files out of the DB by default.
-INCLUDE_EXTS="${INCLUDE_EXTS:-png,pdf,tsv,tab}"
+INCLUDE_EXTS="${INCLUDE_EXTS:-png,pdf,tsv,tab,gct}"
 EXCLUDE_EXTS="${EXCLUDE_EXTS:-sqlite,rds}"
 
 DATABASE=""
@@ -182,4 +182,3 @@ run_cmd "$ISPEC_BIN" db import-results \
   --prefix "$PREFIX_MPP" \
   "${COMMON_ARGS[@]}"
 echo
-

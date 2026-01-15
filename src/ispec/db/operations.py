@@ -833,6 +833,8 @@ def import_project_results(
     if not root.is_dir():
         raise NotADirectoryError(str(root))
 
+    _COMPRESSED_SUFFIXES = {".gz", ".bz2", ".xz", ".zip"}
+
     def _infer_prefix(path: Path) -> str:
         """Infer a stable prefix for a results directory.
 
@@ -869,7 +871,21 @@ def import_project_results(
                     out.add(ext)
         return out
 
-    default_include = {".png", ".pdf", ".tsv", ".tab"}
+    def _path_ext(path: Path) -> str:
+        """Return a normalized extension used for include/exclude checks.
+
+        For compressed files, this returns the "double extension" (e.g.
+        ``.gct.gz``) so callers can include/exclude precisely.
+        """
+
+        suffixes = [suffix.lower() for suffix in path.suffixes]
+        if not suffixes:
+            return ""
+        if suffixes[-1] in _COMPRESSED_SUFFIXES and len(suffixes) >= 2:
+            return suffixes[-2] + suffixes[-1]
+        return suffixes[-1]
+
+    default_include = {".png", ".pdf", ".tsv", ".tab", ".gct"}
     default_exclude = {".sqlite", ".rds"}
 
     resolved_include = _normalize_ext_set(include_exts) if include_exts is not None else default_include
@@ -881,10 +897,10 @@ def import_project_results(
     discovered = [p for p in root.rglob("*") if p.is_file()]
     paths: list[Path] = []
     for path in discovered:
-        suffix = path.suffix.lower()
-        if suffix in resolved_exclude:
+        ext = _path_ext(path)
+        if ext in resolved_exclude:
             continue
-        if resolved_include and suffix not in resolved_include:
+        if resolved_include and ext not in resolved_include:
             continue
         paths.append(path)
     paths.sort()
@@ -914,10 +930,10 @@ def import_project_results(
         guessed, _ = mimetypes.guess_type(str(path))
         if guessed:
             return guessed
-        suffix = path.suffix.lower()
-        if suffix in {".tsv", ".tab"}:
+        ext = _path_ext(path)
+        if ext in {".tsv", ".tab", ".gct"}:
             return "text/tab-separated-values"
-        if suffix in {".log", ".txt"}:
+        if ext in {".log", ".txt"}:
             return "text/plain"
         return None
 
