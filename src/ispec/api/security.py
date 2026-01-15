@@ -28,7 +28,7 @@ from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBea
 from sqlalchemy.orm import Session
 
 from ispec.db.connect import get_session_dep
-from ispec.db.models import AuthSession, AuthUser, UserRole
+from ispec.db.models import AuthSession, AuthUser, AuthUserProject, Project, UserRole
 
 _API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 _BEARER = HTTPBearer(auto_error=False)
@@ -286,6 +286,38 @@ def require_admin(user: AuthUser = Depends(require_user)) -> AuthUser:
             status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required."
         )
     return user
+
+
+def get_project_or_404_for_user(
+    db: Session,
+    *,
+    project_id: int,
+    user: AuthUser | None,
+) -> Project:
+    """Fetch a project if it exists and the user can access it.
+
+    Staff/admin bypass project scoping. Client users must be explicitly mapped
+    via ``auth_user_project``.
+    """
+
+    if user is not None and user.role == UserRole.client:
+        project = (
+            db.query(Project)
+            .join(AuthUserProject, AuthUserProject.project_id == Project.id)
+            .filter(
+                Project.id == project_id,
+                AuthUserProject.user_id == user.id,
+            )
+            .first()
+        )
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return project
+
+    project = db.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return project
 
 
 def _require_login() -> bool:
