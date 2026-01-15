@@ -93,6 +93,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISPEC_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ISPEC_FULL_ROOT="$(cd "${ISPEC_ROOT}/.." && pwd)"
 
 ISPEC_BIN="${ISPEC_BIN:-${ISPEC_ROOT}/.venv/bin/ispec}"
 if [[ ! -x "$ISPEC_BIN" ]]; then
@@ -102,6 +103,23 @@ if [[ ! -x "$ISPEC_BIN" ]]; then
     echo "Unable to find iSPEC CLI. Activate iSPEC/.venv or set ISPEC_BIN=/path/to/ispec." >&2
     exit 1
   fi
+fi
+
+ISPEC_ENV_FILE="${ISPEC_ENV_FILE:-}"
+if [[ -z "$ISPEC_ENV_FILE" ]]; then
+  DEFAULT_ENV_FILE="${ISPEC_FULL_ROOT}/.env.local"
+  if [[ -f "$DEFAULT_ENV_FILE" ]]; then
+    ISPEC_ENV_FILE="$DEFAULT_ENV_FILE"
+  fi
+fi
+
+ENV_ARGS=()
+if [[ -n "$ISPEC_ENV_FILE" ]]; then
+  if [[ ! -f "$ISPEC_ENV_FILE" ]]; then
+    echo "Env file not found: ${ISPEC_ENV_FILE}" >&2
+    exit 1
+  fi
+  ENV_ARGS+=(--env-file "$ISPEC_ENV_FILE")
 fi
 
 run_cmd() {
@@ -114,6 +132,9 @@ run_cmd() {
 
 echo "Project ID: ${PROJECT_ID}"
 echo "Database:   ${DATABASE}"
+if [[ -n "$ISPEC_ENV_FILE" ]]; then
+  echo "Env file:   ${ISPEC_ENV_FILE}"
+fi
 if [[ -n "$OMICS_DATABASE" ]]; then
   echo "Omics DB:   ${OMICS_DATABASE}"
 fi
@@ -158,7 +179,7 @@ fi
 
 echo "== Import: E2G (QUAL/QUANT) =="
 if [[ -d "$E2G_DIR" ]]; then
-  run_cmd "$ISPEC_BIN" db import-e2g --dir "$E2G_DIR" --database "$DATABASE" "${E2G_ARGS[@]}"
+  run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-e2g --dir "$E2G_DIR" --database "$DATABASE" "${E2G_ARGS[@]}"
 else
   echo "Skipping E2G: directory not found: $E2G_DIR" >&2
 fi
@@ -181,7 +202,7 @@ if [[ "${#volcano_files[@]}" -eq 0 ]]; then
   echo "No volcano TSVs found." >&2
 else
   for path in "${volcano_files[@]}"; do
-    run_cmd "$ISPEC_BIN" db import-volcano \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-volcano \
       --project-id "$PROJECT_ID" \
       --database "$DATABASE" \
       --file "$path" \
@@ -202,7 +223,7 @@ if [[ "${#gsea_files[@]}" -eq 0 ]]; then
   echo "No GSEA TSVs found." >&2
 else
   for path in "${gsea_files[@]}"; do
-    run_cmd "$ISPEC_BIN" db import-gsea \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-gsea \
       --project-id "$PROJECT_ID" \
       --database "$DATABASE" \
       --file "$path" \

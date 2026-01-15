@@ -108,6 +108,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISPEC_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ISPEC_FULL_ROOT="$(cd "${ISPEC_ROOT}/.." && pwd)"
 
 ISPEC_BIN="${ISPEC_BIN:-${ISPEC_ROOT}/.venv/bin/ispec}"
 if [[ ! -x "$ISPEC_BIN" ]]; then
@@ -117,6 +118,23 @@ if [[ ! -x "$ISPEC_BIN" ]]; then
     echo "Unable to find iSPEC CLI. Activate iSPEC/.venv or set ISPEC_BIN=/path/to/ispec." >&2
     exit 1
   fi
+fi
+
+ISPEC_ENV_FILE="${ISPEC_ENV_FILE:-}"
+if [[ -z "$ISPEC_ENV_FILE" ]]; then
+  DEFAULT_ENV_FILE="${ISPEC_FULL_ROOT}/.env.local"
+  if [[ -f "$DEFAULT_ENV_FILE" ]]; then
+    ISPEC_ENV_FILE="$DEFAULT_ENV_FILE"
+  fi
+fi
+
+ENV_ARGS=()
+if [[ -n "$ISPEC_ENV_FILE" ]]; then
+  if [[ ! -f "$ISPEC_ENV_FILE" ]]; then
+    echo "Env file not found: ${ISPEC_ENV_FILE}" >&2
+    exit 1
+  fi
+  ENV_ARGS+=(--env-file "$ISPEC_ENV_FILE")
 fi
 
 COMMON_ARGS=(
@@ -144,6 +162,9 @@ run_cmd() {
 
 echo "Project ID:    ${PROJECT_ID}"
 echo "Database:      ${DATABASE}"
+if [[ -n "$ISPEC_ENV_FILE" ]]; then
+  echo "Env file:      ${ISPEC_ENV_FILE}"
+fi
 if [[ -n "$OMICS_DATABASE" ]]; then
   echo "Omics DB:      ${OMICS_DATABASE}"
 fi
@@ -160,7 +181,7 @@ echo "Force:         ${FORCE}"
 echo
 
 echo "== Import: HSC =="
-run_cmd "$ISPEC_BIN" db import-results \
+run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
   --project-id "$PROJECT_ID" \
   --results-dir "$RESULTS_HSC_DIR" \
   --prefix "$PREFIX_HSC" \
@@ -168,7 +189,7 @@ run_cmd "$ISPEC_BIN" db import-results \
 echo
 
 echo "== Import: LMPP =="
-run_cmd "$ISPEC_BIN" db import-results \
+run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
   --project-id "$PROJECT_ID" \
   --results-dir "$RESULTS_LMPP_DIR" \
   --prefix "$PREFIX_LMPP" \
@@ -176,7 +197,7 @@ run_cmd "$ISPEC_BIN" db import-results \
 echo
 
 echo "== Import: MPP =="
-run_cmd "$ISPEC_BIN" db import-results \
+run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
   --project-id "$PROJECT_ID" \
   --results-dir "$RESULTS_MPP_DIR" \
   --prefix "$PREFIX_MPP" \

@@ -170,6 +170,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISPEC_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ISPEC_FULL_ROOT="$(cd "${ISPEC_ROOT}/.." && pwd)"
 
 ISPEC_BIN="${ISPEC_BIN:-${ISPEC_ROOT}/.venv/bin/ispec}"
 if [[ ! -x "$ISPEC_BIN" ]]; then
@@ -179,6 +180,23 @@ if [[ ! -x "$ISPEC_BIN" ]]; then
     echo "Unable to find iSPEC CLI. Activate iSPEC/.venv or set ISPEC_BIN=/path/to/ispec." >&2
     exit 1
   fi
+fi
+
+ISPEC_ENV_FILE="${ISPEC_ENV_FILE:-}"
+if [[ -z "$ISPEC_ENV_FILE" ]]; then
+  DEFAULT_ENV_FILE="${ISPEC_FULL_ROOT}/.env.local"
+  if [[ -f "$DEFAULT_ENV_FILE" ]]; then
+    ISPEC_ENV_FILE="$DEFAULT_ENV_FILE"
+  fi
+fi
+
+ENV_ARGS=()
+if [[ -n "$ISPEC_ENV_FILE" ]]; then
+  if [[ ! -f "$ISPEC_ENV_FILE" ]]; then
+    echo "Env file not found: ${ISPEC_ENV_FILE}" >&2
+    exit 1
+  fi
+  ENV_ARGS+=(--env-file "$ISPEC_ENV_FILE")
 fi
 
 COMMON_ARGS=(
@@ -226,7 +244,7 @@ echo
 if [[ "$IMPORT_PROF" -eq 1 ]]; then
   echo "== Import: prof (Nov2025) =="
   if [[ -d "$RESULTS_PROF_NOV2025_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PROF_NOV2025_DIR" \
       --prefix "$PREFIX_PROF_NOV2025" \
@@ -238,7 +256,7 @@ if [[ "$IMPORT_PROF" -eq 1 ]]; then
 
   echo "== Import: prof (topdiff) =="
   if [[ -d "$RESULTS_PROF_TOPDIFF_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PROF_TOPDIFF_DIR" \
       --prefix "$PREFIX_PROF_TOPDIFF" \
@@ -252,7 +270,7 @@ fi
 if [[ "$IMPORT_PHOS" -eq 1 ]]; then
   echo "== Import: phos (qc) =="
   if [[ -d "$RESULTS_PHOS_QC_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_QC_DIR" \
       --prefix "$PREFIX_PHOS_QC" \
@@ -264,7 +282,7 @@ if [[ "$IMPORT_PHOS" -eq 1 ]]; then
 
   echo "== Import: phos (pca) =="
   if [[ -d "$RESULTS_PHOS_PCA_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_PCA_DIR" \
       --prefix "$PREFIX_PHOS_PCA" \
@@ -276,7 +294,7 @@ if [[ "$IMPORT_PHOS" -eq 1 ]]; then
 
   echo "== Import: phos (volcano plots) =="
   if [[ -d "$RESULTS_PHOS_VOLCANO_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_VOLCANO_DIR" \
       --prefix "$PREFIX_PHOS_VOLCANO" \
@@ -288,7 +306,7 @@ if [[ "$IMPORT_PHOS" -eq 1 ]]; then
 
   echo "== Import: phos (limma tables) =="
   if [[ -d "$RESULTS_PHOS_TABLES_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_TABLES_DIR" \
       --prefix "$PREFIX_PHOS_TABLES" \
@@ -300,7 +318,7 @@ if [[ "$IMPORT_PHOS" -eq 1 ]]; then
 
   echo "== Import: phos (cluster heatmap) =="
   if [[ -d "$RESULTS_PHOS_CLUSTER_HEATMAP_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_CLUSTER_HEATMAP_DIR" \
       --prefix "$PREFIX_PHOS_CLUSTER_HEATMAP" \
@@ -312,7 +330,7 @@ if [[ "$IMPORT_PHOS" -eq 1 ]]; then
 
   echo "== Import: phos (cluster limma/all) =="
   if [[ -d "$RESULTS_PHOS_CLUSTER_LIMMA_ALL_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_CLUSTER_LIMMA_ALL_DIR" \
       --prefix "$PREFIX_PHOS_CLUSTER_LIMMA_ALL" \
@@ -324,7 +342,7 @@ if [[ "$IMPORT_PHOS" -eq 1 ]]; then
 
   echo "== Import: phos (cluster limma/subsets) =="
   if [[ -d "$RESULTS_PHOS_CLUSTER_LIMMA_SUBSETS_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_CLUSTER_LIMMA_SUBSETS_DIR" \
       --prefix "$PREFIX_PHOS_CLUSTER_LIMMA_SUBSETS" \
@@ -336,7 +354,7 @@ if [[ "$IMPORT_PHOS" -eq 1 ]]; then
 
   echo "== Import: phos (export) =="
   if [[ -d "$RESULTS_PHOS_EXPORT_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_PHOS_EXPORT_DIR" \
       --prefix "$PREFIX_PHOS_EXPORT" \
@@ -350,7 +368,7 @@ fi
 if [[ "$IMPORT_GSEA" -eq 1 ]]; then
   echo "== Import: gsea =="
   if [[ -d "$RESULTS_GSEA_DIR" ]]; then
-    run_cmd "$ISPEC_BIN" db import-results \
+    run_cmd "$ISPEC_BIN" "${ENV_ARGS[@]}" db import-results \
       --project-id "$PROJECT_ID" \
       --results-dir "$RESULTS_GSEA_DIR" \
       --prefix "$PREFIX_GSEA" \
