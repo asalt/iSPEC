@@ -790,3 +790,335 @@ def import_gsea(
         "inserted_total": inserted_total,
         "skipped": skipped,
     }
+
+
+def import_project_results(
+    *,
+    project_id: int,
+    results_dir: str,
+    db_file_path: str | None = None,
+    omics_db_file_path: str | None = None,
+    prefix: str | None = None,
+    added_by: str | None = None,
+    skip_existing: bool = True,
+    force: bool = False,
+    dry_run: bool = False,
+    import_volcano: bool = True,
+    include_exts: list[str] | None = None,
+    exclude_exts: list[str] | None = None,
+) -> dict[str, Any]:
+    """Import a project-level results directory.
+
+    Currently this performs two actions:
+      1) Attach every file under ``results_dir`` to ``project_file``.
+      2) Import volcano-style TSVs (files with a ``GeneID`` column) into the
+         omics database via :func:`import_gene_contrasts`.
+
+    The attachment filenames are derived from the relative path under
+    ``results_dir`` (path separators replaced with ``__``), optionally prefixed
+    with ``prefix`` (defaults to the directory basename).
+    """
+
+    import hashlib
+    import mimetypes
+    from pathlib import Path
+
+    from sqlalchemy import delete, select, update
+
+    from ispec.db.models import Project, ProjectFile
+
+    root = Path(results_dir).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(str(root))
+    if not root.is_dir():
+        raise NotADirectoryError(str(root))
+
+    def _infer_prefix(path: Path) -> str:
+        """Infer a stable prefix for a results directory.
+
+        For layouts like ``.../MSPC1427_20251208.by-lineage.HSC/Dec2025``, using
+        the leaf directory name alone (``Dec2025``) is ambiguous across
+        lineages. In those cases we automatically include the lineage label so
+        attachments group cleanly in the UI.
+        """
+
+        parent = path.parent
+        marker = ".by-lineage."
+        if marker in parent.name:
+            lineage = parent.name.split(marker, 1)[1].strip().strip(".")
+            if lineage:
+                return f"{lineage}__{path.name}"
+        return path.name
+
+    def _normalize_ext(value: str) -> str:
+        raw = (value or "").strip().lower()
+        if not raw:
+            return ""
+        if raw.startswith("."):
+            return raw
+        return "." + raw
+
+    def _normalize_ext_set(values: list[str] | None) -> set[str]:
+        if not values:
+            return set()
+        out: set[str] = set()
+        for item in values:
+            for part in str(item).split(","):
+                ext = _normalize_ext(part)
+                if ext:
+                    out.add(ext)
+        return out
+
+    default_include = {".png", ".pdf", ".tsv", ".tab"}
+    default_exclude = {".sqlite", ".rds"}
+
+    resolved_include = _normalize_ext_set(include_exts) if include_exts is not None else default_include
+    resolved_exclude = _normalize_ext_set(exclude_exts) if exclude_exts is not None else default_exclude
+
+    resolved_prefix = (prefix or _infer_prefix(root)).strip()
+    added_by = (added_by or "").strip() or None
+
+    discovered = [p for p in root.rglob("*") if p.is_file()]
+    paths: list[Path] = []
+    for path in discovered:
+        suffix = path.suffix.lower()
+        if suffix in resolved_exclude:
+            continue
+        if resolved_include and suffix not in resolved_include:
+            continue
+        paths.append(path)
+    paths.sort()
+    _log_info(
+        "importing project results: project_id=%d, dir=%s, files=%d/%d, prefix=%s, include_exts=%s, exclude_exts=%s, skip_existing=%s, force=%s, dry_run=%s, import_volcano=%s",
+        int(project_id),
+        str(root),
+        len(paths),
+        len(discovered),
+        resolved_prefix,
+        ",".join(sorted(resolved_include)) if resolved_include else "*",
+        ",".join(sorted(resolved_exclude)) if resolved_exclude else "",
+        bool(skip_existing),
+        bool(force),
+        bool(dry_run),
+        bool(import_volcano),
+    )
+
+    def _stored_name(path: Path) -> str:
+        rel = path.relative_to(root).as_posix()
+        rel = rel.replace("/", "__")
+        if resolved_prefix:
+            return f"{resolved_prefix}__{rel}"
+        return rel
+
+    def _guess_content_type(path: Path) -> str | None:
+        guessed, _ = mimetypes.guess_type(str(path))
+        if guessed:
+            return guessed
+        suffix = path.suffix.lower()
+        if suffix in {".tsv", ".tab"}:
+            return "text/tab-separated-values"
+        if suffix in {".log", ".txt"}:
+            return "text/plain"
+        return None
+
+    def _sha256_and_bytes(path: Path) -> tuple[str, bytes, int]:
+        sha = hashlib.sha256()
+        parts: list[bytes] = []
+        total = 0
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                sha.update(chunk)
+                parts.append(chunk)
+        return sha.hexdigest(), b"".join(parts), total
+
+    def _is_gene_contrast_tsv(path: Path) -> bool:
+        if path.suffix.lower() != ".tsv":
+            return False
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                header = handle.readline()
+        except Exception:
+            return False
+        if not header:
+            return False
+        columns = [col.strip() for col in header.split("\t") if col.strip()]
+        return "GeneID" in columns
+
+    attachments: list[dict[str, Any]] = []
+    volcano_paths: list[str] = []
+    with get_session(file_path=db_file_path) as core_session:
+        project = core_session.get(Project, int(project_id))
+        if project is None:
+            raise ValueError(f"Project {project_id} not found.")
+
+        existing_rows = core_session.execute(
+            select(
+                ProjectFile.id,
+                ProjectFile.prjfile_FileName,
+                ProjectFile.prjfile_Sha256,
+                ProjectFile.prjfile_AddedBy,
+            ).where(ProjectFile.project_id == int(project_id))
+        ).all()
+
+        existing_by_name: dict[str, dict[str, Any]] = {}
+        existing_by_sha: dict[str, list[dict[str, Any]]] = {}
+        for row in existing_rows:
+            record_id = int(row[0])
+            name = row[1]
+            existing_sha256 = row[2]
+            record = {
+                "id": record_id,
+                "name": name,
+                "sha256": existing_sha256,
+                "added_by": row[3],
+            }
+            if name:
+                existing_by_name[str(name)] = record
+            if existing_sha256:
+                existing_by_sha.setdefault(str(existing_sha256), []).append(record)
+
+        for path in paths:
+            stored = _stored_name(path)
+            sha256, data, size_bytes = _sha256_and_bytes(path)
+            content_type = _guess_content_type(path)
+            exists_by_name = stored in existing_by_name
+            exists_by_sha = sha256 in existing_by_sha
+            should_skip = False
+            skip_reason: str | None = None
+            action = "insert"
+            per_file_metadata_updates = 0
+
+            if skip_existing and (exists_by_name or exists_by_sha):
+                should_skip = True
+                skip_reason = "exists"
+                action = "skip"
+
+            if force and exists_by_name:
+                action = "overwrite"
+                should_skip = False
+                skip_reason = None
+                if not dry_run:
+                    core_session.execute(
+                        delete(ProjectFile)
+                        .where(ProjectFile.project_id == int(project_id))
+                        .where(ProjectFile.prjfile_FileName == stored)
+                    )
+                    deleted = existing_by_name.pop(stored, None)
+                    if deleted is not None:
+                        deleted_sha = deleted.get("sha256")
+                        if deleted_sha:
+                            bucket = existing_by_sha.get(str(deleted_sha))
+                            if bucket is not None:
+                                existing_by_sha[str(deleted_sha)] = [
+                                    item
+                                    for item in bucket
+                                    if int(item.get("id")) != int(deleted["id"])
+                                ]
+                                if not existing_by_sha[str(deleted_sha)]:
+                                    existing_by_sha.pop(str(deleted_sha), None)
+
+            if should_skip and added_by and not dry_run:
+                candidates: list[dict[str, Any]] = []
+                if exists_by_name:
+                    candidates.append(existing_by_name[stored])
+                if exists_by_sha:
+                    candidates.extend(existing_by_sha.get(sha256, []))
+
+                updated_ids: set[int] = set()
+                for candidate in candidates:
+                    candidate_id = int(candidate.get("id"))
+                    if candidate_id in updated_ids:
+                        continue
+                    updated_ids.add(candidate_id)
+
+                    current_added_by = (candidate.get("added_by") or "").strip()
+                    if current_added_by:
+                        continue
+
+                    core_session.execute(
+                        update(ProjectFile)
+                        .where(ProjectFile.id == candidate_id)
+                        .values(prjfile_AddedBy=added_by)
+                    )
+                    candidate["added_by"] = added_by
+                    per_file_metadata_updates += 1
+
+            inserted_id: int | None = None
+            if not should_skip and not dry_run:
+                record = ProjectFile(
+                    project_id=int(project_id),
+                    prjfile_FileName=stored,
+                    prjfile_ContentType=content_type,
+                    prjfile_SizeBytes=size_bytes,
+                    prjfile_Sha256=sha256,
+                    prjfile_AddedBy=added_by,
+                    prjfile_Data=data,
+                )
+                core_session.add(record)
+                core_session.flush()
+                inserted_id = int(record.id)
+                record_ref = {
+                    "id": inserted_id,
+                    "name": stored,
+                    "sha256": sha256,
+                    "added_by": added_by,
+                }
+                existing_by_name[stored] = record_ref
+                existing_by_sha.setdefault(sha256, []).append(record_ref)
+
+            attachments.append(
+                {
+                    "path": str(path),
+                    "name": stored,
+                    "bytes": size_bytes,
+                    "sha256": sha256,
+                    "content_type": content_type,
+                    "project_file_id": inserted_id,
+                    "action": action,
+                    "skipped": bool(should_skip),
+                    "skip_reason": skip_reason,
+                    "metadata_updates": per_file_metadata_updates,
+                }
+            )
+
+            if import_volcano and _is_gene_contrast_tsv(path):
+                volcano_paths.append(str(path))
+
+    volcano_summary: dict[str, Any] | None = None
+    if import_volcano and volcano_paths and not dry_run:
+        volcano_summary = import_gene_contrasts(
+            project_id=int(project_id),
+            paths=volcano_paths,
+            db_file_path=db_file_path,
+            omics_db_file_path=omics_db_file_path,
+            kind="limma",
+            store_metadata=True,
+            skip_imported=True,
+            force=False,
+        )
+
+    inserted = sum(1 for row in attachments if row["action"] in {"insert", "overwrite"} and not dry_run)
+    would_insert = sum(1 for row in attachments if row["action"] in {"insert", "overwrite"})
+    skipped = sum(1 for row in attachments if row["action"] == "skip")
+    metadata_updates = sum(int(row.get("metadata_updates") or 0) for row in attachments)
+
+    return {
+        "project_id": int(project_id),
+        "results_dir": str(root),
+        "prefix": resolved_prefix,
+        "dry_run": bool(dry_run),
+        "files_total": len(paths),
+        "files_discovered": len(discovered),
+        "include_exts": sorted(resolved_include),
+        "exclude_exts": sorted(resolved_exclude),
+        "attachments_inserted": inserted,
+        "attachments_would_insert": would_insert,
+        "attachments_skipped": skipped,
+        "attachments_metadata_updated": metadata_updates,
+        "attachments": attachments,
+        "volcano": volcano_summary,
+    }

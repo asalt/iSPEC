@@ -268,6 +268,86 @@ def register_subcommands(subparsers):
         help="Alias for overwrite; clears existing rows before import.",
     )
 
+    import_results_parser = subparsers.add_parser(
+        "import-results", help="Import a project results directory (attachments + volcano TSVs)"
+    )
+    import_results_parser.add_argument(
+        "--project-id",
+        dest="project_id",
+        type=int,
+        required=True,
+        help="Project id to attach results to",
+    )
+    import_results_parser.add_argument(
+        "--results-dir",
+        dest="results_dir",
+        required=True,
+        help="Directory to recursively import (e.g. .../MSPC1544/Dec2025)",
+    )
+    import_results_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    import_results_parser.add_argument(
+        "--omics-database",
+        dest="omics_database",
+        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
+    )
+    import_results_parser.add_argument(
+        "--prefix",
+        help="Prefix to apply to stored attachment filenames (default: results dir basename).",
+    )
+    import_results_parser.add_argument(
+        "--added-by",
+        dest="added_by",
+        help="Optional username to store in prjfile_AddedBy for attachments.",
+    )
+    import_results_parser.add_argument(
+        "--skip-existing",
+        dest="skip_existing",
+        action="store_true",
+        default=True,
+        help="Skip attachments that already exist for this project (default: enabled).",
+    )
+    import_results_parser.add_argument(
+        "--no-skip-existing",
+        dest="skip_existing",
+        action="store_false",
+        help="Disable skipping existing attachments.",
+    )
+    import_results_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite attachments that share the same stored name.",
+    )
+    import_results_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be imported without writing.",
+    )
+    import_results_parser.add_argument(
+        "--no-import-volcano",
+        dest="import_volcano",
+        action="store_false",
+        default=True,
+        help="Disable importing volcano TSVs into the omics database.",
+    )
+    import_results_parser.add_argument(
+        "--include-ext",
+        dest="include_exts",
+        action="append",
+        default=None,
+        help="File extension(s) to attach (repeatable or comma-separated). Default: png,pdf,tsv,tab",
+    )
+    import_results_parser.add_argument(
+        "--exclude-ext",
+        dest="exclude_exts",
+        action="append",
+        default=None,
+        help="File extension(s) to skip (repeatable or comma-separated). Default: sqlite,rds",
+    )
+
     export_parser = subparsers.add_parser("export", help="Export table to CSV or JSON")
     export_parser.add_argument("--table-name", required=True, choices=("person", "project"))
     export_parser.add_argument("--file", required=True, help="Output file (CSV or JSON)")
@@ -391,6 +471,44 @@ def register_subcommands(subparsers):
         help="When a row is conflicted, still fill NULL/blank fields from legacy without overwriting existing values.",
     )
     sync_projects_parser.add_argument(
+        "--dump-json",
+        dest="dump_json",
+        help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
+    )
+
+    sync_project_comments_parser = subparsers.add_parser(
+        "sync-legacy-project-comments",
+        help="Sync legacy iSPEC ProjectHistory rows into the local project_comment table",
+    )
+    sync_project_comments_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    sync_project_comments_parser.add_argument(
+        "--legacy-url",
+        dest="legacy_url",
+        help="Legacy API base URL (defaults to ISPEC_LEGACY_API_URL or iSPEC/data/ispec-legacy-schema.json base_url)",
+    )
+    sync_project_comments_parser.add_argument(
+        "--schema",
+        dest="schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
+    )
+    sync_project_comments_parser.add_argument(
+        "--id",
+        dest="project_id",
+        type=int,
+        required=True,
+        help="Sync legacy project history rows for a single PRJRecNo (required).",
+    )
+    sync_project_comments_parser.add_argument("--limit", type=int, default=5000)
+    sync_project_comments_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch + compute changes without writing to the DB",
+    )
+    sync_project_comments_parser.add_argument(
         "--dump-json",
         dest="dump_json",
         help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
@@ -560,6 +678,22 @@ def dispatch(args):
             force=bool(getattr(args, "force", False)),
         )
         logger.info("GSEA import summary: %s", summary)
+    elif args.subcommand == "import-results":
+        summary = operations.import_project_results(
+            project_id=int(getattr(args, "project_id")),
+            results_dir=str(getattr(args, "results_dir")),
+            db_file_path=getattr(args, "database", None),
+            omics_db_file_path=getattr(args, "omics_database", None),
+            prefix=getattr(args, "prefix", None),
+            added_by=getattr(args, "added_by", None),
+            skip_existing=bool(getattr(args, "skip_existing", True)),
+            force=bool(getattr(args, "force", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            import_volcano=bool(getattr(args, "import_volcano", True)),
+            include_exts=list(getattr(args, "include_exts", None) or []) or None,
+            exclude_exts=list(getattr(args, "exclude_exts", None) or []) or None,
+        )
+        logger.info("Project results import summary: %s", summary)
     elif args.subcommand == "export":
         operations.export_table(args.table_name, args.file)
     elif args.subcommand == "init":
@@ -599,6 +733,19 @@ def dispatch(args):
             dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy projects sync summary: %s", summary)
+    elif args.subcommand == "sync-legacy-project-comments":
+        from ispec.db.legacy_sync import sync_legacy_project_comments
+
+        summary = sync_legacy_project_comments(
+            legacy_url=getattr(args, "legacy_url", None),
+            schema_path=getattr(args, "schema", None),
+            db_file_path=getattr(args, "database", None),
+            project_id=int(getattr(args, "project_id")),
+            limit=int(getattr(args, "limit", 5000)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            dump_json=getattr(args, "dump_json", None),
+        )
+        logger.info("legacy project comments sync summary: %s", summary)
     elif args.subcommand == "sync-legacy-experiments":
         from ispec.db.legacy_sync import sync_legacy_experiments
 

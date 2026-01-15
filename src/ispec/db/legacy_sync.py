@@ -15,7 +15,14 @@ from sqlalchemy import Boolean, DateTime, Float, Integer
 from sqlalchemy.exc import MultipleResultsFound
 
 from ispec.db.connect import get_db_path, get_session
-from ispec.db.models import Experiment, ExperimentRun, LegacySyncState, Project
+from ispec.db.models import (
+    Experiment,
+    ExperimentRun,
+    LegacySyncState,
+    Person,
+    Project,
+    ProjectComment,
+)
 from ispec.logging import get_logger
 
 logger = get_logger(__file__)
@@ -233,6 +240,19 @@ def _can_update_imported(
     if modified_at <= imported_at:
         return True
     return (modified_at - imported_at) <= drift_grace
+
+
+def _can_update_imported_comment(comment: ProjectComment) -> bool:
+    imported_at = _normalize_datetime(getattr(comment, "com_LegacyImportTS", None))
+    modified_at = _normalize_datetime(getattr(comment, "com_ModificationTS", None))
+    if imported_at is None:
+        if int(getattr(comment, "person_id", -1)) != 0:
+            return False
+        created_at = _normalize_datetime(getattr(comment, "com_CreationTS", None))
+        return bool(created_at is not None and modified_at == created_at)
+    if modified_at is None:
+        return True
+    return modified_at <= imported_at
 
 
 def _legacy_headers() -> dict[str, str]:
@@ -893,6 +913,23 @@ def _ensure_placeholder_project(session, project_id: int) -> None:
     session.flush()
 
 
+def _ensure_system_person(session, *, imported_at: datetime) -> None:
+    if session.get(Person, 0) is not None:
+        return
+
+    session.add(
+        Person(
+            id=0,
+            ppl_AddedBy="legacy_import",
+            ppl_LegacyImportTS=imported_at,
+            ppl_Name_First="System",
+            ppl_Name_Last="System",
+            ppl_ModificationTS=imported_at,
+        )
+    )
+    session.flush()
+
+
 def _ensure_placeholder_experiment(session, experiment_id: int, *, project_id: int) -> None:
     if session.get(Experiment, experiment_id) is not None:
         return
@@ -1397,6 +1434,192 @@ def sync_legacy_projects(
         "updated": updated,
         "backfilled": backfilled,
         "conflicted": conflicted,
+    }
+
+
+def sync_legacy_project_comments(
+    *,
+    legacy_url: str | None = None,
+    schema_path: str | Path | None = None,
+    db_file_path: str | None = None,
+    project_id: int,
+    limit: int = 5000,
+    dry_run: bool = False,
+    dump_json: str | Path | None = None,
+) -> dict[str, int]:
+    """Sync legacy iSPEC ProjectHistory rows into the local ProjectComment table."""
+
+    resolved_schema = Path(schema_path).expanduser().resolve() if schema_path else default_schema_path()
+    base_url = _resolve_legacy_url(legacy_url=legacy_url, schema_path=resolved_schema)
+
+    if not db_file_path:
+        db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
+
+    legacy_table = "iSPEC_ProjectHistory"
+    pk_field = "prh_PRJRecNo"
+    modified_field = "prh_ModificationTS"
+    fields = [
+        pk_field,
+        modified_field,
+        "prh_CreationTS",
+        "prh_AddedBy",
+        "prh_CommentType",
+        "prh_Comment",
+    ]
+    expected_fields = set(fields)
+    required_fields = [pk_field, modified_field]
+
+    url = f"{base_url}/api/v2/legacy/tables/{legacy_table}/rows"
+    params: dict[str, Any] = {
+        "pk_field": pk_field,
+        "modified_field": modified_field,
+        "id": int(project_id),
+        "limit": int(limit),
+        "order_by": f"-{modified_field}",
+    }
+
+    threshold_missing = max(1, int(0.1 * len(expected_fields)))
+    payload, fields_mode = _fetch_legacy_rows_best_effort(
+        url=url,
+        params=params,
+        modes=["repeat", "csv", "none"],
+        fields=list(fields),
+        expected_fields=expected_fields,
+        required_fields=required_fields,
+        merge_key_fields=[pk_field, modified_field, "prh_CreationTS"],
+        threshold_missing=threshold_missing,
+        log_label="legacy project history",
+    )
+
+    dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
+    dump_path = _legacy_dump_path_for_request(
+        dump_file,
+        dump_dir,
+        table=legacy_table,
+        page=1,
+        mode=fields_mode,
+        id_value=project_id,
+    )
+    if dump_path is not None:
+        if not _legacy_debug_requests_enabled():
+            request_url = _prepared_request_url(
+                url,
+                _legacy_params_with_fields(params, fields=list(fields), mode=str(fields_mode)),
+            )
+            logger.info("legacy project history request_url mode=%s %s", fields_mode, request_url)
+        _dump_legacy_payload(payload, path=dump_path)
+        logger.info("legacy project history dumped payload to %s", dump_path)
+
+    raw_items = payload.get("items") or payload.get("rows") or []
+    items: list[dict[str, Any]] = [i for i in raw_items if isinstance(i, dict)]
+
+    inserted = updated = conflicted = skipped_blank = skipped_other_project = 0
+
+    imported_at = _normalize_datetime(datetime.now(UTC)) or datetime.utcnow()
+
+    def comment_key_from_record(record: dict[str, Any]) -> tuple[Any, ...]:
+        created_at = _normalize_datetime(record.get("com_CreationTS"))
+        created_key = created_at.isoformat() if created_at else None
+        return (
+            int(record.get("project_id")),
+            int(record.get("person_id", 0)),
+            created_key,
+            (record.get("com_CommentType") or "").strip(),
+            (record.get("com_AddedBy") or "").strip(),
+        )
+
+    def comment_key_from_obj(comment: ProjectComment) -> tuple[Any, ...]:
+        created_at = _normalize_datetime(getattr(comment, "com_CreationTS", None))
+        created_key = created_at.isoformat() if created_at else None
+        return (
+            int(comment.project_id),
+            int(comment.person_id),
+            created_key,
+            (comment.com_CommentType or "").strip(),
+            (comment.com_AddedBy or "").strip(),
+        )
+
+    with get_session(file_path=db_file_path) as session:
+        _ensure_placeholder_project(session, int(project_id))
+        _ensure_system_person(session, imported_at=imported_at)
+
+        existing_comments = (
+            session.query(ProjectComment)
+            .filter(ProjectComment.project_id == int(project_id))
+            .filter(ProjectComment.person_id == 0)
+            .all()
+        )
+        comment_index: dict[tuple[Any, ...], ProjectComment] = {}
+        for comment in existing_comments:
+            comment_index[comment_key_from_obj(comment)] = comment
+
+        processed_keys: set[tuple[Any, ...]] = set()
+        for item in items:
+            legacy_project_id = item.get(pk_field)
+            if legacy_project_id is None:
+                continue
+            try:
+                legacy_project_id_int = int(legacy_project_id)
+            except Exception:
+                continue
+            if legacy_project_id_int != int(project_id):
+                skipped_other_project += 1
+                continue
+
+            comment = item.get("prh_Comment")
+            if comment is None or (isinstance(comment, str) and not comment.strip()):
+                skipped_blank += 1
+                continue
+
+            created_dt = _normalize_datetime(_coerce_datetime(item.get("prh_CreationTS")))
+            if created_dt is None:
+                created_dt = _normalize_datetime(_coerce_datetime(item.get(modified_field)))
+
+            record: dict[str, Any] = {
+                "project_id": legacy_project_id_int,
+                "person_id": 0,
+                "com_LegacyImportTS": imported_at,
+                "com_Comment": comment,
+                "com_CommentType": item.get("prh_CommentType"),
+                "com_AddedBy": item.get("prh_AddedBy"),
+                "com_ModificationTS": imported_at,
+            }
+            if created_dt is not None:
+                record["com_CreationTS"] = created_dt
+
+            key = comment_key_from_record(record)
+            if key in processed_keys:
+                continue
+            processed_keys.add(key)
+            existing = comment_index.get(key)
+            if existing is None:
+                comment_obj = ProjectComment(**record)
+                if not dry_run:
+                    session.add(comment_obj)
+                comment_index[key] = comment_obj
+                inserted += 1
+                continue
+
+            if _can_update_imported_comment(existing):
+                if not dry_run:
+                    for field in ("com_Comment", "com_CommentType", "com_AddedBy", "com_LegacyImportTS"):
+                        if field in record:
+                            setattr(existing, field, record[field])
+                    existing.com_ModificationTS = imported_at
+                updated += 1
+            else:
+                conflicted += 1
+
+        if dry_run:
+            session.rollback()
+
+    return {
+        "items": len(items),
+        "inserted": inserted,
+        "updated": updated,
+        "conflicted": conflicted,
+        "skipped_blank": skipped_blank,
+        "skipped_other_project": skipped_other_project,
     }
 
 
