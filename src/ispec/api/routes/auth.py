@@ -12,6 +12,7 @@ from ispec.api.security import (
     delete_session,
     hash_password,
     require_admin,
+    require_staff,
     require_user,
     session_cookie_name,
     set_session_cookie,
@@ -142,7 +143,7 @@ def me(user: AuthUser = Depends(require_user)):
 
 
 @router.get("/users", response_model=list[UserOut])
-def list_users(_: AuthUser = Depends(require_admin), db: Session = Depends(get_session_dep)):
+def list_users(_: AuthUser = Depends(require_staff), db: Session = Depends(get_session_dep)):
     users = db.query(AuthUser).order_by(AuthUser.username.asc()).all()
     return [_user_out(u) for u in users]
 
@@ -228,7 +229,7 @@ def reset_password(
 @router.get("/users/{user_id}/projects", response_model=UserProjectsOut)
 def list_user_projects(
     user_id: int,
-    _: AuthUser = Depends(require_admin),
+    _: AuthUser = Depends(require_staff),
     db: Session = Depends(get_session_dep),
 ):
     user = db.get(AuthUser, user_id)
@@ -251,7 +252,7 @@ def list_user_projects(
 def update_user_projects(
     user_id: int,
     payload: UserProjectsUpdate,
-    _: AuthUser = Depends(require_admin),
+    _: AuthUser = Depends(require_staff),
     db: Session = Depends(get_session_dep),
 ):
     user = db.get(AuthUser, user_id)

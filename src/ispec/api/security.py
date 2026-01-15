@@ -288,6 +288,15 @@ def require_admin(user: AuthUser = Depends(require_user)) -> AuthUser:
     return user
 
 
+def require_staff(user: AuthUser = Depends(require_user)) -> AuthUser:
+    if user.role not in {UserRole.admin, UserRole.editor}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Staff access required.",
+        )
+    return user
+
+
 def get_project_or_404_for_user(
     db: Session,
     *,
