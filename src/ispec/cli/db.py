@@ -18,6 +18,38 @@ from ispec.db import operations
 from ispec.logging import get_logger
 
 
+def _compact_project_results_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a log-friendly summary for `import-results`.
+
+    The full `operations.import_project_results` return value includes a
+    potentially large `attachments` list; logging that verbatim can overwhelm
+    terminals for big result sets (e.g., thousands of PDFs).
+    """
+
+    out = dict(summary)
+    attachments = out.pop("attachments", None)
+    if isinstance(attachments, Sequence):
+        out["attachments_count"] = len(attachments)
+        sample: list[Any] = []
+        for item in list(attachments)[:5]:
+            if isinstance(item, Mapping):
+                sample.append(
+                    {
+                        "action": item.get("action"),
+                        "name": item.get("name"),
+                        "bytes": item.get("bytes"),
+                        "content_type": item.get("content_type"),
+                        "skipped": item.get("skipped"),
+                        "skip_reason": item.get("skip_reason"),
+                    }
+                )
+            else:
+                sample.append(item)
+        if sample:
+            out["attachments_sample"] = sample
+    return out
+
+
 def register_subcommands(subparsers):
     """Attach database subcommands to an ``argparse`` parser.
 
@@ -693,7 +725,7 @@ def dispatch(args):
             include_exts=list(getattr(args, "include_exts", None) or []) or None,
             exclude_exts=list(getattr(args, "exclude_exts", None) or []) or None,
         )
-        logger.info("Project results import summary: %s", summary)
+        logger.info("Project results import summary: %s", _compact_project_results_summary(summary))
     elif args.subcommand == "export":
         operations.export_table(args.table_name, args.file)
     elif args.subcommand == "init":

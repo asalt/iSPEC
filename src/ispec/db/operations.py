@@ -21,6 +21,41 @@ def _log_info(message: str, *args: Any) -> None:
     logging.getLogger().info(message, *args)
 
 
+def _resolve_omics_db_file_path(
+    *,
+    db_file_path: str | None,
+    omics_db_file_path: str | None,
+) -> str | None:
+    """Resolve an omics DB path, preferring the supplied core DB location.
+
+    The CLI often provides `--database` without `--omics-database`. In that
+    case we derive `ispec-omics.db` next to the core DB file, instead of
+    falling back to `~/ispec/ispec-omics.db` (which may be unwritable in some
+    environments).
+    """
+
+    if omics_db_file_path:
+        return omics_db_file_path
+    if not db_file_path:
+        return None
+
+    from pathlib import Path
+
+    raw = str(db_file_path).strip()
+    if not raw:
+        return None
+
+    if raw.startswith("sqlite:///"):
+        candidate = Path(raw.removeprefix("sqlite:///"))
+    elif "://" in raw:
+        return None
+    else:
+        candidate = Path(raw)
+
+    candidate = candidate.expanduser().resolve()
+    return str(candidate.parent / "ispec-omics.db")
+
+
 def check_status():
     """Query the database for its SQLite version and log/return it."""
     _log_info("checking db status...")
@@ -640,8 +675,13 @@ def import_e2g(
         bool(store_metadata),
     )
 
+    resolved_omics_db_file_path = _resolve_omics_db_file_path(
+        db_file_path=db_file_path,
+        omics_db_file_path=omics_db_file_path,
+    )
+
     with get_session(file_path=db_file_path) as core_session, get_omics_session(
-        file_path=omics_db_file_path
+        file_path=resolved_omics_db_file_path
     ) as omics_session:
         return import_e2g_files(
             core_session=core_session,
@@ -696,8 +736,13 @@ def import_gene_contrasts(
     )
 
     results: list[dict[str, Any]] = []
+    resolved_omics_db_file_path = _resolve_omics_db_file_path(
+        db_file_path=db_file_path,
+        omics_db_file_path=omics_db_file_path,
+    )
+
     with get_session(file_path=db_file_path) as core_session, get_omics_session(
-        file_path=omics_db_file_path
+        file_path=resolved_omics_db_file_path
     ) as omics_session:
         for path in resolved:
             result = import_gene_contrast_file(
@@ -764,8 +809,13 @@ def import_gsea(
     )
 
     results: list[dict[str, Any]] = []
+    resolved_omics_db_file_path = _resolve_omics_db_file_path(
+        db_file_path=db_file_path,
+        omics_db_file_path=omics_db_file_path,
+    )
+
     with get_session(file_path=db_file_path) as core_session, get_omics_session(
-        file_path=omics_db_file_path
+        file_path=resolved_omics_db_file_path
     ) as omics_session:
         for path in resolved:
             result = import_gsea_file(
@@ -937,9 +987,8 @@ def import_project_results(
             return "text/plain"
         return None
 
-    def _sha256_and_bytes(path: Path) -> tuple[str, bytes, int]:
+    def _sha256_and_size(path: Path) -> tuple[str, int]:
         sha = hashlib.sha256()
-        parts: list[bytes] = []
         total = 0
         with path.open("rb") as handle:
             while True:
@@ -948,8 +997,12 @@ def import_project_results(
                     break
                 total += len(chunk)
                 sha.update(chunk)
-                parts.append(chunk)
-        return sha.hexdigest(), b"".join(parts), total
+        return sha.hexdigest(), total
+
+    def _sha256_and_bytes(path: Path) -> tuple[str, bytes, int]:
+        data = path.read_bytes()
+        sha256 = hashlib.sha256(data).hexdigest()
+        return sha256, data, len(data)
 
     def _is_gene_contrast_tsv(path: Path) -> bool:
         if path.suffix.lower() != ".tsv":
@@ -997,21 +1050,48 @@ def import_project_results(
             if existing_sha256:
                 existing_by_sha.setdefault(str(existing_sha256), []).append(record)
 
-        for path in paths:
+        commit_every = 200
+        inserted_since_commit = 0
+        inserted_count = 0
+        skipped_count = 0
+        progress_every = 500
+
+        for idx, path in enumerate(paths, start=1):
             stored = _stored_name(path)
-            sha256, data, size_bytes = _sha256_and_bytes(path)
             content_type = _guess_content_type(path)
             exists_by_name = stored in existing_by_name
-            exists_by_sha = sha256 in existing_by_sha
+            sha256: str = ""
+            data: bytes | None = None
+            size_bytes = 0
+            exists_by_sha = False
+
             should_skip = False
             skip_reason: str | None = None
             action = "insert"
             per_file_metadata_updates = 0
 
-            if skip_existing and (exists_by_name or exists_by_sha):
+            if skip_existing and exists_by_name and not force:
                 should_skip = True
                 skip_reason = "exists"
                 action = "skip"
+
+                existing = existing_by_name.get(stored) or {}
+                sha256 = str(existing.get("sha256") or "")
+                try:
+                    size_bytes = int(path.stat().st_size)
+                except Exception:
+                    size_bytes = 0
+            else:
+                if dry_run:
+                    sha256, size_bytes = _sha256_and_size(path)
+                else:
+                    sha256, data, size_bytes = _sha256_and_bytes(path)
+
+                exists_by_sha = bool(sha256) and sha256 in existing_by_sha
+                if skip_existing and (exists_by_name or exists_by_sha):
+                    should_skip = True
+                    skip_reason = "exists"
+                    action = "skip"
 
             if force and exists_by_name:
                 action = "overwrite"
@@ -1065,6 +1145,8 @@ def import_project_results(
 
             inserted_id: int | None = None
             if not should_skip and not dry_run:
+                if data is None:
+                    data = path.read_bytes()
                 record = ProjectFile(
                     project_id=int(project_id),
                     prjfile_FileName=stored,
@@ -1077,6 +1159,9 @@ def import_project_results(
                 core_session.add(record)
                 core_session.flush()
                 inserted_id = int(record.id)
+                core_session.expunge(record)
+                inserted_since_commit += 1
+                inserted_count += 1
                 record_ref = {
                     "id": inserted_id,
                     "name": stored,
@@ -1085,6 +1170,12 @@ def import_project_results(
                 }
                 existing_by_name[stored] = record_ref
                 existing_by_sha.setdefault(sha256, []).append(record_ref)
+                if inserted_since_commit >= commit_every:
+                    core_session.commit()
+                    inserted_since_commit = 0
+                data = None
+            elif should_skip:
+                skipped_count += 1
 
             attachments.append(
                 {
@@ -1103,6 +1194,14 @@ def import_project_results(
 
             if import_volcano and _is_gene_contrast_tsv(path):
                 volcano_paths.append(str(path))
+            if idx % progress_every == 0:
+                _log_info(
+                    "importing project results progress: %d/%d processed (inserted=%d skipped=%d)",
+                    idx,
+                    len(paths),
+                    inserted_count,
+                    skipped_count,
+                )
 
     volcano_summary: dict[str, Any] | None = None
     if import_volcano and volcano_paths and not dry_run:
