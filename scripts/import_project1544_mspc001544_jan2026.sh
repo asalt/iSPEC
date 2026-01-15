@@ -27,9 +27,14 @@ PROJECT_ID="${PROJECT_ID:-1544}"
 RESULTS_DIR="${RESULTS_DIR:-/home/alex/amms06/mnt/e/MSPC001544/results/MSPC1544/Jan2026}"
 PREFIX="${PREFIX:-Jan2026}"
 
+# GCT exports often live outside the date-stamped results directory.
+RESULTS_GCT_DIR="${RESULTS_GCT_DIR:-/home/alex/amms06/mnt/e/MSPC001544/results/MSPC1544/export/data_gct}"
+PREFIX_GCT="${PREFIX_GCT:-${PREFIX}__export__data_gct}"
+
 # Keep cache files out of the DB by default.
 INCLUDE_EXTS="${INCLUDE_EXTS:-png,pdf,tsv,tab,gct}"
 EXCLUDE_EXTS="${EXCLUDE_EXTS:-sqlite,rds}"
+INCLUDE_GCT_EXTS="${INCLUDE_GCT_EXTS:-gct}"
 
 DATABASE=""
 OMICS_DATABASE=""
@@ -46,13 +51,17 @@ Options:
   --database <path>        SQLite DB path/URI to write to (required)
   --omics-database <path>  SQLite omics DB path/URI (defaults to ISPEC_OMICS_DB_PATH/derived)
   --prefix <name>          Prefix for stored filenames in project_file (default: ${PREFIX})
+  --prefix-gct <name>      Prefix for GCT export attachments (default: ${PREFIX_GCT})
   --added-by <username>    Record in prjfile_AddedBy for attachments
   --no-volcano             Do not import volcano TSVs into the omics DB
   --dry-run                Do not write; report what would be imported
   --force                  Overwrite attachments that share the same stored name
 
 Environment overrides:
-  PROJECT_ID, RESULTS_DIR, PREFIX, INCLUDE_EXTS, EXCLUDE_EXTS, ADDED_BY
+  PROJECT_ID, RESULTS_DIR, PREFIX,
+  RESULTS_GCT_DIR, PREFIX_GCT,
+  INCLUDE_EXTS, INCLUDE_GCT_EXTS, EXCLUDE_EXTS,
+  ADDED_BY
 EOF
 }
 
@@ -68,6 +77,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --prefix)
       PREFIX="${2:-}"
+      shift 2
+      ;;
+    --prefix-gct)
+      PREFIX_GCT="${2:-}"
       shift 2
       ;;
     --added-by)
@@ -150,7 +163,10 @@ if [[ -n "$OMICS_DATABASE" ]]; then
 fi
 echo "Results dir:   ${RESULTS_DIR}"
 echo "Prefix:        ${PREFIX}"
+echo "GCT dir:       ${RESULTS_GCT_DIR}"
+echo "GCT prefix:    ${PREFIX_GCT}"
 echo "Include exts:  ${INCLUDE_EXTS}"
+echo "GCT exts:      ${INCLUDE_GCT_EXTS}"
 echo "Exclude exts:  ${EXCLUDE_EXTS}"
 if [[ -n "$ADDED_BY" ]]; then
   echo "Added by:      ${ADDED_BY}"
@@ -165,3 +181,36 @@ run_cmd "$ISPEC_BIN" db import-results \
   --results-dir "$RESULTS_DIR" \
   --prefix "$PREFIX" \
   "${COMMON_ARGS[@]}"
+
+if [[ -d "$RESULTS_GCT_DIR" ]]; then
+  echo
+  echo "== Import: GCT exports =="
+
+  GCT_ARGS=(
+    --database "$DATABASE"
+    --include-ext "$INCLUDE_GCT_EXTS"
+    --exclude-ext "$EXCLUDE_EXTS"
+    --no-import-volcano
+  )
+  if [[ -n "$OMICS_DATABASE" ]]; then
+    GCT_ARGS+=(--omics-database "$OMICS_DATABASE")
+  fi
+  if [[ -n "$ADDED_BY" ]]; then
+    GCT_ARGS+=(--added-by "$ADDED_BY")
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    GCT_ARGS+=(--dry-run)
+  fi
+  if [[ "$FORCE" -eq 1 ]]; then
+    GCT_ARGS+=(--force)
+  fi
+
+  run_cmd "$ISPEC_BIN" db import-results \
+    --project-id "$PROJECT_ID" \
+    --results-dir "$RESULTS_GCT_DIR" \
+    --prefix "$PREFIX_GCT" \
+    "${GCT_ARGS[@]}"
+else
+  echo
+  echo "Skipping GCT import (dir not found): ${RESULTS_GCT_DIR}" >&2
+fi
