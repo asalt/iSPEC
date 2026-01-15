@@ -12,7 +12,7 @@ from ispec.schedule.connect import get_schedule_session
 
 
 def test_support_chat_self_review_can_rewrite_final_answer(tmp_path, db_session, monkeypatch):
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "0")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "1")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
@@ -22,6 +22,7 @@ def test_support_chat_self_review_can_rewrite_final_answer(tmp_path, db_session,
 
     def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
         calls.append({"messages": messages, "tools": tools})
+        assert tools is None
 
         assert isinstance(messages, list)
         last_user = next(
@@ -32,8 +33,21 @@ def test_support_chat_self_review_can_rewrite_final_answer(tmp_path, db_session,
         last_user_content = str(last_user.get("content") or "")
 
         if last_user_content == "Hello":
+            if any(
+                isinstance(msg, dict)
+                and msg.get("role") == "system"
+                and isinstance(msg.get("content"), str)
+                and msg["content"].startswith("TOOL_RESULT")
+                for msg in messages
+            ):
+                return AssistantReply(
+                    content="PLAN:\n- Draft\nFINAL:\nDraft answer.",
+                    provider="test",
+                    model="test-model",
+                    meta=None,
+                )
             return AssistantReply(
-                content="PLAN:\n- Draft\nFINAL:\nDraft answer.",
+                content=f'{support_routes.TOOL_CALL_PREFIX} {{"name":"assistant_stats","arguments":{{}}}}',
                 provider="test",
                 model="test-model",
                 meta=None,
@@ -77,7 +91,7 @@ def test_support_chat_self_review_can_rewrite_final_answer(tmp_path, db_session,
             )
 
         assert response.message == "Revised answer."
-        assert len(calls) == 2
+        assert len(calls) == 3
 
         assistant_row = (
             assistant_db.query(support_routes.SupportMessage)
@@ -97,7 +111,7 @@ def test_support_chat_self_review_can_rewrite_final_answer(tmp_path, db_session,
 
 def test_support_chat_self_review_decider_can_keep_draft_without_rewrite(tmp_path, db_session, monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "0")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "1")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
@@ -108,6 +122,7 @@ def test_support_chat_self_review_decider_can_keep_draft_without_rewrite(tmp_pat
 
     def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_) -> AssistantReply:
         calls.append({"messages": messages, "tools": tools, "vllm_extra_body": vllm_extra_body})
+        assert tools is None
 
         assert isinstance(messages, list)
         last_user = next((msg for msg in reversed(messages) if msg.get("role") == "user"), None)
@@ -115,8 +130,21 @@ def test_support_chat_self_review_decider_can_keep_draft_without_rewrite(tmp_pat
         last_user_content = str(last_user.get("content") or "")
 
         if last_user_content == "Hello":
+            if any(
+                isinstance(msg, dict)
+                and msg.get("role") == "system"
+                and isinstance(msg.get("content"), str)
+                and msg["content"].startswith("TOOL_RESULT")
+                for msg in messages
+            ):
+                return AssistantReply(
+                    content="PLAN:\n- Draft\nFINAL:\nDraft answer.",
+                    provider="test",
+                    model="test-model",
+                    meta=None,
+                )
             return AssistantReply(
-                content="PLAN:\n- Draft\nFINAL:\nDraft answer.",
+                content=f'{support_routes.TOOL_CALL_PREFIX} {{"name":"assistant_stats","arguments":{{}}}}',
                 provider="test",
                 model="test-model",
                 meta=None,
@@ -160,7 +188,7 @@ def test_support_chat_self_review_decider_can_keep_draft_without_rewrite(tmp_pat
             )
 
         assert response.message == "Draft answer."
-        assert len(calls) == 2
+        assert len(calls) == 3
 
         assistant_row = (
             assistant_db.query(support_routes.SupportMessage)

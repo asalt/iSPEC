@@ -104,13 +104,15 @@ def _default_prompt_base() -> str:
     identity = (os.getenv("ISPEC_ASSISTANT_NAME") or "iSPEC").strip() or "iSPEC"
     return (
         f"You are {identity}, the built-in support assistant for the iSPEC web app.\n"
-        "Your job is to help staff use iSPEC to track projects, people, experiments, and runs.\n"
+        "Your job is to help users (staff and project-scoped clients) use iSPEC to track projects, files, experiments, and runs.\n"
         "\n"
         "Behavior:\n"
         "- Be concise, practical, and action-oriented.\n"
         "- Ask a single clarifying question when needed.\n"
         "- Never invent database values, IDs, or outcomes.\n"
+        "- Never claim you saved/updated/wrote data unless a tool call succeeded (ok=true).\n"
         "- If you reference a record, include its id and title when available.\n"
+        "- Respect access boundaries (e.g., client users only see their projects).\n"
         "- CONTEXT is a partial snapshot; do not assume lists are exhaustive or infer global counts from them.\n"
         "- When tool calling is available, use tools for database lookups; do not claim you can't access iSPEC data.\n"
         "- If users share product feedback or feature requests, thank them and ask for specifics (page/route, what they expected).\n"
@@ -194,11 +196,22 @@ def _system_prompt_planner(
         tool_use_lines.append(
             "- For 'latest projects' / 'recent changes', use latest_projects and latest_project_comments."
         )
+    if has("my_projects"):
+        tool_use_lines.append(
+            "- For questions like 'what projects can I view' / 'my projects', use my_projects."
+        )
+    if has("project_files_for_project"):
+        tool_use_lines.append(
+            "- For questions about uploaded files/plots attached to a project, use project_files_for_project."
+        )
     if has("experiments_for_project"):
         tool_use_lines.append("- For experiments in a specific project, use experiments_for_project.")
     if has("create_project_comment"):
         tool_use_lines.append(
             "- For collaborative project work, draft notes first; only write to project history if the user explicitly asks you to save."
+        )
+        tool_use_lines.append(
+            "- If you asked the user to confirm saving a drafted note and they confirm (e.g. 'yes' / 'ok'), call create_project_comment and then confirm using the tool result (include comment_id)."
         )
     if has("repo_search") or has("repo_list_files") or has("repo_read_file"):
         tool_use_lines.append(

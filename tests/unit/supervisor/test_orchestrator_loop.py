@@ -264,3 +264,203 @@ def test_supervisor_processes_support_session_review_and_writes_review_table(tmp
         assert row is not None
         assert int(row.target_message_id) == int(last_id)
         assert isinstance(row.review_json, dict)
+
+
+def test_orchestrator_tick_applies_idle_backoff(tmp_path, monkeypatch):
+    agent_db_path = tmp_path / "agent.db"
+    assistant_db_path = tmp_path / "assistant.db"
+
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_DB_PATH", str(assistant_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_BASE_SECONDS", "60")
+
+    # No sessions -> no work.
+    with get_assistant_session(assistant_db_path):
+        pass
+
+    from ispec.agent.connect import get_agent_session
+
+    with get_agent_session(agent_db_path) as agent_db:
+        agent_db.add(
+            AgentRun(
+                run_id="run-1",
+                agent_id="agent-1",
+                kind="supervisor",
+                status="running",
+                created_at=utcnow(),
+                updated_at=utcnow(),
+                config_json={},
+                state_json={"checks": {}},
+                summary_json={},
+            )
+        )
+        agent_db.commit()
+
+    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
+        assert tools is None
+        decision = {
+            "schema_version": 1,
+            "thoughts": "No work right now.",
+            "next_tick_seconds": 30,
+            "commands": [],
+        }
+        return AssistantReply(content=json.dumps(decision), provider="test", model="test-model", meta=None)
+
+    import ispec.supervisor.loop as supervisor_loop
+
+    monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
+
+    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    assert isinstance(cmd_id, int)
+    assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
+
+    with get_agent_session(agent_db_path) as agent_db:
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
+        orchestrator = run.summary_json.get("orchestrator") if isinstance(run.summary_json, dict) else None
+        assert isinstance(orchestrator, dict)
+        assert orchestrator["idle_streak"] == 1
+        assert orchestrator["next_tick_reason"] == "idle_backoff"
+        assert orchestrator["next_tick_seconds"] == 60
+
+        queued_tick = (
+            agent_db.query(AgentCommand)
+            .filter(AgentCommand.command_type == COMMAND_ORCHESTRATOR_TICK)
+            .filter(AgentCommand.status == "queued")
+            .order_by(AgentCommand.id.desc())
+            .first()
+        )
+        assert queued_tick is not None
+        queued_tick.available_at = utcnow()
+        agent_db.commit()
+
+    assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
+
+    with get_agent_session(agent_db_path) as agent_db:
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
+        orchestrator = run.summary_json.get("orchestrator") if isinstance(run.summary_json, dict) else None
+        assert isinstance(orchestrator, dict)
+        assert orchestrator["idle_streak"] == 2
+        assert orchestrator["next_tick_reason"] == "idle_backoff"
+        assert orchestrator["next_tick_seconds"] == 120
+
+
+def test_orchestrator_tick_schedules_fast_when_review_backlog(tmp_path, monkeypatch):
+    agent_db_path = tmp_path / "agent.db"
+    assistant_db_path = tmp_path / "assistant.db"
+
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_DB_PATH", str(assistant_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_BASE_SECONDS", "60")
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        for session_id in ("s1", "s2"):
+            session = SupportSession(session_id=session_id, user_id=None)
+            assistant_db.add(session)
+            assistant_db.flush()
+            assistant_db.add_all(
+                [
+                    SupportMessage(session_pk=session.id, role="user", content="Hi"),
+                    SupportMessage(session_pk=session.id, role="assistant", content="Hello"),
+                ]
+            )
+        assistant_db.commit()
+
+    from ispec.agent.connect import get_agent_session
+
+    with get_agent_session(agent_db_path) as agent_db:
+        agent_db.add(
+            AgentRun(
+                run_id="run-1",
+                agent_id="agent-1",
+                kind="supervisor",
+                status="running",
+                created_at=utcnow(),
+                updated_at=utcnow(),
+                config_json={},
+                state_json={"checks": {}},
+                summary_json={},
+            )
+        )
+        agent_db.commit()
+
+    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
+        assert tools is None
+        decision = {
+            "schema_version": 1,
+            "thoughts": "Let the system force a review.",
+            "next_tick_seconds": 600,
+            "commands": [],
+        }
+        return AssistantReply(content=json.dumps(decision), provider="test", model="test-model", meta=None)
+
+    import ispec.supervisor.loop as supervisor_loop
+
+    monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
+
+    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    assert isinstance(cmd_id, int)
+    assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
+
+    with get_agent_session(agent_db_path) as agent_db:
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
+        orchestrator = run.summary_json.get("orchestrator") if isinstance(run.summary_json, dict) else None
+        assert isinstance(orchestrator, dict)
+        assert orchestrator["idle_streak"] == 0
+        assert orchestrator["next_tick_reason"] == "review_backlog"
+        assert orchestrator["next_tick_seconds"] == 30
+
+
+def test_orchestrator_tick_invalid_output_uses_error_backoff(tmp_path, monkeypatch):
+    agent_db_path = tmp_path / "agent.db"
+    assistant_db_path = tmp_path / "assistant.db"
+
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_DB_PATH", str(assistant_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_BASE_SECONDS", "60")
+
+    with get_assistant_session(assistant_db_path):
+        pass
+
+    from ispec.agent.connect import get_agent_session
+
+    with get_agent_session(agent_db_path) as agent_db:
+        agent_db.add(
+            AgentRun(
+                run_id="run-1",
+                agent_id="agent-1",
+                kind="supervisor",
+                status="running",
+                created_at=utcnow(),
+                updated_at=utcnow(),
+                config_json={},
+                state_json={"checks": {}},
+                summary_json={},
+            )
+        )
+        agent_db.commit()
+
+    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
+        assert tools is None
+        return AssistantReply(content="not-json", provider="test", model="test-model", meta=None)
+
+    import ispec.supervisor.loop as supervisor_loop
+
+    monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
+
+    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    assert isinstance(cmd_id, int)
+    assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
+
+    with get_agent_session(agent_db_path) as agent_db:
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
+        assert cmd.status == "failed"
+
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
+        orchestrator = run.summary_json.get("orchestrator") if isinstance(run.summary_json, dict) else None
+        assert isinstance(orchestrator, dict)
+        assert orchestrator["error_streak"] == 1
+        assert orchestrator["next_tick_reason"] == "invalid_output_backoff"
+        assert orchestrator["next_tick_seconds"] == 120

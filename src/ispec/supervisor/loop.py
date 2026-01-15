@@ -13,10 +13,12 @@ from typing import Any, Callable
 
 import psutil
 import requests
+from sqlalchemy.orm.attributes import flag_modified
 
 from ispec.agent.connect import get_agent_db_uri, get_agent_session
 from ispec.agent.commands import (
     COMMAND_COMPACT_SESSION_MEMORY,
+    COMMAND_BUILD_SUPPORT_DIGEST,
     COMMAND_ORCHESTRATOR_TICK,
     COMMAND_REVIEW_REPO,
     COMMAND_REVIEW_SUPPORT_SESSION,
@@ -664,7 +666,10 @@ def _compact_session_memory(payload: dict[str, Any]) -> tuple[bool, dict[str, An
 _ORCHESTRATOR_STATE_VERSION = 1
 _ORCHESTRATOR_DECISION_VERSION = 1
 _SESSION_REVIEW_VERSION = 1
+_SUPPORT_DIGEST_VERSION = 1
 _REPO_REVIEW_VERSION = 1
+_ORCHESTRATOR_DEFAULT_BASE_SECONDS = 60
+_ORCHESTRATOR_BACKOFF_MAX_EXP = 6
 
 
 def _orchestrator_enabled() -> bool:
@@ -705,6 +710,38 @@ def _orchestrator_max_commands_per_tick() -> int:
         return 2
 
 
+def _orchestrator_base_tick_seconds(*, min_tick_seconds: int, max_tick_seconds: int) -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_BASE_SECONDS") or "").strip()
+    base = _ORCHESTRATOR_DEFAULT_BASE_SECONDS
+    if raw:
+        try:
+            base = int(raw)
+        except ValueError:
+            base = _ORCHESTRATOR_DEFAULT_BASE_SECONDS
+    base = max(int(min_tick_seconds), int(base))
+    return _clamp_int(base, min_value=int(min_tick_seconds), max_value=int(max_tick_seconds))
+
+
+def _orchestrator_idle_backoff_seconds(*, base_seconds: int, idle_streak: int) -> int:
+    """Exponential backoff for idle orchestrator ticks.
+
+    We treat the first idle tick as ``base_seconds`` and then double for each
+    consecutive idle tick.
+    """
+
+    if idle_streak <= 1:
+        return int(base_seconds)
+    exp = min(_ORCHESTRATOR_BACKOFF_MAX_EXP, int(idle_streak) - 1)
+    return int(base_seconds) * (2**exp)
+
+
+def _orchestrator_error_backoff_seconds(*, base_seconds: int, error_streak: int) -> int:
+    """Exponential backoff for invalid orchestrator outputs."""
+
+    exp = min(_ORCHESTRATOR_BACKOFF_MAX_EXP, max(0, int(error_streak)))
+    return int(base_seconds) * (2**exp)
+
+
 def _load_orchestrator_state(run: AgentRun) -> dict[str, Any]:
     summary = run.summary_json if isinstance(run.summary_json, dict) else {}
     state = summary.get("orchestrator")
@@ -728,6 +765,7 @@ def _save_orchestrator_state(*, run: AgentRun, state: dict[str, Any]) -> None:
     summary = dict(summary)
     summary["orchestrator"] = dict(state)
     run.summary_json = summary
+    flag_modified(run, "summary_json")
 
 
 def _assistant_snapshot(*, assistant_db) -> dict[str, Any]:
@@ -739,6 +777,24 @@ def _assistant_snapshot(*, assistant_db) -> dict[str, Any]:
         total_messages = int(assistant_db.query(SupportMessage.id).count())
     except Exception:
         total_messages = 0
+    try:
+        total_reviews = int(assistant_db.query(SupportSessionReview.id).count())
+    except Exception:
+        total_reviews = 0
+    latest_review_id = 0
+    latest_review_at: str | None = None
+    try:
+        latest_review = (
+            assistant_db.query(SupportSessionReview)
+            .order_by(SupportSessionReview.id.desc())
+            .first()
+        )
+        if latest_review is not None:
+            latest_review_id = int(latest_review.id or 0)
+            latest_review_at = latest_review.updated_at.isoformat() if latest_review.updated_at else None
+    except Exception:
+        latest_review_id = 0
+        latest_review_at = None
 
     sessions: list[SupportSession] = (
         assistant_db.query(SupportSession)
@@ -838,13 +894,16 @@ def _assistant_snapshot(*, assistant_db) -> dict[str, Any]:
         "ok": True,
         "sessions_total": total_sessions,
         "messages_total": total_messages,
+        "reviews_total": total_reviews,
+        "latest_review_id": latest_review_id,
+        "latest_review_at": latest_review_at,
         "recent_sessions": items,
         "sessions_needing_review": needs_review,
     }
 
 
 def _orchestrator_decision_schema(*, max_commands: int) -> dict[str, Any]:
-    allowed_commands = [COMMAND_REVIEW_SUPPORT_SESSION, COMMAND_REVIEW_REPO]
+    allowed_commands = [COMMAND_REVIEW_SUPPORT_SESSION, COMMAND_BUILD_SUPPORT_DIGEST, COMMAND_REVIEW_REPO]
     return {
         "type": "object",
         "additionalProperties": False,
@@ -879,6 +938,7 @@ def _orchestrator_system_prompt(*, max_commands: int) -> str:
         "",
         "Goals:",
         "- Review new/updated user support sessions to spot issues and follow-ups.",
+        "- Periodically build a short digest across new session reviews for longer-term retrieval.",
         "- Optionally review the codebase (backend + frontend) based on what users are running into.",
         "- Keep internal notes concise and actionable.",
         "",
@@ -916,7 +976,7 @@ def _validate_orchestrator_decision(
         if not isinstance(item, dict):
             continue
         cmd_type = str(item.get("command_type") or "").strip()
-        if cmd_type not in {COMMAND_REVIEW_SUPPORT_SESSION, COMMAND_REVIEW_REPO}:
+        if cmd_type not in {COMMAND_REVIEW_SUPPORT_SESSION, COMMAND_BUILD_SUPPORT_DIGEST, COMMAND_REVIEW_REPO}:
             continue
         payload = item.get("payload")
         if not isinstance(payload, dict):
@@ -945,18 +1005,35 @@ def _validate_orchestrator_decision(
 def _schedule_orchestrator_tick(*, delay_seconds: int, current_command_id: int | None = None) -> int | None:
     if not _orchestrator_enabled():
         return None
+    now = utcnow()
     delay_seconds = max(10, int(delay_seconds))
-    available_at = utcnow() + timedelta(seconds=delay_seconds)
+    available_at = now + timedelta(seconds=delay_seconds)
     with get_agent_session() as db:
         existing = (
             db.query(AgentCommand)
             .filter(AgentCommand.command_type == COMMAND_ORCHESTRATOR_TICK)
             .filter(AgentCommand.status == "queued")
-            .filter(AgentCommand.available_at > utcnow())
+            .filter(AgentCommand.available_at > now)
             .order_by(AgentCommand.available_at.asc())
             .first()
         )
         if existing is not None:
+            try:
+                delta_seconds = abs(
+                    float((existing.available_at - available_at).total_seconds())
+                )
+            except Exception:
+                delta_seconds = 0.0
+            if delta_seconds >= 1.0:
+                existing.available_at = available_at
+                existing.updated_at = now
+                payload = dict(existing.payload_json or {})
+                payload["source"] = payload.get("source") or "self_schedule"
+                payload["previous_command_id"] = (
+                    int(current_command_id) if current_command_id else None
+                )
+                payload["rescheduled_at"] = now.isoformat()
+                existing.payload_json = payload
             return int(existing.id)
     return _enqueue_command(
         command_type=COMMAND_ORCHESTRATOR_TICK,
@@ -981,11 +1058,18 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
     min_tick = _orchestrator_tick_min_seconds()
     max_tick = _orchestrator_tick_max_seconds()
     max_commands = _orchestrator_max_commands_per_tick()
+    base_tick = _orchestrator_base_tick_seconds(
+        min_tick_seconds=min_tick, max_tick_seconds=max_tick
+    )
 
     state_for_prompt: dict[str, Any] = {}
+    prev_idle_streak = 0
+    prev_error_streak = 0
     with get_agent_session() as agent_db:
         run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
         state = _load_orchestrator_state(run)
+        prev_idle_streak = int(state.get("idle_streak") or 0)
+        prev_error_streak = int(state.get("error_streak") or 0)
         state["ticks"] = int(state.get("ticks") or 0) + 1
         state["last_tick_at"] = utcnow().isoformat()
         recent_thoughts = [str(x) for x in state.get("recent_thoughts") if isinstance(x, str)]
@@ -1000,6 +1084,8 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
             "last_tick_at": state.get("last_tick_at"),
             "next_tick_seconds": state.get("next_tick_seconds"),
             "next_tick_command_id": state.get("next_tick_command_id"),
+            "digest_last_review_id": int(state.get("digest_last_review_id") or 0),
+            "digest_last_at": state.get("digest_last_at"),
         }
         _save_orchestrator_state(run=run, state=state)
         agent_db.commit()
@@ -1037,6 +1123,7 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
     sessions_needing_review = assistant_snapshot.get("sessions_needing_review") if isinstance(assistant_snapshot, dict) else None
     if not isinstance(sessions_needing_review, list):
         sessions_needing_review = []
+    sessions_needing_review_count = len(sessions_needing_review)
 
     if validated is not None and sessions_needing_review:
         wants_session_review = any(
@@ -1067,6 +1154,24 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
                 if not (validated.get("thoughts") or "").strip():
                     validated["thoughts"] = f"Reviewing latest support session: {session_id.strip()}."
 
+    if validated is not None and not sessions_needing_review:
+        latest_review_id = _safe_int(assistant_snapshot.get("latest_review_id")) if isinstance(assistant_snapshot, dict) else None
+        latest_review_id = int(latest_review_id or 0)
+        digest_last_review_id = _safe_int(state_for_prompt.get("digest_last_review_id"))
+        digest_last_review_id = int(digest_last_review_id or 0)
+        existing_commands = validated.get("commands") if isinstance(validated.get("commands"), list) else []
+        if latest_review_id > digest_last_review_id and not existing_commands:
+            validated["commands"] = [
+                {
+                    "command_type": COMMAND_BUILD_SUPPORT_DIGEST,
+                    "priority": -1,
+                    "delay_seconds": 0,
+                    "payload": {"cursor_review_id": digest_last_review_id},
+                }
+            ]
+            if not (validated.get("thoughts") or "").strip():
+                validated["thoughts"] = "Building a digest for newly reviewed support sessions."
+
     scheduled: list[dict[str, Any]] = []
     if validated is not None:
         now = utcnow()
@@ -1088,7 +1193,27 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
                 }
             )
 
-        tick_seconds = int(validated.get("next_tick_seconds") or min_tick)
+        requested_tick_seconds = int(validated.get("next_tick_seconds") or min_tick)
+        tick_reason = "model"
+        new_error_streak = 0
+        new_idle_streak = 0 if scheduled else prev_idle_streak + 1
+        tick_seconds = requested_tick_seconds
+
+        if scheduled and sessions_needing_review_count > 1:
+            tick_seconds = min_tick
+            tick_reason = "review_backlog"
+        elif scheduled:
+            tick_seconds = min(requested_tick_seconds, base_tick)
+            tick_reason = "work"
+        else:
+            tick_seconds = max(
+                requested_tick_seconds,
+                _orchestrator_idle_backoff_seconds(
+                    base_seconds=base_tick, idle_streak=new_idle_streak
+                ),
+            )
+            tick_reason = "idle_backoff"
+        tick_seconds = _clamp_int(int(tick_seconds), min_value=min_tick, max_value=max_tick)
         scheduled_tick_id = _schedule_orchestrator_tick(
             delay_seconds=tick_seconds,
             current_command_id=command_id,
@@ -1101,13 +1226,13 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
             state["recent_thoughts"] = (
                 [*([str(x) for x in state.get("recent_thoughts") if isinstance(x, str)]), validated.get("thoughts") or ""]
             )[-10:]
-            if scheduled:
-                state["idle_streak"] = 0
-                state["error_streak"] = 0
-            else:
-                state["idle_streak"] = int(state.get("idle_streak") or 0) + 1
-            state["next_tick_seconds"] = tick_seconds
+            state["idle_streak"] = int(new_idle_streak)
+            state["error_streak"] = int(new_error_streak)
+            state["next_tick_seconds"] = int(tick_seconds)
             state["next_tick_command_id"] = scheduled_tick_id
+            state["next_tick_reason"] = tick_reason
+            state["base_tick_seconds"] = int(base_tick)
+            state["requested_tick_seconds"] = int(requested_tick_seconds)
             _save_orchestrator_state(run=run, state=state)
             agent_db.commit()
 
@@ -1134,12 +1259,18 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
     with get_agent_session() as agent_db:
         run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
         state = _load_orchestrator_state(run)
-        state["error_streak"] = int(state.get("error_streak") or 0) + 1
-        backoff = min_tick * (2 ** min(6, int(state["error_streak"])))
+        new_error_streak = prev_error_streak + 1
+        state["error_streak"] = int(new_error_streak)
+        backoff = _orchestrator_error_backoff_seconds(
+            base_seconds=base_tick, error_streak=new_error_streak
+        )
         tick_seconds = _clamp_int(int(backoff), min_value=min_tick, max_value=max_tick)
         scheduled_tick_id = _schedule_orchestrator_tick(delay_seconds=tick_seconds, current_command_id=command_id)
-        state["next_tick_seconds"] = tick_seconds
+        state["next_tick_seconds"] = int(tick_seconds)
         state["next_tick_command_id"] = scheduled_tick_id
+        state["next_tick_reason"] = "invalid_output_backoff"
+        state["base_tick_seconds"] = int(base_tick)
+        state["requested_tick_seconds"] = 0
         _save_orchestrator_state(run=run, state=state)
         agent_db.commit()
 
@@ -1514,6 +1645,342 @@ def _run_support_session_review(
             prompt={"messages": messages, "guided_json": schema},
             response={"raw": reply.content, "parsed": parsed, "coerced": coerced},
         )
+
+
+def _support_digest_schema(*, max_sessions: int) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "integer", "enum": [_SUPPORT_DIGEST_VERSION]},
+            "from_review_id": {"type": "integer", "minimum": 0},
+            "to_review_id": {"type": "integer", "minimum": 0},
+            "summary": {"type": "string", "maxLength": 2000},
+            "highlights": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {"type": "string", "maxLength": 240},
+            },
+            "followups": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {"type": "string", "maxLength": 240},
+            },
+            "sessions": {
+                "type": "array",
+                "maxItems": max(0, int(max_sessions)),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "session_id": {"type": "string", "maxLength": 256},
+                        "user_id": {"type": ["integer", "null"]},
+                        "review_id": {"type": "integer", "minimum": 1},
+                        "target_message_id": {"type": "integer", "minimum": 1},
+                        "summary": {"type": "string", "maxLength": 600},
+                        "issues_count": {"type": "integer", "minimum": 0, "maximum": 50},
+                        "followups": {
+                            "type": "array",
+                            "maxItems": 10,
+                            "items": {"type": "string", "maxLength": 240},
+                        },
+                    },
+                    "required": [
+                        "session_id",
+                        "user_id",
+                        "review_id",
+                        "target_message_id",
+                        "summary",
+                        "issues_count",
+                        "followups",
+                    ],
+                },
+            },
+        },
+        "required": [
+            "schema_version",
+            "from_review_id",
+            "to_review_id",
+            "summary",
+            "highlights",
+            "followups",
+            "sessions",
+        ],
+    }
+
+
+def _support_digest_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are the iSPEC internal summarizer.",
+            "You write short internal digests from structured support-session reviews.",
+            "",
+            "Guidelines:",
+            "- Summarize what changed since the last digest.",
+            "- Focus on user goals, notable issues, and actionable follow-ups.",
+            "- Do not add new facts; only summarize the provided review items.",
+            "- Do not call tools.",
+            "- Return ONLY JSON that matches the schema.",
+        ]
+    ).strip()
+
+
+def _coerce_support_digest_output(
+    parsed: dict[str, Any] | None,
+    *,
+    from_review_id: int,
+    to_review_id: int,
+) -> dict[str, Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+    if int(parsed.get("schema_version") or 0) != _SUPPORT_DIGEST_VERSION:
+        return None
+
+    summary = parsed.get("summary") if isinstance(parsed.get("summary"), str) else ""
+    summary = _truncate_text(summary, limit=2000)
+    if not summary:
+        summary = _truncate_text("Support digest generated.", limit=2000)
+
+    highlights: list[str] = []
+    raw_highlights = parsed.get("highlights")
+    if isinstance(raw_highlights, list):
+        for item in raw_highlights:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            highlights.append(_truncate_text(text, limit=240))
+
+    followups: list[str] = []
+    raw_followups = parsed.get("followups")
+    if isinstance(raw_followups, str) and raw_followups.strip():
+        raw_followups = [raw_followups]
+    if isinstance(raw_followups, list):
+        for item in raw_followups:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            followups.append(_truncate_text(text, limit=240))
+
+    sessions: list[dict[str, Any]] = []
+    raw_sessions = parsed.get("sessions")
+    if isinstance(raw_sessions, list):
+        for item in raw_sessions:
+            if not isinstance(item, dict):
+                continue
+            session_id = item.get("session_id")
+            if not isinstance(session_id, str) or not session_id.strip():
+                continue
+            review_id = _safe_int(item.get("review_id")) or 0
+            target_message_id = _safe_int(item.get("target_message_id")) or 0
+            if review_id <= 0 or target_message_id <= 0:
+                continue
+            user_id_raw = item.get("user_id")
+            user_id = int(user_id_raw) if isinstance(user_id_raw, int) and user_id_raw > 0 else None
+            item_summary = item.get("summary") if isinstance(item.get("summary"), str) else ""
+            item_summary = _truncate_text(item_summary, limit=600)
+            issues_count = _safe_int(item.get("issues_count")) or 0
+            issues_count = _clamp_int(int(issues_count), min_value=0, max_value=50)
+            item_followups: list[str] = []
+            followups_raw = item.get("followups")
+            if isinstance(followups_raw, str) and followups_raw.strip():
+                followups_raw = [followups_raw]
+            if isinstance(followups_raw, list):
+                for value in followups_raw:
+                    if not isinstance(value, str):
+                        continue
+                    text = value.strip()
+                    if not text:
+                        continue
+                    item_followups.append(_truncate_text(text, limit=240))
+            sessions.append(
+                {
+                    "session_id": session_id.strip(),
+                    "user_id": user_id,
+                    "review_id": int(review_id),
+                    "target_message_id": int(target_message_id),
+                    "summary": item_summary,
+                    "issues_count": int(issues_count),
+                    "followups": item_followups[:10],
+                }
+            )
+
+    return {
+        "schema_version": _SUPPORT_DIGEST_VERSION,
+        "from_review_id": int(from_review_id),
+        "to_review_id": int(to_review_id),
+        "summary": summary,
+        "highlights": highlights[:20],
+        "followups": followups[:20],
+        "sessions": sessions,
+    }
+
+
+def _run_support_digest(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> CommandExecution:
+    provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
+    if provider != "vllm":
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Support digest requires ISPEC_ASSISTANT_PROVIDER=vllm."},
+            error="provider_not_vllm",
+        )
+
+    cursor_review_id = _safe_int(payload.get("cursor_review_id"))
+    if cursor_review_id is None:
+        cursor_review_id = _safe_int(payload.get("from_review_id"))
+    cursor_review_id = int(cursor_review_id or 0)
+
+    max_reviews = _clamp_int(_safe_int(payload.get("max_reviews")) or 20, min_value=1, max_value=100)
+
+    review_items: list[dict[str, Any]] = []
+    evidence_message_ids: list[int] = []
+    with get_assistant_session() as assistant_db:
+        rows = (
+            assistant_db.query(
+                SupportSessionReview.id,
+                SupportSessionReview.target_message_id,
+                SupportSessionReview.updated_at,
+                SupportSessionReview.review_json,
+                SupportSession.session_id,
+                SupportSession.user_id,
+            )
+            .join(SupportSession, SupportSessionReview.session_pk == SupportSession.id)
+            .filter(SupportSessionReview.id > cursor_review_id)
+            .order_by(SupportSessionReview.id.asc())
+            .limit(max_reviews)
+            .all()
+        )
+        for review_id, target_message_id, updated_at, review_json, session_id, user_id in rows:
+            review_id_int = int(review_id or 0)
+            if review_id_int <= 0:
+                continue
+            target_message_id_int = int(target_message_id or 0)
+            if target_message_id_int > 0:
+                evidence_message_ids.append(target_message_id_int)
+            review_items.append(
+                {
+                    "review_id": review_id_int,
+                    "session_id": str(session_id),
+                    "user_id": int(user_id) if user_id is not None else None,
+                    "target_message_id": target_message_id_int,
+                    "updated_at": updated_at.isoformat() if updated_at else None,
+                    "review": review_json if isinstance(review_json, dict) else None,
+                }
+            )
+
+    if not review_items:
+        return CommandExecution(
+            ok=True,
+            result={
+                "ok": True,
+                "noop": True,
+                "cursor_review_id": int(cursor_review_id),
+                "max_reviews": int(max_reviews),
+            },
+        )
+
+    from_review_id = int(review_items[0]["review_id"])
+    to_review_id = int(review_items[-1]["review_id"])
+
+    context = {
+        "schema_version": 1,
+        "agent": {"agent_id": agent_id, "run_id": run_id, "command_id": int(command_id) if command_id else None},
+        "cursor_review_id": int(cursor_review_id),
+        "reviews": review_items,
+    }
+
+    schema = _support_digest_schema(max_sessions=len(review_items))
+    messages = [
+        {"role": "system", "content": _support_digest_system_prompt()},
+        {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+    ]
+    reply = generate_reply(
+        messages=messages,
+        tools=None,
+        vllm_extra_body={"guided_json": schema, "temperature": 0, "max_tokens": 1200},
+    )
+    parsed = _parse_json_object(reply.content)
+    coerced = _coerce_support_digest_output(
+        parsed if isinstance(parsed, dict) else None,
+        from_review_id=from_review_id,
+        to_review_id=to_review_id,
+    )
+    if not isinstance(coerced, dict):
+        return CommandExecution(
+            ok=False,
+            result={
+                "ok": False,
+                "error": "Invalid support digest output.",
+                "cursor_review_id": int(cursor_review_id),
+                "from_review_id": from_review_id,
+                "to_review_id": to_review_id,
+                "raw": _truncate_text(reply.content, limit=1200),
+                "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+            },
+            error="invalid_digest_output",
+            prompt={"messages": messages, "guided_json": schema},
+            response={"raw": reply.content, "parsed": parsed},
+        )
+
+    digest_id: int | None = None
+    with get_assistant_session() as assistant_db:
+        record = SupportMemory(
+            session_pk=None,
+            user_id=0,
+            kind="digest",
+            key="global",
+            value_json=_dump_json(coerced),
+        )
+        assistant_db.add(record)
+        assistant_db.flush()
+        digest_id = int(record.id)
+
+        for message_id in sorted({int(x) for x in evidence_message_ids if int(x) > 0}):
+            assistant_db.add(
+                SupportMemoryEvidence(
+                    memory_id=int(record.id),
+                    message_id=int(message_id),
+                    weight=1.0,
+                )
+            )
+        assistant_db.commit()
+
+    if digest_id is not None:
+        try:
+            with get_agent_session() as agent_db:
+                run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+                state = _load_orchestrator_state(run)
+                state["digest_last_review_id"] = int(to_review_id)
+                state["digest_last_at"] = utcnow().isoformat()
+                _save_orchestrator_state(run=run, state=state)
+                agent_db.commit()
+        except Exception:
+            logger.exception("Failed to persist digest cursor in orchestrator state (run_id=%s)", run_id)
+
+    return CommandExecution(
+        ok=True,
+        result={
+            "ok": True,
+            "digest_id": int(digest_id) if digest_id is not None else None,
+            "cursor_review_id": int(cursor_review_id),
+            "from_review_id": from_review_id,
+            "to_review_id": to_review_id,
+            "review_count": len(review_items),
+            "digest": coerced,
+            "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+        },
+        prompt={"messages": messages, "guided_json": schema},
+        response={"raw": reply.content, "parsed": parsed, "coerced": coerced},
+    )
 
 
 _REPO_REVIEW_MAX_FILE_BYTES = 250_000
@@ -1913,6 +2380,13 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
         if cmd.command_type == COMMAND_COMPACT_SESSION_MEMORY:
             ok, result, error = _compact_session_memory(cmd.payload)
             execution = CommandExecution(ok=bool(ok), result=dict(result or {}), error=error)
+        elif cmd.command_type == COMMAND_BUILD_SUPPORT_DIGEST:
+            execution = _run_support_digest(
+                payload=cmd.payload,
+                agent_id=agent_id,
+                run_id=run_id,
+                command_id=int(cmd.id),
+            )
         elif cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
             execution = _run_orchestrator_tick(
                 payload=cmd.payload,
@@ -2088,6 +2562,25 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
     run_id = uuid.uuid4().hex
     started_at = utcnow()
     with get_agent_session() as db:
+        previous_orchestrator: dict[str, Any] | None = None
+        try:
+            previous = (
+                db.query(AgentRun)
+                .filter(AgentRun.agent_id == config.agent_id)
+                .filter(AgentRun.kind == "supervisor")
+                .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+                .first()
+            )
+            if previous is not None and isinstance(previous.summary_json, dict):
+                previous_state = previous.summary_json.get("orchestrator")
+                if isinstance(previous_state, dict) and previous_state:
+                    previous_orchestrator = dict(previous_state)
+        except Exception:
+            previous_orchestrator = None
+
+        summary_json: dict[str, Any] = {}
+        if previous_orchestrator:
+            summary_json["orchestrator"] = previous_orchestrator
         run = AgentRun(
             run_id=run_id,
             agent_id=config.agent_id,
@@ -2102,7 +2595,7 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                 "timeout_seconds": config.timeout_seconds,
             },
             state_json={"checks": {}},
-            summary_json={},
+            summary_json=summary_json,
         )
         db.add(run)
         db.commit()

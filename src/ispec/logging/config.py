@@ -8,12 +8,23 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-_DEFAULT_CONFIG_DIR = Path(
-    os.environ.get("ISPEC_CONFIG_DIR", Path.home() / ".ispec")
-)
-_DEFAULT_CONFIG_PATH = Path(
-    os.environ.get("ISPEC_LOG_CONFIG", _DEFAULT_CONFIG_DIR / "logging.json")
-)
+
+def _default_config_dir() -> Path:
+    """Return the default config directory, honoring env overrides."""
+
+    raw = os.environ.get("ISPEC_CONFIG_DIR")
+    if raw and raw.strip():
+        return Path(raw).expanduser()
+    return Path.home() / ".ispec"
+
+
+def _default_config_path() -> Path:
+    """Return the default logging config path, honoring env overrides."""
+
+    raw = os.environ.get("ISPEC_LOG_CONFIG")
+    if raw and raw.strip():
+        return Path(raw).expanduser()
+    return _default_config_dir() / "logging.json"
 
 
 def _resolve_config_path(config_file: Optional[os.PathLike[str] | str] = None) -> Path:
@@ -21,7 +32,7 @@ def _resolve_config_path(config_file: Optional[os.PathLike[str] | str] = None) -
 
     if config_file is not None:
         return Path(config_file)
-    return _DEFAULT_CONFIG_PATH
+    return _default_config_path()
 
 
 def load_config(config_file: Optional[os.PathLike[str] | str] = None) -> Dict[str, Any]:

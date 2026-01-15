@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ispec.assistant.tools import openai_tools_for_user, run_tool
-from ispec.db.models import AuthUser, Person, Project, ProjectComment, UserRole
+from ispec.db.models import AuthUser, AuthUserProject, Person, Project, ProjectComment, UserRole
 
 
 def _make_user(username: str, *, role: UserRole) -> AuthUser:
@@ -19,6 +19,61 @@ def test_create_project_comment_tool_hidden_for_viewer():
     user = _make_user("viewer", role=UserRole.viewer)
     tool_names = {tool["function"]["name"] for tool in openai_tools_for_user(user)}
     assert "create_project_comment" not in tool_names
+
+
+def test_create_project_comment_tool_visible_for_client():
+    user = _make_user("client", role=UserRole.client)
+    tool_names = {tool["function"]["name"] for tool in openai_tools_for_user(user)}
+    assert "create_project_comment" in tool_names
+
+
+def test_create_project_comment_requires_client_project_access(db_session):
+    allowed = Project(id=10, prj_AddedBy="test", prj_ProjectTitle="Allowed Project")
+    denied = Project(id=11, prj_AddedBy="test", prj_ProjectTitle="Denied Project")
+    user = _make_user("client", role=UserRole.client)
+    db_session.add_all([allowed, denied, user])
+    db_session.commit()
+    db_session.refresh(user)
+
+    db_session.add(AuthUserProject(user_id=int(user.id), project_id=int(allowed.id)))
+    db_session.commit()
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": int(denied.id), "comment": "My note", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="please save this note to project history",
+    )
+    assert payload["ok"] is False
+    assert "accessible" in (payload.get("error") or "").lower()
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={
+            "project_id": int(allowed.id),
+            "comment": "Client note: please focus on PC1 vs PC2 biplot.",
+            "comment_type": "meeting_note",
+            "confirm": True,
+        },
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="please save this note to project history",
+    )
+    assert payload["ok"] is True
+    result = payload["result"]
+    comment_id = int(result["comment_id"])
+
+    comment = db_session.get(ProjectComment, comment_id)
+    assert comment is not None
+    assert comment.project_id == int(allowed.id)
+    assert comment.com_AddedBy == "client"
+    assert comment.com_CommentType == "client_note"
+    assert "Client note" in (comment.com_Comment or "")
 
 
 def test_create_project_comment_requires_confirm_and_explicit_user_request(db_session):
@@ -87,4 +142,3 @@ def test_create_project_comment_creates_comment_and_assistant_person(db_session)
     assert person is not None
     assert person.ppl_Name_First == "iSPEC"
     assert person.ppl_Name_Last == "Assistant"
-

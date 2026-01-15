@@ -12,11 +12,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import Text, cast, func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from ispec.assistant.context import person_summary, project_summary
 from ispec.assistant.models import (
     SupportMemory,
+    SupportMemoryEvidence,
     SupportMessage as AssistantSupportMessage,
     SupportSession,
     SupportSessionReview,
@@ -24,12 +25,14 @@ from ispec.assistant.models import (
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.db.models import (
     AuthUser,
+    AuthUserProject,
     E2G,
     Experiment,
     ExperimentRun,
     Person,
     Project,
     ProjectComment,
+    ProjectFile,
     UserRole,
 )
 from ispec.schedule.models import ScheduleRequest, ScheduleSlot
@@ -63,6 +66,9 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_get_session_review": ToolScope.staff,
     "assistant_search_messages": ToolScope.admin,
     "assistant_get_message_context": ToolScope.admin,
+    "assistant_list_digests": ToolScope.admin,
+    "assistant_get_digest": ToolScope.admin,
+    "assistant_search_digests": ToolScope.admin,
     "assistant_search_internal_logs": ToolScope.admin,
     "assistant_get_agent_step": ToolScope.admin,
     "assistant_get_agent_command": ToolScope.admin,
@@ -76,6 +82,8 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "search_projects": ToolScope.staff,
     "projects": ToolScope.staff,
     "get_project": ToolScope.staff,
+    "my_projects": ToolScope.user,
+    "project_files_for_project": ToolScope.user,
     "search_api": ToolScope.user,
     "experiments_for_project": ToolScope.staff,
     "latest_experiments": ToolScope.staff,
@@ -92,7 +100,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "repo_list_files": ToolScope.staff,
     "repo_search": ToolScope.staff,
     "repo_read_file": ToolScope.staff,
-    "create_project_comment": ToolScope.staff,
+    "create_project_comment": ToolScope.user,
 }
 
 _WRITE_TOOL_NAMES: set[str] = {"create_project_comment"}
@@ -521,6 +529,15 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
         "- assistant_get_message_context(message_id: int, before: int = 3, after: int = 3, max_chars: int = 800)  # admin-only",
     )
     add(
+        "assistant_list_digests",
+        "- assistant_list_digests(limit: int = 10, key: str | None = 'global', user_id: int | None = None)  # admin-only",
+    )
+    add("assistant_get_digest", "- assistant_get_digest(digest_id: int)  # admin-only")
+    add(
+        "assistant_search_digests",
+        "- assistant_search_digests(query: str, limit: int = 20, key: str | None = None, user_id: int | None = None)  # admin-only",
+    )
+    add(
         "assistant_search_internal_logs",
         "- assistant_search_internal_logs(query: str, limit: int = 20)  # admin-only; searches agent runs/steps/commands/events",
     )
@@ -536,10 +553,15 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add("search_projects", "- search_projects(query: str, limit: int = 5)")
     add("projects", "- projects(project_id: int)  # alias for get_project")
     add("get_project", "- get_project(id: int)")
+    add("my_projects", "- my_projects(limit: int = 50, query: str | None = None, current_only: bool = false)")
+    add(
+        "project_files_for_project",
+        "- project_files_for_project(project_id: int, limit: int = 50, query: str | None = None)",
+    )
     add("search_api", "- search_api(query: str, limit: int = 10)  # search FastAPI/OpenAPI endpoints")
     add(
         "create_project_comment",
-        "- create_project_comment(project_id: int, comment: str, comment_type: str | None = None, confirm: bool = true)  # write: requires explicit user request",
+        "- create_project_comment(project_id: int, comment: str, comment_type: str | None = None, confirm: bool = true)  # write: requires explicit user request; client notes saved as client_note",
     )
 
     add(
@@ -1102,20 +1124,38 @@ def run_tool(
         if name == "create_project_comment":
             if user is None:
                 return {"ok": False, "tool": name, "error": "Not authenticated."}
-            if user.role in {UserRole.viewer, UserRole.client}:
+            if user.role == UserRole.viewer:
                 return {"ok": False, "tool": name, "error": "Write access required."}
+
+            is_client_user = user.role == UserRole.client
 
             confirm = args.get("confirm")
             if confirm is not True:
                 return {"ok": False, "tool": name, "error": "confirm=true is required to write project history."}
 
             user_msg = (user_message or "").strip().lower()
+            if user_msg and (
+                re.search(r"\b(do not|don't|dont)\s+(save|log|record|add)\b", user_msg)
+                or re.search(r"\bnot\s+save\b", user_msg)
+            ):
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "User requested not to save yet.",
+                }
             explicit = False
             if user_msg:
                 if re.search(r"\b(save|log|record|add)\b", user_msg) and re.search(
                     r"\b(history|comment|note|meeting)\b", user_msg
                 ):
                     explicit = True
+                else:
+                    normalized = re.sub(r"[^\w\s]", "", user_msg)
+                    normalized = re.sub(r"\s+", " ", normalized).strip()
+                    if re.fullmatch(r"(?:yes|y|yeah|yep|yup|ok|okay|sure|confirm)(?: please)?", normalized):
+                        explicit = True
+                    elif normalized in {"go ahead", "do it", "please do", "please do it"}:
+                        explicit = True
             if not explicit:
                 return {
                     "ok": False,
@@ -1132,12 +1172,28 @@ def run_tool(
                 return {"ok": False, "tool": name, "error": "comment text is required."}
 
             comment_type = _safe_str(args.get("comment_type"), max_len=64) or "assistant_note"
+            if is_client_user:
+                comment_type = "client_note"
 
-            project = core_db.get(Project, int(project_id))
+            if is_client_user:
+                project = (
+                    core_db.query(Project)
+                    .join(AuthUserProject, AuthUserProject.project_id == Project.id)
+                    .filter(Project.id == int(project_id), AuthUserProject.user_id == user.id)
+                    .first()
+                )
+            else:
+                project = core_db.get(Project, int(project_id))
             if project is None:
+                if is_client_user:
+                    return {
+                        "ok": False,
+                        "tool": name,
+                        "error": f"Project {project_id} not found or not accessible.",
+                    }
                 return {"ok": False, "tool": name, "error": f"Project {project_id} not found."}
 
-            person_id = _safe_int(args.get("person_id"))
+            person_id = _safe_int(args.get("person_id")) if not is_client_user else None
             if person_id is not None and person_id > 0:
                 person = core_db.get(Person, int(person_id))
                 if person is None:
@@ -1779,6 +1835,179 @@ def run_tool(
                     "after": after,
                     "count": len(messages),
                     "messages": messages,
+                },
+            }
+
+        if name == "assistant_list_digests":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=10, min_value=1, max_value=100)
+            key = _safe_str(args.get("key"), max_len=128) if args.get("key") is not None else "global"
+            user_id = _safe_int(args.get("user_id"))
+
+            query = (
+                assistant_db.query(SupportMemory, SupportSession.session_id)
+                .outerjoin(SupportSession, SupportMemory.session_pk == SupportSession.id)
+                .filter(SupportMemory.kind == "digest")
+            )
+            if key:
+                query = query.filter(SupportMemory.key == key)
+            if user_id is not None:
+                query = query.filter(SupportMemory.user_id == int(user_id))
+
+            rows = (
+                query.order_by(SupportMemory.created_at.desc(), SupportMemory.id.desc())
+                .limit(limit)
+                .all()
+            )
+            items: list[dict[str, Any]] = []
+            for digest, session_id in rows:
+                digest_json: dict[str, Any] | None = None
+                raw_value = getattr(digest, "value_json", None)
+                if isinstance(raw_value, str) and raw_value.strip():
+                    try:
+                        parsed_value = json.loads(raw_value)
+                        if isinstance(parsed_value, dict):
+                            digest_json = parsed_value
+                    except Exception:
+                        digest_json = None
+                summary_preview = ""
+                if isinstance(digest_json, dict):
+                    summary_preview = _safe_str(digest_json.get("summary"), max_len=240) or ""
+                if not summary_preview and isinstance(raw_value, str):
+                    summary_preview = _safe_str(raw_value, max_len=240) or ""
+                items.append(
+                    {
+                        "digest_id": int(digest.id),
+                        "kind": digest.kind,
+                        "key": digest.key,
+                        "user_id": int(digest.user_id) if getattr(digest, "user_id", None) is not None else 0,
+                        "session_id": session_id,
+                        "created_at": digest.created_at.isoformat() if getattr(digest, "created_at", None) else None,
+                        "updated_at": digest.updated_at.isoformat() if getattr(digest, "updated_at", None) else None,
+                        "summary": summary_preview,
+                    }
+                )
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "limit": limit,
+                    "key": key,
+                    "user_id": int(user_id) if user_id is not None else None,
+                    "count": len(items),
+                    "digests": items,
+                },
+            }
+
+        if name == "assistant_get_digest":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            digest_id = _safe_int(args.get("digest_id"))
+            if digest_id is None:
+                digest_id = _safe_int(args.get("id"))
+            if digest_id is None:
+                return {"ok": False, "tool": name, "error": "Missing integer argument: digest_id (or id)"}
+
+            digest = (
+                assistant_db.query(SupportMemory)
+                .filter(SupportMemory.id == int(digest_id))
+                .filter(SupportMemory.kind == "digest")
+                .first()
+            )
+            if digest is None:
+                return {"ok": False, "tool": name, "error": "Digest not found.", "digest_id": int(digest_id)}
+
+            session_id = None
+            if getattr(digest, "session_pk", None) is not None:
+                session = assistant_db.query(SupportSession).filter(SupportSession.id == int(digest.session_pk)).first()
+                session_id = session.session_id if session is not None else None
+
+            parsed_value: dict[str, Any] | None = None
+            raw_value = getattr(digest, "value_json", None)
+            if isinstance(raw_value, str) and raw_value.strip():
+                try:
+                    payload_value = json.loads(raw_value)
+                    if isinstance(payload_value, dict):
+                        parsed_value = payload_value
+                except Exception:
+                    parsed_value = None
+
+            evidence_rows = (
+                assistant_db.query(SupportMemoryEvidence.message_id)
+                .filter(SupportMemoryEvidence.memory_id == int(digest.id))
+                .order_by(SupportMemoryEvidence.message_id.asc())
+                .all()
+            )
+            evidence_message_ids = [int(row[0]) for row in evidence_rows if row and int(row[0]) > 0]
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "digest_id": int(digest.id),
+                    "key": digest.key,
+                    "user_id": int(digest.user_id) if getattr(digest, "user_id", None) is not None else 0,
+                    "session_id": session_id,
+                    "created_at": digest.created_at.isoformat() if getattr(digest, "created_at", None) else None,
+                    "updated_at": digest.updated_at.isoformat() if getattr(digest, "updated_at", None) else None,
+                    "digest": parsed_value,
+                    "raw": raw_value if parsed_value is None else None,
+                    "evidence_message_ids": evidence_message_ids,
+                },
+            }
+
+        if name == "assistant_search_digests":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            query_text = _safe_str(args.get("query"), max_len=512) or _safe_str(args.get("q"), max_len=512)
+            if not query_text:
+                return {"ok": False, "tool": name, "error": "Missing argument: query"}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=100)
+            key = _safe_str(args.get("key"), max_len=128)
+            user_id = _safe_int(args.get("user_id"))
+
+            pattern = f"%{query_text}%"
+            query = assistant_db.query(SupportMemory).filter(SupportMemory.kind == "digest").filter(
+                cast(SupportMemory.value_json, Text).ilike(pattern)
+            )
+            if key:
+                query = query.filter(SupportMemory.key == key)
+            if user_id is not None:
+                query = query.filter(SupportMemory.user_id == int(user_id))
+
+            rows = (
+                query.order_by(SupportMemory.created_at.desc(), SupportMemory.id.desc())
+                .limit(limit)
+                .all()
+            )
+            matches: list[dict[str, Any]] = []
+            for digest in rows:
+                raw_value = getattr(digest, "value_json", "") or ""
+                matches.append(
+                    {
+                        "digest_id": int(digest.id),
+                        "key": digest.key,
+                        "user_id": int(digest.user_id) if getattr(digest, "user_id", None) is not None else 0,
+                        "created_at": digest.created_at.isoformat() if getattr(digest, "created_at", None) else None,
+                        "snippet": _snippet_for_query(raw_value, query_text, window=80, max_len=320),
+                    }
+                )
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "query": query_text,
+                    "limit": limit,
+                    "key": key,
+                    "user_id": int(user_id) if user_id is not None else None,
+                    "count": len(matches),
+                    "matches": matches,
                 },
             }
 
@@ -2799,6 +3028,177 @@ def run_tool(
                 )
             return {"ok": True, "tool": name, "result": {"matches": matches}}
 
+        if name == "my_projects":
+            if user is None:
+                return {"ok": False, "tool": name, "error": "Not authenticated."}
+
+            query_text = _safe_str(args.get("query"), max_len=200)
+            limit = _clamp_int(_safe_int(args.get("limit")), default=50, min_value=1, max_value=500)
+            current_only = bool(args.get("current_only"))
+
+            query = core_db.query(Project)
+            if user.role == UserRole.client:
+                query = query.join(
+                    AuthUserProject,
+                    AuthUserProject.project_id == Project.id,
+                ).filter(AuthUserProject.user_id == user.id)
+
+            if current_only:
+                query = query.filter(Project.prj_Current_FLAG.is_(True))
+
+            if query_text:
+                pattern = f"%{query_text}%"
+                query = query.filter(
+                    or_(
+                        Project.prj_ProjectTitle.ilike(pattern),
+                        Project.prj_PI.ilike(pattern),
+                        Project.prj_Project_LabContact.ilike(pattern),
+                    )
+                )
+
+            try:
+                total = int(query.order_by(None).count())
+            except Exception:
+                total = int(query.count())
+
+            rows = query.order_by(Project.id.asc()).limit(limit).all()
+            projects = [
+                {
+                    "id": int(project.id),
+                    "title": project.prj_ProjectTitle,
+                    "status": project.prj_Status,
+                    "current": bool(getattr(project, "prj_Current_FLAG", False)),
+                    "links": {
+                        "ui": f"/project/{project.id}",
+                        "api": f"/api/projects/{project.id}",
+                    },
+                }
+                for project in rows
+            ]
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "count": len(projects),
+                    "total": total,
+                    "projects": projects,
+                },
+            }
+
+        if name == "project_files_for_project":
+            if user is None:
+                return {"ok": False, "tool": name, "error": "Not authenticated."}
+
+            project_id = _safe_int(args.get("project_id"))
+            if project_id is None:
+                project_id = _safe_int(args.get("id"))
+            if project_id is None:
+                return {"ok": False, "tool": name, "error": "Missing integer argument: project_id (or id)"}
+
+            query_text = _safe_str(args.get("query"), max_len=200)
+            limit = _clamp_int(_safe_int(args.get("limit")), default=50, min_value=1, max_value=500)
+
+            project_query = core_db.query(Project).filter(Project.id == project_id)
+            if user.role == UserRole.client:
+                project_query = project_query.join(
+                    AuthUserProject,
+                    AuthUserProject.project_id == Project.id,
+                ).filter(AuthUserProject.user_id == user.id)
+            project = project_query.first()
+            if project is None:
+                return {"ok": False, "tool": name, "error": f"Project {project_id} not found."}
+
+            def display_path(filename: str | None) -> str:
+                raw = (filename or "").strip()
+                if not raw:
+                    return ""
+                return raw.replace("__", "/")
+
+            def analysis_key(filename: str | None) -> str:
+                display = display_path(filename)
+                if not display:
+                    return "Ungrouped"
+                parts = [part for part in display.split("/") if part]
+                return parts[0] if parts else "Ungrouped"
+
+            def relative_path(filename: str | None) -> str:
+                display = display_path(filename)
+                if not display:
+                    return ""
+                parts = [part for part in display.split("/") if part]
+                if len(parts) <= 1:
+                    return display
+                return "/".join(parts[1:])
+
+            def file_payload(row: ProjectFile) -> dict[str, Any]:
+                analysis = analysis_key(getattr(row, "prjfile_FileName", None))
+                display = display_path(getattr(row, "prjfile_FileName", None))
+                return {
+                    "id": int(row.id),
+                    "project_id": int(row.project_id),
+                    "analysis": analysis,
+                    "path": display,
+                    "name": relative_path(getattr(row, "prjfile_FileName", None)),
+                    "filename_raw": getattr(row, "prjfile_FileName", None),
+                    "content_type": getattr(row, "prjfile_ContentType", None),
+                    "size_bytes": int(getattr(row, "prjfile_SizeBytes", 0) or 0),
+                    "sha256": getattr(row, "prjfile_Sha256", None),
+                    "added_by": getattr(row, "prjfile_AddedBy", None),
+                    "created": row.prjfile_CreationTS.isoformat() if row.prjfile_CreationTS else None,
+                    "modified": row.prjfile_ModificationTS.isoformat() if row.prjfile_ModificationTS else None,
+                    "links": {
+                        "download": f"/api/projects/{row.project_id}/files/{row.id}",
+                        "preview": f"/api/projects/{row.project_id}/files/{row.id}/preview",
+                    },
+                }
+
+            file_query = (
+                core_db.query(ProjectFile)
+                .options(defer(ProjectFile.prjfile_Data))
+                .filter(ProjectFile.project_id == project_id)
+            )
+            if query_text:
+                file_query = file_query.filter(ProjectFile.prjfile_FileName.ilike(f"%{query_text}%"))
+
+            try:
+                total = int(file_query.order_by(None).count())
+            except Exception:
+                total = int(file_query.count())
+
+            rows = file_query.order_by(ProjectFile.id.asc()).limit(limit).all()
+            files = [file_payload(row) for row in rows]
+
+            by_analysis: dict[str, int] = {}
+            for item in files:
+                key = str(item.get("analysis") or "Ungrouped")
+                by_analysis[key] = by_analysis.get(key, 0) + 1
+
+            pca_hint = re.compile(r"\bpca\b|pc1|pc2|biplot|pcaplot", re.IGNORECASE)
+            highlights = [
+                item
+                for item in files
+                if pca_hint.search(str(item.get("path") or ""))
+                or pca_hint.search(str(item.get("filename_raw") or ""))
+            ][:10]
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "project": {
+                        "id": int(project.id),
+                        "title": project.prj_ProjectTitle,
+                        "status": project.prj_Status,
+                        "links": {"ui": f"/project/{project.id}", "api": f"/api/projects/{project.id}"},
+                    },
+                    "count": len(files),
+                    "total": total,
+                    "by_analysis": by_analysis,
+                    "highlights": highlights,
+                    "files": files,
+                },
+            }
+
         if name == "get_person":
             person_id = _safe_int(args.get("id"))
             if person_id is None:
@@ -3165,6 +3565,52 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "assistant_list_digests": {
+        "type": "function",
+        "function": {
+            "name": "assistant_list_digests",
+            "description": "List stored internal support digests (support_memory kind='digest').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max digests to return (default 10)."},
+                    "key": {"type": "string", "description": "Optional digest key filter (default 'global')."},
+                    "user_id": {"type": "integer", "description": "Optional user_id filter."},
+                },
+            },
+        },
+    },
+    "assistant_get_digest": {
+        "type": "function",
+        "function": {
+            "name": "assistant_get_digest",
+            "description": "Fetch a stored support digest by id (includes evidence message ids when available).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "digest_id": {"type": "integer", "description": "support_memory.id for kind='digest'."},
+                },
+                "required": ["digest_id"],
+            },
+        },
+    },
+    "assistant_search_digests": {
+        "type": "function",
+        "function": {
+            "name": "assistant_search_digests",
+            "description": "Search stored support digests (support_memory kind='digest') by substring match.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Substring to search for."},
+                    "limit": {"type": "integer", "description": "Max matches to return (default 20)."},
+                    "key": {"type": "string", "description": "Optional digest key filter."},
+                    "user_id": {"type": "integer", "description": "Optional user_id filter."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     "assistant_list_users": {
         "type": "function",
         "function": {
@@ -3343,6 +3789,40 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "my_projects": {
+        "type": "function",
+        "function": {
+            "name": "my_projects",
+            "description": "List projects the current authenticated user can access.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max projects to return."},
+                    "query": {"type": "string", "description": "Optional keyword filter."},
+                    "current_only": {
+                        "type": "boolean",
+                        "description": "If true, include only current projects.",
+                    },
+                },
+            },
+        },
+    },
+    "project_files_for_project": {
+        "type": "function",
+        "function": {
+            "name": "project_files_for_project",
+            "description": "List uploaded files attached to a project (metadata only; no file bytes).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "integer", "description": "Project id."},
+                    "limit": {"type": "integer", "description": "Max files to return."},
+                    "query": {"type": "string", "description": "Optional filename filter."},
+                },
+                "required": ["project_id"],
+            },
+        },
+    },
     "create_project_comment": {
         "type": "function",
         "function": {
@@ -3355,7 +3835,7 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "comment": {"type": "string", "description": "Comment text to store."},
                     "comment_type": {
                         "type": "string",
-                        "description": "Optional comment type label (e.g. meeting_note, assistant_note).",
+                        "description": "Optional comment type label (e.g. meeting_note, assistant_note). For client users this is stored as client_note.",
                     },
                     "person_id": {
                         "type": "integer",
@@ -3619,7 +4099,9 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
         if name in _WRITE_TOOL_NAMES:
             if user is None:
                 continue
-            if user.role in {UserRole.viewer, UserRole.client}:
+            if user.role == UserRole.viewer:
+                continue
+            if user.role == UserRole.client and name != "create_project_comment":
                 continue
         scope = _TOOL_SCOPES.get(name, ToolScope.staff)
         if _scope_error(scope, user) is None:

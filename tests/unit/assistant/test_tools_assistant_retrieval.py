@@ -4,7 +4,7 @@ import json
 
 from ispec.agent.models import AgentCommand, AgentRun, AgentStep
 from ispec.assistant.connect import get_assistant_session
-from ispec.assistant.models import SupportMessage, SupportSession
+from ispec.assistant.models import SupportMemory, SupportMemoryEvidence, SupportMessage, SupportSession
 from ispec.assistant.tools import run_tool
 from ispec.db.models import AuthUser, UserRole
 
@@ -233,3 +233,84 @@ def test_assistant_list_users_reports_linkage(tmp_path, db_session):
         assert item["linkage"]["projects"][0]["project_id"] == 123
         assert item["linkage"]["ui_routes"][0]["route"] == "ProjectDetail"
 
+
+def test_assistant_digest_tools_list_get_and_search(tmp_path, db_session):
+    assistant_db_path = tmp_path / "assistant.db"
+    digest_obj = {
+        "schema_version": 1,
+        "from_review_id": 10,
+        "to_review_id": 12,
+        "summary": "Recent chats include clustering discussion.",
+        "highlights": ["Project 1427 clustering"],
+        "followups": ["Add vector DB next"],
+        "sessions": [],
+    }
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        session = SupportSession(session_id="s1", user_id=None)
+        assistant_db.add(session)
+        assistant_db.flush()
+        message = SupportMessage(session_pk=session.id, role="assistant", content="Anchor message")
+        assistant_db.add(message)
+        assistant_db.flush()
+
+        digest = SupportMemory(
+            session_pk=None,
+            user_id=0,
+            kind="digest",
+            key="global",
+            value_json=json.dumps(digest_obj, ensure_ascii=False),
+        )
+        assistant_db.add(digest)
+        assistant_db.flush()
+        digest_id = int(digest.id)
+
+        assistant_db.add(
+            SupportMemoryEvidence(memory_id=digest_id, message_id=int(message.id), weight=1.0)
+        )
+        assistant_db.commit()
+        message_id = int(message.id)
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        list_payload = run_tool(
+            name="assistant_list_digests",
+            args={"limit": 10},
+            core_db=db_session,
+            assistant_db=assistant_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert list_payload["ok"] is True
+        listed_ids = [item["digest_id"] for item in list_payload["result"]["digests"]]
+        assert digest_id in listed_ids
+
+        get_payload = run_tool(
+            name="assistant_get_digest",
+            args={"digest_id": digest_id},
+            core_db=db_session,
+            assistant_db=assistant_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert get_payload["ok"] is True
+        result = get_payload["result"]
+        assert result["digest_id"] == digest_id
+        assert result["digest"]["summary"] == digest_obj["summary"]
+        assert message_id in result["evidence_message_ids"]
+
+        search_payload = run_tool(
+            name="assistant_search_digests",
+            args={"query": "clustering", "limit": 10},
+            core_db=db_session,
+            assistant_db=assistant_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert search_payload["ok"] is True
+        assert any(item.get("digest_id") == digest_id for item in search_payload["result"]["matches"])

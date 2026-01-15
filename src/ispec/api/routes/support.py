@@ -64,6 +64,12 @@ _COUNT_CURRENT_PROJECTS_RE = re.compile(
     r"|\b(?:projects?|prjs?|projs?)\s+(current|active|ongoing)\b",
     re.IGNORECASE,
 )
+_LIST_MY_PROJECTS_RE = re.compile(
+    r"\bmy\s+(?:projects?|prjs?|projs?)\b"
+    r"|\b(?:projects?|prjs?|projs?)\s+(?:can\s+i|do\s+i)\s+(?:view|see|access)\b"
+    r"|\b(?:what|which|show|list)\s+(?:projects?|prjs?|projs?)\b",
+    re.IGNORECASE,
+)
 
 
 def _policy_tool_for_message(message: str) -> str | None:
@@ -73,6 +79,8 @@ def _policy_tool_for_message(message: str) -> str | None:
             if _COUNT_CURRENT_PROJECTS_RE.search(message or "")
             else "count_all_projects"
         )
+    if _LIST_MY_PROJECTS_RE.search(message or ""):
+        return "my_projects"
     return None
 
 
@@ -333,6 +341,77 @@ def _openai_tool_choice_for_message(message: str) -> str | dict[str, Any] | None
     if not _EXPLICIT_TOOL_REQUEST_RE.search(message or ""):
         return None
     return "required"
+
+
+def _is_confirmation_reply(message: str | None) -> bool:
+    if not message:
+        return False
+    normalized = re.sub(r"[^\w\s]", "", message.strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+    if len(normalized) > 24:
+        return False
+    return normalized in {
+        "yes",
+        "y",
+        "yeah",
+        "yep",
+        "yup",
+        "ok",
+        "okay",
+        "sure",
+        "confirm",
+        "go ahead",
+        "do it",
+        "please do",
+        "please do it",
+        "no",
+        "n",
+        "nope",
+        "nah",
+    }
+
+
+def _is_affirmative_reply(message: str | None) -> bool:
+    if not message:
+        return False
+    normalized = re.sub(r"[^\w\s]", "", message.strip().lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
+    if len(normalized) > 24:
+        return False
+    return normalized in {
+        "yes",
+        "y",
+        "yeah",
+        "yep",
+        "yup",
+        "ok",
+        "okay",
+        "sure",
+        "confirm",
+        "go ahead",
+        "do it",
+        "please do",
+        "please do it",
+    }
+
+
+def _assistant_requested_project_history_save(message: str | None) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if "confirm" not in text:
+        return False
+    if not any(token in text for token in ("save", "log", "record", "add")):
+        return False
+    if not any(token in text for token in ("history", "comment", "note", "meeting")):
+        return False
+    if "project history" in text:
+        return True
+    return "project" in text
 
 
 def _load_state(raw: str | None) -> dict[str, Any]:
@@ -653,12 +732,15 @@ def chat(
     tool_router: dict[str, Any] | None = None
     tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
 
+    confirmation_reply = _is_confirmation_reply(payload.message)
+
     if (
         tool_protocol == "openai"
         and tools_enabled
         and isinstance(tool_schemas, list)
         and tool_schemas
         and _assistant_provider() == "vllm"
+        and not confirmation_reply
     ):
         available_tool_names = _openai_tool_names(tool_schemas)
         groups = tool_groups_for_available_tools(available_tool_names)
@@ -693,6 +775,15 @@ def chat(
                 if filtered:
                     tool_schemas = filtered
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
+    elif (
+        tool_protocol == "openai"
+        and tools_enabled
+        and isinstance(tool_schemas, list)
+        and tool_schemas
+        and _assistant_provider() == "vllm"
+        and confirmation_reply
+    ):
+        tool_router = {"ok": True, "skipped": True, "reason": "confirmation_reply"}
 
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
     openai_tool_names = _openai_tool_names(tool_schemas)
@@ -735,7 +826,7 @@ def chat(
             and row.content
         ]
 
-        ispec_context = build_ispec_context(core_db, message=payload.message, state=state)
+        ispec_context = build_ispec_context(core_db, message=payload.message, state=state, user=user)
         state_for_context = dict(state)
         for key in ("ui_route", "ui_project_id", "ui_experiment_id", "ui_experiment_run_id"):
             state_for_context.pop(key, None)
@@ -818,7 +909,27 @@ def chat(
     reply = None
     history_for_llm: list[dict[str, Any]] = []
     forced_tool_choice = _openai_tool_choice_for_message(payload.message) if tool_protocol == "openai" else None
+    if (
+        tool_protocol == "openai"
+        and confirmation_reply
+        and _is_affirmative_reply(payload.message)
+        and isinstance(focused_project_id, int)
+        and focused_project_id > 0
+        and "create_project_comment" in openai_tool_names
+    ):
+        last_assistant_text = next(
+            (
+                str(item.get("content") or "")
+                for item in reversed(history_payload)
+                if isinstance(item, dict) and item.get("role") == "assistant" and item.get("content")
+            ),
+            "",
+        )
+        if _assistant_requested_project_history_save(last_assistant_text):
+            forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
     policy_tool_name = _policy_tool_for_message(payload.message)
+    if policy_tool_name and policy_tool_name not in openai_no_arg_tool_names:
+        policy_tool_name = None
     llm_round = 0
 
     while True:
@@ -1166,7 +1277,15 @@ def chat(
     self_review_error: str | None = None
     self_review_mode: str | None = None
     self_review_decision: str | None = None
-    if _self_review_enabled() and compare_choices is None and final_reply.ok and assistant_content.strip():
+    should_self_review = (
+        _self_review_enabled()
+        and compare_choices is None
+        and final_reply.ok
+        and assistant_content.strip()
+    )
+    if should_self_review and used_tool_calls <= 0:
+        self_review_mode = "skipped_no_tool_calls"
+    elif should_self_review:
         self_review_mode = "rewrite"
 
         if _assistant_provider() == "vllm" and _self_review_decider_enabled():

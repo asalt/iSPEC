@@ -221,14 +221,21 @@ def insert_df_to_table(conn, table_name, df, column_definitions, _depth: int = 0
             import random
             df[constrained_col] = [random.choice(parent_ids) for _ in range(len(df))]
 
+    pk_cols = [col for col in table_cols if column_definitions[col].get("pk")]
+    skip_pk_int = bool(
+        len(pk_cols) == 1
+        and column_definitions.get(pk_cols[0], {}).get("sqltype", "").startswith("INTEGER")
+    )
+
+    if len(pk_cols) > 1 and not df.empty:
+        existing = [col for col in pk_cols if col in df.columns]
+        if existing:
+            df = df.drop_duplicates(subset=existing, keep="first")
+
     common_cols = [
         col
         for col in table_cols
-        if col in df.columns
-        and not (
-            column_definitions[col].get("pk")
-            and column_definitions[col].get("sqltype", "").startswith("INTEGER")
-        )
+        if col in df.columns and not (skip_pk_int and col in pk_cols)
     ]
 
     if not common_cols or df.empty:
@@ -236,8 +243,9 @@ def insert_df_to_table(conn, table_name, df, column_definitions, _depth: int = 0
         return
 
     placeholders = ", ".join([f":{c}" for c in common_cols])
+    insert_verb = "INSERT OR IGNORE" if len(pk_cols) > 1 else "INSERT"
     q = text(
-        f"INSERT INTO {table_name} ({', '.join(common_cols)}) VALUES ({placeholders})"
+        f"{insert_verb} INTO {table_name} ({', '.join(common_cols)}) VALUES ({placeholders})"
     )
     values = df[common_cols].to_dict(orient="records")
 
