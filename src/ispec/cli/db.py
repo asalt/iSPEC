@@ -380,6 +380,82 @@ def register_subcommands(subparsers):
         help="File extension(s) to skip (repeatable or comma-separated). Default: sqlite,rds",
     )
 
+    scaffold_import_script_parser = subparsers.add_parser(
+        "scaffold-import-script",
+        help="Generate a per-project bash import script (does not write to the DB).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--project-id",
+        dest="project_id",
+        type=int,
+        required=True,
+        help="Project id to embed in the generated script.",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--results-dir",
+        dest="results_dir",
+        required=True,
+        help="Default results directory path to embed in the script.",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--out",
+        dest="out",
+        help="Write the generated script to this path (file) or directory. Defaults to stdout.",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--mspc-id",
+        dest="mspc_id",
+        help="Optional MSPC identifier (used to suggest a script filename).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--tag",
+        help="Optional tag like Jan2026 (used to suggest a script filename).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--script-name",
+        dest="script_name",
+        help="Override the generated script filename (only used when --out is a directory).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--prefix",
+        help="Default prefix to embed in the script (defaults to results dir basename).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--include-ext",
+        dest="include_exts",
+        action="append",
+        default=None,
+        help="Default include extensions to embed (repeatable or comma-separated). Default: png,pdf,tsv,tab,gct",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--exclude-ext",
+        dest="exclude_exts",
+        action="append",
+        default=None,
+        help="Default exclude extensions to embed (repeatable or comma-separated). Default: sqlite,rds",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--with-gct-export",
+        dest="with_gct_export",
+        action="store_true",
+        help="Also include an optional GCT export import block (tries to auto-detect export/data_gct).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--gct-dir",
+        dest="gct_dir",
+        help="Explicit export/data_gct directory to embed (overrides auto-detection).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--prefix-gct",
+        dest="prefix_gct",
+        help="Default prefix for the GCT import block (defaults to <prefix>__export__data_gct).",
+    )
+    scaffold_import_script_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the output script if it already exists.",
+    )
+
     export_parser = subparsers.add_parser("export", help="Export table to CSV or JSON")
     export_parser.add_argument("--table-name", required=True, choices=("person", "project"))
     export_parser.add_argument("--file", required=True, help="Output file (CSV or JSON)")
@@ -726,6 +802,28 @@ def dispatch(args):
             exclude_exts=list(getattr(args, "exclude_exts", None) or []) or None,
         )
         logger.info("Project results import summary: %s", _compact_project_results_summary(summary))
+    elif args.subcommand == "scaffold-import-script":
+        from ispec.cli.scaffold_import_script import scaffold_import_results_script
+
+        result = scaffold_import_results_script(
+            project_id=int(getattr(args, "project_id")),
+            results_dir=str(getattr(args, "results_dir")),
+            out=getattr(args, "out", None),
+            mspc_id=getattr(args, "mspc_id", None),
+            tag=getattr(args, "tag", None),
+            script_name=getattr(args, "script_name", None),
+            prefix=getattr(args, "prefix", None),
+            include_ext=getattr(args, "include_exts", None),
+            exclude_ext=getattr(args, "exclude_exts", None),
+            with_gct_export=bool(getattr(args, "with_gct_export", False)),
+            gct_dir=getattr(args, "gct_dir", None),
+            prefix_gct=getattr(args, "prefix_gct", None),
+            force=bool(getattr(args, "force", False)),
+        )
+        if result.out_path is not None:
+            logger.info("Wrote import script: %s", result.out_path)
+        else:
+            print(result.content, end="")
     elif args.subcommand == "export":
         operations.export_table(args.table_name, args.file)
     elif args.subcommand == "init":
