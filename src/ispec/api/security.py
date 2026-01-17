@@ -18,6 +18,7 @@ Notes on password storage:
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import os
@@ -34,6 +35,22 @@ _API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 _BEARER = HTTPBearer(auto_error=False)
 
 _DEFAULT_SESSION_COOKIE = "ispec_session"
+
+@dataclass(frozen=True)
+class _ApiKeyServiceUser:
+    """Synthetic user for API-key-only assistant access.
+
+    This is intentionally read-only (viewer) and used to keep assistant tooling
+    and prompts in an "authenticated staff" posture without requiring a
+    cookie-backed browser session.
+    """
+
+    id: int = 0
+    username: str = "api_key"
+    role: UserRole = UserRole.viewer
+    is_active: bool = True
+    must_change_password: bool = False
+    can_write_project_comments: bool = False
 
 
 def _is_truthy(value: str | None) -> bool:
@@ -389,22 +406,42 @@ def require_assistant_access(
     """
 
     expected = _expected_api_key()
-    if expected is not None and (
-        provided_api_key is None or not secrets.compare_digest(provided_api_key, expected)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid API key.",
+    api_key_ok = expected is None
+    if expected is not None:
+        api_key_ok = bool(
+            provided_api_key is not None and secrets.compare_digest(provided_api_key, expected)
         )
+        if not api_key_ok:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing or invalid API key.",
+            )
 
     if not _require_login():
         request.state.user = None
         return None
 
+    # Prefer a cookie-backed user session when present.
     user = get_current_user(request, db)
     if user is None:
+        # In some environments (bots, local agents), we want API-key authenticated
+        # calls to assistant endpoints without requiring a cookie-backed session.
+        if (
+            api_key_ok
+            and expected is not None
+            and _is_truthy(os.getenv("ISPEC_ASSISTANT_ALLOW_API_KEY_ONLY"))
+        ):
+            user = _ApiKeyServiceUser(
+                can_write_project_comments=_is_truthy(
+                    os.getenv("ISPEC_ASSISTANT_ALLOW_API_KEY_WRITE_PROJECT_COMMENTS")
+                )
+            )
+            request.state.user = user
+            return user
+
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated.",
         )
 
     request.state.user = user

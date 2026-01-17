@@ -9,6 +9,7 @@ from ispec.api.security import (
     hash_password,
     require_user,
     require_access,
+    require_assistant_access,
     session_cookie_name,
     verify_password,
 )
@@ -147,3 +148,66 @@ def test_require_access_blocks_when_password_change_required(db_session, monkeyp
     with pytest.raises(HTTPException) as exc:
         require_access(request, db_session, provided_api_key=None)
     assert exc.value.status_code == 403
+
+
+def test_require_assistant_access_can_allow_api_key_only(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_REQUIRE_LOGIN", "1")
+    monkeypatch.setenv("ISPEC_API_KEY", "secret")
+    monkeypatch.setenv("ISPEC_ASSISTANT_ALLOW_API_KEY_ONLY", "1")
+
+    request = _make_request(method="POST", path="/api/support/chat")
+    user = require_assistant_access(request, db_session, provided_api_key="secret")
+    assert user is not None
+    assert getattr(user, "role", None) == UserRole.viewer
+    assert bool(getattr(user, "can_write_project_comments", False)) is False
+
+
+def test_require_assistant_access_can_allow_api_key_project_comment_writes(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_REQUIRE_LOGIN", "1")
+    monkeypatch.setenv("ISPEC_API_KEY", "secret")
+    monkeypatch.setenv("ISPEC_ASSISTANT_ALLOW_API_KEY_ONLY", "1")
+    monkeypatch.setenv("ISPEC_ASSISTANT_ALLOW_API_KEY_WRITE_PROJECT_COMMENTS", "1")
+
+    request = _make_request(method="POST", path="/api/support/chat")
+    user = require_assistant_access(request, db_session, provided_api_key="secret")
+    assert user is not None
+    assert getattr(user, "role", None) == UserRole.viewer
+    assert bool(getattr(user, "can_write_project_comments", False)) is True
+
+
+def test_require_assistant_access_prefers_cookie_user_over_api_key_only(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_REQUIRE_LOGIN", "1")
+    monkeypatch.setenv("ISPEC_API_KEY", "secret")
+    monkeypatch.setenv("ISPEC_ASSISTANT_ALLOW_API_KEY_ONLY", "1")
+
+    user = AuthUser(
+        username="editor",
+        password_hash="x",
+        password_salt="y",
+        password_iterations=1,
+        role=UserRole.editor,
+        is_active=True,
+        must_change_password=False,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    token = create_session(db_session, user=user)
+    cookie = f"{session_cookie_name()}={token}"
+    request = _make_request(method="POST", path="/api/support/chat", cookie=cookie)
+
+    resolved = require_assistant_access(request, db_session, provided_api_key="secret")
+    assert resolved is not None
+    assert getattr(resolved, "id", None) == user.id
+
+
+def test_require_assistant_access_requires_login_when_disabled(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_REQUIRE_LOGIN", "1")
+    monkeypatch.setenv("ISPEC_API_KEY", "secret")
+    monkeypatch.delenv("ISPEC_ASSISTANT_ALLOW_API_KEY_ONLY", raising=False)
+
+    request = _make_request(method="POST", path="/api/support/chat")
+    with pytest.raises(HTTPException) as exc:
+        require_assistant_access(request, db_session, provided_api_key="secret")
+    assert exc.value.status_code == 401

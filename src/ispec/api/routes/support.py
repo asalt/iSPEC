@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ispec.api.security import require_access, require_assistant_access
+from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY
 from ispec.agent.models import AgentCommand
 from ispec.assistant.context import build_ispec_context, extract_project_ids
@@ -182,6 +183,7 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=20_000)
     history: list[ChatHistoryItem] = Field(default_factory=list)
     ui: UIContext | None = None
+    meta: dict[str, Any] | None = None
 
 
 class ChatCompareChoice(BaseModel):
@@ -462,6 +464,7 @@ def _safe_int_from_state(value: Any) -> int | None:
 def _maybe_enqueue_session_compaction(
     *,
     assistant_db: Session,
+    agent_db: Session,
     session: SupportSession,
     state: dict[str, Any],
     triggered_by_message_id: int | None,
@@ -506,7 +509,7 @@ def _maybe_enqueue_session_compaction(
     if new_count < min_new_messages:
         return state, False
 
-    assistant_db.add(
+    agent_db.add(
         AgentCommand(
             command_type=COMMAND_COMPACT_SESSION_MEMORY,
             status="queued",
@@ -629,6 +632,7 @@ def chat(
     payload: ChatRequest,
     request: Request = None,
     assistant_db: Session = Depends(get_assistant_session_dep),
+    agent_db: Session = Depends(get_agent_session_dep),
     core_db: Session = Depends(get_session_dep),
     omics_db: Session = Depends(get_omics_session_dep),
     schedule_db: Session = Depends(get_schedule_session_dep),
@@ -714,7 +718,17 @@ def chat(
         session_pk=session.id,
         role="user",
         content=payload.message,
-        provider="frontend",
+        provider=(
+            "slack"
+            if isinstance(payload.meta, dict)
+            and str(payload.meta.get("source") or "").strip().lower() == "slack"
+            else "frontend"
+        ),
+        meta_json=(
+            json.dumps({"client_meta": payload.meta}, ensure_ascii=False)
+            if isinstance(payload.meta, dict) and payload.meta
+            else None
+        ),
     )
     assistant_db.add(user_message)
     session.updated_at = utcnow()
@@ -1441,12 +1455,16 @@ def chat(
             user_meta["ui"] = ui_payload
         if user is not None:
             user_meta["user"] = {"id": int(user.id), "username": user.username, "role": str(user.role)}
-        user_message.meta_json = json.dumps(user_meta, ensure_ascii=False)
+        user_message.meta_json = json.dumps(
+            {**_load_state(getattr(user_message, "meta_json", None)), **user_meta},
+            ensure_ascii=False,
+        )
         session.updated_at = utcnow()
         assistant_db.flush()
 
         state, enqueued = _maybe_enqueue_session_compaction(
             assistant_db=assistant_db,
+            agent_db=agent_db,
             session=session,
             state=state,
             triggered_by_message_id=int(user_message.id),
@@ -1481,6 +1499,7 @@ def chat(
 
     state, enqueued = _maybe_enqueue_session_compaction(
         assistant_db=assistant_db,
+        agent_db=agent_db,
         session=session,
         state=state,
         triggered_by_message_id=int(assistant_message.id),
@@ -1501,6 +1520,7 @@ def chat(
 def choose(
     payload: ChooseRequest,
     assistant_db: Session = Depends(get_assistant_session_dep),
+    agent_db: Session = Depends(get_agent_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ):
     session = (
@@ -1595,6 +1615,7 @@ def choose(
     state = _load_state(getattr(session, "state_json", None))
     state, enqueued = _maybe_enqueue_session_compaction(
         assistant_db=assistant_db,
+        agent_db=agent_db,
         session=session,
         state=state,
         triggered_by_message_id=int(assistant_message.id),
