@@ -286,6 +286,7 @@ def import_legacy_dump(
 
         record = {k: v for k, v in row.items() if str(k).startswith("ppl_")}
         record["id"] = person_id
+        record["ppl_LegacyPersonID"] = person_id
         added_by = record.get("ppl_AddedBy")
         if not (isinstance(added_by, str) and added_by.strip()):
             record["ppl_AddedBy"] = "legacy_import"

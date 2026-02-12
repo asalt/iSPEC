@@ -84,12 +84,14 @@ def test_sync_legacy_people_single_id_inserts_person(tmp_path, monkeypatch):
     with get_session(file_path=str(db_path)) as session:
         person = session.get(Person, 12)
         assert person is not None
+        assert person.ppl_LegacyPersonID == 12
         assert person.ppl_Name_First == "Alice"
         assert person.ppl_Name_Last == "Smith"
         assert person.ppl_Email == "alice@example.com"
         assert person.ppl_AddedBy == "legacy_import"
-        assert isinstance(person.ppl_CreationTS, datetime)
-        assert isinstance(person.ppl_ModificationTS, datetime)
+        assert person.ppl_CreationTS == datetime(2025, 9, 29, 11, 14, 33)
+        # Local modification timestamp remains app-managed (not copied from legacy).
+        assert person.ppl_ModificationTS != datetime(2025, 12, 5, 12, 16, 37)
 
         # Single-id sync should not advance the incremental cursor.
         assert session.query(LegacySyncState).count() == 0
@@ -123,6 +125,7 @@ def test_sync_legacy_people_backfills_missing_fields_on_conflict(tmp_path, monke
         session.add(
             Person(
                 id=12,
+                ppl_LegacyPersonID=12,
                 ppl_AddedBy="user",
                 ppl_LegacyImportTS=datetime(2026, 1, 1, 0, 0, 0),
                 ppl_ModificationTS=datetime(2026, 1, 2, 0, 0, 0),
@@ -179,9 +182,286 @@ def test_sync_legacy_people_backfills_missing_fields_on_conflict(tmp_path, monke
     with get_session(file_path=str(db_path)) as session:
         person = session.get(Person, 12)
         assert person is not None
+        assert person.ppl_LegacyPersonID == 12
         assert person.ppl_Name_First == "Local"
         assert person.ppl_Name_Last == "User"
         assert person.ppl_Email == "legacy@example.com"
+
+
+def test_sync_legacy_people_handles_pk_collision_with_local_person(tmp_path, monkeypatch):
+    db_path = tmp_path / "sync.db"
+    mapping_path = tmp_path / "mapping.json"
+
+    mapping_path.write_text(
+        json.dumps(
+            {
+                "tables": {
+                    "iSPEC_People": {
+                        "pk": {"legacy": "ppl_PPLRecNo", "local": "id"},
+                        "created_ts": "ppl_CreationTS",
+                        "modified_ts": "ppl_ModificationTS",
+                        "field_map": {
+                            "ppl_AddedBy": "ppl_AddedBy",
+                            "ppl_Name_First": "ppl_Name_First",
+                            "ppl_Name_Last": "ppl_Name_Last",
+                            "ppl_Email": "ppl_Email",
+                        },
+                    }
+                }
+            }
+        )
+    )
+
+    with get_session(file_path=str(db_path)) as session:
+        session.add(
+            Person(
+                id=1,
+                ppl_AddedBy="admin",
+                ppl_Name_First="iSPEC",
+                ppl_Name_Last="Assistant",
+            )
+        )
+
+    payload = {
+        "ok": True,
+        "table": "iSPEC_People",
+        "items": [
+            {
+                "ppl_PPLRecNo": 1,
+                "ppl_AddedBy": None,
+                "ppl_Name_First": "Anna",
+                "ppl_Name_Last": "Malovannaya",
+                "ppl_Email": "anna.malovannaya@bcm.edu",
+                "ppl_CreationTS": "2025-09-29 11:14:33",
+                "ppl_ModificationTS": "2025-12-05 12:16:37",
+            }
+        ],
+        "has_more": False,
+    }
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    def fake_get(url, params=None, headers=None, auth=None, timeout=None):
+        return DummyResponse()
+
+    from ispec.db import legacy_sync
+
+    monkeypatch.setattr(legacy_sync.requests, "get", fake_get)
+
+    summary = legacy_sync.sync_legacy_people(
+        legacy_url="http://legacy.example",
+        mapping_path=str(mapping_path),
+        db_file_path=str(db_path),
+        person_id=1,
+        dry_run=False,
+    )
+
+    assert summary["inserted"] == 1
+    assert summary["conflicted"] == 0
+
+    with get_session(file_path=str(db_path)) as session:
+        assistant = session.get(Person, 1)
+        assert assistant is not None
+        assert assistant.ppl_Name_First == "iSPEC"
+        assert assistant.ppl_Name_Last == "Assistant"
+        assert assistant.ppl_LegacyPersonID is None
+
+        imported = (
+            session.query(Person)
+            .filter(Person.ppl_LegacyPersonID == 1)
+            .one_or_none()
+        )
+        assert imported is not None
+        assert int(imported.id) != 1
+        assert imported.ppl_Name_First == "Anna"
+        assert imported.ppl_Name_Last == "Malovannaya"
+
+
+def test_sync_legacy_people_links_existing_local_person_by_name(tmp_path, monkeypatch):
+    db_path = tmp_path / "sync.db"
+    mapping_path = tmp_path / "mapping.json"
+
+    mapping_path.write_text(
+        json.dumps(
+            {
+                "tables": {
+                    "iSPEC_People": {
+                        "pk": {"legacy": "ppl_PPLRecNo", "local": "id"},
+                        "created_ts": "ppl_CreationTS",
+                        "modified_ts": "ppl_ModificationTS",
+                        "field_map": {
+                            "ppl_AddedBy": "ppl_AddedBy",
+                            "ppl_Name_First": "ppl_Name_First",
+                            "ppl_Name_Last": "ppl_Name_Last",
+                            "ppl_Email": "ppl_Email",
+                        },
+                    }
+                }
+            }
+        )
+    )
+
+    with get_session(file_path=str(db_path)) as session:
+        session.add(
+            Person(
+                id=42,
+                ppl_AddedBy="admin",
+                ppl_Name_First="Anna",
+                ppl_Name_Last="Malovannaya",
+                ppl_Email="anna.malovannaya@bcm.edu",
+            )
+        )
+
+    payload = {
+        "ok": True,
+        "table": "iSPEC_People",
+        "items": [
+            {
+                "ppl_PPLRecNo": 1,
+                "ppl_AddedBy": None,
+                "ppl_Name_First": "Anna",
+                "ppl_Name_Last": "Malovannaya",
+                "ppl_Email": "anna.malovannaya@bcm.edu",
+                "ppl_CreationTS": "2025-09-29 11:14:33",
+                "ppl_ModificationTS": "2025-12-05 12:16:37",
+            }
+        ],
+        "has_more": False,
+    }
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    def fake_get(url, params=None, headers=None, auth=None, timeout=None):
+        return DummyResponse()
+
+    from ispec.db import legacy_sync
+
+    monkeypatch.setattr(legacy_sync.requests, "get", fake_get)
+
+    summary = legacy_sync.sync_legacy_people(
+        legacy_url="http://legacy.example",
+        mapping_path=str(mapping_path),
+        db_file_path=str(db_path),
+        person_id=1,
+        dry_run=False,
+    )
+
+    assert summary["inserted"] == 0
+    assert summary["backfilled"] == 1
+    assert summary["conflicted"] == 0
+
+    with get_session(file_path=str(db_path)) as session:
+        linked = session.get(Person, 42)
+        assert linked is not None
+        assert linked.ppl_Name_First == "Anna"
+        assert linked.ppl_Name_Last == "Malovannaya"
+        assert linked.ppl_AddedBy == "admin"
+        assert linked.ppl_LegacyPersonID == 1
+
+
+def test_sync_legacy_people_links_existing_local_person_by_email(tmp_path, monkeypatch):
+    db_path = tmp_path / "sync.db"
+    mapping_path = tmp_path / "mapping.json"
+
+    mapping_path.write_text(
+        json.dumps(
+            {
+                "tables": {
+                    "iSPEC_People": {
+                        "pk": {"legacy": "ppl_PPLRecNo", "local": "id"},
+                        "created_ts": "ppl_CreationTS",
+                        "modified_ts": "ppl_ModificationTS",
+                        "field_map": {
+                            "ppl_AddedBy": "ppl_AddedBy",
+                            "ppl_Name_First": "ppl_Name_First",
+                            "ppl_Name_Last": "ppl_Name_Last",
+                            "ppl_Email": "ppl_Email",
+                        },
+                    }
+                }
+            }
+        )
+    )
+
+    with get_session(file_path=str(db_path)) as session:
+        session.add(
+            Person(
+                id=42,
+                ppl_AddedBy="admin",
+                ppl_Name_First="Charlie",
+                ppl_Name_Last="Cope",
+                ppl_Email="anna.malovannaya@bcm.edu",
+            )
+        )
+
+    payload = {
+        "ok": True,
+        "table": "iSPEC_People",
+        "items": [
+            {
+                "ppl_PPLRecNo": 1,
+                "ppl_AddedBy": None,
+                "ppl_Name_First": "Anna",
+                "ppl_Name_Last": "Malovannaya",
+                "ppl_Email": "anna.malovannaya@bcm.edu",
+                "ppl_CreationTS": "2025-09-29 11:14:33",
+                "ppl_ModificationTS": "2025-12-05 12:16:37",
+            }
+        ],
+        "has_more": False,
+    }
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    def fake_get(url, params=None, headers=None, auth=None, timeout=None):
+        return DummyResponse()
+
+    from ispec.db import legacy_sync
+
+    monkeypatch.setattr(legacy_sync.requests, "get", fake_get)
+
+    summary = legacy_sync.sync_legacy_people(
+        legacy_url="http://legacy.example",
+        mapping_path=str(mapping_path),
+        db_file_path=str(db_path),
+        person_id=1,
+        dry_run=False,
+    )
+
+    assert summary["inserted"] == 0
+    assert summary["backfilled"] == 1
+    assert summary["conflicted"] == 0
+
+    with get_session(file_path=str(db_path)) as session:
+        linked = session.get(Person, 42)
+        assert linked is not None
+        assert linked.ppl_Name_First == "Charlie"
+        assert linked.ppl_Name_Last == "Cope"
+        assert linked.ppl_Email == "anna.malovannaya@bcm.edu"
+        assert linked.ppl_LegacyPersonID == 1
+
+        mapped = (
+            session.query(Person)
+            .filter(Person.ppl_LegacyPersonID == 1)
+            .one_or_none()
+        )
+        assert mapped is not None
+        assert mapped.id == 42
 
 
 def test_sync_legacy_people_persists_incremental_cursor(tmp_path, monkeypatch):

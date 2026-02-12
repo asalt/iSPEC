@@ -75,8 +75,9 @@ def test_sync_legacy_projects_single_id_inserts_project(tmp_path, monkeypatch):
         assert project.prj_RnD is False
         assert project.prj_Current_FLAG is False
         assert project.prj_ProjectCostMinimum == 0
-        assert isinstance(project.prj_CreationTS, datetime)
-        assert isinstance(project.prj_ModificationTS, datetime)
+        assert project.prj_CreationTS == datetime(2025, 9, 29, 11, 14, 33)
+        # Local modification timestamp remains app-managed (not copied from legacy).
+        assert project.prj_ModificationTS != datetime(2025, 12, 5, 12, 16, 37)
 
         # Single-id sync should not advance the incremental cursor.
         assert session.query(LegacySyncState).count() == 0

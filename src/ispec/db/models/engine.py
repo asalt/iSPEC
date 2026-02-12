@@ -79,6 +79,7 @@ def sqlite_engine(db_path: str = "sqlite:///./example.db") -> Engine:
 def initialize_db(engine: Engine):
     Base.metadata.create_all(bind=engine)
     _ensure_project_type_column(engine)
+    _ensure_person_columns(engine)
     _ensure_project_comment_columns(engine)
     _ensure_legacy_import_tracking_columns(engine)
     _ensure_experiment_columns(engine)
@@ -113,6 +114,32 @@ def _ensure_project_type_column(engine: Engine) -> None:
         for column in missing:
             conn.execute(text(f'ALTER TABLE project ADD COLUMN "{column}" TEXT'))
     logger.info("Added missing columns project.%s", ", ".join(missing))
+
+
+def _ensure_person_columns(engine: Engine) -> None:
+    """Ensure legacy SQLite schemas include newer person columns/indexes."""
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("person")}
+    except Exception:
+        return
+
+    if "ppl_LegacyPersonID" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text('ALTER TABLE person ADD COLUMN "ppl_LegacyPersonID" INTEGER'))
+        logger.info("Added missing column person.ppl_LegacyPersonID")
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    'CREATE UNIQUE INDEX IF NOT EXISTS "ux_person_ppl_LegacyPersonID" '
+                    'ON person("ppl_LegacyPersonID")'
+                )
+            )
+    except Exception:
+        # Best effort for older/locked SQLite files.
+        pass
 
 
 def _ensure_project_comment_columns(engine: Engine) -> None:

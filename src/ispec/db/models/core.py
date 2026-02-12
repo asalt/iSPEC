@@ -17,6 +17,7 @@ class Person(PplTimestamp, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ppl_AddedBy: Mapped[str] = mapped_column(Text)
+    ppl_LegacyPersonID: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True)
     ppl_LegacyImportTS: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     ppl_Name_First: Mapped[str] = mapped_column(Text, nullable=False)

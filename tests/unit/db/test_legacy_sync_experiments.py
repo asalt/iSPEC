@@ -77,8 +77,9 @@ def test_sync_legacy_experiments_single_id_inserts_experiment(tmp_path, monkeypa
         assert exp.exp_DTT is False
         assert exp.exp_IAA is True
         assert exp.exp_Description == "Some description"
-        assert isinstance(exp.Experiment_CreationTS, datetime)
-        assert isinstance(exp.Experiment_ModificationTS, datetime)
+        assert exp.Experiment_CreationTS == datetime(2025, 9, 29, 11, 14, 33)
+        # Local modification timestamp remains app-managed (not copied from legacy).
+        assert exp.Experiment_ModificationTS != datetime(2025, 12, 5, 12, 16, 37)
 
         # Single-id sync should not advance the incremental cursor.
         assert session.query(LegacySyncState).count() == 0

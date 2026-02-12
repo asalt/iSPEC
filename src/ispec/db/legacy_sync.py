@@ -967,16 +967,22 @@ def _build_person_record(
         return None
 
     record: dict[str, Any] = {
-        "id": person_id,
+        "ppl_LegacyPersonID": person_id,
         "ppl_LegacyImportTS": imported_at,
     }
 
     for legacy_field, local_field in plan.field_map.items():
         if legacy_field not in item:
             continue
-        if local_field.endswith("_CreationTS") or local_field.endswith("_ModificationTS"):
+        # Keep local modification timestamps app-managed; preserve legacy creation.
+        if local_field.endswith("_ModificationTS"):
             continue
         record[local_field] = _coerce_model_field(Person, local_field, item.get(legacy_field))
+
+    if plan.legacy_created_field:
+        created_dt = _normalize_datetime(_coerce_datetime(item.get(plan.legacy_created_field)))
+        if created_dt is not None:
+            record["ppl_CreationTS"] = created_dt
 
     added_by = record.get("ppl_AddedBy")
     if not (isinstance(added_by, str) and added_by.strip()):
@@ -998,15 +1004,107 @@ def _build_person_record(
 def _apply_person_record(
     session,
     *,
-    person_id: int,
+    legacy_person_id: int,
     record: dict[str, Any],
     dry_run: bool,
     backfill_missing: bool,
 ) -> str:
-    existing = session.get(Person, person_id)
+    legacy_person_id = int(legacy_person_id)
+
+    def _person_name_matches(obj: Person, first: str, last: str) -> bool:
+        obj_first = str(getattr(obj, "ppl_Name_First", "") or "").strip().lower()
+        obj_last = str(getattr(obj, "ppl_Name_Last", "") or "").strip().lower()
+        return obj_first == first.strip().lower() and obj_last == last.strip().lower()
+
+    def _person_email_matches(obj: Person, email: str | None) -> bool:
+        if not isinstance(email, str) or not email.strip():
+            return False
+        obj_email = str(getattr(obj, "ppl_Email", "") or "").strip().lower()
+        return bool(obj_email) and obj_email == email.strip().lower()
+
+    mapping_linked = False
+    existing = (
+        session.query(Person)
+        .filter(Person.ppl_LegacyPersonID == legacy_person_id)
+        .one_or_none()
+    )
+
     if existing is None:
+        by_id = session.get(Person, legacy_person_id)
+        if by_id is not None:
+            linked_id = getattr(by_id, "ppl_LegacyPersonID", None)
+            row_name_ok = _person_name_matches(
+                by_id,
+                str(record.get("ppl_Name_First") or ""),
+                str(record.get("ppl_Name_Last") or ""),
+            )
+            row_email_ok = _person_email_matches(by_id, record.get("ppl_Email"))
+            if linked_id in {None, legacy_person_id} and (
+                _can_update_imported(
+                    obj=by_id,
+                    added_by_field="ppl_AddedBy",
+                    created_field="ppl_CreationTS",
+                    modified_field="ppl_ModificationTS",
+                    import_ts_field="ppl_LegacyImportTS",
+                )
+                or row_name_ok
+                or row_email_ok
+            ):
+                existing = by_id
+                if linked_id is None:
+                    if not dry_run:
+                        existing.ppl_LegacyPersonID = legacy_person_id
+                    mapping_linked = True
+
+    if existing is None:
+        email = str(record.get("ppl_Email") or "").strip()
+        if email:
+            email_matches = (
+                session.query(Person)
+                .filter(Person.ppl_Email.ilike(email))
+                .all()
+            )
+            valid_matches = [
+                row
+                for row in email_matches
+                if getattr(row, "ppl_LegacyPersonID", None) in {None, legacy_person_id}
+            ]
+            if len(valid_matches) == 1:
+                existing = valid_matches[0]
+                if getattr(existing, "ppl_LegacyPersonID", None) is None:
+                    if not dry_run:
+                        existing.ppl_LegacyPersonID = legacy_person_id
+                    mapping_linked = True
+
+    if existing is None:
+        first = str(record.get("ppl_Name_First") or "").strip()
+        last = str(record.get("ppl_Name_Last") or "").strip()
+        if first and last:
+            name_matches = (
+                session.query(Person)
+                .filter(Person.ppl_Name_First.ilike(first))
+                .filter(Person.ppl_Name_Last.ilike(last))
+                .all()
+            )
+            valid_matches = [
+                row
+                for row in name_matches
+                if getattr(row, "ppl_LegacyPersonID", None) in {None, legacy_person_id}
+            ]
+            if len(valid_matches) == 1:
+                existing = valid_matches[0]
+                if getattr(existing, "ppl_LegacyPersonID", None) is None:
+                    if not dry_run:
+                        existing.ppl_LegacyPersonID = legacy_person_id
+                    mapping_linked = True
+
+    if existing is None:
+        insert_record = dict(record)
+        # Preserve legacy IDs when available, but avoid collisions with local rows.
+        if session.get(Person, legacy_person_id) is None:
+            insert_record["id"] = legacy_person_id
         if not dry_run:
-            session.add(Person(**record))
+            session.add(Person(**insert_record))
         return "inserted"
 
     if _can_update_imported(
@@ -1025,7 +1123,7 @@ def _apply_person_record(
         return "updated"
 
     if not backfill_missing:
-        return "conflicted"
+        return "backfilled" if mapping_linked else "conflicted"
 
     changed = False
     for key, value in record.items():
@@ -1052,7 +1150,9 @@ def _apply_person_record(
             setattr(existing, key, value)
         changed = True
 
-    return "backfilled" if changed else "conflicted"
+    if changed or mapping_linked:
+        return "backfilled"
+    return "conflicted"
 
 
 def _build_project_record(
@@ -1078,11 +1178,15 @@ def _build_project_record(
     for legacy_field, local_field in plan.field_map.items():
         if legacy_field not in item:
             continue
-        # Local timestamp columns are managed by the app/DB; do not overwrite
-        # them with legacy values.
-        if local_field.endswith("_CreationTS") or local_field.endswith("_ModificationTS"):
+        # Keep local modification timestamps app-managed; preserve legacy creation.
+        if local_field.endswith("_ModificationTS"):
             continue
         record[local_field] = _coerce_model_field(Project, local_field, item.get(legacy_field))
+
+    if plan.legacy_created_field:
+        created_dt = _normalize_datetime(_coerce_datetime(item.get(plan.legacy_created_field)))
+        if created_dt is not None:
+            record["prj_CreationTS"] = created_dt
 
     added_by = record.get("prj_AddedBy")
     if not (isinstance(added_by, str) and added_by.strip()):
@@ -1147,9 +1251,15 @@ def _build_experiment_record(
             continue
         if local_field not in model_columns:
             continue
-        if local_field.endswith("_CreationTS") or local_field.endswith("_ModificationTS"):
+        # Keep local modification timestamps app-managed; preserve legacy creation.
+        if local_field.endswith("_ModificationTS"):
             continue
         record[local_field] = _coerce_model_field(Experiment, local_field, item.get(legacy_field))
+
+    if plan.legacy_created_field:
+        created_dt = _normalize_datetime(_coerce_datetime(item.get(plan.legacy_created_field)))
+        if created_dt is not None:
+            record["Experiment_CreationTS"] = created_dt
 
     if "exp_LabelFLAG" in record and record["exp_LabelFLAG"] is None:
         record["exp_LabelFLAG"] = 0
@@ -1257,6 +1367,11 @@ def _build_experiment_run_record(
         if local_field not in model_columns:
             continue
         record[local_field] = _coerce_model_field(ExperimentRun, local_field, item.get(legacy_field))
+
+    if plan.legacy_created_field and "ExperimentRun_CreationTS" in model_columns:
+        created_dt = _normalize_datetime(_coerce_datetime(item.get(plan.legacy_created_field)))
+        if created_dt is not None:
+            record["ExperimentRun_CreationTS"] = created_dt
 
     exp_id = record.get("experiment_id")
     run_no = record.get("run_no")
@@ -1812,7 +1927,7 @@ def sync_legacy_people(
                 legacy_person_id, record, item_modified_dt = built
                 outcome = _apply_person_record(
                     session,
-                    person_id=legacy_person_id,
+                    legacy_person_id=legacy_person_id,
                     record=record,
                     dry_run=dry_run,
                     backfill_missing=backfill_missing,
