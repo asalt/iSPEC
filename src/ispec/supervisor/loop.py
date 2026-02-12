@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import psutil
 import requests
@@ -19,11 +20,14 @@ from ispec.agent.connect import get_agent_db_uri, get_agent_session
 from ispec.agent.commands import (
     COMMAND_COMPACT_SESSION_MEMORY,
     COMMAND_BUILD_SUPPORT_DIGEST,
+    COMMAND_LEGACY_SYNC_ALL,
     COMMAND_ORCHESTRATOR_TICK,
     COMMAND_REVIEW_REPO,
     COMMAND_REVIEW_SUPPORT_SESSION,
+    COMMAND_SLACK_POST_MESSAGE,
 )
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
+from ispec.agent.policies.primitives.backoff import backoff_exponential_current
 from ispec.assistant.compaction import distill_conversation_memory
 from ispec.assistant.connect import get_assistant_db_uri, get_assistant_session
 from ispec.assistant.models import (
@@ -71,17 +75,116 @@ def _truncate_text(value: str | None, *, limit: int = 400) -> str:
     return text[: limit - 1] + "…"
 
 
+def _summarize_command_payload(command_type: str, payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict) or not payload:
+        return ""
+
+    parts: list[str] = []
+    session_id = payload.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        parts.append(f"session_id={session_id.strip()}")
+
+    target_message_id = payload.get("target_message_id")
+    if isinstance(target_message_id, int) and target_message_id > 0:
+        parts.append(f"target_message_id={target_message_id}")
+
+    project_id = payload.get("project_id")
+    if isinstance(project_id, int) and project_id > 0:
+        parts.append(f"project_id={project_id}")
+
+    schedule = payload.get("schedule")
+    if isinstance(schedule, dict):
+        schedule_name = schedule.get("name")
+        if isinstance(schedule_name, str) and schedule_name.strip():
+            parts.append(f"schedule={schedule_name.strip()}")
+        schedule_key = schedule.get("key")
+        if isinstance(schedule_key, str) and schedule_key.strip():
+            parts.append(f"schedule_key={schedule_key.strip()}")
+
+    channel = payload.get("channel")
+    if isinstance(channel, str) and channel.strip():
+        parts.append(f"channel={channel.strip()}")
+
+    return " ".join(parts[:6])
+
+
 def _parse_json_object(text: str | None) -> dict[str, Any] | None:
     if not text:
         return None
     raw = str(text).strip()
     if not raw:
         return None
+    def maybe_repair(candidate: str) -> dict[str, Any] | None:
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            pass
+
+        # Some models miss a final closing brace/bracket. Attempt a tiny repair
+        # pass that only appends closers when strings are properly terminated.
+        stack: list[str] = []
+        in_string = False
+        escape = False
+        for ch in candidate:
+            if in_string:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == "\"":
+                    in_string = False
+                continue
+
+            if ch == "\"":
+                in_string = True
+                continue
+
+            if ch in "{[":
+                stack.append(ch)
+                continue
+
+            if ch in "}]":
+                if not stack:
+                    continue
+                opener = stack[-1]
+                if (ch == "}" and opener == "{") or (ch == "]" and opener == "["):
+                    stack.pop()
+                continue
+
+        if in_string or not stack:
+            return None
+
+        closers: list[str] = []
+        while stack and len(closers) < 8:
+            opener = stack.pop()
+            closers.append("}" if opener == "{" else "]")
+
+        repaired = candidate + "".join(closers)
+        try:
+            parsed = json.loads(repaired)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
     try:
         parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else None
+        if isinstance(parsed, dict):
+            return parsed
+        # Some guided decoding responses arrive as a JSON string that itself
+        # contains a serialized object (escaped quotes). Attempt one more pass.
+        if isinstance(parsed, str):
+            inner = parsed.strip()
+            if inner.startswith("{") and inner.endswith("}"):
+                repaired = maybe_repair(inner)
+                if repaired is not None:
+                    return repaired
     except Exception:
-        pass
+        repaired = maybe_repair(raw)
+        if repaired is not None:
+            return repaired
 
     start = raw.find("{")
     end = raw.rfind("}")
@@ -89,8 +192,22 @@ def _parse_json_object(text: str | None) -> dict[str, Any] | None:
         return None
     try:
         parsed = json.loads(raw[start : end + 1])
-        return parsed if isinstance(parsed, dict) else None
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            inner = parsed.strip()
+            if inner.startswith("{") and inner.endswith("}"):
+                repaired = maybe_repair(inner)
+                if repaired is not None:
+                    return repaired
+        repaired = maybe_repair(raw[start : end + 1])
+        if repaired is not None:
+            return repaired
+        return None
     except Exception:
+        repaired = maybe_repair(raw[start : end + 1])
+        if repaired is not None:
+            return repaired
         return None
 
 
@@ -319,6 +436,56 @@ def _safe_int(value: Any) -> int | None:
     return None
 
 
+def _clamp_float(value: float, *, min_value: float, max_value: float) -> float:
+    if value < min_value:
+        return min_value
+    if value > max_value:
+        return max_value
+    return value
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _structured_llm_temperature(task: str, *, default: float) -> float:
+    global_default = _safe_float(os.getenv("ISPEC_SUPERVISOR_STRUCTURED_TEMPERATURE"))
+    value = _safe_float(os.getenv(f"ISPEC_SUPERVISOR_{task}_TEMPERATURE"))
+    if value is None:
+        value = global_default if global_default is not None else float(default)
+    return _clamp_float(float(value), min_value=0.0, max_value=2.0)
+
+
+def _structured_llm_repair_temperature(task: str, *, default: float) -> float:
+    global_default = _safe_float(os.getenv("ISPEC_SUPERVISOR_STRUCTURED_REPAIR_TEMPERATURE"))
+    value = _safe_float(os.getenv(f"ISPEC_SUPERVISOR_{task}_REPAIR_TEMPERATURE"))
+    if value is None:
+        value = global_default if global_default is not None else float(default)
+    return _clamp_float(float(value), min_value=0.0, max_value=2.0)
+
+
+def _structured_llm_max_repairs(task: str, *, default: int) -> int:
+    global_default = _safe_int(os.getenv("ISPEC_SUPERVISOR_STRUCTURED_MAX_REPAIR_ATTEMPTS"))
+    value = _safe_int(os.getenv(f"ISPEC_SUPERVISOR_{task}_MAX_REPAIR_ATTEMPTS"))
+    if value is None:
+        value = global_default if global_default is not None else int(default)
+    return _clamp_int(int(value), min_value=0, max_value=3)
+
+
 def _scalar_row_int(row: Any) -> int:
     if row is None:
         return 0
@@ -357,6 +524,7 @@ class CommandExecution:
     error: str | None = None
     prompt: dict[str, Any] | None = None
     response: dict[str, Any] | None = None
+    defer_seconds: int | None = None
 
 
 def _claim_next_command(*, agent_id: str, run_id: str) -> ClaimedCommand | None:
@@ -406,6 +574,33 @@ def _finish_command(
             return
         cmd.status = "succeeded" if ok else "failed"
         cmd.ended_at = now
+        cmd.updated_at = now
+        cmd.error = error
+        if result is not None:
+            cmd.result_json = dict(result)
+        db.commit()
+
+
+def _defer_command(
+    *,
+    command_id: int,
+    delay_seconds: int,
+    result: dict[str, Any] | None,
+    error: str | None,
+) -> None:
+    now = utcnow()
+    available_at = now + timedelta(seconds=max(1, int(delay_seconds)))
+    with get_agent_session() as db:
+        cmd = db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+        if cmd is None:
+            return
+        cmd.status = "queued"
+        cmd.available_at = available_at
+        cmd.claimed_at = None
+        cmd.claimed_by_agent_id = None
+        cmd.claimed_by_run_id = None
+        cmd.started_at = None
+        cmd.ended_at = None
         cmd.updated_at = now
         cmd.error = error
         if result is not None:
@@ -517,6 +712,18 @@ def _compact_session_memory(payload: dict[str, Any]) -> tuple[bool, dict[str, An
             .order_by(SupportMessage.id.asc())
             .all()
         )
+        if not rows:
+            return (
+                False,
+                {
+                    "ok": False,
+                    "error": "Support messages not available for compaction yet.",
+                    "session_id": session.session_id,
+                    "memory_up_to_id": memory_up_to_id,
+                    "target_id": target_id,
+                },
+                "messages_not_ready",
+            )
         previous_memory = state.get("conversation_memory") if isinstance(state.get("conversation_memory"), dict) else None
         messages = [
             {"id": int(row.id), "role": row.role, "content": row.content}
@@ -670,6 +877,7 @@ _SUPPORT_DIGEST_VERSION = 1
 _REPO_REVIEW_VERSION = 1
 _ORCHESTRATOR_DEFAULT_BASE_SECONDS = 60
 _ORCHESTRATOR_BACKOFF_MAX_EXP = 6
+_SCHEDULER_STATE_VERSION = 1
 
 
 def _orchestrator_enabled() -> bool:
@@ -729,17 +937,27 @@ def _orchestrator_idle_backoff_seconds(*, base_seconds: int, idle_streak: int) -
     consecutive idle tick.
     """
 
-    if idle_streak <= 1:
-        return int(base_seconds)
-    exp = min(_ORCHESTRATOR_BACKOFF_MAX_EXP, int(idle_streak) - 1)
-    return int(base_seconds) * (2**exp)
+    return int(
+        backoff_exponential_current(
+            int(idle_streak),
+            base_seconds=float(base_seconds),
+            start_step=1,
+            max_exp=int(_ORCHESTRATOR_BACKOFF_MAX_EXP),
+        )
+    )
 
 
 def _orchestrator_error_backoff_seconds(*, base_seconds: int, error_streak: int) -> int:
     """Exponential backoff for invalid orchestrator outputs."""
 
-    exp = min(_ORCHESTRATOR_BACKOFF_MAX_EXP, max(0, int(error_streak)))
-    return int(base_seconds) * (2**exp)
+    return int(
+        backoff_exponential_current(
+            max(0, int(error_streak)),
+            base_seconds=float(base_seconds),
+            start_step=0,
+            max_exp=int(_ORCHESTRATOR_BACKOFF_MAX_EXP),
+        )
+    )
 
 
 def _load_orchestrator_state(run: AgentRun) -> dict[str, Any]:
@@ -764,6 +982,28 @@ def _save_orchestrator_state(*, run: AgentRun, state: dict[str, Any]) -> None:
     summary = run.summary_json if isinstance(run.summary_json, dict) else {}
     summary = dict(summary)
     summary["orchestrator"] = dict(state)
+    run.summary_json = summary
+    flag_modified(run, "summary_json")
+
+
+def _load_scheduler_state(run: AgentRun) -> dict[str, Any]:
+    summary = run.summary_json if isinstance(run.summary_json, dict) else {}
+    state = summary.get("scheduler")
+    if not isinstance(state, dict):
+        state = {}
+    if int(state.get("schema_version") or 0) != _SCHEDULER_STATE_VERSION:
+        state = {"schema_version": _SCHEDULER_STATE_VERSION}
+    if not isinstance(state.get("slack"), dict):
+        state["slack"] = {}
+    if not isinstance(state.get("legacy_sync"), dict):
+        state["legacy_sync"] = {}
+    return state
+
+
+def _save_scheduler_state(*, run: AgentRun, state: dict[str, Any]) -> None:
+    summary = run.summary_json if isinstance(run.summary_json, dict) else {}
+    summary = dict(summary)
+    summary["scheduler"] = dict(state)
     run.summary_json = summary
     flag_modified(run, "summary_json")
 
@@ -947,7 +1187,9 @@ def _orchestrator_system_prompt(*, max_commands: int) -> str:
         "- If any sessions are marked as needing review, enqueue a support-session review command for the most recently updated session.",
         "- If unsure, enqueue nothing and schedule the next tick later.",
         "- Always include a short 'thoughts' string explaining your choice.",
-        "- Return ONLY JSON that matches the schema.",
+        "- Do NOT copy or repeat the input context JSON.",
+        "- Return ONLY a JSON object with keys: schema_version, thoughts, next_tick_seconds, commands.",
+        "- The response must be small (no transcripts, no context echo).",
         "",
         f"Max commands this tick: {max_commands}.",
     ]
@@ -1093,11 +1335,19 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
     with get_assistant_session() as assistant_db:
         assistant_snapshot = _assistant_snapshot(assistant_db=assistant_db)
 
+    prompt_snapshot: dict[str, Any] = dict(assistant_snapshot or {})
+    # The orchestrator only needs a tiny slice of assistant state. Keeping the
+    # prompt small also prevents "echo the input JSON" failures that can be
+    # truncated by max_tokens and become invalid JSON.
+    prompt_snapshot.pop("recent_sessions", None)
+    if isinstance(prompt_snapshot.get("sessions_needing_review"), list):
+        prompt_snapshot["sessions_needing_review"] = prompt_snapshot["sessions_needing_review"][:3]
+
     context = {
         "schema_version": 1,
         "agent": {"agent_id": agent_id, "run_id": run_id, "command_id": int(command_id)},
         "orchestrator": state_for_prompt,
-        "assistant": assistant_snapshot,
+        "assistant": prompt_snapshot,
         "requested": dict(payload or {}),
     }
 
@@ -1119,6 +1369,16 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
         max_tick_seconds=max_tick,
         max_commands=max_commands,
     )
+
+    llm_invalid = validated is None
+    if validated is None:
+        # Recover from invalid model output by continuing with a safe default.
+        validated = {
+            "schema_version": _ORCHESTRATOR_DECISION_VERSION,
+            "thoughts": "",
+            "next_tick_seconds": int(min_tick),
+            "commands": [],
+        }
 
     sessions_needing_review = assistant_snapshot.get("sessions_needing_review") if isinstance(assistant_snapshot, dict) else None
     if not isinstance(sessions_needing_review, list):
@@ -1194,8 +1454,8 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
             )
 
         requested_tick_seconds = int(validated.get("next_tick_seconds") or min_tick)
-        tick_reason = "model"
-        new_error_streak = 0
+        tick_reason = "model" if not llm_invalid else "invalid_output_backoff"
+        new_error_streak = 0 if not llm_invalid else prev_error_streak + 1
         new_idle_streak = 0 if scheduled else prev_idle_streak + 1
         tick_seconds = requested_tick_seconds
 
@@ -1206,13 +1466,19 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
             tick_seconds = min(requested_tick_seconds, base_tick)
             tick_reason = "work"
         else:
-            tick_seconds = max(
-                requested_tick_seconds,
-                _orchestrator_idle_backoff_seconds(
-                    base_seconds=base_tick, idle_streak=new_idle_streak
-                ),
-            )
-            tick_reason = "idle_backoff"
+            if llm_invalid:
+                tick_seconds = _orchestrator_error_backoff_seconds(
+                    base_seconds=base_tick, error_streak=new_error_streak
+                )
+                tick_reason = "invalid_output_backoff"
+            else:
+                tick_seconds = max(
+                    requested_tick_seconds,
+                    _orchestrator_idle_backoff_seconds(
+                        base_seconds=base_tick, idle_streak=new_idle_streak
+                    ),
+                )
+                tick_reason = "idle_backoff"
         tick_seconds = _clamp_int(int(tick_seconds), min_value=min_tick, max_value=max_tick)
         scheduled_tick_id = _schedule_orchestrator_tick(
             delay_seconds=tick_seconds,
@@ -1244,56 +1510,20 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
                 "scheduled": scheduled,
                 "scheduled_tick_command_id": scheduled_tick_id,
                 "assistant_snapshot": assistant_snapshot,
+                "severity": "warning" if llm_invalid else "info",
                 "llm": {
                     "provider": reply.provider,
                     "model": reply.model,
                     "ok": bool(reply.ok),
                     "meta": reply.meta,
+                    "invalid_output_recovered": bool(llm_invalid),
                 },
             },
             prompt={"messages": messages, "guided_json": schema},
-            response={"raw": reply.content, "parsed": parsed, "validated": validated},
+            response={"raw": reply.content, "parsed": parsed, "validated": validated, "llm_invalid": llm_invalid},
         )
 
-    # Fallback: exponential backoff when router output is invalid.
-    with get_agent_session() as agent_db:
-        run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
-        state = _load_orchestrator_state(run)
-        new_error_streak = prev_error_streak + 1
-        state["error_streak"] = int(new_error_streak)
-        backoff = _orchestrator_error_backoff_seconds(
-            base_seconds=base_tick, error_streak=new_error_streak
-        )
-        tick_seconds = _clamp_int(int(backoff), min_value=min_tick, max_value=max_tick)
-        scheduled_tick_id = _schedule_orchestrator_tick(delay_seconds=tick_seconds, current_command_id=command_id)
-        state["next_tick_seconds"] = int(tick_seconds)
-        state["next_tick_command_id"] = scheduled_tick_id
-        state["next_tick_reason"] = "invalid_output_backoff"
-        state["base_tick_seconds"] = int(base_tick)
-        state["requested_tick_seconds"] = 0
-        _save_orchestrator_state(run=run, state=state)
-        agent_db.commit()
-
-    return CommandExecution(
-        ok=False,
-        result={
-            "ok": False,
-            "error": "Invalid orchestrator decision output.",
-            "assistant_snapshot": assistant_snapshot,
-            "scheduled_tick_seconds": tick_seconds,
-            "scheduled_tick_command_id": scheduled_tick_id,
-            "llm": {
-                "provider": reply.provider,
-                "model": reply.model,
-                "ok": bool(reply.ok),
-                "meta": reply.meta,
-                "raw": _truncate_text(reply.content, limit=800),
-            },
-        },
-        error="invalid_orchestrator_output",
-        prompt={"messages": messages, "guided_json": schema},
-        response={"raw": reply.content, "parsed": parsed},
-    )
+    raise RuntimeError("Orchestrator reached an unexpected state.")
 
 
 def _session_review_schema() -> dict[str, Any]:
@@ -1350,7 +1580,24 @@ def _session_review_system_prompt() -> str:
             "You review a single support session transcript and write internal notes.",
             "Focus on: missed tool opportunities, incorrect claims, confusing UX guidance, bugs, and follow-ups.",
             "Do NOT call tools. Do NOT write anything user-facing.",
-            "Return ONLY JSON that matches the schema.",
+            "Return ONLY a JSON object that matches the schema.",
+            "Required top-level keys: schema_version, session_id, target_message_id, summary, issues, repo_search_queries, followups.",
+            "- schema_version must be 1.",
+            "- Do not wrap output in review/review_notes/notes; return the object directly.",
+            "- Do not use markdown fences or quote the JSON.",
+        ]
+    ).strip()
+
+
+def _session_review_repair_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are repairing a previous invalid JSON response for an iSPEC session review.",
+            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
+            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
+            "Required top-level keys: schema_version, session_id, target_message_id, summary, issues, repo_search_queries, followups.",
+            "The object MUST look like:",
+            '{"schema_version":1,"session_id":"...","target_message_id":123,"summary":"...","issues":[],"repo_search_queries":[],"followups":[]}',
         ]
     ).strip()
 
@@ -1367,70 +1614,151 @@ def _coerce_session_review_output(
     if int(parsed.get("schema_version") or 0) == _SESSION_REVIEW_VERSION:
         return parsed
 
-    review = parsed.get("review")
-    if not isinstance(review, dict):
-        return None
+    def normalize_issue(raw_issue: Any) -> dict[str, Any] | None:
+        if not isinstance(raw_issue, dict):
+            return None
+        severity = str(raw_issue.get("severity") or "").strip().lower()
+        if severity not in {"info", "warning", "error"}:
+            severity = "info"
+        category = str(raw_issue.get("category") or "").strip().lower()
+        if category not in {"tool_use", "accuracy", "ux", "bug", "data", "security", "other"}:
+            category = "other"
+        description = raw_issue.get("description")
+        if not isinstance(description, str) or not description.strip():
+            description = raw_issue.get("message")
+        if not isinstance(description, str) or not description.strip():
+            description = raw_issue.get("text")
+        if not isinstance(description, str) or not description.strip():
+            return None
 
-    issues: list[dict[str, Any]] = []
+        issue: dict[str, Any] = {
+            "severity": severity,
+            "category": category,
+            "description": _truncate_text(description, limit=400),
+        }
 
-    def add_issue_list(key: str, *, category: str, severity: str) -> None:
-        raw_items = review.get(key)
-        if isinstance(raw_items, str) and raw_items.strip():
-            raw_items = [raw_items]
-        if not isinstance(raw_items, list):
-            return
-        for item in raw_items:
-            if not isinstance(item, str):
-                continue
-            text = item.strip()
-            if not text:
-                continue
-            issues.append(
-                {
-                    "severity": severity,
-                    "category": category,
-                    "description": _truncate_text(text, limit=400),
-                }
+        evidence_ids: list[int] = []
+        raw_evidence = raw_issue.get("evidence_message_ids")
+        if raw_evidence is None:
+            raw_evidence = raw_issue.get("evidence")
+        if isinstance(raw_evidence, list):
+            for item in raw_evidence[:10]:
+                value = _safe_int(item)
+                if value is not None and value > 0:
+                    evidence_ids.append(int(value))
+        if evidence_ids:
+            issue["evidence_message_ids"] = evidence_ids
+
+        suggested_fix = raw_issue.get("suggested_fix")
+        if suggested_fix is None:
+            suggested_fix = raw_issue.get("fix")
+        if isinstance(suggested_fix, str) and suggested_fix.strip():
+            issue["suggested_fix"] = _truncate_text(suggested_fix, limit=400)
+        return issue
+
+    def normalize_review_dict(review: dict[str, Any]) -> dict[str, Any]:
+        summary = ""
+        if isinstance(review.get("summary"), str):
+            summary = _truncate_text(review.get("summary"), limit=2000)
+        if not summary and isinstance(review.get("review_summary"), str):
+            summary = _truncate_text(review.get("review_summary"), limit=2000)
+
+        issues: list[dict[str, Any]] = []
+        raw_issues = review.get("issues")
+        if isinstance(raw_issues, list):
+            for item in raw_issues[:20]:
+                normalized = normalize_issue(item)
+                if normalized is not None:
+                    issues.append(normalized)
+
+        def add_issue_list(key: str, *, category: str, severity: str) -> None:
+            raw_items = review.get(key)
+            if isinstance(raw_items, str) and raw_items.strip():
+                raw_items = [raw_items]
+            if not isinstance(raw_items, list):
+                return
+            for item in raw_items:
+                if not isinstance(item, str):
+                    continue
+                text = item.strip()
+                if not text:
+                    continue
+                issues.append(
+                    {
+                        "severity": severity,
+                        "category": category,
+                        "description": _truncate_text(text, limit=400),
+                    }
+                )
+
+        if not issues:
+            add_issue_list("missed_tool_opportunities", category="tool_use", severity="info")
+            add_issue_list("incorrect_claims", category="accuracy", severity="warning")
+            add_issue_list("confusing_UX_guidance", category="ux", severity="info")
+            add_issue_list("bugs", category="bug", severity="warning")
+
+        followups: list[str] = []
+        raw_followups = review.get("followups")
+        if raw_followups is None:
+            raw_followups = review.get("follow-ups")
+        if isinstance(raw_followups, str) and raw_followups.strip():
+            raw_followups = [raw_followups]
+        if isinstance(raw_followups, list):
+            for item in raw_followups[:20]:
+                if not isinstance(item, str):
+                    continue
+                text = item.strip()
+                if not text:
+                    continue
+                followups.append(_truncate_text(text, limit=240))
+
+        repo_queries: list[str] = []
+        raw_queries = review.get("repo_search_queries")
+        if raw_queries is None:
+            raw_queries = review.get("repo_search_query")
+        if raw_queries is None:
+            raw_queries = review.get("repo_search")
+        if isinstance(raw_queries, str) and raw_queries.strip():
+            raw_queries = [raw_queries]
+        if isinstance(raw_queries, list):
+            for item in raw_queries[:10]:
+                if not isinstance(item, str):
+                    continue
+                text = item.strip()
+                if not text:
+                    continue
+                repo_queries.append(_truncate_text(text, limit=120))
+
+        if not summary:
+            summary = _truncate_text(
+                f"Auto-parsed review ({len(issues)} issues, {len(followups)} followups).",
+                limit=2000,
             )
 
-    add_issue_list("missed_tool_opportunities", category="tool_use", severity="info")
-    add_issue_list("incorrect_claims", category="accuracy", severity="warning")
-    add_issue_list("confusing_UX_guidance", category="ux", severity="info")
-    add_issue_list("bugs", category="bug", severity="warning")
+        return {
+            "schema_version": _SESSION_REVIEW_VERSION,
+            "session_id": session_id,
+            "target_message_id": int(target_message_id),
+            "summary": summary,
+            "issues": issues[:20],
+            "repo_search_queries": repo_queries[:10],
+            "followups": followups[:20],
+        }
 
-    followups: list[str] = []
-    raw_followups = review.get("followups")
-    if raw_followups is None:
-        raw_followups = review.get("follow-ups")
-    if isinstance(raw_followups, str) and raw_followups.strip():
-        raw_followups = [raw_followups]
-    if isinstance(raw_followups, list):
-        for item in raw_followups:
-            if not isinstance(item, str):
-                continue
-            text = item.strip()
-            if not text:
-                continue
-            followups.append(_truncate_text(text, limit=240))
+    # Some models produce a top-level "review_notes" object or omit the
+    # schema_version entirely. Accept a small set of variants and coerce them.
+    review: dict[str, Any] | None = None
+    for key in ("review", "review_notes", "notes", "review_note"):
+        candidate = parsed.get(key)
+        if isinstance(candidate, dict):
+            review = candidate
+            break
+    if review is None:
+        review = parsed
 
-    summary = ""
-    if isinstance(review.get("summary"), str):
-        summary = _truncate_text(review.get("summary"), limit=2000)
-    if not summary:
-        summary = _truncate_text(
-            f"Auto-parsed review ({len(issues)} issues, {len(followups)} followups).",
-            limit=2000,
-        )
-
-    return {
-        "schema_version": _SESSION_REVIEW_VERSION,
-        "session_id": session_id,
-        "target_message_id": int(target_message_id),
-        "summary": summary,
-        "issues": issues[:20],
-        "repo_search_queries": [],
-        "followups": followups[:20],
-    }
+    if not isinstance(review, dict):
+        return None
+    return normalize_review_dict(review)
 
 
 def _run_support_session_review(
@@ -1587,17 +1915,63 @@ def _run_support_session_review(
             {"role": "system", "content": _session_review_system_prompt()},
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
         ]
-        reply = generate_reply(
-            messages=messages,
-            tools=None,
-            vllm_extra_body={"guided_json": schema, "temperature": 0, "max_tokens": 1200},
-        )
+        temperature = _structured_llm_temperature("SESSION_REVIEW", default=0.0)
+        repair_temperature = _structured_llm_repair_temperature("SESSION_REVIEW", default=0.25)
+        max_repairs = _structured_llm_max_repairs("SESSION_REVIEW", default=1)
+
+        vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
+        reply = generate_reply(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+
+        attempts: list[dict[str, Any]] = []
         parsed = _parse_json_object(reply.content)
         coerced = _coerce_session_review_output(
             parsed if isinstance(parsed, dict) else None,
             session_id=session.session_id,
             target_message_id=int(target_id),
         )
+        attempts.append(
+            {
+                "attempt": 1,
+                "temperature": float(temperature),
+                "raw": reply.content,
+                "parsed": parsed,
+                "coerced": coerced,
+                "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+            }
+        )
+
+        recovered = False
+        if (not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _SESSION_REVIEW_VERSION) and (
+            max_repairs > 0
+        ):
+            repair_messages = [
+                {"role": "system", "content": _session_review_repair_system_prompt()},
+                {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
+            ]
+            repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
+            repair_reply = generate_reply(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+            parsed2 = _parse_json_object(repair_reply.content)
+            coerced2 = _coerce_session_review_output(
+                parsed2 if isinstance(parsed2, dict) else None,
+                session_id=session.session_id,
+                target_message_id=int(target_id),
+            )
+            attempts.append(
+                {
+                    "attempt": 2,
+                    "temperature": float(repair_temperature),
+                    "raw": repair_reply.content,
+                    "parsed": parsed2,
+                    "coerced": coerced2,
+                    "llm": {"provider": repair_reply.provider, "model": repair_reply.model, "meta": repair_reply.meta},
+                }
+            )
+            if isinstance(coerced2, dict) and int(coerced2.get("schema_version") or 0) == _SESSION_REVIEW_VERSION:
+                reply = repair_reply
+                parsed = parsed2
+                coerced = coerced2
+                recovered = True
+
         if not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _SESSION_REVIEW_VERSION:
             return CommandExecution(
                 ok=False,
@@ -1605,11 +1979,12 @@ def _run_support_session_review(
                     "ok": False,
                     "error": "Invalid review output.",
                     "raw": _truncate_text(reply.content, limit=1200),
+                    "attempts": len(attempts),
                     "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
                 },
                 error="invalid_review_output",
-                prompt={"messages": messages, "guided_json": schema},
-                response={"raw": reply.content, "parsed": parsed, "coerced": coerced},
+                prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+                response={"attempts": attempts},
             )
 
         record = (
@@ -1640,10 +2015,16 @@ def _run_support_session_review(
                 "session_id": session.session_id,
                 "target_message_id": target_id,
                 "review": coerced,
-                "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+                "llm": {
+                    "provider": reply.provider,
+                    "model": reply.model,
+                    "meta": reply.meta,
+                    "invalid_output_recovered": bool(recovered),
+                    "attempts": len(attempts),
+                },
             },
-            prompt={"messages": messages, "guided_json": schema},
-            response={"raw": reply.content, "parsed": parsed, "coerced": coerced},
+            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            response={"attempts": attempts},
         )
 
 
@@ -1720,7 +2101,23 @@ def _support_digest_system_prompt() -> str:
             "- Focus on user goals, notable issues, and actionable follow-ups.",
             "- Do not add new facts; only summarize the provided review items.",
             "- Do not call tools.",
-            "- Return ONLY JSON that matches the schema.",
+            "- Return ONLY a JSON object that matches the schema.",
+            "- Required top-level keys: schema_version, from_review_id, to_review_id, summary, highlights, followups, sessions.",
+            "- schema_version must be 1.",
+            "- Do not use markdown fences or quote the JSON.",
+        ]
+    ).strip()
+
+
+def _support_digest_repair_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are repairing a previous invalid JSON response for an iSPEC support digest.",
+            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
+            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
+            "Required top-level keys: schema_version, from_review_id, to_review_id, summary, highlights, followups, sessions.",
+            "The object MUST look like:",
+            '{"schema_version":1,"from_review_id":0,"to_review_id":0,"summary":"...","highlights":[],"followups":[],"sessions":[]}',
         ]
     ).strip()
 
@@ -1733,16 +2130,30 @@ def _coerce_support_digest_output(
 ) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         return None
-    if int(parsed.get("schema_version") or 0) != _SUPPORT_DIGEST_VERSION:
+
+    digest: dict[str, Any] | None = None
+    for key in ("digest", "report", "summary_notes"):
+        candidate = parsed.get(key)
+        if isinstance(candidate, dict):
+            digest = candidate
+            break
+    if digest is None:
+        digest = parsed
+
+    if not isinstance(digest, dict):
         return None
 
-    summary = parsed.get("summary") if isinstance(parsed.get("summary"), str) else ""
+    expected_keys = {"summary", "highlights", "followups", "sessions", "from_review_id", "to_review_id"}
+    if not any(key in digest for key in expected_keys):
+        return None
+
+    summary = digest.get("summary") if isinstance(digest.get("summary"), str) else ""
     summary = _truncate_text(summary, limit=2000)
     if not summary:
         summary = _truncate_text("Support digest generated.", limit=2000)
 
     highlights: list[str] = []
-    raw_highlights = parsed.get("highlights")
+    raw_highlights = digest.get("highlights")
     if isinstance(raw_highlights, list):
         for item in raw_highlights:
             if not isinstance(item, str):
@@ -1753,7 +2164,7 @@ def _coerce_support_digest_output(
             highlights.append(_truncate_text(text, limit=240))
 
     followups: list[str] = []
-    raw_followups = parsed.get("followups")
+    raw_followups = digest.get("followups")
     if isinstance(raw_followups, str) and raw_followups.strip():
         raw_followups = [raw_followups]
     if isinstance(raw_followups, list):
@@ -1766,7 +2177,7 @@ def _coerce_support_digest_output(
             followups.append(_truncate_text(text, limit=240))
 
     sessions: list[dict[str, Any]] = []
-    raw_sessions = parsed.get("sessions")
+    raw_sessions = digest.get("sessions")
     if isinstance(raw_sessions, list):
         for item in raw_sessions:
             if not isinstance(item, dict):
@@ -1903,17 +2314,61 @@ def _run_support_digest(
         {"role": "system", "content": _support_digest_system_prompt()},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
-    reply = generate_reply(
-        messages=messages,
-        tools=None,
-        vllm_extra_body={"guided_json": schema, "temperature": 0, "max_tokens": 1200},
-    )
+    temperature = _structured_llm_temperature("SUPPORT_DIGEST", default=0.0)
+    repair_temperature = _structured_llm_repair_temperature("SUPPORT_DIGEST", default=0.25)
+    max_repairs = _structured_llm_max_repairs("SUPPORT_DIGEST", default=1)
+
+    vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
+    reply = generate_reply(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+
+    attempts: list[dict[str, Any]] = []
     parsed = _parse_json_object(reply.content)
     coerced = _coerce_support_digest_output(
         parsed if isinstance(parsed, dict) else None,
         from_review_id=from_review_id,
         to_review_id=to_review_id,
     )
+    attempts.append(
+        {
+            "attempt": 1,
+            "temperature": float(temperature),
+            "raw": reply.content,
+            "parsed": parsed,
+            "coerced": coerced,
+            "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+        }
+    )
+
+    recovered = False
+    if not isinstance(coerced, dict) and max_repairs > 0:
+        repair_messages = [
+            {"role": "system", "content": _support_digest_repair_system_prompt()},
+            {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
+        ]
+        repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
+        repair_reply = generate_reply(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        parsed2 = _parse_json_object(repair_reply.content)
+        coerced2 = _coerce_support_digest_output(
+            parsed2 if isinstance(parsed2, dict) else None,
+            from_review_id=from_review_id,
+            to_review_id=to_review_id,
+        )
+        attempts.append(
+            {
+                "attempt": 2,
+                "temperature": float(repair_temperature),
+                "raw": repair_reply.content,
+                "parsed": parsed2,
+                "coerced": coerced2,
+                "llm": {"provider": repair_reply.provider, "model": repair_reply.model, "meta": repair_reply.meta},
+            }
+        )
+        if isinstance(coerced2, dict):
+            reply = repair_reply
+            parsed = parsed2
+            coerced = coerced2
+            recovered = True
+
     if not isinstance(coerced, dict):
         return CommandExecution(
             ok=False,
@@ -1924,11 +2379,12 @@ def _run_support_digest(
                 "from_review_id": from_review_id,
                 "to_review_id": to_review_id,
                 "raw": _truncate_text(reply.content, limit=1200),
+                "attempts": len(attempts),
                 "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
             },
             error="invalid_digest_output",
-            prompt={"messages": messages, "guided_json": schema},
-            response={"raw": reply.content, "parsed": parsed},
+            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            response={"attempts": attempts},
         )
 
     digest_id: int | None = None
@@ -1976,10 +2432,16 @@ def _run_support_digest(
             "to_review_id": to_review_id,
             "review_count": len(review_items),
             "digest": coerced,
-            "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+            "llm": {
+                "provider": reply.provider,
+                "model": reply.model,
+                "meta": reply.meta,
+                "invalid_output_recovered": bool(recovered),
+                "attempts": len(attempts),
+            },
         },
-        prompt={"messages": messages, "guided_json": schema},
-        response={"raw": reply.content, "parsed": parsed, "coerced": coerced},
+        prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+        response={"attempts": attempts},
     )
 
 
@@ -2044,7 +2506,23 @@ def _repo_review_system_prompt() -> str:
             "You are given a small set of code snippets and grep matches from the repo.",
             "Produce an internal review report with actionable recommendations.",
             "Do NOT invent files or line numbers; reference only what is provided.",
-            "Return ONLY JSON that matches the schema.",
+            "Return ONLY a JSON object that matches the schema.",
+            "Required top-level keys: schema_version, summary, findings, next_steps.",
+            "- schema_version must be 1.",
+            "- Do not use markdown fences or quote the JSON.",
+        ]
+    ).strip()
+
+
+def _repo_review_repair_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are repairing a previous invalid JSON response for an iSPEC repo review.",
+            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
+            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
+            "Required top-level keys: schema_version, summary, findings, next_steps.",
+            "The object MUST look like:",
+            '{"schema_version":1,"summary":"...","findings":[],"next_steps":[]}',
         ]
     ).strip()
 
@@ -2311,13 +2789,55 @@ def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> 
         {"role": "system", "content": _repo_review_system_prompt()},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
-    reply = generate_reply(
-        messages=messages,
-        tools=None,
-        vllm_extra_body={"guided_json": schema, "temperature": 0, "max_tokens": 1200},
-    )
+    temperature = _structured_llm_temperature("REPO_REVIEW", default=0.0)
+    repair_temperature = _structured_llm_repair_temperature("REPO_REVIEW", default=0.25)
+    max_repairs = _structured_llm_max_repairs("REPO_REVIEW", default=1)
+
+    vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
+    reply = generate_reply(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+
+    attempts: list[dict[str, Any]] = []
     parsed = _parse_json_object(reply.content)
     coerced = _coerce_repo_review_output(parsed if isinstance(parsed, dict) else None)
+    attempts.append(
+        {
+            "attempt": 1,
+            "temperature": float(temperature),
+            "raw": reply.content,
+            "parsed": parsed,
+            "coerced": coerced,
+            "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+        }
+    )
+
+    recovered = False
+    if (not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _REPO_REVIEW_VERSION) and (
+        max_repairs > 0
+    ):
+        repair_messages = [
+            {"role": "system", "content": _repo_review_repair_system_prompt()},
+            {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
+        ]
+        repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
+        repair_reply = generate_reply(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        parsed2 = _parse_json_object(repair_reply.content)
+        coerced2 = _coerce_repo_review_output(parsed2 if isinstance(parsed2, dict) else None)
+        attempts.append(
+            {
+                "attempt": 2,
+                "temperature": float(repair_temperature),
+                "raw": repair_reply.content,
+                "parsed": parsed2,
+                "coerced": coerced2,
+                "llm": {"provider": repair_reply.provider, "model": repair_reply.model, "meta": repair_reply.meta},
+            }
+        )
+        if isinstance(coerced2, dict) and int(coerced2.get("schema_version") or 0) == _REPO_REVIEW_VERSION:
+            reply = repair_reply
+            parsed = parsed2
+            coerced = coerced2
+            recovered = True
+
     if not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _REPO_REVIEW_VERSION:
         return CommandExecution(
             ok=False,
@@ -2329,11 +2849,12 @@ def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> 
                 "queries": queries,
                 "matches": snippets,
                 "raw": _truncate_text(reply.content, limit=1200),
+                "attempts": len(attempts),
                 "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
             },
             error="invalid_repo_review_output",
-            prompt={"messages": messages, "guided_json": schema},
-            response={"raw": reply.content, "parsed": parsed, "coerced": coerced},
+            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            response={"attempts": attempts},
         )
 
     return CommandExecution(
@@ -2345,11 +2866,639 @@ def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> 
             "queries": queries,
             "matches": snippets,
             "review": coerced,
-            "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+            "llm": {
+                "provider": reply.provider,
+                "model": reply.model,
+                "meta": reply.meta,
+                "invalid_output_recovered": bool(recovered),
+                "attempts": len(attempts),
+            },
         },
-        prompt={"messages": messages, "guided_json": schema},
-        response={"raw": reply.content, "parsed": parsed, "coerced": coerced},
+        prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+        response={"attempts": attempts},
     )
+
+
+def _looks_like_slack_channel_id(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    return raw[0] in {"C", "G"} and len(raw) >= 6
+
+
+def _slack_bot_token() -> str:
+    return (os.getenv("ISPEC_SLACK_BOT_TOKEN") or os.getenv("SLACK_BOT_TOKEN") or "").strip()
+
+
+def _slack_timeout_seconds() -> float:
+    raw = (os.getenv("ISPEC_SLACK_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return 10.0
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 10.0
+
+
+def _slack_api_call(
+    *,
+    token: str,
+    endpoint: str,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    resp = requests.post(
+        f"https://slack.com/api/{endpoint.lstrip('/')}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        json=payload,
+        timeout=max(1.0, float(timeout_seconds)),
+    )
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def _run_slack_post_message(payload: dict[str, Any]) -> CommandExecution:
+    token = _slack_bot_token()
+    if not token:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing ISPEC_SLACK_BOT_TOKEN/SLACK_BOT_TOKEN."},
+            error="missing_slack_token",
+        )
+
+    channel = str(payload.get("channel") or "").strip()
+    text = str(payload.get("text") or "").strip()
+    thread_ts = str(payload.get("thread_ts") or "").strip() or None
+    if not channel:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing channel."},
+            error="missing_channel",
+        )
+    if not text:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing text."},
+            error="missing_text",
+        )
+
+    timeout_seconds = _slack_timeout_seconds()
+    message_payload: dict[str, Any] = {"channel": channel, "text": text}
+    if thread_ts:
+        message_payload["thread_ts"] = thread_ts
+
+    slack_response = _slack_api_call(
+        token=token,
+        endpoint="chat.postMessage",
+        payload=message_payload,
+        timeout_seconds=timeout_seconds,
+    )
+    if slack_response.get("ok") is not True:
+        error = str(slack_response.get("error") or "").strip() or "unknown_error"
+        if error == "not_in_channel" and _looks_like_slack_channel_id(channel):
+            join_response = _slack_api_call(
+                token=token,
+                endpoint="conversations.join",
+                payload={"channel": channel},
+                timeout_seconds=timeout_seconds,
+            )
+            if join_response.get("ok") is True:
+                slack_response = _slack_api_call(
+                    token=token,
+                    endpoint="chat.postMessage",
+                    payload=message_payload,
+                    timeout_seconds=timeout_seconds,
+                )
+            if slack_response.get("ok") is not True:
+                error = str(slack_response.get("error") or "").strip() or error
+
+        return CommandExecution(
+            ok=False,
+            result={
+                "ok": False,
+                "error": error,
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "slack": slack_response,
+            },
+            error=f"slack_error:{error}",
+        )
+
+    return CommandExecution(
+        ok=True,
+        result={
+            "ok": True,
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "slack": slack_response,
+        },
+    )
+
+
+_WEEKDAY_ALIASES: dict[str, int] = {
+    "mon": 0,
+    "monday": 0,
+    "tue": 1,
+    "tues": 1,
+    "tuesday": 1,
+    "wed": 2,
+    "wednesday": 2,
+    "thu": 3,
+    "thur": 3,
+    "thurs": 3,
+    "thursday": 3,
+    "fri": 4,
+    "friday": 4,
+    "sat": 5,
+    "saturday": 5,
+    "sun": 6,
+    "sunday": 6,
+}
+
+
+@dataclass(frozen=True)
+class SlackSchedule:
+    name: str
+    weekday: int
+    hour: int
+    minute: int
+    timezone: str
+    channel: str
+    text: str
+    grace_seconds: int = 0
+    priority: int = 0
+    max_attempts: int = 1
+    enabled: bool = True
+
+
+def _parse_weekday(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= 6 else None
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    if raw.isdigit():
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return None
+        return parsed if 0 <= parsed <= 6 else None
+    return _WEEKDAY_ALIASES.get(raw)
+
+
+def _parse_hhmm(value: Any) -> tuple[int, int] | None:
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if ":" not in raw:
+        return None
+    left, right = raw.split(":", 1)
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+        return None
+    try:
+        hour = int(left)
+        minute = int(right)
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def _load_slack_schedule_json() -> list[dict[str, Any]]:
+    path = (os.getenv("ISPEC_SLACK_SCHEDULE_PATH") or "").strip()
+    raw = ""
+    if path:
+        try:
+            raw = Path(path).expanduser().read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed reading ISPEC_SLACK_SCHEDULE_PATH=%s (%s)", path, exc)
+            return []
+    else:
+        raw = (os.getenv("ISPEC_SLACK_SCHEDULE_JSON") or "").strip()
+
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        logger.warning("Invalid ISPEC_SLACK_SCHEDULE_JSON (%s)", exc)
+        return []
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return []
+    return [row for row in parsed if isinstance(row, dict)]
+
+
+def _load_slack_schedules() -> list[SlackSchedule]:
+    default_timezone = (os.getenv("ISPEC_SLACK_DEFAULT_TIMEZONE") or "").strip() or "UTC"
+    schedules: list[SlackSchedule] = []
+    seen: set[str] = set()
+    for row in _load_slack_schedule_json():
+        name = str(row.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        weekday = _parse_weekday(row.get("weekday"))
+        hhmm = _parse_hhmm(row.get("time"))
+        channel = str(row.get("channel") or "").strip()
+        text = str(row.get("text") or "").strip()
+        if weekday is None or hhmm is None or not channel or not text:
+            continue
+        hour, minute = hhmm
+        timezone = str(row.get("timezone") or "").strip() or default_timezone
+        grace_seconds = _safe_int(row.get("grace_seconds")) or 0
+        grace_seconds = _clamp_int(grace_seconds, min_value=0, max_value=3600)
+        priority = _safe_int(row.get("priority")) or 0
+        priority = _clamp_int(priority, min_value=-10, max_value=10)
+        max_attempts = _safe_int(row.get("max_attempts")) or 1
+        max_attempts = _clamp_int(max_attempts, min_value=1, max_value=10)
+        enabled = row.get("enabled")
+        if isinstance(enabled, str):
+            enabled = _is_truthy(enabled)
+        enabled = bool(enabled) if enabled is not None else True
+        schedules.append(
+            SlackSchedule(
+                name=name,
+                weekday=int(weekday),
+                hour=int(hour),
+                minute=int(minute),
+                timezone=timezone,
+                channel=channel,
+                text=text,
+                grace_seconds=int(grace_seconds),
+                priority=int(priority),
+                max_attempts=int(max_attempts),
+                enabled=enabled,
+            )
+        )
+        seen.add(name)
+    return schedules
+
+
+def _slack_schedule_next_occurrence(
+    *,
+    now: datetime,
+    schedule: SlackSchedule,
+) -> tuple[datetime, datetime, str]:
+    tz_name = schedule.timezone or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = UTC
+        tz_name = "UTC"
+
+    now_local = now.astimezone(tz)
+    days_ahead = (int(schedule.weekday) - int(now_local.weekday())) % 7
+    candidate_local = (now_local + timedelta(days=days_ahead)).replace(
+        hour=int(schedule.hour),
+        minute=int(schedule.minute),
+        second=0,
+        microsecond=0,
+    )
+
+    available_at = candidate_local
+    if days_ahead == 0 and candidate_local <= now_local:
+        if schedule.grace_seconds > 0 and now_local <= candidate_local + timedelta(seconds=int(schedule.grace_seconds)):
+            available_at = now
+        else:
+            candidate_local = candidate_local + timedelta(days=7)
+            available_at = candidate_local
+
+    occurrence_utc = candidate_local.astimezone(UTC)
+    available_at_utc = available_at.astimezone(UTC)
+    key = f"{schedule.name}:{occurrence_utc.isoformat()}"
+    return occurrence_utc, available_at_utc, key
+
+
+def _ensure_slack_scheduled_commands(*, agent_id: str, run_id: str) -> dict[str, Any]:
+    schedules = [s for s in _load_slack_schedules() if s.enabled]
+    if not schedules:
+        return {"ok": True, "scheduled": 0, "skipped": 0}
+
+    now = utcnow()
+    scheduled_count = 0
+    skipped = 0
+    with get_agent_session() as db:
+        run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+        scheduler_state = _load_scheduler_state(run)
+        slack_state = scheduler_state.get("slack")
+        if not isinstance(slack_state, dict):
+            slack_state = {}
+
+        existing_keys: set[str] = set()
+        existing_rows = (
+            db.query(AgentCommand)
+            .filter(AgentCommand.command_type == COMMAND_SLACK_POST_MESSAGE)
+            .filter(AgentCommand.status.in_(["queued", "running"]))
+            .all()
+        )
+        for row in existing_rows:
+            payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+            schedule_payload = payload.get("schedule") if isinstance(payload, dict) else None
+            if not isinstance(schedule_payload, dict):
+                continue
+            key = str(schedule_payload.get("key") or "").strip()
+            if key:
+                existing_keys.add(key)
+
+        dirty = False
+        for schedule in schedules:
+            occurrence_utc, available_at_utc, key = _slack_schedule_next_occurrence(now=now, schedule=schedule)
+            existing = slack_state.get(schedule.name)
+            schedule_state = existing if isinstance(existing, dict) else {}
+            if str(schedule_state.get("last_attempted_key") or "").strip() == key:
+                skipped += 1
+                continue
+            if key in existing_keys:
+                skipped += 1
+                continue
+
+            cmd = AgentCommand(
+                command_type=COMMAND_SLACK_POST_MESSAGE,
+                status="queued",
+                priority=int(schedule.priority),
+                created_at=now,
+                updated_at=now,
+                available_at=available_at_utc,
+                attempts=0,
+                max_attempts=int(schedule.max_attempts),
+                payload_json={
+                    "channel": schedule.channel,
+                    "text": schedule.text,
+                    "schedule": {
+                        "name": schedule.name,
+                        "key": key,
+                        "occurrence_utc": occurrence_utc.isoformat(),
+                        "timezone": schedule.timezone,
+                        "weekday": schedule.weekday,
+                        "time": f"{schedule.hour:02d}:{schedule.minute:02d}",
+                    },
+                    "meta": {"enqueued_by": "supervisor", "agent_id": agent_id, "run_id": run_id},
+                },
+                result_json={},
+            )
+            db.add(cmd)
+            db.flush()
+            existing_keys.add(key)
+            scheduled_count += 1
+            dirty = True
+
+            slack_state[schedule.name] = {
+                **schedule_state,
+                "next_enqueued_key": key,
+                "next_enqueued_at": now.isoformat(),
+                "next_command_id": int(cmd.id),
+                "next_occurrence_utc": occurrence_utc.isoformat(),
+                "next_available_at_utc": available_at_utc.isoformat(),
+            }
+
+        if dirty:
+            scheduler_state["slack"] = slack_state
+            _save_scheduler_state(run=run, state=scheduler_state)
+            db.commit()
+
+    return {"ok": True, "scheduled": scheduled_count, "skipped": skipped}
+
+
+def _record_slack_schedule_attempt(
+    *,
+    run: AgentRun,
+    payload: dict[str, Any],
+    execution: CommandExecution,
+    ended_at: datetime,
+) -> None:
+    schedule = payload.get("schedule")
+    if not isinstance(schedule, dict):
+        return
+    name = str(schedule.get("name") or "").strip()
+    key = str(schedule.get("key") or "").strip()
+    if not name or not key:
+        return
+
+    scheduler_state = _load_scheduler_state(run)
+    slack_state = scheduler_state.get("slack")
+    if not isinstance(slack_state, dict):
+        slack_state = {}
+
+    existing = slack_state.get(name)
+    schedule_state = existing if isinstance(existing, dict) else {}
+    schedule_state = dict(schedule_state)
+    schedule_state["last_attempted_key"] = key
+    schedule_state["last_attempted_at"] = ended_at.isoformat()
+    schedule_state["last_attempted_ok"] = bool(execution.ok)
+    if execution.ok:
+        schedule_state["last_sent_key"] = key
+        schedule_state["last_sent_at"] = ended_at.isoformat()
+    else:
+        schedule_state["last_attempted_error"] = execution.error
+
+    next_key = str(schedule_state.get("next_enqueued_key") or "").strip()
+    if next_key == key:
+        schedule_state.pop("next_enqueued_key", None)
+        schedule_state.pop("next_enqueued_at", None)
+        schedule_state.pop("next_command_id", None)
+        schedule_state.pop("next_occurrence_utc", None)
+        schedule_state.pop("next_available_at_utc", None)
+
+    slack_state[name] = schedule_state
+    scheduler_state["slack"] = slack_state
+    _save_scheduler_state(run=run, state=scheduler_state)
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        normalized = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def _legacy_sync_enabled() -> bool:
+    return _is_truthy(os.getenv("ISPEC_LEGACY_SYNC_ENABLED"))
+
+
+def _legacy_sync_interval_seconds() -> int:
+    raw = (os.getenv("ISPEC_LEGACY_SYNC_INTERVAL_SECONDS") or "").strip()
+    if not raw:
+        return 3600
+    parsed = _safe_int(raw)
+    if parsed is None:
+        return 3600
+    return _clamp_int(int(parsed), min_value=60, max_value=7 * 24 * 3600)
+
+
+def _legacy_sync_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[str, Any], int]:
+    interval_seconds = _legacy_sync_interval_seconds()
+    limit = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_LIMIT")) or 1000
+    max_pages = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_PAGES"))
+    if max_pages is not None and max_pages <= 0:
+        max_pages = None
+    max_project_comments = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_PROJECT_COMMENTS")) or 25
+    max_experiment_runs = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_EXPERIMENT_RUNS")) or 25
+    backfill_missing_env = os.getenv("ISPEC_LEGACY_SYNC_BACKFILL_MISSING")
+    backfill_missing = True if backfill_missing_env is None else _is_truthy(backfill_missing_env)
+
+    payload: dict[str, Any] = {
+        "limit": int(limit),
+        "max_pages": int(max_pages) if isinstance(max_pages, int) else None,
+        "backfill_missing": bool(backfill_missing),
+        "max_project_comments": int(max_project_comments),
+        "max_experiment_runs": int(max_experiment_runs),
+        "meta": {"enqueued_by": "supervisor", "agent_id": agent_id, "run_id": run_id},
+    }
+    return payload, interval_seconds
+
+
+def _ensure_legacy_sync_scheduled_commands(*, agent_id: str, run_id: str) -> dict[str, Any]:
+    if not _legacy_sync_enabled():
+        return {"ok": True, "disabled": True}
+
+    now = utcnow()
+    payload, interval_seconds = _legacy_sync_payload_from_env(agent_id=agent_id, run_id=run_id)
+    max_attempts = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_ATTEMPTS")) or 1
+    max_attempts = _clamp_int(int(max_attempts), min_value=1, max_value=10)
+
+    with get_agent_session() as db:
+        run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+        scheduler_state = _load_scheduler_state(run)
+        legacy_state = scheduler_state.get("legacy_sync")
+        if not isinstance(legacy_state, dict):
+            legacy_state = {}
+        legacy_state = dict(legacy_state)
+
+        existing = (
+            db.query(AgentCommand.id)
+            .filter(AgentCommand.command_type == COMMAND_LEGACY_SYNC_ALL)
+            .filter(AgentCommand.status.in_(["queued", "running"]))
+            .first()
+        )
+        if existing is not None:
+            return {"ok": True, "scheduled": 0, "skipped": 1, "reason": "already_enqueued"}
+
+        last_attempted_at = _parse_iso_datetime(legacy_state.get("last_attempted_at"))
+        if last_attempted_at is not None:
+            elapsed = (now - last_attempted_at).total_seconds()
+            if elapsed < float(interval_seconds):
+                return {
+                    "ok": True,
+                    "scheduled": 0,
+                    "skipped": 1,
+                    "reason": "interval_not_elapsed",
+                    "seconds_until_due": int(float(interval_seconds) - elapsed),
+                }
+
+        cmd = AgentCommand(
+            command_type=COMMAND_LEGACY_SYNC_ALL,
+            status="queued",
+            priority=0,
+            created_at=now,
+            updated_at=now,
+            available_at=now,
+            attempts=0,
+            max_attempts=int(max_attempts),
+            payload_json=payload,
+            result_json={},
+        )
+        db.add(cmd)
+        db.flush()
+
+        legacy_state["next_enqueued_at"] = now.isoformat()
+        legacy_state["next_command_id"] = int(cmd.id)
+        legacy_state["interval_seconds"] = int(interval_seconds)
+
+        scheduler_state["legacy_sync"] = legacy_state
+        _save_scheduler_state(run=run, state=scheduler_state)
+        db.commit()
+
+        return {"ok": True, "scheduled": 1, "command_id": int(cmd.id), "interval_seconds": interval_seconds}
+
+
+def _record_legacy_sync_attempt(
+    *,
+    run: AgentRun,
+    command_id: int,
+    execution: CommandExecution,
+    ended_at: datetime,
+) -> None:
+    scheduler_state = _load_scheduler_state(run)
+    legacy_state = scheduler_state.get("legacy_sync")
+    if not isinstance(legacy_state, dict):
+        legacy_state = {}
+
+    legacy_state = dict(legacy_state)
+    legacy_state["last_attempted_at"] = ended_at.isoformat()
+    legacy_state["last_attempted_ok"] = bool(execution.ok)
+    legacy_state["last_attempted_error"] = execution.error
+    legacy_state["last_command_id"] = int(command_id)
+    if execution.ok:
+        legacy_state["last_succeeded_at"] = ended_at.isoformat()
+
+    next_id = _safe_int(legacy_state.get("next_command_id"))
+    if next_id is not None and int(next_id) == int(command_id):
+        legacy_state.pop("next_enqueued_at", None)
+        legacy_state.pop("next_command_id", None)
+
+    scheduler_state["legacy_sync"] = legacy_state
+    _save_scheduler_state(run=run, state=scheduler_state)
+
+
+def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
+    try:
+        from ispec.db.legacy_sync_all import sync_legacy_all
+
+        limit = _safe_int(payload.get("limit")) or 1000
+        max_pages = _safe_int(payload.get("max_pages"))
+        if max_pages is not None and max_pages <= 0:
+            max_pages = None
+        backfill_missing = payload.get("backfill_missing")
+        if isinstance(backfill_missing, str):
+            backfill_missing_bool = _is_truthy(backfill_missing)
+        elif backfill_missing is None:
+            backfill_missing_bool = True
+        else:
+            backfill_missing_bool = bool(backfill_missing)
+
+        max_project_comments = _safe_int(payload.get("max_project_comments")) or 25
+        max_experiment_runs = _safe_int(payload.get("max_experiment_runs")) or 25
+
+        summary = sync_legacy_all(
+            db_file_path=payload.get("db_file_path"),
+            legacy_url=payload.get("legacy_url"),
+            mapping_path=payload.get("mapping_path"),
+            schema_path=payload.get("schema_path"),
+            limit=int(limit),
+            max_pages=max_pages,
+            reset_cursor=bool(payload.get("reset_cursor") or False),
+            dry_run=bool(payload.get("dry_run") or False),
+            backfill_missing=bool(backfill_missing_bool),
+            max_project_comments=int(max_project_comments),
+            max_experiment_runs=int(max_experiment_runs),
+            dump_json=payload.get("dump_json"),
+        )
+        return CommandExecution(ok=True, result=dict(summary))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
 
 
 def _seed_orchestrator_tick(*, delay_seconds: int = 5) -> int | None:
@@ -2372,6 +3521,18 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
     if cmd is None:
         return False
 
+    payload_summary = _summarize_command_payload(cmd.command_type, cmd.payload)
+    if payload_summary:
+        payload_summary = " " + payload_summary
+    logger.info(
+        "Command start id=%s type=%s attempts=%s/%s%s",
+        cmd.id,
+        cmd.command_type,
+        cmd.attempts,
+        cmd.max_attempts,
+        payload_summary,
+    )
+
     step_started = utcnow()
     step_monotonic = time.monotonic()
 
@@ -2380,6 +3541,47 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
         if cmd.command_type == COMMAND_COMPACT_SESSION_MEMORY:
             ok, result, error = _compact_session_memory(cmd.payload)
             execution = CommandExecution(ok=bool(ok), result=dict(result or {}), error=error)
+            if (
+                error == "messages_not_ready"
+                and int(cmd.max_attempts) > 0
+                and int(cmd.attempts) < int(cmd.max_attempts)
+            ):
+                execution = CommandExecution(
+                    ok=True,
+                    result={
+                        "ok": True,
+                        "deferred": True,
+                        "reason": "messages_not_ready",
+                        "command_id": int(cmd.id),
+                        "attempts": int(cmd.attempts),
+                        "max_attempts": int(cmd.max_attempts),
+                        "details": dict(result or {}),
+                    },
+                    error=None,
+                    defer_seconds=2,
+                )
+            elif error == "messages_not_ready":
+                try:
+                    payload = dict(cmd.payload or {})
+                    session_id = str(payload.get("session_id") or "").strip()
+                    session_pk = _safe_int(payload.get("session_pk"))
+                    with get_assistant_session() as db:
+                        session = None
+                        if session_pk is not None:
+                            session = db.query(SupportSession).filter(SupportSession.id == int(session_pk)).first()
+                        if session is None and session_id:
+                            session = db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+                        if session is not None:
+                            state = _load_json_dict(getattr(session, "state_json", None))
+                            state["conversation_memory_last_error"] = "messages_not_ready"
+                            state["conversation_memory_requested_up_to_id"] = int(
+                                _safe_int(state.get("conversation_memory_up_to_id")) or 0
+                            )
+                            state["conversation_memory_updated_at"] = utcnow().isoformat()
+                            session.state_json = _dump_json(state)
+                            session.updated_at = utcnow()
+                except Exception:
+                    logger.exception("Failed resetting compaction request after messages_not_ready (command_id=%s)", cmd.id)
         elif cmd.command_type == COMMAND_BUILD_SUPPORT_DIGEST:
             execution = _run_support_digest(
                 payload=cmd.payload,
@@ -2403,6 +3605,10 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
             )
         elif cmd.command_type == COMMAND_REVIEW_REPO:
             execution = _run_repo_review(payload=cmd.payload, agent_id=agent_id, run_id=run_id)
+        elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
+            execution = _run_legacy_sync_all(cmd.payload)
+        elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
+            execution = _run_slack_post_message(cmd.payload)
         else:
             error = f"Unknown command_type: {cmd.command_type}"
             execution = CommandExecution(
@@ -2421,12 +3627,61 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
     duration_ms = int((time.monotonic() - step_monotonic) * 1000)
     step_ended = utcnow()
 
-    _finish_command(
-        command_id=cmd.id,
-        ok=bool(execution.ok),
-        result=dict(execution.result or {}),
-        error=execution.error,
+    status_label = "deferred" if execution.defer_seconds is not None else ("succeeded" if execution.ok else "failed")
+    extra_parts: list[str] = []
+    if cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
+        decision = execution.result.get("decision") if isinstance(execution.result, dict) else None
+        scheduled = execution.result.get("scheduled") if isinstance(execution.result, dict) else None
+        tick_seconds = None
+        if isinstance(decision, dict):
+            tick_seconds = decision.get("next_tick_seconds")
+        if isinstance(tick_seconds, (int, float)):
+            extra_parts.append(f"next_tick={int(tick_seconds)}s")
+        if isinstance(scheduled, list):
+            extra_parts.append(f"scheduled={len(scheduled)}")
+    elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
+        channel = cmd.payload.get("channel")
+        if isinstance(channel, str) and channel.strip():
+            extra_parts.append(f"channel={channel.strip()}")
+        schedule = cmd.payload.get("schedule")
+        if isinstance(schedule, dict):
+            schedule_name = schedule.get("name")
+            if isinstance(schedule_name, str) and schedule_name.strip():
+                extra_parts.append(f"schedule={schedule_name.strip()}")
+
+    defer_seconds = execution.defer_seconds
+    if isinstance(defer_seconds, int):
+        extra_parts.append(f"defer_seconds={defer_seconds}")
+    if isinstance(execution.error, str) and execution.error.strip():
+        extra_parts.append(f"error={_truncate_text(execution.error, limit=200)}")
+
+    extra_text = ""
+    if extra_parts:
+        extra_text = " " + " ".join(extra_parts[:8])
+    logger.info(
+        "Command done id=%s type=%s status=%s ok=%s duration_ms=%s%s",
+        cmd.id,
+        cmd.command_type,
+        status_label,
+        bool(execution.ok),
+        duration_ms,
+        extra_text,
     )
+
+    if execution.defer_seconds is not None:
+        _defer_command(
+            command_id=cmd.id,
+            delay_seconds=int(execution.defer_seconds),
+            result=dict(execution.result or {}),
+            error=execution.error,
+        )
+    else:
+        _finish_command(
+            command_id=cmd.id,
+            ok=bool(execution.ok),
+            result=dict(execution.result or {}),
+            error=execution.error,
+        )
 
     try:
         with get_agent_session() as db:
@@ -2446,6 +3701,27 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
             run.updated_at = step_ended
             run.last_error = execution.error
             run.status_bar = _format_status_bar(state_after)
+
+            if cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
+                try:
+                    _record_slack_schedule_attempt(
+                        run=run,
+                        payload=dict(cmd.payload or {}),
+                        execution=execution,
+                        ended_at=step_ended,
+                    )
+                except Exception:
+                    logger.exception("Failed recording Slack schedule attempt (command_id=%s)", cmd.id)
+            elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
+                try:
+                    _record_legacy_sync_attempt(
+                        run=run,
+                        command_id=int(cmd.id),
+                        execution=execution,
+                        ended_at=step_ended,
+                    )
+                except Exception:
+                    logger.exception("Failed recording legacy sync attempt (command_id=%s)", cmd.id)
 
             result_payload = dict(execution.result or {})
             step = AgentStep(
@@ -2563,6 +3839,7 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
     started_at = utcnow()
     with get_agent_session() as db:
         previous_orchestrator: dict[str, Any] | None = None
+        previous_scheduler: dict[str, Any] | None = None
         try:
             previous = (
                 db.query(AgentRun)
@@ -2575,12 +3852,18 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                 previous_state = previous.summary_json.get("orchestrator")
                 if isinstance(previous_state, dict) and previous_state:
                     previous_orchestrator = dict(previous_state)
+                previous_sched = previous.summary_json.get("scheduler")
+                if isinstance(previous_sched, dict) and previous_sched:
+                    previous_scheduler = dict(previous_sched)
         except Exception:
             previous_orchestrator = None
+            previous_scheduler = None
 
         summary_json: dict[str, Any] = {}
         if previous_orchestrator:
             summary_json["orchestrator"] = previous_orchestrator
+        if previous_scheduler:
+            summary_json["scheduler"] = previous_scheduler
         run = AgentRun(
             run_id=run_id,
             agent_id=config.agent_id,
@@ -2609,111 +3892,170 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
     if seeded_id is not None:
         logger.info("Seeded orchestrator tick (command_id=%s)", seeded_id)
 
-    while True:
-        if _process_one_command(agent_id=config.agent_id, run_id=run_id):
+    schedule_poll_seconds = _clamp_int(
+        _safe_int(os.getenv("ISPEC_SLACK_SCHEDULE_POLL_SECONDS")) or 30,
+        min_value=10,
+        max_value=3600,
+    )
+    last_schedule_poll_at: datetime | None = None
+    legacy_sync_poll_seconds = _clamp_int(
+        _safe_int(os.getenv("ISPEC_LEGACY_SYNC_POLL_SECONDS")) or 60,
+        min_value=10,
+        max_value=3600,
+    )
+    last_legacy_sync_poll_at: datetime | None = None
+
+    final_status = "stopped"
+    final_error: str | None = None
+    try:
+        while True:
+            now = utcnow()
+            if last_schedule_poll_at is None or (now - last_schedule_poll_at).total_seconds() >= schedule_poll_seconds:
+                try:
+                    seeded = _ensure_slack_scheduled_commands(agent_id=config.agent_id, run_id=run_id)
+                    if int(seeded.get("scheduled") or 0) > 0:
+                        logger.info(
+                            "Enqueued Slack scheduled messages scheduled=%s skipped=%s",
+                            seeded.get("scheduled"),
+                            seeded.get("skipped"),
+                        )
+                except Exception:
+                    logger.exception("Failed ensuring Slack scheduled commands")
+                last_schedule_poll_at = now
+
+            if (
+                last_legacy_sync_poll_at is None
+                or (now - last_legacy_sync_poll_at).total_seconds() >= legacy_sync_poll_seconds
+            ):
+                try:
+                    seeded = _ensure_legacy_sync_scheduled_commands(agent_id=config.agent_id, run_id=run_id)
+                    if int(seeded.get("scheduled") or 0) > 0:
+                        logger.info(
+                            "Enqueued legacy sync command scheduled=%s",
+                            seeded.get("scheduled"),
+                        )
+                except Exception:
+                    logger.exception("Failed ensuring legacy sync commands")
+                last_legacy_sync_poll_at = now
+
+            if _process_one_command(agent_id=config.agent_id, run_id=run_id):
+                if once:
+                    break
+                continue
+
+            step_started = utcnow()
+            step_monotonic = time.monotonic()
+            with get_agent_session() as db:
+                run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+                step_index = int(run.step_index or 0)
+
+                if not actions:
+                    raise RuntimeError("No supervisor actions configured.")
+
+                candidates = list(actions)
+                chosen_index = step_index % len(candidates)
+                chosen = candidates[chosen_index]
+                action_id = str(chosen.get("id"))
+
+                result: dict[str, Any]
+                ok = True
+                error: str | None = None
+                try:
+                    func = funcs.get(action_id)
+                    if func is None:
+                        raise KeyError(f"Unknown action: {action_id}")
+                    result = func()
+                    if result.get("ok") is False:
+                        ok = False
+                except Exception as exc:
+                    ok = False
+                    error = f"{type(exc).__name__}: {exc}"
+                    result = {"ok": False, "error": error}
+
+                duration_ms = int((time.monotonic() - step_monotonic) * 1000)
+                step_ended = utcnow()
+                severity = _severity_from_result(result)
+
+                state_before = dict(run.state_json or {})
+                checks = state_before.get("checks")
+                if not isinstance(checks, dict):
+                    checks = {}
+                checks[action_id] = {"checked_at": step_ended.isoformat(), **result}
+                state_after = {**state_before, "checks": checks, "last_action": action_id}
+
+                run.state_json = state_after
+                run.step_index = step_index + 1
+                run.updated_at = step_ended
+                run.last_error = error
+                run.status_bar = _format_status_bar(state_after)
+
+                step = AgentStep(
+                    run_pk=run.id,
+                    step_index=step_index,
+                    kind=action_id,
+                    started_at=step_started,
+                    ended_at=step_ended,
+                    duration_ms=duration_ms,
+                    ok=ok,
+                    severity=severity,
+                    error=error,
+                    candidates_json=candidates,
+                    chosen_index=chosen_index,
+                    chosen_json=chosen,
+                    tool_results_json=[result],
+                    state_before_json=state_before,
+                    state_after_json=state_after,
+                )
+                db.add(step)
+
+                event = AgentEvent(
+                    agent_id=config.agent_id,
+                    event_type="supervisor",
+                    ts=step_ended,
+                    received_at=step_ended,
+                    name=action_id,
+                    severity=severity,
+                    trace_id=f"{run_id}:{step_index}",
+                    correlation_id=run_id,
+                    payload_json=json.dumps(
+                        {
+                            "run_id": run_id,
+                            "step_index": step_index,
+                            "action": action_id,
+                            "ok": ok,
+                            "result": result,
+                            "status_bar": run.status_bar,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
+                db.add(event)
+                db.commit()
+
             if once:
                 break
-            continue
-
-        step_started = utcnow()
-        step_monotonic = time.monotonic()
-        with get_agent_session() as db:
-            run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
-            step_index = int(run.step_index or 0)
-
-            if not actions:
-                raise RuntimeError("No supervisor actions configured.")
-
-            candidates = list(actions)
-            chosen_index = step_index % len(candidates)
-            chosen = candidates[chosen_index]
-            action_id = str(chosen.get("id"))
-
-            result: dict[str, Any]
-            ok = True
-            error: str | None = None
-            try:
-                func = funcs.get(action_id)
-                if func is None:
-                    raise KeyError(f"Unknown action: {action_id}")
-                result = func()
-                if result.get("ok") is False:
-                    ok = False
-            except Exception as exc:
-                ok = False
-                error = f"{type(exc).__name__}: {exc}"
-                result = {"ok": False, "error": error}
-
-            duration_ms = int((time.monotonic() - step_monotonic) * 1000)
-            step_ended = utcnow()
-            severity = _severity_from_result(result)
-
-            state_before = dict(run.state_json or {})
-            checks = state_before.get("checks")
-            if not isinstance(checks, dict):
-                checks = {}
-            checks[action_id] = {"checked_at": step_ended.isoformat(), **result}
-            state_after = {**state_before, "checks": checks, "last_action": action_id}
-
-            run.state_json = state_after
-            run.step_index = step_index + 1
-            run.updated_at = step_ended
-            run.last_error = error
-            run.status_bar = _format_status_bar(state_after)
-
-            step = AgentStep(
-                run_pk=run.id,
-                step_index=step_index,
-                kind=action_id,
-                started_at=step_started,
-                ended_at=step_ended,
-                duration_ms=duration_ms,
-                ok=ok,
-                severity=severity,
-                error=error,
-                candidates_json=candidates,
-                chosen_index=chosen_index,
-                chosen_json=chosen,
-                tool_results_json=[result],
-                state_before_json=state_before,
-                state_after_json=state_after,
-            )
-            db.add(step)
-
-            event = AgentEvent(
-                agent_id=config.agent_id,
-                event_type="supervisor",
-                ts=step_ended,
-                received_at=step_ended,
-                name=action_id,
-                severity=severity,
-                trace_id=f"{run_id}:{step_index}",
-                correlation_id=run_id,
-                payload_json=json.dumps(
-                    {
-                        "run_id": run_id,
-                        "step_index": step_index,
-                        "action": action_id,
-                        "ok": ok,
-                        "result": result,
-                        "status_bar": run.status_bar,
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-            )
-            db.add(event)
-            db.commit()
-
-        if once:
-            break
-        time.sleep(max(1, int(config.interval_seconds)))
-
-    with get_agent_session() as db:
-        run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
-        run.status = "stopped"
-        run.ended_at = utcnow()
-        db.commit()
+            time.sleep(max(1, int(config.interval_seconds)))
+    except KeyboardInterrupt:
+        logger.info("Supervisor interrupted (run_id=%s)", run_id)
+    except Exception as exc:
+        final_status = "failed"
+        final_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("Supervisor crashed (run_id=%s)", run_id)
+        raise
+    finally:
+        try:
+            ended_at = utcnow()
+            with get_agent_session() as db:
+                run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+                run.status = final_status
+                run.ended_at = ended_at
+                run.updated_at = ended_at
+                if final_status != "stopped" and final_error:
+                    run.last_error = final_error
+                db.commit()
+        except Exception:
+            logger.exception("Failed to mark supervisor run stopped (run_id=%s)", run_id)
 
     logger.info("Supervisor run stopped (run_id=%s)", run_id)
     return run_id

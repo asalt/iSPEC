@@ -456,7 +456,7 @@ def test_orchestrator_tick_invalid_output_uses_error_backoff(tmp_path, monkeypat
 
     with get_agent_session(agent_db_path) as agent_db:
         cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
-        assert cmd.status == "failed"
+        assert cmd.status == "succeeded"
 
         run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
         orchestrator = run.summary_json.get("orchestrator") if isinstance(run.summary_json, dict) else None
