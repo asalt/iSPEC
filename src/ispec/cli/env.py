@@ -94,6 +94,44 @@ def parse_env_file_text(text: str) -> dict[str, str]:
     return parsed
 
 
+def _looks_like_ispec_path_key(key: str) -> bool:
+    if not key:
+        return False
+    if not key.startswith("ISPEC_"):
+        return False
+    return key.endswith("_PATH") or key.endswith("_DIR") or key.endswith("_FILE")
+
+
+def _looks_like_windows_absolute_path(value: str) -> bool:
+    raw = value.strip()
+    if len(raw) >= 3 and raw[1] == ":" and raw[0].isalpha() and raw[2] in {"\\", "/"}:
+        return True
+    return raw.startswith("\\\\")
+
+
+def _maybe_resolve_ispec_path_value(*, key: str, value: str, base_dir: Path) -> str:
+    """Best-effort path normalization for ISPEC_*_{PATH,DIR,FILE} values.
+
+    - Expands `~`
+    - Resolves relative paths against the env file directory
+    - Leaves URI-like values unchanged (e.g. sqlite:///..., postgres://...)
+    """
+
+    raw = value.strip()
+    if not raw:
+        return value
+    if "://" in raw or raw.startswith("sqlite:"):
+        return value
+
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and not _looks_like_windows_absolute_path(raw):
+        path = base_dir / path
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
 def load_env_file(path: str | Path, *, override: bool = True) -> dict[str, str]:
     """Load env vars from a file into ``os.environ``."""
 
@@ -102,6 +140,10 @@ def load_env_file(path: str | Path, *, override: bool = True) -> dict[str, str]:
         raise SystemExit(f"--env-file does not exist: {resolved}")
 
     parsed = parse_env_file_text(resolved.read_text(encoding="utf-8"))
+    base_dir = resolved.parent
+    for key, value in list(parsed.items()):
+        if _looks_like_ispec_path_key(key):
+            parsed[key] = _maybe_resolve_ispec_path_value(key=key, value=value, base_dir=base_dir)
     for key, value in parsed.items():
         if override or key not in os.environ:
             os.environ[key] = value
@@ -115,4 +157,3 @@ def load_env_files(paths: Iterable[str | Path], *, override: bool = True) -> dic
     for path in paths:
         merged.update(load_env_file(path, override=override))
     return merged
-

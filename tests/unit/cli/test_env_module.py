@@ -66,3 +66,32 @@ def test_load_env_files_overrides_in_order(tmp_path, monkeypatch):
     assert os.environ["FOO"] == "second"
     assert os.environ["BAR"] == "from_one"
 
+
+def test_load_env_file_resolves_ispec_path_keys_relative_to_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("ISPEC_DB_PATH", raising=False)
+    env_file = tmp_path / "config.env"
+    env_file.write_text("ISPEC_DB_PATH=data/ispec.db\nFOO=bar\n", encoding="utf-8")
+
+    loaded = load_env_files([env_file], override=True)
+    assert loaded["FOO"] == "bar"
+    assert loaded["ISPEC_DB_PATH"] == str((tmp_path / "data" / "ispec.db").resolve())
+    assert os.environ["ISPEC_DB_PATH"] == str((tmp_path / "data" / "ispec.db").resolve())
+
+
+def test_load_env_file_expands_user_in_ispec_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ISPEC_DB_PATH", raising=False)
+    env_file = tmp_path / "config.env"
+    env_file.write_text("ISPEC_DB_PATH=~/ispec.db\n", encoding="utf-8")
+
+    loaded = load_env_files([env_file], override=True)
+    assert loaded["ISPEC_DB_PATH"] == str((tmp_path / "ispec.db").resolve())
+
+
+def test_load_env_file_does_not_modify_ispec_db_uri(tmp_path, monkeypatch):
+    monkeypatch.delenv("ISPEC_DB_PATH", raising=False)
+    env_file = tmp_path / "config.env"
+    env_file.write_text("ISPEC_DB_PATH=sqlite:///tmp/ispec.db\n", encoding="utf-8")
+
+    loaded = load_env_files([env_file], override=True)
+    assert loaded["ISPEC_DB_PATH"] == "sqlite:///tmp/ispec.db"

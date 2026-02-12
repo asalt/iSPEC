@@ -284,8 +284,6 @@ with tempfile.NamedTemporaryFile(suffix=".db") as tmp_db:
 @pytest.mark.parametrize("table_name", ALL_TABLES)
 def test_fake_data_insert(tmp_path, table_name):
     dbfile = tmp_path / "test3.db"
-    dbfile = Path("sandbox") / "test3.db"
-    dbfile.parent.mkdir(exist_ok=True)
     engine = init.initialize_db(file_path=dbfile)
 
     with engine.begin() as conn:
