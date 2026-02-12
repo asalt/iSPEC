@@ -1,2 +1,1 @@
-"""Agent-sidecar database helpers (telemetry, events, command queue)."""
-
+"""Agent-sidecar helpers (telemetry, events, command queue, policy tracking)."""
