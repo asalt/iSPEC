@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ispec.api.routes.auth import router as auth_router
 from ispec.api.routes.agents import router as agents_router
+from ispec.api.routes.ops import router as ops_router
 from ispec.api.routes.project_files import router as project_files_router
 from ispec.api.routes.routes import router as crud_router
 from ispec.api.routes.schedule import router as schedule_router
@@ -69,6 +70,9 @@ app.include_router(crud_router, prefix="/api", dependencies=[Depends(require_acc
 
 # Support assistant endpoints (/api/support/*).
 app.include_router(support_router, prefix="/api")
+
+# Operations endpoints for dashboards (/api/ops/*).
+app.include_router(ops_router, prefix="/api")
 
 # Project file attachment endpoints (/api/projects/{id}/files/*).
 app.include_router(project_files_router, prefix="/api")
