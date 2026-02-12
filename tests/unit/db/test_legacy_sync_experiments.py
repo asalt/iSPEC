@@ -85,6 +85,61 @@ def test_sync_legacy_experiments_single_id_inserts_experiment(tmp_path, monkeypa
         assert session.query(LegacySyncState).count() == 0
 
 
+def test_sync_legacy_experiments_accepts_unexpected_type_and_lysis_values(tmp_path, monkeypatch):
+    db_path = tmp_path / "sync.db"
+
+    with get_session(file_path=str(db_path)) as session:
+        session.add(Project(id=1380, prj_AddedBy="user", prj_ProjectTitle="P"))
+
+    payload = {
+        "ok": True,
+        "table": "iSPEC_Experiments",
+        "items": [
+            {
+                "exp_EXPRecNo": 57543.0,
+                "exp_Exp_ProjectNo": 1380.0,
+                "exp_IDENTIFIER": "Legacy free-text enum case",
+                "exp_ExpType": "phos",
+                "exp_Extract_LysisBuffer": "idk",
+                "exp_CreationTS": "2025-09-29 11:14:33",
+                "exp_ModificationTS": "2025-12-05 12:16:37",
+            }
+        ],
+        "has_more": False,
+    }
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    def fake_get(url, params=None, headers=None, auth=None, timeout=None):
+        return DummyResponse()
+
+    from ispec.db import legacy_sync
+
+    monkeypatch.setattr(legacy_sync.requests, "get", fake_get)
+
+    summary = legacy_sync.sync_legacy_experiments(
+        legacy_url="http://legacy.example",
+        db_file_path=str(db_path),
+        experiment_id=57543,
+        dry_run=False,
+    )
+
+    assert summary["inserted"] == 1
+    assert summary["conflicted"] == 0
+
+    with get_session(file_path=str(db_path)) as session:
+        exp = session.get(Experiment, 57543)
+        assert exp is not None
+        assert exp.project_id == 1380
+        assert exp.exp_Type == "phos"
+        assert exp.exp_Lysis == "idk"
+
+
 def test_sync_legacy_experiments_creates_placeholder_project(tmp_path, monkeypatch):
     db_path = tmp_path / "sync.db"
 

@@ -11,31 +11,6 @@ ExperimentRunTimestamp = make_timestamp_mixin("ExperimentRun")
 JobTimestamp = make_timestamp_mixin("job")
 
 
-class ExperimentType(str, enum.Enum):
-    affinity = "Affinity"
-    affinity_xl = "Affinity-XL"
-    profiling = "Profiling"
-    prof = "prof"
-    IP = "IP"
-    IPXL = "IP-XL"
-    Other = "Other"
-    DPD = "DPD"  # dna pulldown
-    cIP = "cIP" 
-    tagIP = "tagIP"
-    x = "x"
-
-
-class LysisMethod(str, enum.Enum):
-    abc = "ABC"
-    ripa = "RIPA"
-    mib = "MIB"
-    other = "Other"
-    mu8 = "8MU"
-    netn = "NETN"
-    sds = "SDS"
-    other2 = "Tris-EDTA-sucrose + lysozyme + mutanolysin"  
-
-
 class Experiment(ExperimentTimestamp, Base):
     __tablename__ = "experiment"
 
@@ -69,19 +44,13 @@ class Experiment(ExperimentTimestamp, Base):
             }
         },
     )
-    exp_Type = mapped_column(
-        SAEnum(ExperimentType, native_enum=True, validate_strings=True),
-        nullable=True, # options need to be updated dynamically from ExperimentType enum
+    exp_Type: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
         info={
             "ui": {
                 "label": "Type",
-                "component": "RadioGroup",
-                "options": [
-                    {"value": "Affinity", "label": "Affinity"},
-                    {"value": "Affinity-XL", "label": "Affinity-XL"},
-                    {"value": "Profiling", "label": "Profiling"},
-                ],
-                "allowClear": True,
+                "component": "Text",
             }
         },
     )
@@ -109,23 +78,13 @@ class Experiment(ExperimentTimestamp, Base):
     exp_Fractions: Mapped[str | None] = mapped_column(
         Text, nullable=True, info={"ui": {"label": "Fractions"}}
     )
-    exp_Lysis = mapped_column(
-        SAEnum(LysisMethod, native_enum=True, validate_strings=True),
+    exp_Lysis: Mapped[str | None] = mapped_column(
+        Text,
         nullable=True,
         info={
             "ui": {
                 "label": "Lysis",
-                "component": "RadioGroup",
-                "options": [
-                    {"value": "ABC", "label": "ABC"},
-                    {"value": "RIPA", "label": "RIPA"},
-                    {"value": "MIB", "label": "MIB"},
-                    {"value": "Other", "label": "Other..."},
-                    {"value": "8MU", "label": "8MU"},
-                    {"value": "NETN", "label": "NETN"},
-                    {"value": "SDS", "label": "SDS"},
-                ],
-                "allowClear": True,
+                "component": "Text",
             }
         },
     )
