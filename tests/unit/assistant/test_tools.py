@@ -69,3 +69,29 @@ def test_tool_prompt_can_filter_to_subset():
     assert "count_all_projects" in prompt
     assert "get_project" in prompt
     assert "search_people" not in prompt
+
+
+def test_my_projects_allows_api_key_mode_user_none(db_session):
+    db_session.add_all(
+        [
+            Project(prj_AddedBy="test", prj_ProjectTitle="Alpha"),
+            Project(
+                prj_AddedBy="test",
+                prj_ProjectTitle="Beta",
+                prj_Billing_ReadyToBill=True,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    payload = run_tool(
+        name="my_projects",
+        args={"limit": 10},
+        core_db=db_session,
+        schedule_db=None,
+        user=None,
+        api_schema=None,
+    )
+    assert payload["ok"] is True
+    assert payload["result"]["count"] == 2
+    assert any(p.get("to_be_billed") is True for p in payload["result"]["projects"])

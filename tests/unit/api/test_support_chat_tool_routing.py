@@ -13,6 +13,7 @@ from ispec.schedule.connect import get_schedule_session
 
 def test_support_chat_tool_router_filters_openai_tools_by_group(tmp_path, db_session, monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_COMPACTION_ENABLED", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "1")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
@@ -51,7 +52,7 @@ def test_support_chat_tool_router_filters_openai_tools_by_group(tmp_path, db_ses
             name = func_obj.get("name")
             if isinstance(name, str) and name:
                 tool_names.add(name)
-        assert tool_names == {"search_people", "get_person"}
+        assert tool_names == {"assistant_prompt_header", "search_people", "get_person"}
 
         assert isinstance(messages, list)
         system_prompt = str(messages[0].get("content") or "")
@@ -100,4 +101,8 @@ def test_support_chat_tool_router_filters_openai_tools_by_group(tmp_path, db_ses
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
         assert meta["tool_router"]["decision"]["primary"] == "people"
-        assert set(meta["tool_router"]["selected_tool_names"]) == {"search_people", "get_person"}
+        assert set(meta["tool_router"]["selected_tool_names"]) == {
+            "assistant_prompt_header",
+            "get_person",
+            "search_people",
+        }

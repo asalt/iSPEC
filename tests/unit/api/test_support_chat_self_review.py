@@ -111,6 +111,7 @@ def test_support_chat_self_review_can_rewrite_final_answer(tmp_path, db_session,
 
 def test_support_chat_self_review_decider_can_keep_draft_without_rewrite(tmp_path, db_session, monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_COMPACTION_ENABLED", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "1")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")

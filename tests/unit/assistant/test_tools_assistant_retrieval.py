@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import json
 
+from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand, AgentRun, AgentStep
 from ispec.assistant.connect import get_assistant_session
-from ispec.assistant.models import SupportMemory, SupportMemoryEvidence, SupportMessage, SupportSession
+from ispec.assistant.models import (
+    SupportMemory,
+    SupportMemoryEvidence,
+    SupportMessage,
+    SupportSession,
+    SupportSessionReview,
+)
 from ispec.assistant.tools import run_tool
 from ispec.db.models import AuthUser, UserRole
 
@@ -79,8 +86,8 @@ def test_assistant_get_message_context_returns_window(tmp_path, db_session):
 
 
 def test_assistant_search_internal_logs_finds_agent_step(tmp_path, db_session):
-    assistant_db_path = tmp_path / "assistant.db"
-    with get_assistant_session(assistant_db_path) as assistant_db:
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
         run = AgentRun(
             run_id="run-1",
             agent_id="agent-1",
@@ -90,9 +97,9 @@ def test_assistant_search_internal_logs_finds_agent_step(tmp_path, db_session):
             state_json={},
             summary_json={},
         )
-        assistant_db.add(run)
-        assistant_db.commit()
-        assistant_db.refresh(run)
+        agent_db.add(run)
+        agent_db.commit()
+        agent_db.refresh(run)
 
         step = AgentStep(
             run_pk=int(run.id),
@@ -100,16 +107,16 @@ def test_assistant_search_internal_logs_finds_agent_step(tmp_path, db_session):
             kind="orchestrator_tick_v1",
             response_json={"note": "needle is here"},
         )
-        assistant_db.add(step)
-        assistant_db.commit()
+        agent_db.add(step)
+        agent_db.commit()
         step_id = int(step.id)
 
-    with get_assistant_session(assistant_db_path) as assistant_db:
+    with get_agent_session(agent_db_path) as agent_db:
         payload = run_tool(
             name="assistant_search_internal_logs",
             args={"query": "needle", "limit": 10},
             core_db=db_session,
-            assistant_db=assistant_db,
+            agent_db=agent_db,
             schedule_db=None,
             omics_db=None,
             user=None,
@@ -121,8 +128,8 @@ def test_assistant_search_internal_logs_finds_agent_step(tmp_path, db_session):
 
 
 def test_assistant_get_agent_step_and_command(tmp_path, db_session):
-    assistant_db_path = tmp_path / "assistant.db"
-    with get_assistant_session(assistant_db_path) as assistant_db:
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
         run = AgentRun(
             run_id="run-1",
             agent_id="agent-1",
@@ -132,9 +139,9 @@ def test_assistant_get_agent_step_and_command(tmp_path, db_session):
             state_json={},
             summary_json={},
         )
-        assistant_db.add(run)
-        assistant_db.commit()
-        assistant_db.refresh(run)
+        agent_db.add(run)
+        agent_db.commit()
+        agent_db.refresh(run)
 
         step = AgentStep(
             run_pk=int(run.id),
@@ -143,20 +150,20 @@ def test_assistant_get_agent_step_and_command(tmp_path, db_session):
             prompt_json={"question": "hi"},
             response_json={"answer": "ok"},
         )
-        assistant_db.add(step)
+        agent_db.add(step)
 
         command = AgentCommand(command_type="test_cmd", status="queued", payload_json={"note": "hello"})
-        assistant_db.add(command)
-        assistant_db.commit()
+        agent_db.add(command)
+        agent_db.commit()
         step_id = int(step.id)
         command_id = int(command.id)
 
-    with get_assistant_session(assistant_db_path) as assistant_db:
+    with get_agent_session(agent_db_path) as agent_db:
         step_payload = run_tool(
             name="assistant_get_agent_step",
             args={"step_id": step_id},
             core_db=db_session,
-            assistant_db=assistant_db,
+            agent_db=agent_db,
             schedule_db=None,
             omics_db=None,
             user=None,
@@ -170,7 +177,7 @@ def test_assistant_get_agent_step_and_command(tmp_path, db_session):
             name="assistant_get_agent_command",
             args={"command_id": command_id},
             core_db=db_session,
-            assistant_db=assistant_db,
+            agent_db=agent_db,
             schedule_db=None,
             omics_db=None,
             user=None,
@@ -179,6 +186,115 @@ def test_assistant_get_agent_step_and_command(tmp_path, db_session):
         assert cmd_payload["ok"] is True
         assert cmd_payload["result"]["command_id"] == command_id
         assert cmd_payload["result"]["payload_json"] == {"note": "hello"}
+
+
+def test_assistant_recent_agent_commands_and_steps(tmp_path, db_session):
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
+        run = AgentRun(
+            run_id="run-1",
+            agent_id="agent-1",
+            kind="supervisor",
+            status="running",
+            config_json={},
+            state_json={},
+            summary_json={},
+        )
+        agent_db.add(run)
+        agent_db.commit()
+        agent_db.refresh(run)
+
+        cmd = AgentCommand(command_type="test_cmd", status="queued", payload_json={"note": "hello"})
+        agent_db.add(cmd)
+
+        step = AgentStep(
+            run_pk=int(run.id),
+            step_index=0,
+            kind="test_kind",
+            ok=True,
+            severity="info",
+            chosen_json={"command_id": None, "command_type": None},
+        )
+        agent_db.add(step)
+        agent_db.commit()
+        command_id = int(cmd.id)
+        step_id = int(step.id)
+
+    with get_agent_session(agent_db_path) as agent_db:
+        commands_payload = run_tool(
+            name="assistant_recent_agent_commands",
+            args={"limit": 10},
+            core_db=db_session,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert commands_payload["ok"] is True
+        commands = commands_payload["result"]["commands"]
+        assert any(int(item["id"]) == command_id for item in commands)
+
+        steps_payload = run_tool(
+            name="assistant_recent_agent_steps",
+            args={"limit": 10},
+            core_db=db_session,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert steps_payload["ok"] is True
+        steps = steps_payload["result"]["steps"]
+        assert any(int(item["id"]) == step_id for item in steps)
+
+
+def test_assistant_recent_session_reviews(tmp_path, db_session):
+    assistant_db_path = tmp_path / "assistant.db"
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        session = SupportSession(session_id="s1", user_id=123)
+        assistant_db.add(session)
+        assistant_db.flush()
+        assistant_db.add_all(
+            [
+                SupportMessage(session_pk=session.id, role="user", content="Question"),
+                SupportMessage(session_pk=session.id, role="assistant", content="Answer"),
+            ]
+        )
+        assistant_db.flush()
+        review = {
+            "schema_version": 1,
+            "session_id": "s1",
+            "target_message_id": 2,
+            "summary": "Looks fine.",
+            "issues": [],
+            "repo_search_queries": [],
+            "followups": [],
+        }
+        review_row = SupportSessionReview(
+            session_pk=int(session.id),
+            target_message_id=2,
+            review_json=review,
+        )
+        assistant_db.add(review_row)
+        assistant_db.commit()
+        review_id = int(review_row.id)
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        payload = run_tool(
+            name="assistant_recent_session_reviews",
+            args={"limit": 10},
+            core_db=db_session,
+            assistant_db=assistant_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert payload["ok"] is True
+        reviews = payload["result"]["reviews"]
+        assert any(int(item["id"]) == review_id for item in reviews)
 
 
 def test_assistant_list_users_reports_linkage(tmp_path, db_session):
@@ -314,3 +430,44 @@ def test_assistant_digest_tools_list_get_and_search(tmp_path, db_session):
         )
         assert search_payload["ok"] is True
         assert any(item.get("digest_id") == digest_id for item in search_payload["result"]["matches"])
+
+
+def test_assistant_prompt_header_returns_header_and_latest_user_message(tmp_path, db_session):
+    assistant_db_path = tmp_path / "assistant.db"
+    state = {
+        "current_project_id": 42,
+        "conversation_summary": "hello",
+        "conversation_memory": {"note": "remember"},
+    }
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        session = SupportSession(session_id="s1", user_id=None, state_json=json.dumps(state))
+        assistant_db.add(session)
+        assistant_db.flush()
+        msg = SupportMessage(session_pk=session.id, role="user", content="hi")
+        assistant_db.add(msg)
+        assistant_db.commit()
+        user_message_id = int(msg.id)
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        payload = run_tool(
+            name="assistant_prompt_header",
+            args={"session_id": "s1", "include_legend": True},
+            core_db=db_session,
+            assistant_db=assistant_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["session_id"] == "s1"
+        assert str(result["header_line"] or "").startswith("@h1 ")
+        fields = result["header_fields"]
+        assert fields["current_project_id"] == 42
+        assert fields["user_message_id"] == user_message_id
+        legend = result["legend"]
+        assert legend["legend_version"] == 1
+        assert "ok_bits" in legend
+        assert "policy_bits" in legend

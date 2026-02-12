@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 from ispec.assistant.tools import openai_tools_for_user, run_tool
 from ispec.db.models import AuthUser, AuthUserProject, Person, Project, ProjectComment, UserRole
 
@@ -25,6 +27,38 @@ def test_create_project_comment_tool_visible_for_client():
     user = _make_user("client", role=UserRole.client)
     tool_names = {tool["function"]["name"] for tool in openai_tools_for_user(user)}
     assert "create_project_comment" in tool_names
+
+
+def test_create_project_comment_tool_visible_for_service_viewer():
+    user = types.SimpleNamespace(
+        username="api_key",
+        role=UserRole.viewer,
+        can_write_project_comments=True,
+    )
+    tool_names = {tool["function"]["name"] for tool in openai_tools_for_user(user)}
+    assert "create_project_comment" in tool_names
+
+
+def test_create_project_comment_allows_service_viewer_write(db_session):
+    project = Project(id=12, prj_AddedBy="test", prj_ProjectTitle="Project 12")
+    db_session.add(project)
+    db_session.commit()
+
+    user = types.SimpleNamespace(
+        username="api_key",
+        role=UserRole.viewer,
+        can_write_project_comments=True,
+    )
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 12, "comment": "Note", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="make a note for project 12",
+    )
+    assert payload["ok"] is True
 
 
 def test_create_project_comment_requires_client_project_access(db_session):
@@ -105,6 +139,39 @@ def test_create_project_comment_requires_confirm_and_explicit_user_request(db_se
     )
     assert payload["ok"] is False
     assert "confirm" in (payload.get("error") or "").lower()
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 1, "comment": "Note", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="make a note for project 1",
+    )
+    assert payload["ok"] is True
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 1, "comment": "Note", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="Confirm yes commit it",
+    )
+    assert payload["ok"] is True
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 1, "comment": "Note", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="please commit the project note",
+    )
+    assert payload["ok"] is True
 
 
 def test_create_project_comment_creates_comment_and_assistant_person(db_session):

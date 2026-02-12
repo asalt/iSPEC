@@ -22,6 +22,7 @@ from ispec.assistant.models import (
     SupportSession,
     SupportSessionReview,
 )
+from ispec.assistant.prompt_header import build_prompt_header, header_legend
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.db.models import (
     AuthUser,
@@ -64,12 +65,16 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_stats": ToolScope.staff,
     "assistant_recent_sessions": ToolScope.staff,
     "assistant_get_session_review": ToolScope.staff,
+    "assistant_prompt_header": ToolScope.staff,
     "assistant_search_messages": ToolScope.admin,
     "assistant_get_message_context": ToolScope.admin,
     "assistant_list_digests": ToolScope.admin,
     "assistant_get_digest": ToolScope.admin,
     "assistant_search_digests": ToolScope.admin,
     "assistant_search_internal_logs": ToolScope.admin,
+    "assistant_recent_agent_commands": ToolScope.admin,
+    "assistant_recent_agent_steps": ToolScope.admin,
+    "assistant_recent_session_reviews": ToolScope.admin,
     "assistant_get_agent_step": ToolScope.admin,
     "assistant_get_agent_command": ToolScope.admin,
     "assistant_get_agent_run": ToolScope.admin,
@@ -521,6 +526,10 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add("assistant_recent_sessions", "- assistant_recent_sessions(limit: int = 10)")
     add("assistant_get_session_review", "- assistant_get_session_review(session_id: str)")
     add(
+        "assistant_prompt_header",
+        "- assistant_prompt_header(session_id: str, user_message_id: int | None = None, include_legend: bool = false)",
+    )
+    add(
         "assistant_search_messages",
         "- assistant_search_messages(query: str, limit: int = 20, role: str | None = None, session_id: str | None = None, user_id: int | None = None)  # admin-only",
     )
@@ -540,6 +549,18 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add(
         "assistant_search_internal_logs",
         "- assistant_search_internal_logs(query: str, limit: int = 20)  # admin-only; searches agent runs/steps/commands/events",
+    )
+    add(
+        "assistant_recent_agent_commands",
+        "- assistant_recent_agent_commands(limit: int = 20, statuses: list[str] | None = None, command_types: list[str] | None = None, after_id: int | None = None)  # admin-only",
+    )
+    add(
+        "assistant_recent_agent_steps",
+        "- assistant_recent_agent_steps(limit: int = 20, kinds: list[str] | None = None, run_id: str | None = None, ok: bool | None = None, after_id: int | None = None)  # admin-only",
+    )
+    add(
+        "assistant_recent_session_reviews",
+        "- assistant_recent_session_reviews(limit: int = 20, session_id: str | None = None, user_id: int | None = None, after_id: int | None = None)  # admin-only",
     )
     add("assistant_get_agent_step", "- assistant_get_agent_step(step_id: int)  # admin-only")
     add("assistant_get_agent_command", "- assistant_get_agent_command(command_id: int)  # admin-only")
@@ -949,6 +970,7 @@ def run_tool(
     args: dict[str, Any],
     core_db: Session,
     assistant_db: Session | None = None,
+    agent_db: Session | None = None,
     schedule_db: Session | None = None,
     omics_db: Session | None = None,
     user: AuthUser | None = None,
@@ -1124,7 +1146,7 @@ def run_tool(
         if name == "create_project_comment":
             if user is None:
                 return {"ok": False, "tool": name, "error": "Not authenticated."}
-            if user.role == UserRole.viewer:
+            if user.role == UserRole.viewer and not bool(getattr(user, "can_write_project_comments", False)):
                 return {"ok": False, "tool": name, "error": "Write access required."}
 
             is_client_user = user.role == UserRole.client
@@ -1135,8 +1157,8 @@ def run_tool(
 
             user_msg = (user_message or "").strip().lower()
             if user_msg and (
-                re.search(r"\b(do not|don't|dont)\s+(save|log|record|add)\b", user_msg)
-                or re.search(r"\bnot\s+save\b", user_msg)
+                re.search(r"\b(do not|don't|dont)\s+(save|log|record|add|commit)\b", user_msg)
+                or re.search(r"\bnot\s+(?:save|commit)\b", user_msg)
             ):
                 return {
                     "ok": False,
@@ -1145,9 +1167,9 @@ def run_tool(
                 }
             explicit = False
             if user_msg:
-                if re.search(r"\b(save|log|record|add)\b", user_msg) and re.search(
-                    r"\b(history|comment|note|meeting)\b", user_msg
-                ):
+                verbs = r"(?:save|log|record|add|write|create|make|leave|commit)"
+                nouns = r"(?:history|comment|comments|note|notes|meeting|memo)"
+                if re.search(rf"\b{verbs}\b", user_msg) and re.search(rf"\b{nouns}\b", user_msg):
                     explicit = True
                 else:
                     normalized = re.sub(r"[^\w\s]", "", user_msg)
@@ -1156,6 +1178,18 @@ def run_tool(
                         explicit = True
                     elif normalized in {"go ahead", "do it", "please do", "please do it"}:
                         explicit = True
+                    else:
+                        tokens = normalized.split()
+                        if len(tokens) <= 6:
+                            negative = {"no", "n", "nope", "nah"}
+                            if any(token in negative for token in tokens):
+                                explicit = False
+                            else:
+                                affirmative = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm"}
+                                if "commit" in tokens and ("it" in tokens or any(token in affirmative for token in tokens)):
+                                    explicit = True
+                                elif normalized in {"commit", "commit it", "please commit", "please commit it"}:
+                                    explicit = True
             if not explicit:
                 return {
                     "ok": False,
@@ -1443,6 +1477,71 @@ def run_tool(
                 },
             }
 
+        if name == "assistant_prompt_header":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            session_id = _safe_str(args.get("session_id"), max_len=256) or _safe_str(args.get("sessionId"), max_len=256)
+            if not session_id:
+                return {"ok": False, "tool": name, "error": "Missing argument: session_id"}
+
+            include_legend = bool(args.get("include_legend"))
+            user_message_id = _safe_int(args.get("user_message_id"))
+            if user_message_id is None:
+                user_message_id = _safe_int(args.get("message_id"))
+            if user_message_id is None:
+                user_message_id = _safe_int(args.get("userMessageId"))
+
+            session = assistant_db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+            if session is None:
+                return {"ok": False, "tool": name, "error": "Session not found.", "session_id": session_id}
+
+            state: dict[str, Any] = {}
+            raw_state = getattr(session, "state_json", None)
+            if raw_state:
+                try:
+                    parsed_state = json.loads(raw_state)
+                    if isinstance(parsed_state, dict):
+                        state = parsed_state
+                except Exception:
+                    state = {}
+
+            if user_message_id is None:
+                last_user_message = (
+                    assistant_db.query(AssistantSupportMessage)
+                    .filter(AssistantSupportMessage.session_pk == int(session.id))
+                    .filter(AssistantSupportMessage.role == "user")
+                    .order_by(AssistantSupportMessage.id.desc())
+                    .first()
+                )
+                if last_user_message is not None:
+                    user_message_id = int(last_user_message.id)
+
+            tool_protocol = (os.getenv("ISPEC_ASSISTANT_TOOL_PROTOCOL") or "line").strip()
+            header = build_prompt_header(
+                session_id=session.session_id,
+                user_role=user.role if user is not None else None,
+                user_id=int(user.id) if user is not None else None,
+                session_state=state,
+                user_message_id=user_message_id,
+                tools_available=True,
+                tool_protocol=tool_protocol,
+                compare_mode=False,
+                forced_tool_choice=False,
+                repo_tools_enabled=_repo_tools_enabled(),
+            )
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "session_id": session.session_id,
+                    "header_line": header.line,
+                    "header_fields": header.fields,
+                    "legend": header_legend() if include_legend else None,
+                },
+            }
+
         if name == "assistant_stats":
             if assistant_db is None:
                 return {"ok": False, "tool": name, "error": "assistant_db is required."}
@@ -1527,19 +1626,31 @@ def run_tool(
                 elif last_assistant_id > reviewed_up_to:
                     needs_review += 1
 
-            queued_commands = int(assistant_db.query(func.count(AgentCommand.id)).filter(AgentCommand.status == "queued").scalar() or 0)
-            running_commands = int(
-                assistant_db.query(func.count(AgentCommand.id)).filter(AgentCommand.status == "running").scalar() or 0
-            )
-            last_run = (
-                assistant_db.query(AgentRun)
-                .filter(AgentRun.kind == "supervisor")
-                .order_by(AgentRun.id.desc())
-                .first()
-            )
+            queued_commands: int | None = None
+            running_commands: int | None = None
+            last_run: AgentRun | None = None
             orchestrator_state = None
-            if last_run is not None and isinstance(last_run.summary_json, dict):
-                orchestrator_state = last_run.summary_json.get("orchestrator")
+            if agent_db is not None:
+                queued_commands = int(
+                    agent_db.query(func.count(AgentCommand.id))
+                    .filter(AgentCommand.status == "queued")
+                    .scalar()
+                    or 0
+                )
+                running_commands = int(
+                    agent_db.query(func.count(AgentCommand.id))
+                    .filter(AgentCommand.status == "running")
+                    .scalar()
+                    or 0
+                )
+                last_run = (
+                    agent_db.query(AgentRun)
+                    .filter(AgentRun.kind == "supervisor")
+                    .order_by(AgentRun.id.desc())
+                    .first()
+                )
+                if last_run is not None and isinstance(last_run.summary_json, dict):
+                    orchestrator_state = last_run.summary_json.get("orchestrator")
 
             return {
                 "ok": True,
@@ -1552,7 +1663,11 @@ def run_tool(
                     "sessions_reviewed": reviewed,
                     "sessions_pending_user_turn": pending_user_turn,
                     "sessions_without_assistant_messages": no_assistant_messages,
-                    "agent_commands": {"queued": queued_commands, "running": running_commands},
+                    "agent_commands": (
+                        {"queued": queued_commands, "running": running_commands}
+                        if queued_commands is not None and running_commands is not None
+                        else None
+                    ),
                     "latest_supervisor_run": {
                         "run_id": getattr(last_run, "run_id", None),
                         "agent_id": getattr(last_run, "agent_id", None),
@@ -1562,6 +1677,225 @@ def run_tool(
                     }
                     if last_run is not None
                     else None,
+                },
+            }
+
+        if name == "assistant_recent_agent_commands":
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=200)
+            statuses = _coerce_str_list(args.get("statuses"), max_items=10) or _coerce_str_list(args.get("status"), max_items=10)
+            command_types = _coerce_str_list(args.get("command_types"), max_items=20) or _coerce_str_list(args.get("command_type"), max_items=20)
+            after_id = _safe_int(args.get("after_id"))
+            order = (_safe_str(args.get("order"), max_len=8) or "desc").lower()
+            if order not in {"asc", "desc"}:
+                return {"ok": False, "tool": name, "error": "order must be 'asc' or 'desc'."}
+            include_payload = bool(args.get("include_payload"))
+            include_result = bool(args.get("include_result"))
+
+            query = agent_db.query(AgentCommand)
+            if statuses:
+                normalized_statuses = [s.strip().lower() for s in statuses if s.strip()]
+                query = query.filter(AgentCommand.status.in_(normalized_statuses))
+            if command_types:
+                normalized_types = [s.strip() for s in command_types if s.strip()]
+                query = query.filter(AgentCommand.command_type.in_(normalized_types))
+            if after_id is not None and after_id > 0:
+                query = query.filter(AgentCommand.id > int(after_id))
+
+            if order == "asc":
+                query = query.order_by(AgentCommand.id.asc())
+            else:
+                query = query.order_by(AgentCommand.id.desc())
+
+            rows = query.limit(limit).all()
+            items: list[dict[str, Any]] = []
+            for row in rows:
+                payload_json = row.payload_json if isinstance(row.payload_json, dict) else {}
+                result_json = row.result_json if isinstance(row.result_json, dict) else {}
+                item: dict[str, Any] = {
+                    "id": int(row.id),
+                    "command_type": row.command_type,
+                    "status": row.status,
+                    "priority": int(row.priority or 0),
+                    "attempts": int(row.attempts or 0),
+                    "max_attempts": int(row.max_attempts or 0),
+                    "available_at": row.available_at.isoformat() if row.available_at else None,
+                    "claimed_at": row.claimed_at.isoformat() if row.claimed_at else None,
+                    "claimed_by_agent_id": row.claimed_by_agent_id,
+                    "claimed_by_run_id": row.claimed_by_run_id,
+                    "started_at": row.started_at.isoformat() if row.started_at else None,
+                    "ended_at": row.ended_at.isoformat() if row.ended_at else None,
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                    "error": row.error,
+                    "payload_keys": sorted(payload_json.keys())[:50],
+                    "result_keys": sorted(result_json.keys())[:50],
+                }
+                if include_payload:
+                    item["payload_json"] = payload_json
+                if include_result:
+                    item["result_json"] = result_json
+                items.append(item)
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "limit": limit,
+                    "order": order,
+                    "after_id": after_id,
+                    "filters": {"statuses": statuses, "command_types": command_types},
+                    "count": len(items),
+                    "commands": items,
+                },
+            }
+
+        if name == "assistant_recent_agent_steps":
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=200)
+            kinds = _coerce_str_list(args.get("kinds"), max_items=20) or _coerce_str_list(args.get("kind"), max_items=20)
+            run_id = _safe_str(args.get("run_id"), max_len=128)
+            ok_filter = args.get("ok")
+            if ok_filter is not None and not isinstance(ok_filter, bool):
+                ok_filter = bool(ok_filter)
+            after_id = _safe_int(args.get("after_id"))
+            order = (_safe_str(args.get("order"), max_len=8) or "desc").lower()
+            if order not in {"asc", "desc"}:
+                return {"ok": False, "tool": name, "error": "order must be 'asc' or 'desc'."}
+            include_prompt = bool(args.get("include_prompt"))
+            include_response = bool(args.get("include_response"))
+            include_state = bool(args.get("include_state"))
+
+            query = agent_db.query(AgentStep, AgentRun.run_id).join(AgentRun, AgentRun.id == AgentStep.run_pk)
+            if run_id:
+                query = query.filter(AgentRun.run_id == run_id)
+            if kinds:
+                normalized = [k.strip() for k in kinds if k.strip()]
+                query = query.filter(AgentStep.kind.in_(normalized))
+            if ok_filter is not None:
+                query = query.filter(AgentStep.ok.is_(bool(ok_filter)))
+            if after_id is not None and after_id > 0:
+                query = query.filter(AgentStep.id > int(after_id))
+
+            if order == "asc":
+                query = query.order_by(AgentStep.id.asc())
+            else:
+                query = query.order_by(AgentStep.id.desc())
+
+            rows = query.limit(limit).all()
+            items: list[dict[str, Any]] = []
+            for step, step_run_id in rows:
+                chosen = step.chosen_json if isinstance(step.chosen_json, dict) else {}
+                command_id = _safe_int(chosen.get("command_id"))
+                command_type = str(chosen.get("command_type") or "").strip() or None
+                item: dict[str, Any] = {
+                    "id": int(step.id),
+                    "run_id": step_run_id,
+                    "run_pk": int(step.run_pk),
+                    "step_index": int(step.step_index or 0),
+                    "kind": step.kind,
+                    "ok": bool(step.ok),
+                    "severity": step.severity,
+                    "duration_ms": int(step.duration_ms) if step.duration_ms is not None else None,
+                    "started_at": step.started_at.isoformat() if step.started_at else None,
+                    "ended_at": step.ended_at.isoformat() if step.ended_at else None,
+                    "error": step.error,
+                    "command_id": command_id,
+                    "command_type": command_type,
+                }
+                if include_prompt:
+                    item["prompt_json"] = step.prompt_json
+                if include_response:
+                    item["response_json"] = step.response_json
+                if include_state:
+                    item["state_before_json"] = step.state_before_json
+                    item["state_after_json"] = step.state_after_json
+                items.append(item)
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "limit": limit,
+                    "order": order,
+                    "after_id": after_id,
+                    "filters": {"kinds": kinds, "run_id": run_id, "ok": ok_filter},
+                    "count": len(items),
+                    "steps": items,
+                },
+            }
+
+        if name == "assistant_recent_session_reviews":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=200)
+            session_id = _safe_str(args.get("session_id"), max_len=256)
+            user_id = _safe_int(args.get("user_id"))
+            after_id = _safe_int(args.get("after_id"))
+            order = (_safe_str(args.get("order"), max_len=8) or "desc").lower()
+            if order not in {"asc", "desc"}:
+                return {"ok": False, "tool": name, "error": "order must be 'asc' or 'desc'."}
+            include_review_json = bool(args.get("include_review_json"))
+
+            query = assistant_db.query(SupportSessionReview, SupportSession.session_id, SupportSession.user_id).join(
+                SupportSession, SupportSession.id == SupportSessionReview.session_pk
+            )
+            if session_id:
+                query = query.filter(SupportSession.session_id == session_id)
+            if user_id is not None:
+                query = query.filter(SupportSession.user_id == int(user_id))
+            if after_id is not None and after_id > 0:
+                query = query.filter(SupportSessionReview.id > int(after_id))
+
+            if order == "asc":
+                query = query.order_by(SupportSessionReview.id.asc())
+            else:
+                query = query.order_by(SupportSessionReview.id.desc())
+
+            rows = query.limit(limit).all()
+            items: list[dict[str, Any]] = []
+            for review, review_session_id, review_user_id in rows:
+                review_json = review.review_json if isinstance(review.review_json, dict) else {}
+                summary = review_json.get("summary")
+                if not isinstance(summary, str):
+                    summary = ""
+                issues = review_json.get("issues")
+                issue_count = len(issues) if isinstance(issues, list) else 0
+                followups = review_json.get("followups")
+                followup_count = len(followups) if isinstance(followups, list) else 0
+                repo_queries = review_json.get("repo_search_queries")
+                repo_query_count = len(repo_queries) if isinstance(repo_queries, list) else 0
+
+                item: dict[str, Any] = {
+                    "id": int(review.id),
+                    "session_id": review_session_id,
+                    "session_pk": int(review.session_pk),
+                    "user_id": int(review_user_id) if review_user_id is not None else None,
+                    "target_message_id": int(review.target_message_id),
+                    "updated_at": review.updated_at.isoformat() if review.updated_at else None,
+                    "issues_count": issue_count,
+                    "followups_count": followup_count,
+                    "repo_search_queries_count": repo_query_count,
+                    "summary": summary[:400] + ("…" if isinstance(summary, str) and len(summary) > 400 else ""),
+                }
+                if include_review_json:
+                    item["review_json"] = review_json
+                items.append(item)
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "limit": limit,
+                    "order": order,
+                    "after_id": after_id,
+                    "filters": {"session_id": session_id, "user_id": user_id},
+                    "count": len(items),
+                    "reviews": items,
                 },
             }
 
@@ -2164,8 +2498,8 @@ def run_tool(
             }
 
         if name == "assistant_search_internal_logs":
-            if assistant_db is None:
-                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
             query_text = _safe_str(args.get("query"), max_len=512) or _safe_str(args.get("q"), max_len=512)
             if not query_text:
                 return {"ok": False, "tool": name, "error": "Missing argument: query"}
@@ -2173,7 +2507,7 @@ def run_tool(
 
             pattern = f"%{query_text}%"
             step_rows = (
-                assistant_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
+                agent_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
                 .join(AgentRun, AgentStep.run_pk == AgentRun.id)
                 .filter(
                     or_(
@@ -2214,7 +2548,7 @@ def run_tool(
                 )
 
             command_rows = (
-                assistant_db.query(AgentCommand)
+                agent_db.query(AgentCommand)
                 .filter(
                     or_(
                         AgentCommand.command_type.ilike(pattern),
@@ -2251,7 +2585,7 @@ def run_tool(
                 )
 
             run_rows = (
-                assistant_db.query(AgentRun)
+                agent_db.query(AgentRun)
                 .filter(
                     or_(
                         AgentRun.run_id.ilike(pattern),
@@ -2288,7 +2622,7 @@ def run_tool(
                 )
 
             event_rows = (
-                assistant_db.query(AgentEvent)
+                agent_db.query(AgentEvent)
                 .filter(
                     or_(
                         AgentEvent.agent_id.ilike(pattern),
@@ -2331,8 +2665,8 @@ def run_tool(
             }
 
         if name == "assistant_get_agent_step":
-            if assistant_db is None:
-                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
             step_id = _safe_int(args.get("step_id"))
             if step_id is None:
                 step_id = _safe_int(args.get("id"))
@@ -2340,7 +2674,7 @@ def run_tool(
                 return {"ok": False, "tool": name, "error": "Missing integer argument: step_id (or id)"}
 
             row = (
-                assistant_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
+                agent_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
                 .join(AgentRun, AgentStep.run_pk == AgentRun.id)
                 .filter(AgentStep.id == int(step_id))
                 .first()
@@ -2373,15 +2707,15 @@ def run_tool(
             }
 
         if name == "assistant_get_agent_command":
-            if assistant_db is None:
-                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
             command_id = _safe_int(args.get("command_id"))
             if command_id is None:
                 command_id = _safe_int(args.get("id"))
             if command_id is None:
                 return {"ok": False, "tool": name, "error": "Missing integer argument: command_id (or id)"}
 
-            cmd = assistant_db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+            cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
             if cmd is None:
                 return {"ok": False, "tool": name, "error": "Agent command not found.", "command_id": int(command_id)}
             return {
@@ -2409,12 +2743,12 @@ def run_tool(
             }
 
         if name == "assistant_get_agent_run":
-            if assistant_db is None:
-                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
             run_id = _safe_str(args.get("run_id"), max_len=128) or _safe_str(args.get("id"), max_len=128)
             if not run_id:
                 return {"ok": False, "tool": name, "error": "Missing argument: run_id"}
-            run = assistant_db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
+            run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
             if run is None:
                 return {"ok": False, "tool": name, "error": "Agent run not found.", "run_id": run_id}
             return {
@@ -3029,15 +3363,12 @@ def run_tool(
             return {"ok": True, "tool": name, "result": {"matches": matches}}
 
         if name == "my_projects":
-            if user is None:
-                return {"ok": False, "tool": name, "error": "Not authenticated."}
-
             query_text = _safe_str(args.get("query"), max_len=200)
             limit = _clamp_int(_safe_int(args.get("limit")), default=50, min_value=1, max_value=500)
             current_only = bool(args.get("current_only"))
 
             query = core_db.query(Project)
-            if user.role == UserRole.client:
+            if user is not None and user.role == UserRole.client:
                 query = query.join(
                     AuthUserProject,
                     AuthUserProject.project_id == Project.id,
@@ -3068,6 +3399,7 @@ def run_tool(
                     "title": project.prj_ProjectTitle,
                     "status": project.prj_Status,
                     "current": bool(getattr(project, "prj_Current_FLAG", False)),
+                    "to_be_billed": bool(getattr(project, "prj_Billing_ReadyToBill", False)),
                     "links": {
                         "ui": f"/project/{project.id}",
                         "api": f"/api/projects/{project.id}",
@@ -3086,9 +3418,6 @@ def run_tool(
             }
 
         if name == "project_files_for_project":
-            if user is None:
-                return {"ok": False, "tool": name, "error": "Not authenticated."}
-
             project_id = _safe_int(args.get("project_id"))
             if project_id is None:
                 project_id = _safe_int(args.get("id"))
@@ -3099,7 +3428,7 @@ def run_tool(
             limit = _clamp_int(_safe_int(args.get("limit")), default=50, min_value=1, max_value=500)
 
             project_query = core_db.query(Project).filter(Project.id == project_id)
-            if user.role == UserRole.client:
+            if user is not None and user.role == UserRole.client:
                 project_query = project_query.join(
                     AuthUserProject,
                     AuthUserProject.project_id == Project.id,
@@ -3530,6 +3859,22 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "assistant_prompt_header": {
+        "type": "function",
+        "function": {
+            "name": "assistant_prompt_header",
+            "description": "Return the compact @h1 prompt header (pointers + bitmasks) for a support session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Support session_id to summarize."},
+                    "user_message_id": {"type": "integer", "description": "Optional user message id to include in the header."},
+                    "include_legend": {"type": "boolean", "description": "If true, include bit legend mappings (default false)."},
+                },
+                "required": ["session_id"],
+            },
+        },
+    },
     "assistant_search_messages": {
         "type": "function",
         "function": {
@@ -3638,6 +3983,72 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "limit": {"type": "integer", "description": "Max matches per table (default 20)."},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    "assistant_recent_agent_commands": {
+        "type": "function",
+        "function": {
+            "name": "assistant_recent_agent_commands",
+            "description": "List recent agent_command rows (queue state for the supervisor/agents).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max commands to return (default 20)."},
+                    "statuses": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional status filter (queued|running|succeeded|failed).",
+                    },
+                    "command_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional command_type filter.",
+                    },
+                    "after_id": {"type": "integer", "description": "Only return commands with id > after_id."},
+                    "order": {"type": "string", "description": "asc or desc (default desc)."},
+                    "include_payload": {"type": "boolean", "description": "Include payload_json (default false)."},
+                    "include_result": {"type": "boolean", "description": "Include result_json (default false)."},
+                },
+            },
+        },
+    },
+    "assistant_recent_agent_steps": {
+        "type": "function",
+        "function": {
+            "name": "assistant_recent_agent_steps",
+            "description": "List recent agent_step rows (supervisor action and command execution logs).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max steps to return (default 20)."},
+                    "kinds": {"type": "array", "items": {"type": "string"}, "description": "Optional step kind filter."},
+                    "run_id": {"type": "string", "description": "Optional agent_run.run_id filter."},
+                    "ok": {"type": "boolean", "description": "Optional ok filter."},
+                    "after_id": {"type": "integer", "description": "Only return steps with id > after_id."},
+                    "order": {"type": "string", "description": "asc or desc (default desc)."},
+                    "include_prompt": {"type": "boolean", "description": "Include prompt_json (default false)."},
+                    "include_response": {"type": "boolean", "description": "Include response_json (default false)."},
+                    "include_state": {"type": "boolean", "description": "Include state_before_json/state_after_json (default false)."},
+                },
+            },
+        },
+    },
+    "assistant_recent_session_reviews": {
+        "type": "function",
+        "function": {
+            "name": "assistant_recent_session_reviews",
+            "description": "List recent support_session_review rows (internal QA reviews).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max reviews to return (default 20)."},
+                    "session_id": {"type": "string", "description": "Optional support_session.session_id filter."},
+                    "user_id": {"type": "integer", "description": "Optional support_session.user_id filter."},
+                    "after_id": {"type": "integer", "description": "Only return reviews with id > after_id."},
+                    "order": {"type": "string", "description": "asc or desc (default desc)."},
+                    "include_review_json": {"type": "boolean", "description": "Include full review_json (default false)."},
+                },
             },
         },
     },
@@ -4100,7 +4511,10 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
             if user is None:
                 continue
             if user.role == UserRole.viewer:
-                continue
+                if name != "create_project_comment" or not bool(
+                    getattr(user, "can_write_project_comments", False)
+                ):
+                    continue
             if user.role == UserRole.client and name != "create_project_comment":
                 continue
         scope = _TOOL_SCOPES.get(name, ToolScope.staff)

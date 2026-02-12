@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import cache
 import os
 import re
 import json
@@ -20,6 +21,7 @@ from ispec.assistant.connect import get_assistant_session_dep
 from ispec.assistant.formatting import split_compare_finals, split_plan_final
 from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
+from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
 from ispec.assistant.service import (
     _system_prompt_answer,
@@ -49,6 +51,8 @@ from ispec.schedule.connect import get_schedule_session_dep
 
 router = APIRouter(prefix="/support", tags=["Support"])
 
+# we will be careful about these "hard coding of keywords" and try not
+# to be too reliant on it for functionality
 _PROJECT_ROUTE_RE = re.compile(r"/project/(\d+)", re.IGNORECASE)
 _EXPERIMENT_ROUTE_RE = re.compile(r"/experiment/(\d+)", re.IGNORECASE)
 _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
@@ -71,6 +75,26 @@ _LIST_MY_PROJECTS_RE = re.compile(
     r"|\b(?:what|which|show|list)\s+(?:projects?|prjs?|projs?)\b",
     re.IGNORECASE,
 )
+_TRUTHY_ENV = {"1", "true", "yes", "y", "on"}
+
+
+@cache
+def _truthy_value(raw: str) -> bool:
+    return raw.strip().lower() in _TRUTHY_ENV
+
+
+def _env_truthy(key: str) -> bool:
+    return _truthy_value(os.getenv(key) or "")
+
+
+@cache
+def _parse_int_setting(raw: str, default: int, minimum: int) -> int:
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
 
 
 def _policy_tool_for_message(message: str) -> str | None:
@@ -245,48 +269,27 @@ def _rating_value(rating: str) -> int:
 
 def _history_limit() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_HISTORY_LIMIT") or "").strip()
-    if not raw:
-        return 20
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 20
+    return _parse_int_setting(raw, 20, 0)
 
 
 def _max_prompt_tokens() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS") or "").strip()
-    if not raw:
-        return 6000
-    try:
-        return max(256, int(raw))
-    except ValueError:
-        return 6000
+    return _parse_int_setting(raw, 6000, 256)
 
 
 def _summary_max_chars() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS") or "").strip()
-    if not raw:
-        return 2000
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 2000
+    return _parse_int_setting(raw, 2000, 0)
 
 
 def _max_tool_calls() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS") or "").strip()
-    if not raw:
-        return 2
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 2
+    return _parse_int_setting(raw, 2, 0)
 
 
+# this func is redundant with above env truthy
 def _is_truthy(value: str | None) -> bool:
-    if value is None:
-        return False
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return _truthy_value(value or "")
 
 
 def _self_review_enabled() -> bool:
@@ -307,22 +310,12 @@ def _compaction_enabled() -> bool:
 
 def _compaction_keep_last() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_COMPACTION_KEEP_LAST") or "").strip()
-    if not raw:
-        return 6
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 6
+    return _parse_int_setting(raw, 6, 1)
 
 
 def _compaction_min_new_messages() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_COMPACTION_MIN_NEW_MESSAGES") or "").strip()
-    if not raw:
-        return 8
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return 8
+    return _parse_int_setting(raw, 8, 1)
 
 
 def _decide_if_dualchoice(*, payload: ChatRequest) -> bool:
@@ -331,12 +324,23 @@ def _decide_if_dualchoice(*, payload: ChatRequest) -> bool:
 
 
 def _assistant_provider() -> str:
-    return (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub").strip().lower()
+    return _parse_assistant_provider(os.getenv("ISPEC_ASSISTANT_PROVIDER") or "")
 
 
 def _tool_protocol() -> str:
-    raw = (os.getenv("ISPEC_ASSISTANT_TOOL_PROTOCOL") or "").strip().lower()
-    return raw if raw in {"line", "openai"} else "line"
+    return _parse_tool_protocol(os.getenv("ISPEC_ASSISTANT_TOOL_PROTOCOL") or "")
+
+
+@cache
+def _parse_assistant_provider(raw: str) -> str:
+    normalized = raw.strip().lower()
+    return normalized or "stub"
+
+
+@cache
+def _parse_tool_protocol(raw: str) -> str:
+    normalized = raw.strip().lower()
+    return normalized if normalized in {"line", "openai"} else "line"
 
 
 def _openai_tool_choice_for_message(message: str) -> str | dict[str, Any] | None:
@@ -352,9 +356,9 @@ def _is_confirmation_reply(message: str | None) -> bool:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     if not normalized:
         return False
-    if len(normalized) > 24:
+    if len(normalized) > 64:
         return False
-    return normalized in {
+    if normalized in {
         "yes",
         "y",
         "yeah",
@@ -372,7 +376,15 @@ def _is_confirmation_reply(message: str | None) -> bool:
         "n",
         "nope",
         "nah",
-    }
+    }:
+        return True
+
+    tokens = normalized.split()
+    if len(tokens) > 6:
+        return False
+    affirmative = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm"}
+    negative = {"no", "n", "nope", "nah"}
+    return any(token in affirmative for token in tokens) or any(token in negative for token in tokens)
 
 
 def _is_affirmative_reply(message: str | None) -> bool:
@@ -382,9 +394,9 @@ def _is_affirmative_reply(message: str | None) -> bool:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     if not normalized:
         return False
-    if len(normalized) > 24:
+    if len(normalized) > 64:
         return False
-    return normalized in {
+    if normalized in {
         "yes",
         "y",
         "yeah",
@@ -398,7 +410,17 @@ def _is_affirmative_reply(message: str | None) -> bool:
         "do it",
         "please do",
         "please do it",
-    }
+    }:
+        return True
+
+    tokens = normalized.split()
+    if len(tokens) > 6:
+        return False
+    negative = {"no", "n", "nope", "nah"}
+    if any(token in negative for token in tokens):
+        return False
+    affirmative = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm"}
+    return any(token in affirmative for token in tokens)
 
 
 def _assistant_requested_project_history_save(message: str | None) -> bool:
@@ -737,6 +759,7 @@ def chat(
 
     history_limit = _history_limit()
     max_tokens = _max_prompt_tokens()
+    assistant_provider = _assistant_provider()
 
     tool_protocol = _tool_protocol()
     max_tool_calls = _max_tool_calls()
@@ -747,13 +770,16 @@ def chat(
     tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
 
     confirmation_reply = _is_confirmation_reply(payload.message)
+    compare_mode_enabled = _compare_mode_enabled()
+    self_review_enabled = _self_review_enabled()
+    self_review_decider_enabled = _self_review_decider_enabled()
 
     if (
         tool_protocol == "openai"
         and tools_enabled
         and isinstance(tool_schemas, list)
         and tool_schemas
-        and _assistant_provider() == "vllm"
+        and assistant_provider == "vllm"
         and not confirmation_reply
     ):
         available_tool_names = _openai_tool_names(tool_schemas)
@@ -779,6 +805,7 @@ def chat(
                 primary=str(decision["primary"]),
                 secondary=list(decision["secondary"]),
             )
+            selected_tool_names |= {"assistant_prompt_header"}
             if selected_tool_names:
                 filtered: list[dict[str, Any]] = []
                 for spec in tool_schemas:
@@ -794,7 +821,7 @@ def chat(
         and tools_enabled
         and isinstance(tool_schemas, list)
         and tool_schemas
-        and _assistant_provider() == "vllm"
+        and assistant_provider == "vllm"
         and confirmation_reply
     ):
         tool_router = {"ok": True, "skipped": True, "reason": "confirmation_reply"}
@@ -803,7 +830,7 @@ def chat(
     openai_tool_names = _openai_tool_names(tool_schemas)
     openai_no_arg_tool_names = _openai_no_arg_tool_names(tool_schemas)
 
-    compare_mode_requested = _compare_mode_enabled() and _decide_if_dualchoice(payload=payload)
+    compare_mode_requested = compare_mode_enabled and _decide_if_dualchoice(payload=payload)
     response_format = "compare" if compare_mode_requested else "single"
 
     tools_available = tool_schemas_count > 0 and tools_enabled
@@ -944,6 +971,27 @@ def chat(
     policy_tool_name = _policy_tool_for_message(payload.message)
     if policy_tool_name and policy_tool_name not in openai_no_arg_tool_names:
         policy_tool_name = None
+
+    prompt_header = None
+    prompt_header_included_round1 = False
+    prompt_header_error: str | None = None
+    if prompt_header_enabled():
+        try:
+            prompt_header = build_prompt_header(
+                session_id=session.session_id,
+                user_role=user.role if user is not None else None,
+                user_id=int(user.id) if user is not None else None,
+                session_state=state_for_context,
+                user_message_id=int(user_message.id),
+                tools_available=bool(tools_available),
+                tool_protocol=str(tool_protocol or ""),
+                compare_mode=bool(compare_mode_requested),
+                forced_tool_choice=forced_tool_choice is not None,
+                repo_tools_enabled=_env_truthy("ISPEC_ASSISTANT_ENABLE_REPO_TOOLS"),
+            )
+        except Exception as exc:
+            prompt_header_error = f"{type(exc).__name__}: {exc}"
+
     llm_round = 0
 
     while True:
@@ -954,8 +1002,16 @@ def chat(
         context_message = _context_message(payload=context_payload)
 
         system_prompt = planner_prompt if tools_enabled else answer_prompt
+        header_message = (
+            [{"role": "system", "content": prompt_header.line}]
+            if prompt_header is not None and llm_round == 1
+            else []
+        )
+        if header_message:
+            prompt_header_included_round1 = True
         base_messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
+            *header_message,
             {"role": "system", "content": context_message},
             {"role": "user", "content": payload.message},
             *tool_messages,
@@ -973,6 +1029,7 @@ def chat(
 
         messages_for_llm: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
+            *header_message,
             {"role": "system", "content": context_message},
             *trimmed_history,
             {"role": "user", "content": payload.message},
@@ -1072,6 +1129,7 @@ def chat(
                         args=parsed_args if isinstance(parsed_args, dict) else {},
                         core_db=core_db,
                         assistant_db=assistant_db,
+                        agent_db=agent_db,
                         schedule_db=schedule_db,
                         omics_db=omics_db,
                         user=user,
@@ -1127,6 +1185,7 @@ def chat(
                     args=tool_args,
                     core_db=core_db,
                     assistant_db=assistant_db,
+                    agent_db=agent_db,
                     schedule_db=schedule_db,
                     omics_db=omics_db,
                     user=user,
@@ -1176,6 +1235,7 @@ def chat(
                     args=tool_args,
                     core_db=core_db,
                     assistant_db=assistant_db,
+                    agent_db=agent_db,
                     schedule_db=schedule_db,
                     omics_db=omics_db,
                     user=user,
@@ -1224,6 +1284,7 @@ def chat(
             args=tool_args,
             core_db=core_db,
             assistant_db=assistant_db,
+            agent_db=agent_db,
             schedule_db=schedule_db,
             omics_db=omics_db,
             user=user,
@@ -1292,7 +1353,7 @@ def chat(
     self_review_mode: str | None = None
     self_review_decision: str | None = None
     should_self_review = (
-        _self_review_enabled()
+        self_review_enabled
         and compare_choices is None
         and final_reply.ok
         and assistant_content.strip()
@@ -1302,7 +1363,7 @@ def chat(
     elif should_self_review:
         self_review_mode = "rewrite"
 
-        if _assistant_provider() == "vllm" and _self_review_decider_enabled():
+        if assistant_provider == "vllm" and self_review_decider_enabled:
             self_review_mode = "guided_choice"
             decider_instruction = (
                 "Decide if the draft answer needs changes. "
@@ -1404,6 +1465,17 @@ def chat(
     if final_reply.meta:
         meta["provider_meta"] = final_reply.meta
     meta["tool_calls"] = tool_calls
+    prompt_header_configured = prompt_header_enabled()
+    if prompt_header_configured or prompt_header_error:
+        meta["prompt_header"] = {
+            "configured": prompt_header_configured,
+            "built": prompt_header is not None,
+            "included_round1": prompt_header_included_round1,
+            "line": prompt_header.line if prompt_header is not None else None,
+            "fields": prompt_header.fields if prompt_header is not None else None,
+            "legend_version": prompt_header.legend_version if prompt_header is not None else None,
+            "error": prompt_header_error,
+        }
     if llm_trace:
         meta["llm_trace"] = llm_trace
     if plan_text:
@@ -1411,7 +1483,7 @@ def chat(
     raw_final = final_raw_reply_content.strip()
     if raw_final and raw_final != assistant_content.strip():
         meta["raw_content"] = raw_final
-    if _self_review_enabled():
+    if self_review_enabled:
         meta["self_review"] = {
             "changed": self_review_changed,
             "error": self_review_error,

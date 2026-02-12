@@ -115,6 +115,9 @@ def _default_prompt_base() -> str:
         "- Respect access boundaries (e.g., client users only see their projects).\n"
         "- CONTEXT is a partial snapshot; do not assume lists are exhaustive or infer global counts from them.\n"
         "- When tool calling is available, use tools for database lookups; do not claim you can't access iSPEC data.\n"
+        "- When discussing new features or implementation, prefer using existing iSPEC data/endpoints; if unsure what exists, ask.\n"
+        "- iSPEC already tracks project timestamps (created/modified, milestone dates, and timestamped comments); do not suggest adding timestamps unless confirmed missing.\n"
+        "- If asked about end-user setup/UX, describe the UI flow (where to click, what appears), not backend schema changes.\n"
         "- If users share product feedback or feature requests, thank them and ask for specifics (page/route, what they expected).\n"
         "- Do not reveal secrets (API keys, env vars, credentials) or internal paths.\n"
         "\n"
@@ -209,6 +212,9 @@ def _system_prompt_planner(
     if has("create_project_comment"):
         tool_use_lines.append(
             "- For collaborative project work, draft notes first; only write to project history if the user explicitly asks you to save."
+        )
+        tool_use_lines.append(
+            "- If the user explicitly asks you to add/save/log a project note/comment (e.g. 'make a note for project 1478'), call create_project_comment immediately (confirm=true) and then confirm using the tool result (include comment_id)."
         )
         tool_use_lines.append(
             "- If you asked the user to confirm saving a drafted note and they confirm (e.g. 'yes' / 'ok'), call create_project_comment and then confirm using the tool result (include comment_id)."
