@@ -584,6 +584,70 @@ def register_subcommands(subparsers):
         help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
     )
 
+    sync_people_parser = subparsers.add_parser(
+        "sync-legacy-people",
+        help="Incrementally sync legacy iSPEC People via the legacy API",
+    )
+    sync_people_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    sync_people_parser.add_argument(
+        "--legacy-url",
+        dest="legacy_url",
+        help="Legacy API base URL (defaults to ISPEC_LEGACY_API_URL or iSPEC/data/ispec-legacy-schema.json base_url)",
+    )
+    sync_people_parser.add_argument(
+        "--id",
+        dest="person_id",
+        type=int,
+        help="Sync a single legacy person by PPLRecNo (debug/verification)",
+    )
+    sync_people_parser.add_argument(
+        "--mapping",
+        dest="mapping",
+        help="Path to legacy-mapping.json (default: iSPEC/data/legacy-mapping.json)",
+    )
+    sync_people_parser.add_argument(
+        "--schema",
+        dest="schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
+    )
+    sync_people_parser.add_argument("--limit", type=int, default=1000)
+    sync_people_parser.add_argument("--max-pages", type=int, default=None)
+    sync_people_parser.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="Ignore stored sync cursor and start from the beginning (fetches all rows)",
+    )
+    sync_people_parser.add_argument(
+        "--since",
+        dest="since",
+        help="Override cursor timestamp (ISO-8601 recommended)",
+    )
+    sync_people_parser.add_argument(
+        "--since-pk",
+        dest="since_pk",
+        type=int,
+        help="Override cursor PK tie-breaker (integer)",
+    )
+    sync_people_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch + compute changes without writing to the DB or advancing the cursor",
+    )
+    sync_people_parser.add_argument(
+        "--backfill-missing",
+        action="store_true",
+        help="When a row is conflicted, still fill NULL/blank fields from legacy without overwriting existing values.",
+    )
+    sync_people_parser.add_argument(
+        "--dump-json",
+        dest="dump_json",
+        help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
+    )
+
     sync_project_comments_parser = subparsers.add_parser(
         "sync-legacy-project-comments",
         help="Sync legacy iSPEC ProjectHistory rows into the local project_comment table",
@@ -653,10 +717,32 @@ def register_subcommands(subparsers):
         help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
     )
     sync_experiments_parser.add_argument("--limit", type=int, default=1000)
+    sync_experiments_parser.add_argument("--max-pages", type=int, default=None)
+    sync_experiments_parser.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="Ignore stored sync cursor and start from the beginning (fetches all rows)",
+    )
+    sync_experiments_parser.add_argument(
+        "--since",
+        dest="since",
+        help="Override cursor timestamp (ISO-8601 recommended)",
+    )
+    sync_experiments_parser.add_argument(
+        "--since-pk",
+        dest="since_pk",
+        type=int,
+        help="Override cursor PK tie-breaker (integer)",
+    )
     sync_experiments_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Fetch + compute changes without writing to the DB",
+    )
+    sync_experiments_parser.add_argument(
+        "--backfill-missing",
+        action="store_true",
+        help="When a row is conflicted, still fill NULL/blank fields from legacy without overwriting existing values.",
     )
     sync_experiments_parser.add_argument(
         "--dump-json",
@@ -702,6 +788,74 @@ def register_subcommands(subparsers):
         help="Fetch + compute changes without writing to the DB",
     )
     sync_runs_parser.add_argument(
+        "--backfill-missing",
+        action="store_true",
+        help="When a row is conflicted, still fill NULL/blank fields from legacy without overwriting existing values.",
+    )
+    sync_runs_parser.add_argument(
+        "--dump-json",
+        dest="dump_json",
+        help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
+    )
+
+    sync_all_parser = subparsers.add_parser(
+        "sync-legacy-all",
+        help="Sync core legacy metadata (projects/people/experiments) and then fetch a small number of related comments/runs",
+    )
+    sync_all_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    sync_all_parser.add_argument(
+        "--legacy-url",
+        dest="legacy_url",
+        help="Legacy API base URL (defaults to ISPEC_LEGACY_API_URL or iSPEC/data/ispec-legacy-schema.json base_url)",
+    )
+    sync_all_parser.add_argument(
+        "--mapping",
+        dest="mapping",
+        help="Path to legacy-mapping.json (default: iSPEC/data/legacy-mapping.json)",
+    )
+    sync_all_parser.add_argument(
+        "--schema",
+        dest="schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
+    )
+    sync_all_parser.add_argument("--limit", type=int, default=1000)
+    sync_all_parser.add_argument("--max-pages", type=int, default=None)
+    sync_all_parser.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="Reset cursors for projects/people/experiments before syncing (fetches all rows)",
+    )
+    sync_all_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Fetch + compute changes without writing to the DB or advancing cursors",
+    )
+    sync_all_parser.add_argument(
+        "--no-backfill-missing",
+        dest="backfill_missing",
+        action="store_false",
+        default=True,
+        help="Disable filling NULL/blank fields when a row is conflicted (default: backfill is enabled).",
+    )
+    sync_all_parser.add_argument(
+        "--max-project-comments",
+        dest="max_project_comments",
+        type=int,
+        default=25,
+        help="Max number of recently touched projects to fetch comments for (default: 25).",
+    )
+    sync_all_parser.add_argument(
+        "--max-experiment-runs",
+        dest="max_experiment_runs",
+        type=int,
+        default=25,
+        help="Max number of recently touched experiments to fetch runs for (default: 25).",
+    )
+    sync_all_parser.add_argument(
         "--dump-json",
         dest="dump_json",
         help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
@@ -863,6 +1017,25 @@ def dispatch(args):
             dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy projects sync summary: %s", summary)
+    elif args.subcommand == "sync-legacy-people":
+        from ispec.db.legacy_sync import sync_legacy_people
+
+        summary = sync_legacy_people(
+            legacy_url=getattr(args, "legacy_url", None),
+            mapping_path=getattr(args, "mapping", None),
+            schema_path=getattr(args, "schema", None),
+            db_file_path=getattr(args, "database", None),
+            person_id=getattr(args, "person_id", None),
+            limit=int(getattr(args, "limit", 1000)),
+            max_pages=getattr(args, "max_pages", None),
+            reset_cursor=bool(getattr(args, "reset_cursor", False)),
+            since=getattr(args, "since", None),
+            since_pk=getattr(args, "since_pk", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            backfill_missing=bool(getattr(args, "backfill_missing", False)),
+            dump_json=getattr(args, "dump_json", None),
+        )
+        logger.info("legacy people sync summary: %s", summary)
     elif args.subcommand == "sync-legacy-project-comments":
         from ispec.db.legacy_sync import sync_legacy_project_comments
 
@@ -886,7 +1059,12 @@ def dispatch(args):
             db_file_path=getattr(args, "database", None),
             experiment_id=getattr(args, "experiment_id", None),
             limit=int(getattr(args, "limit", 1000)),
+            max_pages=getattr(args, "max_pages", None),
+            reset_cursor=bool(getattr(args, "reset_cursor", False)),
+            since=getattr(args, "since", None),
+            since_pk=getattr(args, "since_pk", None),
             dry_run=bool(getattr(args, "dry_run", False)),
+            backfill_missing=bool(getattr(args, "backfill_missing", False)),
             dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy experiments sync summary: %s", summary)
@@ -901,9 +1079,28 @@ def dispatch(args):
             experiment_id=int(getattr(args, "experiment_id")),
             limit=int(getattr(args, "limit", 5000)),
             dry_run=bool(getattr(args, "dry_run", False)),
+            backfill_missing=bool(getattr(args, "backfill_missing", False)),
             dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy experiment runs sync summary: %s", summary)
+    elif args.subcommand == "sync-legacy-all":
+        from ispec.db.legacy_sync_all import sync_legacy_all
+
+        summary = sync_legacy_all(
+            legacy_url=getattr(args, "legacy_url", None),
+            mapping_path=getattr(args, "mapping", None),
+            schema_path=getattr(args, "schema", None),
+            db_file_path=getattr(args, "database", None),
+            limit=int(getattr(args, "limit", 1000)),
+            max_pages=getattr(args, "max_pages", None),
+            reset_cursor=bool(getattr(args, "reset_cursor", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            backfill_missing=bool(getattr(args, "backfill_missing", True)),
+            max_project_comments=int(getattr(args, "max_project_comments", 25)),
+            max_experiment_runs=int(getattr(args, "max_experiment_runs", 25)),
+            dump_json=getattr(args, "dump_json", None),
+        )
+        logger.info("legacy sync-all summary: %s", summary)
     else:
         logger.info("no dispatched function provided for %s", args.subcommand)
 

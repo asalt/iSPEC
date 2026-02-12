@@ -930,10 +930,16 @@ def _ensure_system_person(session, *, imported_at: datetime) -> None:
     session.flush()
 
 
-def _ensure_placeholder_experiment(session, experiment_id: int, *, project_id: int) -> None:
+def _ensure_placeholder_experiment(
+    session,
+    experiment_id: int,
+    *,
+    project_id: int | None = None,
+) -> None:
     if session.get(Experiment, experiment_id) is not None:
         return
-    _ensure_placeholder_project(session, project_id)
+    if project_id is not None:
+        _ensure_placeholder_project(session, project_id)
     session.add(
         Experiment(
             id=experiment_id,
@@ -942,6 +948,111 @@ def _ensure_placeholder_experiment(session, experiment_id: int, *, project_id: i
         )
     )
     session.flush()
+
+
+def _build_person_record(
+    item: dict[str, Any],
+    *,
+    plan: LegacyTablePlan,
+    imported_at: datetime,
+) -> tuple[int, dict[str, Any], datetime | None] | None:
+    legacy_pk = item.get(plan.legacy_pk_field)
+    if legacy_pk is None:
+        return None
+    try:
+        person_id = int(legacy_pk)
+    except Exception:
+        return None
+    if person_id <= 0:
+        return None
+
+    record: dict[str, Any] = {
+        "id": person_id,
+        "ppl_LegacyImportTS": imported_at,
+    }
+
+    for legacy_field, local_field in plan.field_map.items():
+        if legacy_field not in item:
+            continue
+        if local_field.endswith("_CreationTS") or local_field.endswith("_ModificationTS"):
+            continue
+        record[local_field] = _coerce_model_field(Person, local_field, item.get(legacy_field))
+
+    added_by = record.get("ppl_AddedBy")
+    if not (isinstance(added_by, str) and added_by.strip()):
+        record["ppl_AddedBy"] = "legacy_import"
+
+    first = record.get("ppl_Name_First")
+    if not (isinstance(first, str) and first.strip()):
+        record["ppl_Name_First"] = "Unknown"
+
+    last = record.get("ppl_Name_Last")
+    if not (isinstance(last, str) and last.strip()):
+        record["ppl_Name_Last"] = f"Unknown ({person_id})"
+
+    last_modified_raw = item.get(plan.legacy_modified_field)
+    last_modified_dt = _normalize_datetime(_coerce_datetime(last_modified_raw))
+    return person_id, record, last_modified_dt
+
+
+def _apply_person_record(
+    session,
+    *,
+    person_id: int,
+    record: dict[str, Any],
+    dry_run: bool,
+    backfill_missing: bool,
+) -> str:
+    existing = session.get(Person, person_id)
+    if existing is None:
+        if not dry_run:
+            session.add(Person(**record))
+        return "inserted"
+
+    if _can_update_imported(
+        obj=existing,
+        added_by_field="ppl_AddedBy",
+        created_field="ppl_CreationTS",
+        modified_field="ppl_ModificationTS",
+        import_ts_field="ppl_LegacyImportTS",
+    ):
+        if not dry_run:
+            for key, value in record.items():
+                if key == "id":
+                    continue
+                if hasattr(existing, key):
+                    setattr(existing, key, value)
+        return "updated"
+
+    if not backfill_missing:
+        return "conflicted"
+
+    changed = False
+    for key, value in record.items():
+        if key in {"id", "ppl_LegacyImportTS"}:
+            continue
+        if not hasattr(existing, key):
+            continue
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        current = getattr(existing, key, None)
+        missing_current = current is None
+        if isinstance(current, str):
+            missing_current = missing_current or not current.strip()
+        if key.endswith("_AddedBy") and current == "legacy_import":
+            missing_current = True
+
+        if not missing_current:
+            continue
+
+        if not dry_run:
+            setattr(existing, key, value)
+        changed = True
+
+    return "backfilled" if changed else "conflicted"
 
 
 def _build_project_record(
@@ -1015,7 +1126,8 @@ def _build_experiment_record(
     *,
     plan: LegacyTablePlan,
     model_columns: set[str],
-) -> tuple[int, dict[str, Any], int | None] | None:
+    imported_at: datetime,
+) -> tuple[int, dict[str, Any], int | None, datetime | None] | None:
     legacy_pk = item.get(plan.legacy_pk_field)
     if legacy_pk is None:
         return None
@@ -1024,12 +1136,18 @@ def _build_experiment_record(
     except Exception:
         return None
 
-    record: dict[str, Any] = {"id": exp_id, "record_no": str(exp_id)}
+    record: dict[str, Any] = {
+        "id": exp_id,
+        "record_no": str(exp_id),
+        "Experiment_LegacyImportTS": imported_at,
+    }
 
     for legacy_field, local_field in plan.field_map.items():
         if legacy_field not in item:
             continue
         if local_field not in model_columns:
+            continue
+        if local_field.endswith("_CreationTS") or local_field.endswith("_ModificationTS"):
             continue
         record[local_field] = _coerce_model_field(Experiment, local_field, item.get(legacy_field))
 
@@ -1050,7 +1168,8 @@ def _build_experiment_record(
     project_id = record.get("project_id")
     if project_id is None:
         record["project_id"] = None
-        return exp_id, record, None
+        last_modified_dt = _normalize_datetime(_coerce_datetime(item.get(plan.legacy_modified_field)))
+        return exp_id, record, None, last_modified_dt
 
     try:
         project_id_int = int(project_id)
@@ -1059,26 +1178,70 @@ def _build_experiment_record(
 
     if project_id_int <= 0:
         record["project_id"] = None
-        return exp_id, record, None
+        last_modified_dt = _normalize_datetime(_coerce_datetime(item.get(plan.legacy_modified_field)))
+        return exp_id, record, None, last_modified_dt
 
     record["project_id"] = project_id_int
-    return exp_id, record, project_id_int
+    last_modified_dt = _normalize_datetime(_coerce_datetime(item.get(plan.legacy_modified_field)))
+    return exp_id, record, project_id_int, last_modified_dt
 
 
-def _apply_experiment_record(session, *, exp_id: int, record: dict[str, Any], dry_run: bool) -> str:
+def _apply_experiment_record(
+    session,
+    *,
+    exp_id: int,
+    record: dict[str, Any],
+    dry_run: bool,
+    backfill_missing: bool,
+) -> str:
     existing = session.get(Experiment, exp_id)
     if existing is None:
         if not dry_run:
             session.add(Experiment(**record))
         return "inserted"
 
-    if not dry_run:
-        for key, value in record.items():
-            if key == "id":
-                continue
-            if hasattr(existing, key):
-                setattr(existing, key, value)
-    return "updated"
+    if _can_update_imported(
+        obj=existing,
+        added_by_field="__legacy_added_by__",  # Experiment has no AddedBy column
+        created_field="Experiment_CreationTS",
+        modified_field="Experiment_ModificationTS",
+        import_ts_field="Experiment_LegacyImportTS",
+    ):
+        if not dry_run:
+            for key, value in record.items():
+                if key == "id":
+                    continue
+                if hasattr(existing, key):
+                    setattr(existing, key, value)
+        return "updated"
+
+    if not backfill_missing:
+        return "conflicted"
+
+    changed = False
+    for key, value in record.items():
+        if key in {"id", "Experiment_LegacyImportTS"}:
+            continue
+        if not hasattr(existing, key):
+            continue
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        current = getattr(existing, key, None)
+        missing_current = current is None
+        if isinstance(current, str):
+            missing_current = missing_current or not current.strip()
+
+        if not missing_current:
+            continue
+
+        if not dry_run:
+            setattr(existing, key, value)
+        changed = True
+
+    return "backfilled" if changed else "conflicted"
 
 
 def _build_experiment_run_record(
@@ -1145,6 +1308,7 @@ def _apply_experiment_run_record(
     key: tuple[int, int, int, str],
     record: dict[str, Any],
     dry_run: bool,
+    backfill_missing: bool,
 ) -> str:
     exp_id_int, run_no_int, search_no_int, label = key
     try:
@@ -1163,16 +1327,50 @@ def _apply_experiment_run_record(
 
     if existing is None:
         if session.get(Experiment, exp_id_int) is None:
-            return "conflicted"
+            _ensure_placeholder_experiment(session, exp_id_int, project_id=None)
         if not dry_run:
             session.add(ExperimentRun(**record))
         return "inserted"
 
-    if not dry_run:
-        for key_name, value in record.items():
-            if hasattr(existing, key_name):
-                setattr(existing, key_name, value)
-    return "updated"
+    if _can_update_imported(
+        obj=existing,
+        added_by_field="__legacy_added_by__",  # ExperimentRun has no AddedBy column
+        created_field="ExperimentRun_CreationTS",
+        modified_field="ExperimentRun_ModificationTS",
+        import_ts_field="ExperimentRun_LegacyImportTS",
+    ):
+        if not dry_run:
+            for key_name, value in record.items():
+                if hasattr(existing, key_name):
+                    setattr(existing, key_name, value)
+        return "updated"
+
+    if not backfill_missing:
+        return "conflicted"
+
+    changed = False
+    for key_name, value in record.items():
+        if key_name == "ExperimentRun_LegacyImportTS":
+            continue
+        if not hasattr(existing, key_name):
+            continue
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        current = getattr(existing, key_name, None)
+        missing_current = current is None
+        if isinstance(current, str):
+            missing_current = missing_current or not current.strip()
+
+        if not missing_current:
+            continue
+        if not dry_run:
+            setattr(existing, key_name, value)
+        changed = True
+
+    return "backfilled" if changed else "conflicted"
 
 
 def _apply_project_record(
@@ -1249,8 +1447,10 @@ def sync_legacy_projects(
     since_pk: int | None = None,
     dry_run: bool = False,
     backfill_missing: bool = False,
+    collect_ids: bool = False,
+    max_collected_ids: int = 200,
     dump_json: str | Path | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Incrementally sync legacy iSPEC Projects into the local Project table."""
 
     resolved_mapping = Path(mapping_path).expanduser().resolve() if mapping_path else default_mapping_path()
@@ -1266,6 +1466,8 @@ def sync_legacy_projects(
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
 
     inserted = updated = backfilled = conflicted = 0
+    touched_ids: list[int] = []
+    touched_set: set[int] = set()
     pages = 0
     total_items = 0
     seen_cursors: set[tuple[str | None, int | None]] = set()
@@ -1399,6 +1601,10 @@ def sync_legacy_projects(
                     backfilled += 1
                 else:
                     conflicted += 1
+                if collect_ids and outcome != "conflicted":
+                    if legacy_project_id not in touched_set and len(touched_ids) < max_collected_ids:
+                        touched_set.add(legacy_project_id)
+                        touched_ids.append(legacy_project_id)
 
                 last_modified_dt = item_modified_dt
                 last_pk = legacy_project_id
@@ -1427,7 +1633,7 @@ def sync_legacy_projects(
         if dry_run:
             session.rollback()
 
-    return {
+    result: dict[str, Any] = {
         "pages": pages,
         "items": total_items,
         "inserted": inserted,
@@ -1435,6 +1641,233 @@ def sync_legacy_projects(
         "backfilled": backfilled,
         "conflicted": conflicted,
     }
+    if collect_ids:
+        result["touched_ids"] = touched_ids
+    return result
+
+
+def sync_legacy_people(
+    *,
+    legacy_url: str | None = None,
+    mapping_path: str | Path | None = None,
+    schema_path: str | Path | None = None,
+    db_file_path: str | None = None,
+    person_id: int | None = None,
+    limit: int = 1000,
+    max_pages: int | None = None,
+    reset_cursor: bool = False,
+    since: str | None = None,
+    since_pk: int | None = None,
+    dry_run: bool = False,
+    backfill_missing: bool = False,
+    collect_ids: bool = False,
+    max_collected_ids: int = 200,
+    dump_json: str | Path | None = None,
+) -> dict[str, Any]:
+    """Incrementally sync legacy iSPEC People into the local Person table."""
+
+    resolved_mapping = (
+        Path(mapping_path).expanduser().resolve() if mapping_path else default_mapping_path()
+    )
+    resolved_schema = (
+        Path(schema_path).expanduser().resolve() if schema_path else default_schema_path()
+    )
+    base_url = _resolve_legacy_url(legacy_url=legacy_url, schema_path=resolved_schema)
+
+    plan = _load_table_plan(resolved_mapping, legacy_table="iSPEC_People")
+    fields = _plan_fields_to_fetch(plan)
+    model_columns = set(Person.__table__.columns.keys())
+    expected_fields: set[str] = {plan.legacy_pk_field, plan.legacy_modified_field}
+    if plan.legacy_created_field:
+        expected_fields.add(plan.legacy_created_field)
+    for legacy_field, local_field in plan.field_map.items():
+        if local_field in model_columns:
+            expected_fields.add(legacy_field)
+
+    required_fields: list[str] = [plan.legacy_pk_field, plan.legacy_modified_field]
+    if plan.legacy_created_field:
+        required_fields.append(plan.legacy_created_field)
+
+    if not db_file_path:
+        db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
+
+    inserted = updated = backfilled = conflicted = 0
+    touched_ids: list[int] = []
+    touched_set: set[int] = set()
+    pages = 0
+    total_items = 0
+    seen_cursors: set[tuple[str | None, int | None]] = set()
+    fields_mode: str | None = None
+    dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
+
+    with get_session(file_path=db_file_path) as session:
+        cursor_state: LegacySyncState | None = None
+        if person_id is None:
+            cursor_state = session.get(LegacySyncState, plan.legacy_table)
+            if cursor_state is None:
+                cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
+                session.add(cursor_state)
+                session.flush()
+
+        if cursor_state is not None and reset_cursor:
+            cursor_state.since = None
+            cursor_state.since_pk = None
+
+        cursor_since_dt = cursor_state.since if cursor_state is not None else None
+        cursor_since_pk = cursor_state.since_pk if cursor_state is not None else None
+
+        if since:
+            cursor_since_dt = _normalize_datetime(_coerce_datetime(since))
+        if since_pk is not None:
+            cursor_since_pk = int(since_pk)
+
+        url = f"{base_url}/api/v2/legacy/tables/{plan.legacy_table}/rows"
+
+        while True:
+            pages += 1
+            if max_pages is not None and pages > max_pages:
+                break
+
+            params: dict[str, Any] = {
+                "pk_field": plan.legacy_pk_field,
+                "modified_field": plan.legacy_modified_field,
+                "limit": int(limit),
+                "order_by": f"-{plan.legacy_modified_field},-{plan.legacy_pk_field}",
+            }
+            if cursor_since_dt is not None:
+                params["since"] = _format_cursor_datetime(cursor_since_dt)
+            if cursor_since_pk is not None:
+                params["since_pk"] = int(cursor_since_pk)
+            if person_id is not None:
+                params["id"] = int(person_id)
+
+            cursor_key = (
+                params.get("since"),
+                int(params["since_pk"]) if "since_pk" in params else None,
+            )
+            if cursor_key in seen_cursors:
+                logger.warning(
+                    "legacy sync cursor repeated; legacy endpoint may be ignoring since/since_pk (%s)",
+                    cursor_key,
+                )
+                break
+            seen_cursors.add(cursor_key)
+
+            modes = [fields_mode] if fields_mode else ["repeat", "csv", "none"]
+            threshold_missing = max(1, int(0.1 * len(expected_fields)))
+
+            payload, fields_mode = _fetch_legacy_rows_best_effort(
+                url=url,
+                params=params,
+                modes=modes,
+                fields=list(fields),
+                expected_fields=expected_fields,
+                required_fields=required_fields,
+                merge_key_fields=[plan.legacy_pk_field],
+                threshold_missing=threshold_missing,
+                log_label="legacy people",
+            )
+
+            dump_path = _legacy_dump_path_for_request(
+                dump_file,
+                dump_dir,
+                table=plan.legacy_table,
+                page=pages,
+                mode=fields_mode,
+                id_value=person_id,
+            )
+            if dump_path is not None:
+                if not _legacy_debug_requests_enabled():
+                    request_url = _prepared_request_url(
+                        url,
+                        _legacy_params_with_fields(
+                            params, fields=list(fields), mode=str(fields_mode)
+                        ),
+                    )
+                    logger.info("legacy people request_url mode=%s %s", fields_mode, request_url)
+                _dump_legacy_payload(payload, path=dump_path)
+                logger.info("legacy people dumped payload to %s", dump_path)
+
+            raw_items = payload.get("items") or payload.get("rows") or []
+            items: list[dict[str, Any]] = list(raw_items)
+            has_more_raw = payload.get("has_more")
+            has_more = bool(has_more_raw) if has_more_raw is not None else len(items) >= int(limit)
+            total_items += len(items)
+
+            if not items:
+                break
+
+            last_modified_dt: datetime | None = None
+            last_pk: int | None = None
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                imported_at = _normalize_datetime(datetime.now(UTC)) or datetime.utcnow()
+                built = _build_person_record(item, plan=plan, imported_at=imported_at)
+                if built is None:
+                    continue
+
+                legacy_person_id, record, item_modified_dt = built
+                outcome = _apply_person_record(
+                    session,
+                    person_id=legacy_person_id,
+                    record=record,
+                    dry_run=dry_run,
+                    backfill_missing=backfill_missing,
+                )
+                if outcome == "inserted":
+                    inserted += 1
+                elif outcome == "updated":
+                    updated += 1
+                elif outcome == "backfilled":
+                    backfilled += 1
+                else:
+                    conflicted += 1
+                if collect_ids and outcome != "conflicted":
+                    if legacy_person_id not in touched_set and len(touched_ids) < max_collected_ids:
+                        touched_set.add(legacy_person_id)
+                        touched_ids.append(legacy_person_id)
+
+                last_modified_dt = item_modified_dt
+                last_pk = legacy_person_id
+
+            if person_id is None and not dry_run and cursor_state is not None:
+                next_since = payload.get("next_since")
+                next_since_pk = payload.get("next_since_pk")
+
+                if isinstance(next_since, str) and next_since.strip():
+                    cursor_since_dt = _normalize_datetime(_coerce_datetime(next_since))
+                else:
+                    cursor_since_dt = last_modified_dt
+
+                cursor_since_pk = int(next_since_pk) if next_since_pk is not None else last_pk
+
+                cursor_state.since = cursor_since_dt
+                cursor_state.since_pk = cursor_since_pk
+
+                session.flush()
+
+            if not has_more:
+                break
+            if person_id is not None:
+                break
+
+        if dry_run:
+            session.rollback()
+
+    result: dict[str, Any] = {
+        "pages": pages,
+        "items": total_items,
+        "inserted": inserted,
+        "updated": updated,
+        "backfilled": backfilled,
+        "conflicted": conflicted,
+    }
+    if collect_ids:
+        result["touched_ids"] = touched_ids
+    return result
 
 
 def sync_legacy_project_comments(
@@ -1446,7 +1879,7 @@ def sync_legacy_project_comments(
     limit: int = 5000,
     dry_run: bool = False,
     dump_json: str | Path | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Sync legacy iSPEC ProjectHistory rows into the local ProjectComment table."""
 
     resolved_schema = Path(schema_path).expanduser().resolve() if schema_path else default_schema_path()
@@ -1631,10 +2064,17 @@ def sync_legacy_experiments(
     db_file_path: str | None = None,
     experiment_id: int | None = None,
     limit: int = 1000,
+    max_pages: int | None = None,
+    reset_cursor: bool = False,
+    since: str | None = None,
+    since_pk: int | None = None,
     dry_run: bool = False,
+    backfill_missing: bool = False,
+    collect_ids: bool = False,
+    max_collected_ids: int = 200,
     dump_json: str | Path | None = None,
-) -> dict[str, int]:
-    """Sync legacy iSPEC Experiments into the local Experiment table."""
+) -> dict[str, Any]:
+    """Incrementally sync legacy iSPEC Experiments into the local Experiment table."""
 
     resolved_mapping = (
         Path(mapping_path).expanduser().resolve() if mapping_path else default_mapping_path()
@@ -1667,80 +2107,192 @@ def sync_legacy_experiments(
     if not db_file_path:
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
 
-    inserted = updated = conflicted = 0
+    inserted = updated = backfilled = conflicted = 0
+    touched_ids: list[int] = []
+    touched_set: set[int] = set()
+    pages = 0
+    total_items = 0
+    seen_cursors: set[tuple[str | None, int | None]] = set()
+    fields_mode: str | None = None
     dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
 
     url = f"{base_url}/api/v2/legacy/tables/{plan.legacy_table}/rows"
-    params: dict[str, Any] = {
-        "pk_field": plan.legacy_pk_field,
-        "modified_field": plan.legacy_modified_field,
-        "limit": int(limit),
-        "order_by": f"-{plan.legacy_modified_field},-{plan.legacy_pk_field}",
-    }
-    if experiment_id is not None:
-        params["id"] = int(experiment_id)
-
-    threshold_missing = max(1, int(0.1 * len(expected_fields)))
-    payload, fields_mode = _fetch_legacy_rows_best_effort(
-        url=url,
-        params=params,
-        modes=["repeat", "csv", "none"],
-        fields=list(fields),
-        expected_fields=expected_fields,
-        required_fields=required_fields,
-        merge_key_fields=[plan.legacy_pk_field],
-        threshold_missing=threshold_missing,
-        log_label="legacy experiments",
-    )
-
-    dump_path = _legacy_dump_path_for_request(
-        dump_file,
-        dump_dir,
-        table=plan.legacy_table,
-        page=1,
-        mode=fields_mode,
-        id_value=experiment_id,
-    )
-    if dump_path is not None:
-        if not _legacy_debug_requests_enabled():
-            request_url = _prepared_request_url(
-                url,
-                _legacy_params_with_fields(params, fields=list(fields), mode=str(fields_mode)),
-            )
-            logger.info("legacy experiments request_url mode=%s %s", fields_mode, request_url)
-        _dump_legacy_payload(payload, path=dump_path)
-        logger.info("legacy experiments dumped payload to %s", dump_path)
-
-    items = list(payload.get("items") or payload.get("rows") or [])
-
     with get_session(file_path=db_file_path) as session:
-        for item in items:
-            if not isinstance(item, dict):
-                continue
+        cursor_state: LegacySyncState | None = None
+        if experiment_id is None:
+            cursor_state = session.get(LegacySyncState, plan.legacy_table)
+            if cursor_state is None:
+                cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
+                session.add(cursor_state)
+                session.flush()
 
-            built = _build_experiment_record(item, plan=plan, model_columns=model_columns)
-            if built is None:
-                conflicted += 1
-                continue
+        if cursor_state is not None and reset_cursor:
+            cursor_state.since = None
+            cursor_state.since_pk = None
 
-            exp_id, record, project_id_int = built
-            if project_id_int is not None:
-                _ensure_placeholder_project(session, project_id_int)
+        cursor_since_dt = cursor_state.since if cursor_state is not None else None
+        cursor_since_pk = cursor_state.since_pk if cursor_state is not None else None
 
-            outcome = _apply_experiment_record(
-                session, exp_id=exp_id, record=record, dry_run=dry_run
+        if since:
+            cursor_since_dt = _normalize_datetime(_coerce_datetime(since))
+        if since_pk is not None:
+            cursor_since_pk = int(since_pk)
+
+        while True:
+            pages += 1
+            if max_pages is not None and pages > max_pages:
+                break
+
+            params: dict[str, Any] = {
+                "pk_field": plan.legacy_pk_field,
+                "modified_field": plan.legacy_modified_field,
+                "limit": int(limit),
+                "order_by": f"-{plan.legacy_modified_field},-{plan.legacy_pk_field}",
+            }
+            if cursor_since_dt is not None:
+                params["since"] = _format_cursor_datetime(cursor_since_dt)
+            if cursor_since_pk is not None:
+                params["since_pk"] = int(cursor_since_pk)
+            if experiment_id is not None:
+                params["id"] = int(experiment_id)
+
+            cursor_key = (
+                params.get("since"),
+                int(params["since_pk"]) if "since_pk" in params else None,
             )
-            if outcome == "inserted":
-                inserted += 1
-            elif outcome == "updated":
-                updated += 1
-            else:
-                conflicted += 1
+            if cursor_key in seen_cursors:
+                logger.warning(
+                    "legacy sync cursor repeated; legacy endpoint may be ignoring since/since_pk (%s)",
+                    cursor_key,
+                )
+                break
+            seen_cursors.add(cursor_key)
+
+            modes = [fields_mode] if fields_mode else ["repeat", "csv", "none"]
+            threshold_missing = max(1, int(0.1 * len(expected_fields)))
+            payload, fields_mode = _fetch_legacy_rows_best_effort(
+                url=url,
+                params=params,
+                modes=modes,
+                fields=list(fields),
+                expected_fields=expected_fields,
+                required_fields=required_fields,
+                merge_key_fields=[plan.legacy_pk_field],
+                threshold_missing=threshold_missing,
+                log_label="legacy experiments",
+            )
+
+            dump_path = _legacy_dump_path_for_request(
+                dump_file,
+                dump_dir,
+                table=plan.legacy_table,
+                page=pages,
+                mode=fields_mode,
+                id_value=experiment_id,
+            )
+            if dump_path is not None:
+                if not _legacy_debug_requests_enabled():
+                    request_url = _prepared_request_url(
+                        url,
+                        _legacy_params_with_fields(
+                            params, fields=list(fields), mode=str(fields_mode)
+                        ),
+                    )
+                    logger.info(
+                        "legacy experiments request_url mode=%s %s", fields_mode, request_url
+                    )
+                _dump_legacy_payload(payload, path=dump_path)
+                logger.info("legacy experiments dumped payload to %s", dump_path)
+
+            raw_items = payload.get("items") or payload.get("rows") or []
+            items: list[dict[str, Any]] = list(raw_items)
+            has_more_raw = payload.get("has_more")
+            has_more = bool(has_more_raw) if has_more_raw is not None else len(items) >= int(limit)
+            total_items += len(items)
+
+            if not items:
+                break
+
+            last_modified_dt: datetime | None = None
+            last_pk: int | None = None
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                imported_at = _normalize_datetime(datetime.now(UTC)) or datetime.utcnow()
+                built = _build_experiment_record(
+                    item,
+                    plan=plan,
+                    model_columns=model_columns,
+                    imported_at=imported_at,
+                )
+                if built is None:
+                    conflicted += 1
+                    continue
+
+                exp_id, record, project_id_int, item_modified_dt = built
+                if project_id_int is not None:
+                    _ensure_placeholder_project(session, project_id_int)
+
+                outcome = _apply_experiment_record(
+                    session,
+                    exp_id=exp_id,
+                    record=record,
+                    dry_run=dry_run,
+                    backfill_missing=backfill_missing,
+                )
+                if outcome == "inserted":
+                    inserted += 1
+                elif outcome == "updated":
+                    updated += 1
+                elif outcome == "backfilled":
+                    backfilled += 1
+                else:
+                    conflicted += 1
+                if collect_ids and outcome != "conflicted":
+                    if exp_id not in touched_set and len(touched_ids) < max_collected_ids:
+                        touched_set.add(exp_id)
+                        touched_ids.append(exp_id)
+
+                last_modified_dt = item_modified_dt
+                last_pk = exp_id
+
+            if experiment_id is None and not dry_run and cursor_state is not None:
+                next_since = payload.get("next_since")
+                next_since_pk = payload.get("next_since_pk")
+
+                if isinstance(next_since, str) and next_since.strip():
+                    cursor_since_dt = _normalize_datetime(_coerce_datetime(next_since))
+                else:
+                    cursor_since_dt = last_modified_dt
+
+                cursor_since_pk = int(next_since_pk) if next_since_pk is not None else last_pk
+
+                cursor_state.since = cursor_since_dt
+                cursor_state.since_pk = cursor_since_pk
+
+                session.flush()
+
+            if not has_more:
+                break
+            if experiment_id is not None:
+                break
 
         if dry_run:
             session.rollback()
 
-    return {"inserted": inserted, "updated": updated, "conflicted": conflicted}
+    result: dict[str, Any] = {
+        "pages": pages,
+        "items": total_items,
+        "inserted": inserted,
+        "updated": updated,
+        "backfilled": backfilled,
+        "conflicted": conflicted,
+    }
+    if collect_ids:
+        result["touched_ids"] = touched_ids
+    return result
 
 
 def sync_legacy_experiment_runs(
@@ -1752,8 +2304,9 @@ def sync_legacy_experiment_runs(
     experiment_id: int,
     limit: int = 5000,
     dry_run: bool = False,
+    backfill_missing: bool = False,
     dump_json: str | Path | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Sync legacy iSPEC ExperimentRuns for a specific experiment."""
 
     resolved_mapping = (
@@ -1791,7 +2344,7 @@ def sync_legacy_experiment_runs(
     if not db_file_path:
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
 
-    inserted = updated = conflicted = 0
+    inserted = updated = backfilled = conflicted = 0
     dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
 
     url = f"{base_url}/api/v2/legacy/tables/{plan.legacy_table}/rows"
@@ -1854,17 +2407,30 @@ def sync_legacy_experiment_runs(
                 continue
 
             run_key, record = built
+            imported_at = _normalize_datetime(datetime.now(UTC)) or datetime.utcnow()
+            record["ExperimentRun_LegacyImportTS"] = imported_at
             outcome = _apply_experiment_run_record(
-                session, key=run_key, record=record, dry_run=dry_run
+                session,
+                key=run_key,
+                record=record,
+                dry_run=dry_run,
+                backfill_missing=backfill_missing,
             )
             if outcome == "inserted":
                 inserted += 1
             elif outcome == "updated":
                 updated += 1
+            elif outcome == "backfilled":
+                backfilled += 1
             else:
                 conflicted += 1
 
         if dry_run:
             session.rollback()
 
-    return {"inserted": inserted, "updated": updated, "conflicted": conflicted}
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "backfilled": backfilled,
+        "conflicted": conflicted,
+    }

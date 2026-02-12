@@ -82,6 +82,7 @@ def initialize_db(engine: Engine):
     _ensure_project_comment_columns(engine)
     _ensure_legacy_import_tracking_columns(engine)
     _ensure_experiment_columns(engine)
+    _ensure_experiment_run_columns(engine)
     _ensure_e2g_columns(engine)
     _ensure_auth_user_columns(engine)
 
@@ -139,6 +140,8 @@ def _ensure_legacy_import_tracking_columns(engine: Engine) -> None:
         "project": ("prj_LegacyImportTS", "DATETIME"),
         "person": ("ppl_LegacyImportTS", "DATETIME"),
         "project_comment": ("com_LegacyImportTS", "DATETIME"),
+        "experiment": ("Experiment_LegacyImportTS", "DATETIME"),
+        "experiment_run": ("ExperimentRun_LegacyImportTS", "DATETIME"),
     }
 
     for table, (column, col_type) in desired.items():
@@ -194,6 +197,34 @@ def _ensure_experiment_columns(engine: Engine) -> None:
 
     logger.info(
         "Added missing columns experiment.%s", ", ".join(name for name, _ in missing)
+    )
+
+
+def _ensure_experiment_run_columns(engine: Engine) -> None:
+    """Ensure legacy SQLite schemas include newer experiment_run columns."""
+
+    desired: list[tuple[str, str]] = [
+        ("ms_instrument", "TEXT"),
+        ("acquisition_mode", "TEXT"),
+        ("ref_database", "TEXT"),
+        ("taxon_id", "INTEGER"),
+    ]
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("experiment_run")}
+    except Exception:
+        return
+
+    missing = [(name, ddl) for (name, ddl) in desired if name not in columns]
+    if not missing:
+        return
+
+    with engine.begin() as conn:
+        for name, ddl in missing:
+            conn.execute(text(f'ALTER TABLE experiment_run ADD COLUMN "{name}" {ddl}'))
+
+    logger.info(
+        "Added missing columns experiment_run.%s", ", ".join(name for name, _ in missing)
     )
 
 

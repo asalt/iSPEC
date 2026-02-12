@@ -43,6 +43,9 @@ class Experiment(ExperimentTimestamp, Base):
     project_id: Mapped[int | None] = mapped_column(
         ForeignKey("project.id", ondelete="CASCADE"), nullable=True
     )
+    Experiment_LegacyImportTS: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     record_no: Mapped[str] = mapped_column(
         Text,
         nullable=False,
@@ -199,6 +202,9 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
     experiment_id: Mapped[int] = mapped_column(
         ForeignKey("experiment.id", ondelete="CASCADE"), nullable=False
     )
+    ExperimentRun_LegacyImportTS: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     run_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     search_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     label: Mapped[str] = mapped_column(
@@ -228,6 +234,11 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
             }
         },
     )
+
+    ms_instrument: Mapped[str | None] = mapped_column(Text, nullable=True)
+    acquisition_mode: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ref_database: Mapped[str | None] = mapped_column(Text, nullable=True)
+    taxon_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     db_search_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     gpgrouper_flag: Mapped[bool] = mapped_column(Boolean, default=False)
