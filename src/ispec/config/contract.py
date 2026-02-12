@@ -137,10 +137,10 @@ def default_contract() -> tuple[VarSpec, ...]:
             key="ISPEC_AGENT_DB_PATH",
             kind="path",
             group="Database",
-            description="Agent telemetry SQLite DB path or sqlite:/// URI (defaults to ISPEC_ASSISTANT_DB_PATH).",
+            description="Agent telemetry SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
             default_by_profile={
-                "dev": "iSPEC/data/ispec-assistant.db",
-                "prod": "/var/lib/ispec/ispec-assistant.db",
+                "dev": "iSPEC/data/ispec-agent.db",
+                "prod": "/var/lib/ispec/ispec-agent.db",
             },
         ),
         VarSpec(
@@ -227,6 +227,13 @@ def default_contract() -> tuple[VarSpec, ...]:
             description="Tool calling protocol: line (TOOL_CALL) | openai (structured tool_calls).",
             default_by_profile={"dev": "openai", "prod": "openai"},
             choices=("line", "openai"),
+        ),
+        VarSpec(
+            key="ISPEC_ASSISTANT_ENABLE_PROMPT_HEADER",
+            kind="bool",
+            group="Assistant",
+            description="Enable compact @h1 prompt header injection (first LLM round only).",
+            default_by_profile={"dev": "0", "prod": "0"},
         ),
         VarSpec(
             key="ISPEC_VLLM_URL",

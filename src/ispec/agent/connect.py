@@ -32,7 +32,8 @@ def get_agent_db_uri(file: str | Path | None = None) -> str:
     Resolution order:
       1) explicit ``file`` argument
       2) env ``ISPEC_AGENT_DB_PATH``
-      3) default to the support assistant DB (see :func:`ispec.assistant.connect.get_assistant_db_uri`)
+      3) alongside ``ISPEC_DB_PATH`` (same dir, ``ispec-agent.db``)
+      4) fallback to ``ISPEC_DB_DIR`` (via :func:`ispec.db.connect.get_db_dir`)
     """
 
     if file is not None:
@@ -42,9 +43,21 @@ def get_agent_db_uri(file: str | Path | None = None) -> str:
     if env_path:
         return _sqlite_uri(env_path)
 
-    from ispec.assistant.connect import get_assistant_db_uri
+    main_path = (os.getenv("ISPEC_DB_PATH") or "").strip()
+    candidate: Path | None = None
+    if main_path:
+        if main_path.startswith("sqlite:///"):
+            candidate = Path(main_path.removeprefix("sqlite:///"))
+        elif "://" not in main_path:
+            candidate = Path(main_path)
 
-    return get_assistant_db_uri()
+    if candidate is not None:
+        agent_file = candidate.expanduser().resolve().parent / "ispec-agent.db"
+        return _sqlite_uri(agent_file)
+
+    from ispec.db.connect import get_db_dir
+
+    return _sqlite_uri(get_db_dir() / "ispec-agent.db")
 
 
 @lru_cache(maxsize=None)
