@@ -19,6 +19,7 @@ def main():
         db,
         logging as logging_cli,
         slack,
+        support,
         supervisor,
     )
 
@@ -60,6 +61,10 @@ def main():
     slack_subparsers = slack_parser.add_subparsers(dest="subcommand", required=True)
     slack.register_subcommands(slack_subparsers)
 
+    support_parser = subparsers.add_parser("support", help="Support assistant helpers")
+    support_subparsers = support_parser.add_subparsers(dest="subcommand", required=True)
+    support.register_subcommands(support_subparsers)
+
     config_parser = subparsers.add_parser(
         "config", help="Config/env auditing and initialization helpers"
     )
@@ -85,6 +90,8 @@ def main():
         agent.dispatch(args)
     elif args.command == "slack":
         slack.dispatch(args)
+    elif args.command == "support":
+        support.dispatch(args)
     elif args.command == "config":
         config_cli.dispatch(args)
     elif args.command == "supervisor":
