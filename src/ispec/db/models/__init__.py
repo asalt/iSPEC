@@ -9,6 +9,7 @@ from .files import MSRawFile, ProjectFile, RawFileType, RawFileState, StorageBac
 from .support import LetterOfSupport
 from .auth import AuthUser, AuthSession, AuthUserProject, UserRole
 from .sync import LegacySyncState
+from .storage import OmicsDatabaseRegistry
 from .engine import sqlite_engine, initialize_db
 
 # Backwards-compatible module-level logger
@@ -44,6 +45,7 @@ __all__ = [
     "AuthUserProject",
     "UserRole",
     "LegacySyncState",
+    "OmicsDatabaseRegistry",
     "sqlite_engine",
     "initialize_db",
     "logger",

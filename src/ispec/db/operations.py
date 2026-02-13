@@ -681,20 +681,22 @@ def import_e2g(
         omics_db_file_path=omics_db_file_path,
     )
 
-    with get_session(file_path=db_file_path) as core_session, get_omics_session(
-        file_path=resolved_omics_db_file_path
-    ) as omics_session:
-        return import_e2g_files(
+    with get_session(file_path=db_file_path) as core_session:
+        with get_omics_session(
+            file_path=resolved_omics_db_file_path,
             core_session=core_session,
-            omics_session=omics_session,
-            qual_paths=resolved_qual,
-            quant_paths=resolved_quant,
-            create_missing_runs=create_missing_runs,
-            create_missing_experiments=create_missing_experiments,
-            store_metadata=store_metadata,
-            skip_imported=skip_imported,
-            force=force,
-        )
+        ) as omics_session:
+            return import_e2g_files(
+                core_session=core_session,
+                omics_session=omics_session,
+                qual_paths=resolved_qual,
+                quant_paths=resolved_quant,
+                create_missing_runs=create_missing_runs,
+                create_missing_experiments=create_missing_experiments,
+                store_metadata=store_metadata,
+                skip_imported=skip_imported,
+                force=force,
+            )
 
 
 def import_gene_contrasts(
@@ -742,23 +744,25 @@ def import_gene_contrasts(
         omics_db_file_path=omics_db_file_path,
     )
 
-    with get_session(file_path=db_file_path) as core_session, get_omics_session(
-        file_path=resolved_omics_db_file_path
-    ) as omics_session:
-        for path in resolved:
-            result = import_gene_contrast_file(
-                core_session=core_session,
-                omics_session=omics_session,
-                path=path,
-                project_id=int(project_id),
-                name=name,
-                contrast=contrast,
-                kind=kind,
-                store_metadata=bool(store_metadata),
-                skip_imported=bool(skip_imported),
-                force=bool(force),
-            )
-            results.append(asdict(result))
+    with get_session(file_path=db_file_path) as core_session:
+        with get_omics_session(
+            file_path=resolved_omics_db_file_path,
+            core_session=core_session,
+        ) as omics_session:
+            for path in resolved:
+                result = import_gene_contrast_file(
+                    core_session=core_session,
+                    omics_session=omics_session,
+                    path=path,
+                    project_id=int(project_id),
+                    name=name,
+                    contrast=contrast,
+                    kind=kind,
+                    store_metadata=bool(store_metadata),
+                    skip_imported=bool(skip_imported),
+                    force=bool(force),
+                )
+                results.append(asdict(result))
 
     inserted_total = sum(int(item.get("inserted") or 0) for item in results)
     skipped = sum(1 for item in results if item.get("skipped"))
@@ -815,23 +819,25 @@ def import_gsea(
         omics_db_file_path=omics_db_file_path,
     )
 
-    with get_session(file_path=db_file_path) as core_session, get_omics_session(
-        file_path=resolved_omics_db_file_path
-    ) as omics_session:
-        for path in resolved:
-            result = import_gsea_file(
-                core_session=core_session,
-                omics_session=omics_session,
-                path=path,
-                project_id=int(project_id),
-                name=name,
-                contrast=contrast,
-                collection=collection,
-                store_metadata=bool(store_metadata),
-                skip_imported=bool(skip_imported),
-                force=bool(force),
-            )
-            results.append(asdict(result))
+    with get_session(file_path=db_file_path) as core_session:
+        with get_omics_session(
+            file_path=resolved_omics_db_file_path,
+            core_session=core_session,
+        ) as omics_session:
+            for path in resolved:
+                result = import_gsea_file(
+                    core_session=core_session,
+                    omics_session=omics_session,
+                    path=path,
+                    project_id=int(project_id),
+                    name=name,
+                    contrast=contrast,
+                    collection=collection,
+                    store_metadata=bool(store_metadata),
+                    skip_imported=bool(skip_imported),
+                    force=bool(force),
+                )
+                results.append(asdict(result))
 
     inserted_total = sum(int(item.get("inserted") or 0) for item in results)
     skipped = sum(1 for item in results if item.get("skipped"))
