@@ -1580,9 +1580,10 @@ def sync_legacy_projects(
     if not db_file_path:
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
 
-    inserted = updated = backfilled = conflicted = 0
+    inserted = updated = backfilled = conflicted = duplicates_skipped = 0
     touched_ids: list[int] = []
     touched_set: set[int] = set()
+    processed_ids: set[int] = set()
     pages = 0
     total_items = 0
     seen_cursors: set[tuple[str | None, int | None]] = set()
@@ -1700,6 +1701,12 @@ def sync_legacy_projects(
                     continue
 
                 legacy_project_id, record, item_modified_dt = built
+                if legacy_project_id in processed_ids:
+                    duplicates_skipped += 1
+                    last_modified_dt = item_modified_dt
+                    last_pk = legacy_project_id
+                    continue
+                processed_ids.add(legacy_project_id)
 
                 outcome = _apply_project_record(
                     session,
@@ -1755,6 +1762,7 @@ def sync_legacy_projects(
         "updated": updated,
         "backfilled": backfilled,
         "conflicted": conflicted,
+        "duplicates_skipped": duplicates_skipped,
     }
     if collect_ids:
         result["touched_ids"] = touched_ids
@@ -1806,9 +1814,10 @@ def sync_legacy_people(
     if not db_file_path:
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
 
-    inserted = updated = backfilled = conflicted = 0
+    inserted = updated = backfilled = conflicted = duplicates_skipped = 0
     touched_ids: list[int] = []
     touched_set: set[int] = set()
+    processed_ids: set[int] = set()
     pages = 0
     total_items = 0
     seen_cursors: set[tuple[str | None, int | None]] = set()
@@ -1925,6 +1934,12 @@ def sync_legacy_people(
                     continue
 
                 legacy_person_id, record, item_modified_dt = built
+                if legacy_person_id in processed_ids:
+                    duplicates_skipped += 1
+                    last_modified_dt = item_modified_dt
+                    last_pk = legacy_person_id
+                    continue
+                processed_ids.add(legacy_person_id)
                 outcome = _apply_person_record(
                     session,
                     legacy_person_id=legacy_person_id,
@@ -1979,6 +1994,7 @@ def sync_legacy_people(
         "updated": updated,
         "backfilled": backfilled,
         "conflicted": conflicted,
+        "duplicates_skipped": duplicates_skipped,
     }
     if collect_ids:
         result["touched_ids"] = touched_ids
@@ -2222,9 +2238,10 @@ def sync_legacy_experiments(
     if not db_file_path:
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
 
-    inserted = updated = backfilled = conflicted = 0
+    inserted = updated = backfilled = conflicted = duplicates_skipped = 0
     touched_ids: list[int] = []
     touched_set: set[int] = set()
+    processed_ids: set[int] = set()
     pages = 0
     total_items = 0
     seen_cursors: set[tuple[str | None, int | None]] = set()
@@ -2347,6 +2364,12 @@ def sync_legacy_experiments(
                     continue
 
                 exp_id, record, project_id_int, item_modified_dt = built
+                if exp_id in processed_ids:
+                    duplicates_skipped += 1
+                    last_modified_dt = item_modified_dt
+                    last_pk = exp_id
+                    continue
+                processed_ids.add(exp_id)
                 if project_id_int is not None:
                     _ensure_placeholder_project(session, project_id_int)
 
@@ -2404,6 +2427,7 @@ def sync_legacy_experiments(
         "updated": updated,
         "backfilled": backfilled,
         "conflicted": conflicted,
+        "duplicates_skipped": duplicates_skipped,
     }
     if collect_ids:
         result["touched_ids"] = touched_ids

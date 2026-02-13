@@ -277,6 +277,96 @@ def test_sync_legacy_experiments_backfills_missing_fields_on_conflict(tmp_path, 
         assert exp.exp_Description == "Legacy description"
 
 
+def test_sync_legacy_experiments_deduplicates_overlapping_pages(tmp_path, monkeypatch):
+    db_path = tmp_path / "sync.db"
+    mapping_path = tmp_path / "mapping.json"
+
+    mapping_path.write_text(
+        json.dumps(
+            {
+                "tables": {
+                    "iSPEC_Experiments": {
+                        "pk": {"legacy": "exp_EXPRecNo", "local": "id"},
+                        "created_ts": "exp_CreationTS",
+                        "modified_ts": "exp_ModificationTS",
+                        "field_map": {
+                            "exp_Exp_ProjectNo": "project_id",
+                            "exp_IDENTIFIER": "exp_Name",
+                        },
+                    }
+                }
+            }
+        )
+    )
+
+    with get_session(file_path=str(db_path)) as session:
+        session.add(Project(id=1, prj_AddedBy="user", prj_ProjectTitle="P"))
+        # local row without legacy import marker should remain conflict-protected
+        session.add(Experiment(id=2, project_id=1, record_no="2", exp_Name="Local"))
+
+    page1 = {
+        "ok": True,
+        "table": "iSPEC_Experiments",
+        "items": [
+            {
+                "exp_EXPRecNo": 2,
+                "exp_Exp_ProjectNo": 1,
+                "exp_IDENTIFIER": "Legacy Name",
+                "exp_CreationTS": "2025-10-01 01:02:03",
+                "exp_ModificationTS": "2025-12-05 12:16:37",
+            }
+        ],
+        "has_more": True,
+        "next_since": "2025-12-05 12:16:37",
+        "next_since_pk": 2,
+    }
+    page2 = {
+        "ok": True,
+        "table": "iSPEC_Experiments",
+        "items": [
+            {
+                "exp_EXPRecNo": 2,
+                "exp_Exp_ProjectNo": 1,
+                "exp_IDENTIFIER": "Legacy Name",
+                "exp_CreationTS": "2025-10-01 01:02:03",
+                "exp_ModificationTS": "2025-12-05 12:16:37",
+            }
+        ],
+        "has_more": False,
+    }
+
+    class DummyResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, params=None, headers=None, auth=None, timeout=None):
+        params = dict(params or {})
+        if params.get("since"):
+            return DummyResponse(page2)
+        return DummyResponse(page1)
+
+    from ispec.db import legacy_sync
+
+    monkeypatch.setattr(legacy_sync.requests, "get", fake_get)
+
+    summary = legacy_sync.sync_legacy_experiments(
+        legacy_url="http://legacy.example",
+        mapping_path=str(mapping_path),
+        db_file_path=str(db_path),
+        reset_cursor=True,
+        dry_run=False,
+    )
+
+    assert summary["conflicted"] == 1
+    assert summary["duplicates_skipped"] == 1
+
+
 def test_sync_legacy_experiment_runs_single_id_inserts_run(tmp_path, monkeypatch):
     db_path = tmp_path / "sync.db"
 

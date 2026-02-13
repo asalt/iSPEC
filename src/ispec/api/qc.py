@@ -7,27 +7,36 @@ from pathlib import Path
 from typing import Any
 
 _QC_MAP_ENV_VAR = "ISPEC_QC_EXPERIMENTS_JSON"
-_DEFAULT_QC_MAP_FILENAME = "qc-experiments.json"
+_DEFAULT_QC_MAP_RELATIVE_PATH = Path("data") / "qc-experiments.json"
+_DEFAULT_QC_EXPERIMENTS: dict[int, str] = {
+    99990: "Orbitrap Exploris",
+    99991: "Orbitrap Eclipse",
+    99992: "timsTOF 2",
+    99995: "Orbitrap Lumos ETD",
+    99999: "Orbitrap Fusion",
+}
 
 
 def qc_mapping_path() -> Path:
     raw = (os.getenv(_QC_MAP_ENV_VAR) or "").strip()
     if raw:
         return Path(raw).expanduser()
-    return Path(__file__).resolve().with_name(_DEFAULT_QC_MAP_FILENAME)
+    # src/ispec/api/qc.py -> parents[3] is repo root
+    return Path(__file__).resolve().parents[3] / _DEFAULT_QC_MAP_RELATIVE_PATH
 
 
-@lru_cache(maxsize=1)
-def _load_qc_map(path_text: str) -> dict[int, str | None]:
-    path = Path(path_text)
-    if not path.exists():
-        return {}
+def _default_qc_payload() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "description": "Legacy QC experiment ID mapping used for API-only derived classification.",
+        "experiments": {
+            str(exp_id): {"qc_instrument": instrument}
+            for exp_id, instrument in sorted(_DEFAULT_QC_EXPERIMENTS.items())
+        },
+    }
 
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
+def _parse_qc_payload(data: Any) -> dict[int, str | None]:
     entries = data.get("experiments") if isinstance(data, dict) else None
     if not isinstance(entries, dict):
         return {}
@@ -52,6 +61,31 @@ def _load_qc_map(path_text: str) -> dict[int, str | None]:
         resolved[exp_id] = instrument
 
     return resolved
+
+
+@lru_cache(maxsize=1)
+def _load_qc_map(path_text: str) -> dict[int, str | None]:
+    path = Path(path_text)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return _parse_qc_payload(data)
+
+    # If caller explicitly overrides the mapping path, do not auto-create.
+    if (os.getenv(_QC_MAP_ENV_VAR) or "").strip():
+        return {}
+
+    # Bootstrap a sensible default map into the untracked data/ folder.
+    payload = _default_qc_payload()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    return _parse_qc_payload(payload)
 
 
 def clear_qc_map_cache() -> None:
