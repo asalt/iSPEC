@@ -1,12 +1,13 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, create_model as pydantic_create_model
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from ispec.db.connect import get_session_dep
 from typing import Type, Callable
 from ispec.omics.connect import get_omics_session_dep
+from ispec.api.qc import qc_flags_for_experiment_id
 from ispec.db.models import (
     Person,
     Project,
@@ -114,6 +115,12 @@ def _reject_client(
         raise HTTPException(status_code=403, detail=detail)
 
 
+def _serialize_experiment_payload(payload: dict[str, object]) -> dict[str, object]:
+    item = dict(payload)
+    item.update(qc_flags_for_experiment_id(item.get("id")))
+    return item
+
+
 # ----- shared list helpers --------------------------------------------------
 
 
@@ -216,9 +223,23 @@ def _add_crud_endpoints(
     session_dep: Callable[..., Session],
 ) -> None:
     """Attach basic CRUD endpoints to ``router``."""
+    model = crud.model
+    read_response_model = read_model
+    if model is Experiment:
+        read_response_model = pydantic_create_model(
+            f"{read_model.__name__}WithQC",
+            __base__=read_model,
+            is_qc=(bool, False),
+            qc_instrument=(str | None, None),
+        )
+
+    def _serialize_row(row) -> dict[str, object]:
+        payload = read_model.model_validate(row).model_dump()
+        if model is Experiment:
+            return _serialize_experiment_payload(payload)
+        return payload
 
     def _duplicate_detail() -> str:
-        model = crud.model
         if model is ExperimentRun:
             return "ExperimentRun with this (experiment_id, run_no, search_no, label) already exists."
         return f"{tag} already exists"
@@ -243,7 +264,6 @@ def _add_crud_endpoints(
         wrap: bool = Query(default=False, description="Wrap response as {items,total}"),
         db: Session = Depends(session_dep),
     ):
-        model = crud.model
         query = db.query(model)
 
         user = getattr(request.state, "user", None)
@@ -297,7 +317,7 @@ def _add_crud_endpoints(
             total = query.count()
 
         rows = query.offset(offset).limit(limit).all()
-        payload = [read_model.model_validate(r).model_dump() for r in rows]
+        payload = [_serialize_row(r) for r in rows]
         # attach total via header for simple lists
         try:
             if response is not None:
@@ -308,9 +328,8 @@ def _add_crud_endpoints(
             return {"items": payload, "total": total}
         return payload
 
-    @router.get("/{item_id}", response_model=read_model, response_model_exclude_none=True)
+    @router.get("/{item_id}", response_model=read_response_model, response_model_exclude_none=True)
     def get_item(item_id: int, request: Request, db: Session = Depends(session_dep)):
-        model = crud.model
         obj = crud.get(db, item_id)
         if obj is None:
             raise HTTPException(status_code=404, detail=f"{tag} not found")
@@ -338,11 +357,11 @@ def _add_crud_endpoints(
                 if not allowed:
                     raise HTTPException(status_code=404, detail=f"{tag} not found")
 
-        return read_model.model_validate(obj).model_dump()
+        return _serialize_row(obj)
 
     @router.post(
         "",
-        response_model=read_model,
+        response_model=read_response_model,
         response_model_exclude_none=True,
         summary=f"Create new {tag}",
         description="Create a new item. Required fields are marked with * in the request body below.",
@@ -350,7 +369,7 @@ def _add_crud_endpoints(
     )
     @router.post(
         "/",
-        response_model=read_model,
+        response_model=read_response_model,
         response_model_exclude_none=True,
         summary=f"Create new {tag}",
         description="Create a new item. Required fields are marked with * in the request body below.",
@@ -366,9 +385,9 @@ def _add_crud_endpoints(
             raise _integrity_error(exc)
         if obj is None:
             raise HTTPException(status_code=409, detail=_duplicate_detail())
-        return read_model.model_validate(obj).model_dump()
+        return _serialize_row(obj)
 
-    @router.put("/{item_id}", response_model=read_model, response_model_exclude_none=True)
+    @router.put("/{item_id}", response_model=read_response_model, response_model_exclude_none=True)
     def update_item(item_id: int, payload: create_model, db: Session = Depends(session_dep)):
         obj = crud.get(db, item_id)
         if obj is None:
@@ -378,7 +397,7 @@ def _add_crud_endpoints(
         except IntegrityError as exc:
             db.rollback()
             raise _integrity_error(exc)
-        return read_model.model_validate(obj).model_dump()
+        return _serialize_row(obj)
 
     @router.delete("/{item_id}")
     def delete_item(item_id: int, db: Session = Depends(session_dep)):
@@ -1158,7 +1177,8 @@ if _enabled("experiments"):
             .all()
         )
         Read = make_pydantic_model_from_sqlalchemy(Experiment, name_suffix="Read")
-        return [Read.model_validate(r).model_dump() for r in rows]
+        payload = [Read.model_validate(r).model_dump() for r in rows]
+        return [_serialize_experiment_payload(item) for item in payload]
 
 
 if _enabled("project_comment"):

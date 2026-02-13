@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -59,6 +61,8 @@ def test_experiment_crud(client):
     resp = client.get(f"/experiments/{exp_id}")
     assert resp.status_code == 200
     assert resp.json()["project_id"] == project_id
+    assert resp.json()["is_qc"] is False
+    assert resp.json().get("qc_instrument") is None
 
     resp = client.delete(f"/experiments/{exp_id}")
     assert resp.status_code == 200
@@ -66,3 +70,49 @@ def test_experiment_crud(client):
 
     resp = client.get(f"/experiments/{exp_id}")
     assert resp.status_code == 404
+
+
+def test_experiment_qc_classification_from_mapping(client, monkeypatch, tmp_path):
+    mapping_path = tmp_path / "qc-experiments.json"
+    mapping_path.write_text(
+        json.dumps(
+            {
+                "experiments": {
+                    "99990": {"qc_instrument": "Orbitrap Exploris"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ISPEC_QC_EXPERIMENTS_JSON", str(mapping_path))
+
+    from ispec.api import qc as qc_module
+
+    qc_module.clear_qc_map_cache()
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        project = Project(prj_AddedBy="tester", prj_ProjectTitle="P1")
+        db.add(project)
+        db.flush()
+        db.add(
+            Experiment(
+                id=99990,
+                project_id=project.id,
+                record_no="99990",
+                exp_Name="QC Exploris",
+            )
+        )
+        db.commit()
+
+    resp = client.get("/experiments/99990")
+    assert resp.status_code == 200
+    assert resp.json()["is_qc"] is True
+    assert resp.json()["qc_instrument"] == "Orbitrap Exploris"
+
+    resp = client.get("/experiments/", params={"ids": [99990]})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert len(payload) == 1
+    assert payload[0]["id"] == 99990
+    assert payload[0]["is_qc"] is True
+    assert payload[0]["qc_instrument"] == "Orbitrap Exploris"
