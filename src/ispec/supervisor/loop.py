@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
+import threading
 import time
 import uuid
+from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,11 +23,15 @@ from ispec.agent.connect import get_agent_db_uri, get_agent_session
 from ispec.agent.commands import (
     COMMAND_COMPACT_SESSION_MEMORY,
     COMMAND_BUILD_SUPPORT_DIGEST,
+    COMMAND_ASSESS_TACKLE_RESULTS,
+    COMMAND_RUN_TACKLE_PROMPT,
+    COMMAND_DEV_RESTART_SERVICES,
     COMMAND_LEGACY_SYNC_ALL,
     COMMAND_ORCHESTRATOR_TICK,
     COMMAND_REVIEW_REPO,
     COMMAND_REVIEW_SUPPORT_SESSION,
     COMMAND_SLACK_POST_MESSAGE,
+    COMMAND_SUPPORT_CHAT_TURN,
 )
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.agent.policies.primitives.backoff import backoff_exponential_current
@@ -37,12 +44,68 @@ from ispec.assistant.models import (
     SupportSession,
     SupportSessionReview,
 )
-from ispec.assistant.service import generate_reply
-from ispec.db.connect import get_db_path
+from ispec.assistant.service import AssistantReply, generate_reply
+from ispec.concurrency.thread_context import assert_main_thread, main_thread_info, set_main_thread
+from ispec.config.paths import (
+    resolve_db_location,
+    resolve_state_dir,
+    resolve_supervisor_pid_file,
+    resolve_supervisor_state_file,
+)
+from ispec.db.connect import get_session
 from ispec.logging import get_logger
-from ispec.schedule.connect import get_schedule_db_uri
+from ispec.omics.connect import get_omics_session
+from ispec.schedule.connect import get_schedule_db_uri, get_schedule_session
+from ispec.supervisor.inference_broker import InferenceBroker, InferenceRequest
 
 logger = get_logger(__file__)
+
+_DEV_RESTART_ENABLED_ENV = "ISPEC_DEV_RESTART_ENABLED"
+_INFERENCE_BROKER_ENABLED_ENV = "ISPEC_SUPERVISOR_INFERENCE_BROKER_ENABLED"
+
+
+def _supervisor_state_file_path() -> Path:
+    resolved = resolve_supervisor_state_file()
+    return Path(resolved.path or resolved.value)
+
+
+def _supervisor_pid_file_path() -> Path:
+    resolved = resolve_supervisor_pid_file()
+    return Path(resolved.path or resolved.value)
+
+
+def _write_supervisor_state(payload: dict[str, Any]) -> Path | None:
+    path = _supervisor_state_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return path
+    except OSError as exc:
+        logger.warning("Unable to write supervisor state file %s: %s", path, exc)
+        return None
+
+
+def _write_supervisor_pid() -> Path | None:
+    path = _supervisor_pid_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Keep this file intentionally tiny and human-grep-able.
+        path.write_text(f"{os.getpid()}\n")
+        return path
+    except OSError as exc:
+        logger.warning("Unable to write supervisor pid file %s: %s", path, exc)
+        return None
+
+
+def _remove_supervisor_pid(path: Path | None = None) -> None:
+    if path is None:
+        path = _supervisor_pid_file_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Unable to remove supervisor pid file %s: %s", path, exc)
 
 
 def utcnow() -> datetime:
@@ -50,12 +113,119 @@ def utcnow() -> datetime:
 
 
 _TRUTHY = {"1", "true", "yes", "y", "on"}
+_FALSY = {"0", "false", "no", "n", "off"}
 
 
 def _is_truthy(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in _TRUTHY
+
+
+def _parse_env_tristate_bool(raw: str | None, *, key: str) -> tuple[bool | None, str | None]:
+    """Parse a tri-state boolean env var.
+
+    Returns (value, error):
+    - value=True/False when explicitly set
+    - value=None when unset/empty/"auto"
+    - error is non-null when the value is present but invalid
+    """
+
+    if raw is None:
+        return None, None
+    text = str(raw).strip()
+    if not text:
+        return None, None
+    lowered = text.lower()
+    if lowered == "auto":
+        return None, None
+    if lowered in _TRUTHY:
+        return True, None
+    if lowered in _FALSY:
+        return False, None
+    return None, f"Invalid value for {key}: {text!r} (expected 0/1/true/false or unset/auto)."
+
+
+def _state_dir_is_dev() -> bool:
+    resolved = resolve_state_dir()
+    raw = (resolved.path or resolved.value or "").strip()
+    if not raw:
+        return False
+    try:
+        path = Path(raw).expanduser().resolve()
+    except Exception:
+        return False
+    return path.name == ".pids"
+
+
+def _inference_broker_enabled_status() -> tuple[bool, str | None]:
+    raw = os.getenv(_INFERENCE_BROKER_ENABLED_ENV)
+    parsed, err = _parse_env_tristate_bool(raw, key=_INFERENCE_BROKER_ENABLED_ENV)
+    if err:
+        return False, err
+    if parsed is True:
+        return True, None
+    if parsed is False:
+        return False, f"{_INFERENCE_BROKER_ENABLED_ENV}=0 (forced off)."
+    # Auto: enable in dev (.pids) layouts so the supervisor stays responsive
+    # while local model inference is in-flight.
+    return _state_dir_is_dev(), None
+
+
+def _dev_restart_auto_enabled(*, tmux_session: str | None = None, make_root: str | None = None) -> tuple[bool, str | None]:
+    if shutil.which("tmux") is None:
+        return False, "tmux is not installed."
+
+    try:
+        from ispec.cli import dev as dev_cli
+    except Exception as exc:
+        return False, f"Failed importing ispec.cli.dev ({type(exc).__name__})."
+
+    make_root_path: Path | None = None
+    if make_root:
+        try:
+            make_root_path = Path(make_root).expanduser().resolve()
+        except Exception:
+            make_root_path = None
+    if make_root_path is None:
+        make_root_path = dev_cli._find_make_root(start=Path(__file__).resolve().parent)  # type: ignore[attr-defined]
+    if make_root_path is None:
+        return False, "Top-level Makefile not found (run from within the ispec-full repo or pass make_root)."
+
+    state_dir = (os.getenv("ISPEC_STATE_DIR") or "").strip()
+    state_dir_path: Path | None = None
+    if state_dir:
+        try:
+            state_dir_path = Path(state_dir).expanduser().resolve()
+        except Exception:
+            state_dir_path = None
+    state_dir_is_dev = bool(
+        state_dir_path is not None
+        and (state_dir_path.name == ".pids" or state_dir_path == (make_root_path / ".pids").resolve())
+    )
+
+    session = dev_cli._tmux_session_name(tmux_session)  # type: ignore[attr-defined]
+    tmux_session_exists = dev_cli._tmux_has_session(session)  # type: ignore[attr-defined]
+
+    if not state_dir_is_dev and not tmux_session_exists:
+        return (
+            False,
+            "Auto-detect did not find a dev tmux session (set DEV_TMUX_SESSION) and ISPEC_STATE_DIR is not .pids.",
+        )
+
+    return True, None
+
+
+def _dev_restart_enabled_status(*, tmux_session: str | None = None, make_root: str | None = None) -> tuple[bool, str | None]:
+    raw = os.getenv(_DEV_RESTART_ENABLED_ENV)
+    parsed, err = _parse_env_tristate_bool(raw, key=_DEV_RESTART_ENABLED_ENV)
+    if err:
+        return False, err
+    if parsed is True:
+        return True, None
+    if parsed is False:
+        return False, f"{_DEV_RESTART_ENABLED_ENV}=0 (forced off)."
+    return _dev_restart_auto_enabled(tmux_session=tmux_session, make_root=make_root)
 
 
 def _clamp_int(value: int, *, min_value: int, max_value: int) -> int:
@@ -80,6 +250,21 @@ def _summarize_command_payload(command_type: str, payload: dict[str, Any]) -> st
         return ""
 
     parts: list[str] = []
+    if command_type == COMMAND_DEV_RESTART_SERVICES:
+        services = payload.get("services")
+        if isinstance(services, list):
+            cleaned = [str(item).strip() for item in services if isinstance(item, str) and item.strip()]
+            if cleaned:
+                parts.append("services=" + ",".join(cleaned[:6]))
+        elif isinstance(services, str) and services.strip():
+            parts.append(f"services={services.strip()[:80]}")
+    if command_type == COMMAND_SUPPORT_CHAT_TURN:
+        chat_request = payload.get("chat_request")
+        if isinstance(chat_request, dict):
+            queued_session_id = chat_request.get("sessionId")
+            if isinstance(queued_session_id, str) and queued_session_id.strip():
+                parts.append(f"session_id={queued_session_id.strip()}")
+
     session_id = payload.get("session_id")
     if isinstance(session_id, str) and session_id.strip():
         parts.append(f"session_id={session_id.strip()}")
@@ -289,13 +474,17 @@ def _check_frontend(*, url: str, timeout_seconds: float) -> dict[str, Any]:
 
 
 def _check_db_files() -> dict[str, Any]:
-    core_uri = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
+    core = resolve_db_location("core")
+    analysis = resolve_db_location("analysis")
+    psm = resolve_db_location("psm")
     assistant_uri = get_assistant_db_uri()
     schedule_uri = get_schedule_db_uri()
     agent_uri = get_agent_db_uri()
     return {
         "ok": True,
-        "core_db": _stat_path(_sqlite_path_from_uri(core_uri)),
+        "core_db": _stat_path(_sqlite_path_from_uri(core.uri or core.value)),
+        "analysis_db": _stat_path(_sqlite_path_from_uri(analysis.uri or analysis.value)),
+        "psm_db": _stat_path(_sqlite_path_from_uri(psm.uri or psm.value)),
         "assistant_db": _stat_path(_sqlite_path_from_uri(assistant_uri)),
         "schedule_db": _stat_path(_sqlite_path_from_uri(schedule_uri)),
         "agent_db": _stat_path(_sqlite_path_from_uri(agent_uri)),
@@ -486,6 +675,218 @@ def _structured_llm_max_repairs(task: str, *, default: int) -> int:
     return _clamp_int(int(value), min_value=0, max_value=3)
 
 
+def _orchestrator_review_failure_cooldown_seconds() -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_REVIEW_FAILURE_COOLDOWN_SECONDS") or "").strip()
+    if not raw:
+        return 300
+    try:
+        return _clamp_int(int(raw), min_value=0, max_value=86400)
+    except ValueError:
+        return 300
+
+
+def _orchestrator_review_dedupe_lookback() -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_REVIEW_DEDUPE_LOOKBACK") or "").strip()
+    if not raw:
+        return 200
+    try:
+        return _clamp_int(int(raw), min_value=20, max_value=5000)
+    except ValueError:
+        return 200
+
+
+def _orchestrator_digest_failure_cooldown_seconds() -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_DIGEST_FAILURE_COOLDOWN_SECONDS") or "").strip()
+    if not raw:
+        return 300
+    try:
+        return _clamp_int(int(raw), min_value=0, max_value=86400)
+    except ValueError:
+        return 300
+
+
+def _orchestrator_digest_dedupe_lookback() -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_DIGEST_DEDUPE_LOOKBACK") or "").strip()
+    if not raw:
+        return 200
+    try:
+        return _clamp_int(int(raw), min_value=20, max_value=5000)
+    except ValueError:
+        return 200
+
+
+def _orchestrator_review_enqueue_guard(
+    *,
+    payload: dict[str, Any],
+    now: datetime,
+    current_command_id: int | None = None,
+) -> dict[str, Any] | None:
+    session_id = str(payload.get("session_id") or "").strip()
+    if not session_id:
+        return None
+    target_message_id = _safe_int(payload.get("target_message_id"))
+    cooldown_seconds = _orchestrator_review_failure_cooldown_seconds()
+    lookback = _orchestrator_review_dedupe_lookback()
+
+    candidates: list[dict[str, Any]] = []
+    with get_agent_session() as db:
+        rows = (
+            db.query(AgentCommand)
+            .filter(AgentCommand.command_type == COMMAND_REVIEW_SUPPORT_SESSION)
+            .order_by(AgentCommand.id.desc())
+            .limit(int(lookback))
+            .all()
+        )
+        for row in rows:
+            candidates.append(
+                {
+                    "id": int(row.id or 0),
+                    "status": str(row.status or "").strip().lower(),
+                    "error": str(row.error or "").strip().lower(),
+                    "updated_at": getattr(row, "updated_at", None),
+                    "payload": dict(row.payload_json or {}),
+                }
+            )
+
+    for row in candidates:
+        row_id = int(row.get("id") or 0)
+        if current_command_id is not None and row_id == int(current_command_id):
+            continue
+
+        row_payload = dict(row.get("payload") or {})
+        row_session_id = str(row_payload.get("session_id") or "").strip()
+        if row_session_id != session_id:
+            continue
+        row_target_message_id = _safe_int(row_payload.get("target_message_id"))
+        same_target = (
+            target_message_id is None
+            or row_target_message_id is None
+            or int(target_message_id) == int(row_target_message_id)
+        )
+        if not same_target:
+            continue
+
+        status = str(row.get("status") or "").strip().lower()
+        if status in {"queued", "running"}:
+            return {
+                "reason": "duplicate_inflight",
+                "related_command_id": row_id,
+                "related_status": status,
+                "session_id": session_id,
+                "target_message_id": int(target_message_id) if target_message_id else None,
+            }
+
+        if status != "failed" or cooldown_seconds <= 0:
+            continue
+
+        error = str(row.get("error") or "").strip().lower()
+        if error != "invalid_review_output":
+            continue
+
+        updated_at = _as_utc_datetime(row.get("updated_at"))
+        if not isinstance(updated_at, datetime):
+            continue
+        age_seconds = max(0, int((now - updated_at).total_seconds()))
+        if age_seconds >= int(cooldown_seconds):
+            continue
+        return {
+            "reason": "cooldown_after_invalid_review_output",
+            "related_command_id": row_id,
+            "related_status": status,
+            "session_id": session_id,
+            "target_message_id": int(target_message_id) if target_message_id else None,
+            "age_seconds": int(age_seconds),
+            "cooldown_seconds": int(cooldown_seconds),
+            "retry_after_seconds": int(max(1, int(cooldown_seconds) - age_seconds)),
+        }
+
+    return None
+
+
+def _orchestrator_digest_enqueue_guard(
+    *,
+    payload: dict[str, Any],
+    now: datetime,
+    current_command_id: int | None = None,
+) -> dict[str, Any] | None:
+    cursor_review_id = _safe_int(payload.get("cursor_review_id"))
+    if cursor_review_id is None:
+        cursor_review_id = _safe_int(payload.get("from_review_id"))
+    cooldown_seconds = _orchestrator_digest_failure_cooldown_seconds()
+    lookback = _orchestrator_digest_dedupe_lookback()
+
+    candidates: list[dict[str, Any]] = []
+    with get_agent_session() as db:
+        rows = (
+            db.query(AgentCommand)
+            .filter(AgentCommand.command_type == COMMAND_BUILD_SUPPORT_DIGEST)
+            .order_by(AgentCommand.id.desc())
+            .limit(int(lookback))
+            .all()
+        )
+        for row in rows:
+            candidates.append(
+                {
+                    "id": int(row.id or 0),
+                    "status": str(row.status or "").strip().lower(),
+                    "error": str(row.error or "").strip().lower(),
+                    "updated_at": getattr(row, "updated_at", None),
+                    "payload": dict(row.payload_json or {}),
+                }
+            )
+
+    for row in candidates:
+        row_id = int(row.get("id") or 0)
+        if current_command_id is not None and row_id == int(current_command_id):
+            continue
+
+        row_payload = dict(row.get("payload") or {})
+        row_cursor = _safe_int(row_payload.get("cursor_review_id"))
+        if row_cursor is None:
+            row_cursor = _safe_int(row_payload.get("from_review_id"))
+        same_cursor = (
+            cursor_review_id is None
+            or row_cursor is None
+            or int(cursor_review_id) == int(row_cursor)
+        )
+        if not same_cursor:
+            continue
+
+        status = str(row.get("status") or "").strip().lower()
+        if status in {"queued", "running"}:
+            return {
+                "reason": "duplicate_inflight",
+                "related_command_id": row_id,
+                "related_status": status,
+                "cursor_review_id": int(cursor_review_id) if cursor_review_id is not None else None,
+            }
+
+        if status != "failed" or cooldown_seconds <= 0:
+            continue
+
+        error = str(row.get("error") or "").strip().lower()
+        if error != "invalid_digest_output":
+            continue
+
+        updated_at = _as_utc_datetime(row.get("updated_at"))
+        if not isinstance(updated_at, datetime):
+            continue
+        age_seconds = max(0, int((now - updated_at).total_seconds()))
+        if age_seconds >= int(cooldown_seconds):
+            continue
+        return {
+            "reason": "cooldown_after_invalid_digest_output",
+            "related_command_id": row_id,
+            "related_status": status,
+            "cursor_review_id": int(cursor_review_id) if cursor_review_id is not None else None,
+            "age_seconds": int(age_seconds),
+            "cooldown_seconds": int(cooldown_seconds),
+            "retry_after_seconds": int(max(1, int(cooldown_seconds) - age_seconds)),
+        }
+
+    return None
+
+
 def _scalar_row_int(row: Any) -> int:
     if row is None:
         return 0
@@ -527,16 +928,67 @@ class CommandExecution:
     defer_seconds: int | None = None
 
 
-def _claim_next_command(*, agent_id: str, run_id: str) -> ClaimedCommand | None:
+LLMTask = Generator[InferenceRequest, AssistantReply, CommandExecution]
+
+
+def _run_llm_task_sync(task: LLMTask) -> CommandExecution:
+    """Run a generator-style LLM task synchronously (blocking).
+
+    The same task can also be driven asynchronously by the supervisor inference
+    broker. Keeping a single task definition prevents drift between "dev" and
+    "prod" behavior.
+    """
+
+    reply: AssistantReply | None = None
+    while True:
+        try:
+            request = task.send(reply) if reply is not None else next(task)
+        except StopIteration as stop:
+            value = stop.value
+            if isinstance(value, CommandExecution):
+                return value
+            return CommandExecution(
+                ok=False,
+                result={"ok": False, "error": "LLM task returned invalid result type."},
+                error="invalid_llm_task_result",
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            return CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
+
+        if not isinstance(request, InferenceRequest):
+            return CommandExecution(
+                ok=False,
+                result={"ok": False, "error": "LLM task yielded invalid request type."},
+                error="invalid_llm_task_request",
+            )
+
+        reply = generate_reply(
+            messages=request.messages,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            stage=request.stage,  # type: ignore[arg-type]
+            vllm_extra_body=request.vllm_extra_body,
+        )
+
+
+def _claim_next_command(
+    *,
+    agent_id: str,
+    run_id: str,
+    exclude_command_types: set[str] | None = None,
+) -> ClaimedCommand | None:
+    assert_main_thread("supervisor._claim_next_command")
     now = utcnow()
     with get_agent_session() as db:
-        cmd = (
+        query = (
             db.query(AgentCommand)
             .filter(AgentCommand.status == "queued")
             .filter(AgentCommand.available_at <= now)
-            .order_by(AgentCommand.priority.desc(), AgentCommand.id.asc())
-            .first()
         )
+        if exclude_command_types:
+            query = query.filter(~AgentCommand.command_type.in_(sorted({str(x) for x in exclude_command_types if x})))
+        cmd = query.order_by(AgentCommand.priority.desc(), AgentCommand.id.asc()).first()
         if cmd is None:
             return None
 
@@ -567,6 +1019,7 @@ def _finish_command(
     result: dict[str, Any] | None,
     error: str | None,
 ) -> None:
+    assert_main_thread("supervisor._finish_command")
     now = utcnow()
     with get_agent_session() as db:
         cmd = db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
@@ -581,6 +1034,26 @@ def _finish_command(
         db.commit()
 
 
+def _touch_command_updated_at(*, command_id: int) -> None:
+    """Bump `agent_command.updated_at` for a running command.
+
+    This prevents long-running work (e.g. model inference) from being recovered
+    as "stale" while it is legitimately in-flight.
+    """
+
+    assert_main_thread("supervisor._touch_command_updated_at")
+    now = utcnow()
+    with get_agent_session() as db:
+        cmd = db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+        if cmd is None:
+            return
+        status = str(getattr(cmd, "status", "") or "").strip().lower()
+        if status != "running":
+            return
+        cmd.updated_at = now
+        db.commit()
+
+
 def _defer_command(
     *,
     command_id: int,
@@ -588,6 +1061,7 @@ def _defer_command(
     result: dict[str, Any] | None,
     error: str | None,
 ) -> None:
+    assert_main_thread("supervisor._defer_command")
     now = utcnow()
     available_at = now + timedelta(seconds=max(1, int(delay_seconds)))
     with get_agent_session() as db:
@@ -616,6 +1090,7 @@ def _enqueue_command(
     available_at: datetime | None = None,
     max_attempts: int = 3,
 ) -> int | None:
+    assert_main_thread("supervisor._enqueue_command")
     now = utcnow()
     cmd_type = (command_type or "").strip()
     if not cmd_type:
@@ -637,6 +1112,143 @@ def _enqueue_command(
         db.commit()
         db.refresh(row)
         return int(row.id)
+
+
+def _running_command_stale_seconds() -> int:
+    raw = (os.getenv("ISPEC_SUPERVISOR_RUNNING_STALE_SECONDS") or "").strip()
+    if not raw:
+        return 300
+    try:
+        return _clamp_int(int(raw), min_value=30, max_value=7 * 86400)
+    except ValueError:
+        return 300
+
+
+def _command_last_activity_at(cmd: AgentCommand) -> datetime | None:
+    for field in ("updated_at", "started_at", "claimed_at", "created_at"):
+        value = getattr(cmd, field, None)
+        if isinstance(value, datetime):
+            return value
+    return None
+
+
+def _as_utc_datetime(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _recover_stale_running_commands(*, agent_id: str, run_id: str) -> dict[str, Any]:
+    assert_main_thread("supervisor._recover_stale_running_commands")
+    now = utcnow()
+    stale_seconds = _running_command_stale_seconds()
+    stale_before = now - timedelta(seconds=stale_seconds)
+
+    recovered = 0
+    skipped_not_stale = 0
+    skipped_current_run = 0
+    skipped_other_agent = 0
+    skipped_recent_running_run = 0
+    running_total = 0
+
+    with get_agent_session() as db:
+        running_rows = (
+            db.query(AgentCommand)
+            .filter(AgentCommand.status == "running")
+            .order_by(AgentCommand.id.asc())
+            .all()
+        )
+        running_total = len(running_rows)
+
+        claimed_run_ids = sorted(
+            {
+                str(row.claimed_by_run_id).strip()
+                for row in running_rows
+                if isinstance(row.claimed_by_run_id, str) and row.claimed_by_run_id.strip()
+            }
+        )
+        run_state: dict[str, tuple[str, datetime | None]] = {}
+        if claimed_run_ids:
+            run_rows = (
+                db.query(AgentRun.run_id, AgentRun.status, AgentRun.updated_at)
+                .filter(AgentRun.run_id.in_(claimed_run_ids))
+                .all()
+            )
+            for claimed_run_id, status, updated_at in run_rows:
+                run_state[str(claimed_run_id)] = (str(status or "").strip().lower(), updated_at)
+
+        for cmd in running_rows:
+            claimed_agent_id = str(cmd.claimed_by_agent_id or "").strip()
+            if claimed_agent_id and claimed_agent_id != agent_id:
+                skipped_other_agent += 1
+                continue
+
+            last_activity = _as_utc_datetime(_command_last_activity_at(cmd))
+            if isinstance(last_activity, datetime) and last_activity > stale_before:
+                skipped_not_stale += 1
+                continue
+
+            claimed_run_id = str(cmd.claimed_by_run_id or "").strip()
+            if claimed_run_id and claimed_run_id == run_id:
+                skipped_current_run += 1
+                continue
+
+            if claimed_run_id:
+                status_updated = run_state.get(claimed_run_id)
+                if isinstance(status_updated, tuple):
+                    claimed_status, claimed_updated_at = status_updated
+                    claimed_updated_at_utc = _as_utc_datetime(claimed_updated_at)
+                    if (
+                        claimed_status == "running"
+                        and isinstance(claimed_updated_at_utc, datetime)
+                        and claimed_updated_at_utc > stale_before
+                    ):
+                        skipped_recent_running_run += 1
+                        continue
+
+            previous = {
+                "claimed_by_agent_id": claimed_agent_id or None,
+                "claimed_by_run_id": claimed_run_id or None,
+                "claimed_at": cmd.claimed_at.isoformat() if isinstance(cmd.claimed_at, datetime) else None,
+                "started_at": cmd.started_at.isoformat() if isinstance(cmd.started_at, datetime) else None,
+                "updated_at": cmd.updated_at.isoformat() if isinstance(cmd.updated_at, datetime) else None,
+                "error": _truncate_text(cmd.error, limit=240) or None,
+            }
+
+            cmd.status = "queued"
+            cmd.available_at = now
+            cmd.claimed_at = None
+            cmd.claimed_by_agent_id = None
+            cmd.claimed_by_run_id = None
+            cmd.started_at = None
+            cmd.ended_at = None
+            cmd.updated_at = now
+            cmd.error = "recovered_stale_running_command"
+
+            result_payload = dict(cmd.result_json or {})
+            result_payload["stale_recovery"] = {
+                "recovered_at": now.isoformat(),
+                "stale_seconds": int(stale_seconds),
+                "previous": previous,
+            }
+            cmd.result_json = result_payload
+            recovered += 1
+
+        if recovered > 0:
+            db.commit()
+
+    return {
+        "ok": True,
+        "running_total": int(running_total),
+        "recovered": int(recovered),
+        "stale_seconds": int(stale_seconds),
+        "skipped_not_stale": int(skipped_not_stale),
+        "skipped_current_run": int(skipped_current_run),
+        "skipped_other_agent": int(skipped_other_agent),
+        "skipped_recent_running_run": int(skipped_recent_running_run),
+    }
 
 
 def _compact_session_memory(payload: dict[str, Any]) -> tuple[bool, dict[str, Any], str | None]:
@@ -875,15 +1487,25 @@ _ORCHESTRATOR_DECISION_VERSION = 1
 _SESSION_REVIEW_VERSION = 1
 _SUPPORT_DIGEST_VERSION = 1
 _REPO_REVIEW_VERSION = 1
+_TACKLE_ASSESS_VERSION = 1
+_TACKLE_PROMPT_VERSION = 1
 _ORCHESTRATOR_DEFAULT_BASE_SECONDS = 60
 _ORCHESTRATOR_BACKOFF_MAX_EXP = 6
 _SCHEDULER_STATE_VERSION = 1
 
 
 def _orchestrator_enabled() -> bool:
-    raw = (os.getenv("ISPEC_ORCHESTRATOR_ENABLED") or "").strip()
-    if raw:
-        return _is_truthy(raw)
+    parsed, err = _parse_env_tristate_bool(
+        os.getenv("ISPEC_ORCHESTRATOR_ENABLED"),
+        key="ISPEC_ORCHESTRATOR_ENABLED",
+    )
+    if err:
+        logger.warning("%s", err)
+        parsed = None
+    if parsed is True:
+        return True
+    if parsed is False:
+        return False
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
     return provider == "vllm"
 
@@ -901,11 +1523,13 @@ def _orchestrator_tick_min_seconds() -> int:
 def _orchestrator_tick_max_seconds() -> int:
     raw = (os.getenv("ISPEC_ORCHESTRATOR_MAX_SECONDS") or "").strip()
     if not raw:
-        return 600
+        # Default to an hour so the system stays quiet when idle, while allowing
+        # event-driven "pokes" (API + queued work) to bring ticks forward.
+        return 3600
     try:
         return max(30, int(raw))
     except ValueError:
-        return 600
+        return 3600
 
 
 def _orchestrator_max_commands_per_tick() -> int:
@@ -969,6 +1593,8 @@ def _load_orchestrator_state(run: AgentRun) -> dict[str, Any]:
         state = {"schema_version": _ORCHESTRATOR_STATE_VERSION}
     if not isinstance(state.get("recent_thoughts"), list):
         state["recent_thoughts"] = []
+    if not isinstance(state.get("recent_model_thoughts"), list):
+        state["recent_model_thoughts"] = []
     if not isinstance(state.get("ticks"), int):
         state["ticks"] = 0
     if not isinstance(state.get("idle_streak"), int):
@@ -1185,6 +1811,9 @@ def _orchestrator_system_prompt(*, max_commands: int) -> str:
         "Rules:",
         "- Enqueue at most one command per tick unless there is a strong reason for two.",
         "- If any sessions are marked as needing review, enqueue a support-session review command for the most recently updated session.",
+        "- Keep thoughts aligned with actions: only mention tasks that are actually present in commands this tick.",
+        "- Example (no commands): thoughts='No sessions need review right now, so I will wait for the next tick.'",
+        "- Example (one review command): thoughts='Reviewing the newest pending support session now.'",
         "- If unsure, enqueue nothing and schedule the next tick later.",
         "- Always include a short 'thoughts' string explaining your choice.",
         "- Do NOT copy or repeat the input context JSON.",
@@ -1244,6 +1873,89 @@ def _validate_orchestrator_decision(
     }
 
 
+def _orchestrator_command_alias(command_type: str) -> str:
+    mapping = {
+        COMMAND_REVIEW_SUPPORT_SESSION: "session_review",
+        COMMAND_BUILD_SUPPORT_DIGEST: "support_digest",
+        COMMAND_REVIEW_REPO: "repo_review",
+    }
+    key = str(command_type or "").strip()
+    return mapping.get(key, key or "unknown")
+
+
+def _orchestrator_count_commands(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        command_type = str(item.get("command_type") or "").strip()
+        if not command_type:
+            continue
+        alias = _orchestrator_command_alias(command_type)
+        counts[alias] = int(counts.get(alias, 0) or 0) + 1
+    return counts
+
+
+def _orchestrator_action_summary(
+    *,
+    decision_commands: list[dict[str, Any]],
+    scheduled: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> dict[str, Any]:
+    requested_counts = _orchestrator_count_commands(decision_commands)
+    scheduled_counts = _orchestrator_count_commands(scheduled)
+    skipped_counts = _orchestrator_count_commands(skipped)
+
+    skipped_reason_counts: dict[str, int] = {}
+    for item in skipped:
+        if not isinstance(item, dict):
+            continue
+        guard = item.get("guard")
+        reason = guard.get("reason") if isinstance(guard, dict) else None
+        reason_key = str(reason or "").strip() or "unspecified"
+        skipped_reason_counts[reason_key] = int(skipped_reason_counts.get(reason_key, 0) or 0) + 1
+
+    requested_total = int(sum(int(v) for v in requested_counts.values()))
+    scheduled_total = int(sum(int(v) for v in scheduled_counts.values()))
+    skipped_total = int(sum(int(v) for v in skipped_counts.values()))
+
+    summary_parts: list[str] = []
+    if scheduled_total > 0:
+        detail = ", ".join(
+            f"{name}={count}"
+            for name, count in sorted(scheduled_counts.items(), key=lambda pair: pair[0])
+        )
+        summary_parts.append(f"Scheduled {scheduled_total} command(s) ({detail}).")
+    else:
+        summary_parts.append("No commands scheduled this tick.")
+
+    if skipped_total > 0:
+        reason_detail = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(skipped_reason_counts.items(), key=lambda pair: pair[0])
+        )
+        summary_parts.append(f"Skipped {skipped_total} command(s) ({reason_detail}).")
+
+    if requested_total > 0 and scheduled_total == 0 and skipped_total == 0:
+        summary_parts.append(f"Decision requested {requested_total} command(s), but none were accepted.")
+
+    summary = _truncate_text(" ".join(summary_parts).strip(), limit=600)
+
+    return {
+        "schema_version": 1,
+        "requested": requested_counts,
+        "scheduled": scheduled_counts,
+        "skipped": skipped_counts,
+        "skip_reasons": skipped_reason_counts,
+        "totals": {
+            "requested": requested_total,
+            "scheduled": scheduled_total,
+            "skipped": skipped_total,
+        },
+        "summary": summary,
+    }
+
+
 def _schedule_orchestrator_tick(*, delay_seconds: int, current_command_id: int | None = None) -> int | None:
     if not _orchestrator_enabled():
         return None
@@ -1285,7 +1997,13 @@ def _schedule_orchestrator_tick(*, delay_seconds: int, current_command_id: int |
     )
 
 
-def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: str, command_id: int) -> CommandExecution:
+def _task_orchestrator_tick(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int,
+) -> LLMTask:
     if not _orchestrator_enabled():
         return CommandExecution(ok=True, result={"ok": True, "disabled": True})
 
@@ -1300,9 +2018,7 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
     min_tick = _orchestrator_tick_min_seconds()
     max_tick = _orchestrator_tick_max_seconds()
     max_commands = _orchestrator_max_commands_per_tick()
-    base_tick = _orchestrator_base_tick_seconds(
-        min_tick_seconds=min_tick, max_tick_seconds=max_tick
-    )
+    base_tick = _orchestrator_base_tick_seconds(min_tick_seconds=min_tick, max_tick_seconds=max_tick)
 
     state_for_prompt: dict[str, Any] = {}
     prev_idle_streak = 0
@@ -1321,8 +2037,15 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
             "ticks": int(state.get("ticks") or 0),
             "idle_streak": int(state.get("idle_streak") or 0),
             "error_streak": int(state.get("error_streak") or 0),
-            "last_thought": _truncate_text(state.get("last_thought") if isinstance(state.get("last_thought"), str) else None, limit=600),
+            "last_thought": _truncate_text(
+                state.get("last_thought") if isinstance(state.get("last_thought"), str) else None,
+                limit=600,
+            ),
             "recent_thoughts": [_truncate_text(text, limit=300) for text in recent_thoughts[-5:]],
+            "last_action_summary": _truncate_text(
+                state.get("last_action_summary") if isinstance(state.get("last_action_summary"), str) else None,
+                limit=400,
+            ),
             "last_tick_at": state.get("last_tick_at"),
             "next_tick_seconds": state.get("next_tick_seconds"),
             "next_tick_command_id": state.get("next_tick_command_id"),
@@ -1356,7 +2079,7 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
         {"role": "system", "content": _orchestrator_system_prompt(max_commands=max_commands)},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
-    reply = generate_reply(
+    reply = yield InferenceRequest(
         messages=messages,
         tools=None,
         vllm_extra_body={"guided_json": schema, "temperature": 0, "max_tokens": 800},
@@ -1380,7 +2103,9 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
             "commands": [],
         }
 
-    sessions_needing_review = assistant_snapshot.get("sessions_needing_review") if isinstance(assistant_snapshot, dict) else None
+    sessions_needing_review = (
+        assistant_snapshot.get("sessions_needing_review") if isinstance(assistant_snapshot, dict) else None
+    )
     if not isinstance(sessions_needing_review, list):
         sessions_needing_review = []
     sessions_needing_review_count = len(sessions_needing_review)
@@ -1415,7 +2140,9 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
                     validated["thoughts"] = f"Reviewing latest support session: {session_id.strip()}."
 
     if validated is not None and not sessions_needing_review:
-        latest_review_id = _safe_int(assistant_snapshot.get("latest_review_id")) if isinstance(assistant_snapshot, dict) else None
+        latest_review_id = (
+            _safe_int(assistant_snapshot.get("latest_review_id")) if isinstance(assistant_snapshot, dict) else None
+        )
         latest_review_id = int(latest_review_id or 0)
         digest_last_review_id = _safe_int(state_for_prompt.get("digest_last_review_id"))
         digest_last_review_id = int(digest_last_review_id or 0)
@@ -1433,30 +2160,70 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
                 validated["thoughts"] = "Building a digest for newly reviewed support sessions."
 
     scheduled: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     if validated is not None:
         now = utcnow()
         for cmd in validated["commands"]:
+            command_type = str(cmd.get("command_type") or "").strip()
+            payload_cmd = dict(cmd.get("payload") or {})
+            guard: dict[str, Any] | None = None
+            if command_type == COMMAND_REVIEW_SUPPORT_SESSION:
+                guard = _orchestrator_review_enqueue_guard(
+                    payload=payload_cmd,
+                    now=now,
+                    current_command_id=int(command_id) if command_id is not None else None,
+                )
+            elif command_type == COMMAND_BUILD_SUPPORT_DIGEST:
+                guard = _orchestrator_digest_enqueue_guard(
+                    payload=payload_cmd,
+                    now=now,
+                    current_command_id=int(command_id) if command_id is not None else None,
+                )
+            if isinstance(guard, dict):
+                skipped.append(
+                    {
+                        "command_type": command_type,
+                        "priority": int(cmd.get("priority") or 0),
+                        "delay_seconds": int(cmd.get("delay_seconds") or 0),
+                        "payload": payload_cmd,
+                        "guard": guard,
+                    }
+                )
+                continue
+
             delay_seconds = int(cmd.get("delay_seconds") or 0)
             scheduled_at = now + timedelta(seconds=delay_seconds)
             enqueued_id = _enqueue_command(
-                command_type=str(cmd["command_type"]),
-                payload=dict(cmd.get("payload") or {}),
+                command_type=command_type,
+                payload=payload_cmd,
                 priority=int(cmd.get("priority") or 0),
                 available_at=scheduled_at,
             )
             scheduled.append(
                 {
                     "id": enqueued_id,
-                    "command_type": cmd["command_type"],
+                    "command_type": command_type,
                     "available_at": scheduled_at.isoformat(),
                     "priority": cmd.get("priority"),
                 }
             )
 
+        action_summary = _orchestrator_action_summary(
+            decision_commands=list(validated.get("commands") or []),
+            scheduled=scheduled,
+            skipped=skipped,
+        )
+
         requested_tick_seconds = int(validated.get("next_tick_seconds") or min_tick)
         tick_reason = "model" if not llm_invalid else "invalid_output_backoff"
         new_error_streak = 0 if not llm_invalid else prev_error_streak + 1
-        new_idle_streak = 0 if scheduled else prev_idle_streak + 1
+        has_inflight_duplicates = any(
+            isinstance(item, dict)
+            and isinstance(item.get("guard"), dict)
+            and item["guard"].get("reason") == "duplicate_inflight"
+            for item in skipped
+        )
+        new_idle_streak = 0 if scheduled or has_inflight_duplicates else prev_idle_streak + 1
         tick_seconds = requested_tick_seconds
 
         if scheduled and sessions_needing_review_count > 1:
@@ -1465,33 +2232,42 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
         elif scheduled:
             tick_seconds = min(requested_tick_seconds, base_tick)
             tick_reason = "work"
+        elif has_inflight_duplicates:
+            tick_seconds = min(requested_tick_seconds, base_tick)
+            tick_reason = "work_inflight"
         else:
             if llm_invalid:
-                tick_seconds = _orchestrator_error_backoff_seconds(
-                    base_seconds=base_tick, error_streak=new_error_streak
-                )
+                tick_seconds = _orchestrator_error_backoff_seconds(base_seconds=base_tick, error_streak=new_error_streak)
                 tick_reason = "invalid_output_backoff"
             else:
                 tick_seconds = max(
                     requested_tick_seconds,
-                    _orchestrator_idle_backoff_seconds(
-                        base_seconds=base_tick, idle_streak=new_idle_streak
-                    ),
+                    _orchestrator_idle_backoff_seconds(base_seconds=base_tick, idle_streak=new_idle_streak),
                 )
                 tick_reason = "idle_backoff"
         tick_seconds = _clamp_int(int(tick_seconds), min_value=min_tick, max_value=max_tick)
-        scheduled_tick_id = _schedule_orchestrator_tick(
-            delay_seconds=tick_seconds,
-            current_command_id=command_id,
-        )
+        scheduled_tick_id = _schedule_orchestrator_tick(delay_seconds=tick_seconds, current_command_id=command_id)
 
         with get_agent_session() as agent_db:
             run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
             state = _load_orchestrator_state(run)
-            state["last_thought"] = validated.get("thoughts") or ""
+            # Store action-aligned thoughts for status reporting; keep the raw model
+            # thought separately for debugging.
+            model_thought = str(validated.get("thoughts") or "").strip()
+            action_thought = ""
+            if isinstance(action_summary, dict):
+                action_thought = str(action_summary.get("summary") or "").strip()
+            state["last_model_thought"] = model_thought
+            state["last_thought"] = action_thought or model_thought or ""
             state["recent_thoughts"] = (
-                [*([str(x) for x in state.get("recent_thoughts") if isinstance(x, str)]), validated.get("thoughts") or ""]
+                [*([str(x) for x in state.get("recent_thoughts") if isinstance(x, str)]), state["last_thought"]]
             )[-10:]
+            state["recent_model_thoughts"] = (
+                [*([str(x) for x in state.get("recent_model_thoughts") if isinstance(x, str)]), model_thought]
+            )[-10:]
+            state["last_action_summary"] = action_summary.get("summary") if isinstance(action_summary, dict) else None
+            state["last_action"] = action_summary if isinstance(action_summary, dict) else {}
+            state["last_action_at"] = utcnow().isoformat()
             state["idle_streak"] = int(new_idle_streak)
             state["error_streak"] = int(new_error_streak)
             state["next_tick_seconds"] = int(tick_seconds)
@@ -1508,6 +2284,8 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
                 "ok": True,
                 "decision": validated,
                 "scheduled": scheduled,
+                "skipped": skipped,
+                "action_summary": action_summary,
                 "scheduled_tick_command_id": scheduled_tick_id,
                 "assistant_snapshot": assistant_snapshot,
                 "severity": "warning" if llm_invalid else "info",
@@ -1524,6 +2302,12 @@ def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: st
         )
 
     raise RuntimeError("Orchestrator reached an unexpected state.")
+
+
+def _run_orchestrator_tick(*, payload: dict[str, Any], agent_id: str, run_id: str, command_id: int) -> CommandExecution:
+    return _run_llm_task_sync(
+        _task_orchestrator_tick(payload=payload, agent_id=agent_id, run_id=run_id, command_id=command_id)
+    )
 
 
 def _session_review_schema() -> dict[str, Any]:
@@ -1761,13 +2545,117 @@ def _coerce_session_review_output(
     return normalize_review_dict(review)
 
 
-def _run_support_session_review(
+def _run_support_chat_turn(
     *,
     payload: dict[str, Any],
     agent_id: str,
     run_id: str,
     command_id: int | None = None,
 ) -> CommandExecution:
+    request_payload = payload.get("chat_request")
+    if not isinstance(request_payload, dict):
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing chat_request payload."},
+            error="missing_chat_request",
+        )
+
+    user_id = _safe_int(payload.get("user_id"))
+
+    try:
+        from ispec.api.routes import support as support_routes
+    except Exception as exc:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": f"Unable to import support route: {type(exc).__name__}"},
+            error="chat_route_import_error",
+        )
+
+    try:
+        chat_request = support_routes.ChatRequest.model_validate(dict(request_payload))
+    except Exception:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Invalid chat_request payload."},
+            error="invalid_chat_request",
+        )
+
+    queue_meta = dict(chat_request.meta or {})
+    queue_meta["_queue_force_inline"] = True
+    queue_meta["_queue_agent_id"] = str(agent_id)
+    queue_meta["_queue_run_id"] = str(run_id)
+    if command_id is not None:
+        queue_meta["_queue_command_id"] = int(command_id)
+    chat_request = chat_request.model_copy(update={"meta": queue_meta})
+
+    try:
+        with get_session() as core_db:
+            user = None
+            if user_id is not None:
+                from ispec.db.models import AuthUser
+
+                user = core_db.query(AuthUser).filter(AuthUser.id == int(user_id)).first()
+                if user is None:
+                    return CommandExecution(
+                        ok=False,
+                        result={"ok": False, "error": f"User not found for queued chat turn (user_id={user_id})."},
+                        error="chat_user_not_found",
+                    )
+
+            with (
+                get_assistant_session() as assistant_db,
+                get_agent_session() as agent_db,
+                get_omics_session() as omics_db,
+                get_schedule_session() as schedule_db,
+            ):
+                response_obj = support_routes.chat(
+                    payload=chat_request,
+                    request=None,
+                    assistant_db=assistant_db,
+                    agent_db=agent_db,
+                    core_db=core_db,
+                    omics_db=omics_db,
+                    schedule_db=schedule_db,
+                    user=user,
+                )
+    except Exception as exc:
+        detail = getattr(exc, "detail", None)
+        detail_text = str(detail).strip() if detail is not None else ""
+        if not detail_text:
+            detail_text = f"{type(exc).__name__}: {exc}"
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": detail_text},
+            error="queued_chat_turn_failed",
+        )
+
+    response_payload: dict[str, Any]
+    if hasattr(response_obj, "model_dump"):
+        response_payload = response_obj.model_dump(mode="json")
+    elif isinstance(response_obj, dict):
+        response_payload = dict(response_obj)
+    else:
+        response_payload = {"sessionId": chat_request.sessionId, "message": str(response_obj)}
+
+    return CommandExecution(
+        ok=True,
+        result={
+            "ok": True,
+            "chat_response": response_payload,
+            "session_id": chat_request.sessionId,
+            "queued_command_id": int(command_id) if command_id is not None else None,
+            "user_id": int(user_id) if user_id is not None else None,
+        },
+    )
+
+
+def _task_support_session_review(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> LLMTask:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
     if provider != "vllm":
         return CommandExecution(
@@ -1920,7 +2808,7 @@ def _run_support_session_review(
         max_repairs = _structured_llm_max_repairs("SESSION_REVIEW", default=1)
 
         vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
-        reply = generate_reply(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+        reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
 
         attempts: list[dict[str, Any]] = []
         parsed = _parse_json_object(reply.content)
@@ -1949,7 +2837,7 @@ def _run_support_session_review(
                 {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
             ]
             repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
-            repair_reply = generate_reply(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+            repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
             parsed2 = _parse_json_object(repair_reply.content)
             coerced2 = _coerce_session_review_output(
                 parsed2 if isinstance(parsed2, dict) else None,
@@ -2026,6 +2914,18 @@ def _run_support_session_review(
             prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
             response={"attempts": attempts},
         )
+
+
+def _run_support_session_review(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> CommandExecution:
+    return _run_llm_task_sync(
+        _task_support_session_review(payload=payload, agent_id=agent_id, run_id=run_id, command_id=command_id)
+    )
 
 
 def _support_digest_schema(*, max_sessions: int) -> dict[str, Any]:
@@ -2230,13 +3130,13 @@ def _coerce_support_digest_output(
     }
 
 
-def _run_support_digest(
+def _task_support_digest(
     *,
     payload: dict[str, Any],
     agent_id: str,
     run_id: str,
     command_id: int | None = None,
-) -> CommandExecution:
+) -> LLMTask:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
     if provider != "vllm":
         return CommandExecution(
@@ -2319,7 +3219,7 @@ def _run_support_digest(
     max_repairs = _structured_llm_max_repairs("SUPPORT_DIGEST", default=1)
 
     vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
-    reply = generate_reply(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
 
     attempts: list[dict[str, Any]] = []
     parsed = _parse_json_object(reply.content)
@@ -2346,7 +3246,7 @@ def _run_support_digest(
             {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
         ]
         repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
-        repair_reply = generate_reply(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
         parsed2 = _parse_json_object(repair_reply.content)
         coerced2 = _coerce_support_digest_output(
             parsed2 if isinstance(parsed2, dict) else None,
@@ -2442,6 +3342,18 @@ def _run_support_digest(
         },
         prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
         response={"attempts": attempts},
+    )
+
+
+def _run_support_digest(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> CommandExecution:
+    return _run_llm_task_sync(
+        _task_support_digest(payload=payload, agent_id=agent_id, run_id=run_id, command_id=command_id)
     )
 
 
@@ -2728,7 +3640,7 @@ def _repo_read_snippet(*, repo_root: Path, rel_path: str, line: int, context_lin
     return "\n".join(snippet_lines)
 
 
-def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> CommandExecution:
+def _task_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> LLMTask:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
     if provider != "vllm":
         return CommandExecution(
@@ -2794,7 +3706,7 @@ def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> 
     max_repairs = _structured_llm_max_repairs("REPO_REVIEW", default=1)
 
     vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
-    reply = generate_reply(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
 
     attempts: list[dict[str, Any]] = []
     parsed = _parse_json_object(reply.content)
@@ -2819,7 +3731,7 @@ def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> 
             {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
         ]
         repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
-        repair_reply = generate_reply(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
         parsed2 = _parse_json_object(repair_reply.content)
         coerced2 = _coerce_repo_review_output(parsed2 if isinstance(parsed2, dict) else None)
         attempts.append(
@@ -2876,6 +3788,456 @@ def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> 
         },
         prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
         response={"attempts": attempts},
+    )
+
+
+def _run_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) -> CommandExecution:
+    return _run_llm_task_sync(_task_repo_review(payload=payload, agent_id=agent_id, run_id=run_id))
+
+
+def _prune_json_for_prompt(
+    value: Any,
+    *,
+    max_depth: int = 5,
+    max_list_items: int = 80,
+    max_dict_items: int = 120,
+    max_str_chars: int = 3000,
+) -> Any:
+    """Reduce large payloads so we can safely include them in LLM prompts.
+
+    This is intentionally conservative: we keep structure but trim very large
+    strings and collections.
+    """
+
+    if max_depth <= 0:
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, str):
+            return _truncate_text(value, limit=max_str_chars)
+        return "<truncated>"
+
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+
+    if isinstance(value, str):
+        return _truncate_text(value, limit=max_str_chars)
+
+    if isinstance(value, list):
+        items = [_prune_json_for_prompt(item, max_depth=max_depth - 1, max_list_items=max_list_items, max_dict_items=max_dict_items, max_str_chars=max_str_chars) for item in value[: max(0, int(max_list_items))]]
+        if len(value) > int(max_list_items):
+            items.append(f"<truncated {len(value) - int(max_list_items)} more items>")
+        return items
+
+    if isinstance(value, dict):
+        pruned: dict[str, Any] = {}
+        keys = [k for k in value.keys() if isinstance(k, str)]
+        for key in keys[: max(0, int(max_dict_items))]:
+            pruned[key] = _prune_json_for_prompt(
+                value.get(key),
+                max_depth=max_depth - 1,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+                max_str_chars=max_str_chars,
+            )
+        if len(keys) > int(max_dict_items):
+            pruned["_truncated_keys"] = int(len(keys) - int(max_dict_items))
+        return pruned
+
+    # Fallback: represent unknown objects by type name.
+    return str(value)
+
+
+def _tackle_assess_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "schema_version": {"type": "integer", "enum": [_TACKLE_ASSESS_VERSION]},
+            "project_id": {"type": ["integer", "null"], "minimum": 1},
+            "summary": {"type": "string", "maxLength": 2000},
+            "findings": {
+                "type": "array",
+                "maxItems": 25,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "severity": {"type": "string", "enum": ["info", "warning", "error"]},
+                        "topic": {"type": "string", "enum": ["pca", "limma", "telemetry", "io", "other"]},
+                        "description": {"type": "string", "maxLength": 500},
+                        "evidence": {"type": ["string", "null"], "maxLength": 500},
+                    },
+                    "required": ["severity", "topic", "description", "evidence"],
+                },
+            },
+            "next_steps": {
+                "type": "array",
+                "maxItems": 25,
+                "items": {"type": "string", "maxLength": 280},
+            },
+            "questions": {
+                "type": "array",
+                "maxItems": 25,
+                "items": {"type": "string", "maxLength": 280},
+            },
+        },
+        "required": ["schema_version", "project_id", "summary", "findings", "next_steps", "questions"],
+    }
+
+
+def _tackle_assess_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are the iSPEC internal analysis assistant.",
+            "You are given structured telemetry and statistical results from a tackle run (e.g. PCA + limma).",
+            "",
+            "Goals:",
+            "- Provide concise, actionable interpretation and QC notes.",
+            "- Highlight suspicious patterns (batch effects, outliers, tiny N, confounding, label leakage).",
+            "- Suggest follow-up plots/tests or metadata checks.",
+            "",
+            "Rules:",
+            "- Do NOT call tools.",
+            "- Do NOT invent values that are not present in the input payload.",
+            "- Return ONLY a JSON object that matches the schema.",
+            "- Required top-level keys: schema_version, project_id, summary, findings, next_steps, questions.",
+            "- schema_version must be 1.",
+            "- Do not use markdown fences or quote the JSON.",
+        ]
+    ).strip()
+
+
+def _tackle_assess_repair_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are repairing a previous invalid JSON response for an iSPEC tackle results assessment.",
+            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
+            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
+            "Required top-level keys: schema_version, project_id, summary, findings, next_steps, questions.",
+            "The object MUST look like:",
+            '{"schema_version":1,"project_id":null,"summary":"...","findings":[],"next_steps":[],"questions":[]}',
+        ]
+    ).strip()
+
+
+def _coerce_tackle_assess_output(parsed: dict[str, Any] | None, *, project_id: int | None) -> dict[str, Any] | None:
+    if not isinstance(parsed, dict):
+        return None
+
+    assess: dict[str, Any] | None = None
+    for key in ("assessment", "report", "result"):
+        candidate = parsed.get(key)
+        if isinstance(candidate, dict):
+            assess = candidate
+            break
+    if assess is None:
+        assess = parsed
+
+    if not isinstance(assess, dict):
+        return None
+
+    expected_keys = {"summary", "findings", "next_steps", "questions", "project_id"}
+    if not any(key in assess for key in expected_keys):
+        return None
+
+    summary = assess.get("summary") if isinstance(assess.get("summary"), str) else ""
+    summary = _truncate_text(summary, limit=2000)
+    if not summary:
+        summary = _truncate_text("Assessment generated.", limit=2000)
+
+    parsed_project = _safe_int(assess.get("project_id"))
+    if parsed_project is not None and parsed_project <= 0:
+        parsed_project = None
+    effective_project = parsed_project if parsed_project is not None else project_id
+
+    findings_raw = assess.get("findings")
+    if isinstance(findings_raw, dict):
+        findings_raw = [findings_raw]
+    findings: list[dict[str, Any]] = []
+    if isinstance(findings_raw, list):
+        for item in findings_raw:
+            if not isinstance(item, dict):
+                continue
+            severity = item.get("severity")
+            if not isinstance(severity, str) or severity not in {"info", "warning", "error"}:
+                severity = "info"
+            topic = item.get("topic")
+            if not isinstance(topic, str) or topic not in {"pca", "limma", "telemetry", "io", "other"}:
+                topic = "other"
+            description = item.get("description")
+            if not isinstance(description, str) or not description.strip():
+                continue
+            evidence = item.get("evidence")
+            if evidence is not None and not isinstance(evidence, str):
+                evidence = None
+            findings.append(
+                {
+                    "severity": severity,
+                    "topic": topic,
+                    "description": _truncate_text(description.strip(), limit=500),
+                    "evidence": _truncate_text(evidence.strip(), limit=500) if isinstance(evidence, str) and evidence.strip() else None,
+                }
+            )
+
+    next_steps_raw = assess.get("next_steps")
+    if isinstance(next_steps_raw, str) and next_steps_raw.strip():
+        next_steps_raw = [next_steps_raw]
+    next_steps: list[str] = []
+    if isinstance(next_steps_raw, list):
+        for item in next_steps_raw:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            next_steps.append(_truncate_text(text, limit=280))
+
+    questions_raw = assess.get("questions")
+    if isinstance(questions_raw, str) and questions_raw.strip():
+        questions_raw = [questions_raw]
+    questions: list[str] = []
+    if isinstance(questions_raw, list):
+        for item in questions_raw:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            questions.append(_truncate_text(text, limit=280))
+
+    return {
+        "schema_version": _TACKLE_ASSESS_VERSION,
+        "project_id": int(effective_project) if isinstance(effective_project, int) and effective_project > 0 else None,
+        "summary": summary,
+        "findings": findings[:25],
+        "next_steps": next_steps[:25],
+        "questions": questions[:25],
+    }
+
+
+def _task_tackle_results_assess(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int,
+) -> LLMTask:
+    project_id = _safe_int(payload.get("project_id"))
+    if project_id is not None and project_id <= 0:
+        project_id = None
+
+    pruned_payload = _prune_json_for_prompt(payload)
+    context = {
+        "schema_version": 1,
+        "agent": {"agent_id": agent_id, "run_id": run_id, "command_id": int(command_id)},
+        "project_id": int(project_id) if project_id is not None else None,
+        "payload": pruned_payload,
+    }
+
+    schema = _tackle_assess_schema()
+    messages = [
+        {"role": "system", "content": _tackle_assess_system_prompt()},
+        {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+    ]
+    temperature = _structured_llm_temperature("TACKLE_ASSESS", default=0.0)
+    repair_temperature = _structured_llm_repair_temperature("TACKLE_ASSESS", default=0.25)
+    max_repairs = _structured_llm_max_repairs("TACKLE_ASSESS", default=1)
+
+    vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+
+    attempts: list[dict[str, Any]] = []
+    parsed = _parse_json_object(reply.content)
+    coerced = _coerce_tackle_assess_output(parsed if isinstance(parsed, dict) else None, project_id=project_id)
+    attempts.append(
+        {
+            "attempt": 1,
+            "temperature": float(temperature),
+            "raw": reply.content,
+            "parsed": parsed,
+            "coerced": coerced,
+            "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+        }
+    )
+
+    recovered = False
+    if (not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _TACKLE_ASSESS_VERSION) and (
+        max_repairs > 0
+    ):
+        repair_messages = [
+            {"role": "system", "content": _tackle_assess_repair_system_prompt()},
+            {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
+        ]
+        repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
+        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        parsed2 = _parse_json_object(repair_reply.content)
+        coerced2 = _coerce_tackle_assess_output(parsed2 if isinstance(parsed2, dict) else None, project_id=project_id)
+        attempts.append(
+            {
+                "attempt": 2,
+                "temperature": float(repair_temperature),
+                "raw": repair_reply.content,
+                "parsed": parsed2,
+                "coerced": coerced2,
+                "llm": {"provider": repair_reply.provider, "model": repair_reply.model, "meta": repair_reply.meta},
+            }
+        )
+        if isinstance(coerced2, dict) and int(coerced2.get("schema_version") or 0) == _TACKLE_ASSESS_VERSION:
+            reply = repair_reply
+            parsed = parsed2
+            coerced = coerced2
+            recovered = True
+
+    if not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _TACKLE_ASSESS_VERSION:
+        return CommandExecution(
+            ok=False,
+            result={
+                "ok": False,
+                "error": "Invalid tackle assessment output.",
+                "project_id": int(project_id) if project_id is not None else None,
+                "raw": _truncate_text(reply.content, limit=1200),
+                "attempts": len(attempts),
+                "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+            },
+            error="invalid_tackle_assess_output",
+            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            response={"attempts": attempts},
+        )
+
+    return CommandExecution(
+        ok=True,
+        result={
+            "ok": True,
+            "project_id": int(project_id) if project_id is not None else None,
+            "assessment": coerced,
+            "llm": {
+                "provider": reply.provider,
+                "model": reply.model,
+                "meta": reply.meta,
+                "invalid_output_recovered": bool(recovered),
+                "attempts": len(attempts),
+            },
+        },
+        prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+        response={"attempts": attempts},
+    )
+
+
+def _run_tackle_results_assess(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int,
+) -> CommandExecution:
+    return _run_llm_task_sync(
+        _task_tackle_results_assess(payload=payload, agent_id=agent_id, run_id=run_id, command_id=command_id)
+    )
+
+
+def _tackle_prompt_system_prompt() -> str:
+    return "\n".join(
+        [
+            "You are the iSPEC local analysis assistant.",
+            "You are given a freeform prompt from a pipeline (tackle) containing telemetry and statistical results.",
+            "",
+            "Goals:",
+            "- Provide concise, practical commentary on what the prompt shows.",
+            "- Flag likely issues (outliers, batch effects, confounding, tiny N, mislabeled samples).",
+            "- Suggest next checks and follow-ups.",
+            "",
+            "Rules:",
+            "- Do NOT call tools.",
+            "- Do NOT invent values not present in the prompt/context.",
+            "- Do NOT reveal secrets, API keys, or internal paths.",
+            "- Respond in plain text (no JSON required).",
+        ]
+    ).strip()
+
+
+def _task_tackle_prompt_freeform(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int,
+) -> LLMTask:
+    prompt_text = payload.get("prompt")
+    if not isinstance(prompt_text, str) or not prompt_text.strip():
+        prompt_text = payload.get("prompt_text")
+    if not isinstance(prompt_text, str) or not prompt_text.strip():
+        prompt_text = payload.get("message")
+    prompt = (prompt_text or "").strip()
+    if not prompt:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing prompt text (payload.prompt)."},
+            error="missing_prompt",
+        )
+
+    project_id = _safe_int(payload.get("project_id"))
+    if project_id is not None and project_id <= 0:
+        project_id = None
+
+    # Optional structured context that tackle can send alongside the prompt.
+    extra_context = payload.get("context")
+    if not isinstance(extra_context, dict):
+        extra_context = {}
+    pruned_context = _prune_json_for_prompt(extra_context)
+
+    user_parts: list[str] = []
+    if project_id is not None:
+        user_parts.append(f"project_id: {int(project_id)}")
+    if pruned_context:
+        user_parts.append("context_json:\n" + json.dumps(pruned_context, ensure_ascii=False))
+    user_parts.append(prompt)
+    user_content = "\n\n".join(user_parts).strip()
+
+    messages = [
+        {"role": "system", "content": _tackle_prompt_system_prompt()},
+        {"role": "user", "content": user_content},
+    ]
+
+    # Keep output bounded unless the caller explicitly asks for a larger cap.
+    max_tokens = _safe_int(payload.get("max_tokens"))
+    if max_tokens is None:
+        max_tokens = 900
+    max_tokens = _clamp_int(int(max_tokens), min_value=64, max_value=2400)
+
+    vllm_extra_body = {"max_tokens": int(max_tokens)}
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+    if not reply.ok:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": reply.error or "vLLM request failed.", "llm": {"meta": reply.meta}},
+            error="tackle_prompt_llm_failed",
+            prompt={"messages": messages, "vllm_extra_body": vllm_extra_body},
+            response={"raw": reply.content, "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta}},
+        )
+
+    output_text = _truncate_text(reply.content, limit=20_000)
+    return CommandExecution(
+        ok=True,
+        result={
+            "ok": True,
+            "project_id": int(project_id) if project_id is not None else None,
+            "output_text": output_text,
+            "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
+        },
+        prompt={"messages": messages, "vllm_extra_body": vllm_extra_body},
+        response={"raw": output_text},
+    )
+
+
+def _run_tackle_prompt_freeform(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int,
+) -> CommandExecution:
+    return _run_llm_task_sync(
+        _task_tackle_prompt_freeform(payload=payload, agent_id=agent_id, run_id=run_id, command_id=command_id)
     )
 
 
@@ -3000,6 +4362,159 @@ def _run_slack_post_message(payload: dict[str, Any]) -> CommandExecution:
             "slack": slack_response,
         },
     )
+
+
+def _run_dev_restart_services(payload: dict[str, Any]) -> CommandExecution:
+    """Best-effort tmux/make restarts for local dev services.
+
+    This is intentionally gated because it is only valid in a tmux + top-level
+    Makefile workflow.
+    """
+
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if payload.get("confirm") is not True:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "confirm=true is required."},
+            error="confirm_required",
+        )
+
+    services_raw = payload.get("services")
+    services: list[str] = []
+    if isinstance(services_raw, list):
+        services = [str(item).strip().lower() for item in services_raw if isinstance(item, str) and item.strip()]
+    elif isinstance(services_raw, str):
+        services = [tok.strip().lower() for tok in services_raw.replace(",", " ").split() if tok.strip()]
+
+    if not services:
+        services = ["backend", "supervisor"]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for svc in services:
+        if svc in {"api"}:
+            svc = "backend"
+        if svc not in seen:
+            normalized.append(svc)
+            seen.add(svc)
+
+    allowed = {"backend", "supervisor", "frontend", "vllm", "slack"}
+    unknown = sorted({svc for svc in normalized if svc not in allowed})
+    if unknown:
+        return CommandExecution(
+            ok=False,
+            result={
+                "ok": False,
+                "error": "Unknown services requested.",
+                "unknown": unknown,
+                "allowed": sorted(allowed),
+            },
+            error="unknown_services",
+        )
+
+    tmux_session = str(payload.get("tmux_session") or os.getenv("DEV_TMUX_SESSION") or "ispecfull").strip() or "ispecfull"
+    make_root = str(payload.get("make_root") or "").strip() or None
+
+    enabled, reason = _dev_restart_enabled_status(tmux_session=tmux_session, make_root=make_root)
+    if not enabled:
+        return CommandExecution(
+            ok=False,
+            result={
+                "ok": False,
+                "error": "Dev restart is unavailable.",
+                "hint": reason,
+            },
+            error="dev_restart_disabled",
+        )
+
+    restart_supervisor = "supervisor" in normalized
+    immediate_services = [svc for svc in normalized if svc != "supervisor"]
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "services": normalized,
+        "tmux_session": tmux_session,
+        "make_root": make_root,
+        "restarted": [],
+        "scheduled": [],
+    }
+
+    try:
+        from types import SimpleNamespace
+        from ispec.cli import dev as dev_cli
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        result["ok"] = False
+        result["error"] = error
+        return CommandExecution(ok=False, result=result, error="dev_restart_import_failed")
+
+    if immediate_services:
+        try:
+            args = SimpleNamespace(
+                subcommand="restart",
+                services=immediate_services,
+                tmux_session=tmux_session,
+                make_root=make_root,
+            )
+            dev_cli.dispatch(args)
+            result["restarted"] = list(immediate_services)
+        except SystemExit as exc:
+            code = getattr(exc, "code", None)
+            error = str(code) if code is not None else str(exc)
+            result["ok"] = False
+            result["error"] = error or "dev_restart_failed"
+            return CommandExecution(ok=False, result=result, error="dev_restart_failed")
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            result["ok"] = False
+            result["error"] = error
+            return CommandExecution(ok=False, result=result, error="dev_restart_failed")
+
+    if restart_supervisor:
+        try:
+            # Restarting the supervisor from inside itself risks killing this
+            # process before it can mark the agent_command as complete. Schedule
+            # the tmux respawn with a small delay so the command finish can be
+            # committed first.
+            make_root_path = Path(make_root).expanduser().resolve() if make_root else dev_cli._find_make_root()  # type: ignore[attr-defined]
+            if make_root_path is None:
+                raise RuntimeError("Unable to locate the top-level Makefile; pass make_root.")
+
+            window = getattr(dev_cli, "_SERVICE_TO_WINDOW", {}).get("supervisor")
+            make_target = getattr(dev_cli, "_SERVICE_TO_MAKE_TARGET", {}).get("supervisor")
+            if not isinstance(window, str) or not window.strip():
+                raise RuntimeError("Dev mapping missing for supervisor window.")
+            if not isinstance(make_target, str) or not make_target.strip():
+                raise RuntimeError("Dev mapping missing for supervisor make target.")
+
+            target_window = f"{tmux_session}:{window}"
+            pane_id = dev_cli._tmux_first_pane_id(target_window)  # type: ignore[attr-defined]
+            if not pane_id:
+                raise RuntimeError(f"Unable to find a pane for tmux window {target_window!r}.")
+
+            cmd = f'cd "{make_root_path.as_posix()}" && make {make_target}'
+            import shlex
+
+            delay = 0.8
+            script = (
+                f"sleep {delay}; tmux respawn-pane -k -t {shlex.quote(str(pane_id))} {shlex.quote(cmd)}"
+            )
+            subprocess.Popen(
+                ["bash", "-lc", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            result["scheduled"].append({"service": "supervisor", "delay_seconds": delay, "pane_id": pane_id})
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            result["ok"] = False
+            result["error"] = error
+            return CommandExecution(ok=False, result=result, error="dev_restart_supervisor_failed")
+
+    return CommandExecution(ok=True, result=result)
 
 
 _WEEKDAY_ALIASES: dict[str, int] = {
@@ -3501,9 +5016,19 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
         return CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
 
 
-def _seed_orchestrator_tick(*, delay_seconds: int = 5) -> int | None:
+def _seed_orchestrator_tick(
+    *,
+    delay_seconds: int = 5,
+    agent_id: str | None = None,
+    run_id: str | None = None,
+) -> int | None:
     if not _orchestrator_enabled():
         return None
+    if isinstance(agent_id, str) and agent_id.strip():
+        _recover_stale_running_commands(
+            agent_id=agent_id.strip(),
+            run_id=(run_id or "").strip(),
+        )
     with get_agent_session() as db:
         existing = (
             db.query(AgentCommand.id)
@@ -3516,7 +5041,155 @@ def _seed_orchestrator_tick(*, delay_seconds: int = 5) -> int | None:
     return _schedule_orchestrator_tick(delay_seconds=max(10, int(delay_seconds)))
 
 
+def _log_command_done(*, cmd: ClaimedCommand, execution: CommandExecution, duration_ms: int) -> None:
+    status_label = "deferred" if execution.defer_seconds is not None else ("succeeded" if execution.ok else "failed")
+    extra_parts: list[str] = []
+    if cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
+        decision = execution.result.get("decision") if isinstance(execution.result, dict) else None
+        scheduled = execution.result.get("scheduled") if isinstance(execution.result, dict) else None
+        tick_seconds = None
+        if isinstance(decision, dict):
+            tick_seconds = decision.get("next_tick_seconds")
+        if isinstance(tick_seconds, (int, float)):
+            extra_parts.append(f"next_tick={int(tick_seconds)}s")
+        if isinstance(scheduled, list):
+            extra_parts.append(f"scheduled={len(scheduled)}")
+    elif cmd.command_type == COMMAND_SUPPORT_CHAT_TURN:
+        session_id = execution.result.get("session_id") if isinstance(execution.result, dict) else None
+        if not isinstance(session_id, str) or not session_id.strip():
+            chat_request = cmd.payload.get("chat_request") if isinstance(cmd.payload, dict) else None
+            session_id = chat_request.get("sessionId") if isinstance(chat_request, dict) else None
+        if isinstance(session_id, str) and session_id.strip():
+            extra_parts.append(f"session_id={session_id.strip()}")
+    elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
+        channel = cmd.payload.get("channel")
+        if isinstance(channel, str) and channel.strip():
+            extra_parts.append(f"channel={channel.strip()}")
+        schedule = cmd.payload.get("schedule")
+        if isinstance(schedule, dict):
+            schedule_name = schedule.get("name")
+            if isinstance(schedule_name, str) and schedule_name.strip():
+                extra_parts.append(f"schedule={schedule_name.strip()}")
+
+    defer_seconds = execution.defer_seconds
+    if isinstance(defer_seconds, int):
+        extra_parts.append(f"defer_seconds={defer_seconds}")
+    if isinstance(execution.error, str) and execution.error.strip():
+        extra_parts.append(f"error={_truncate_text(execution.error, limit=200)}")
+
+    extra_text = ""
+    if extra_parts:
+        extra_text = " " + " ".join(extra_parts[:8])
+    logger.info(
+        "Command done id=%s type=%s status=%s ok=%s duration_ms=%s%s",
+        cmd.id,
+        cmd.command_type,
+        status_label,
+        bool(execution.ok),
+        int(duration_ms),
+        extra_text,
+    )
+
+
+def _persist_command_execution(
+    *,
+    cmd: ClaimedCommand,
+    execution: CommandExecution,
+    run_id: str,
+    step_started: datetime,
+    step_ended: datetime,
+    duration_ms: int,
+) -> None:
+    if execution.defer_seconds is not None:
+        _defer_command(
+            command_id=cmd.id,
+            delay_seconds=int(execution.defer_seconds),
+            result=dict(execution.result or {}),
+            error=execution.error,
+        )
+    else:
+        _finish_command(
+            command_id=cmd.id,
+            ok=bool(execution.ok),
+            result=dict(execution.result or {}),
+            error=execution.error,
+        )
+
+    try:
+        with get_agent_session() as db:
+            run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+            step_index = int(run.step_index or 0)
+
+            state_before = dict(run.state_json or {})
+            state_after = dict(state_before)
+            state_after["last_command"] = {
+                "id": int(cmd.id),
+                "command_type": cmd.command_type,
+                "ok": bool(execution.ok),
+                "ended_at": step_ended.isoformat(),
+            }
+            run.state_json = state_after
+            run.step_index = step_index + 1
+            run.updated_at = step_ended
+            run.last_error = execution.error
+            run.status_bar = _format_status_bar(state_after)
+
+            if cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
+                try:
+                    _record_slack_schedule_attempt(
+                        run=run,
+                        payload=dict(cmd.payload or {}),
+                        execution=execution,
+                        ended_at=step_ended,
+                    )
+                except Exception:
+                    logger.exception("Failed recording Slack schedule attempt (command_id=%s)", cmd.id)
+            elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
+                try:
+                    _record_legacy_sync_attempt(
+                        run=run,
+                        command_id=int(cmd.id),
+                        execution=execution,
+                        ended_at=step_ended,
+                    )
+                except Exception:
+                    logger.exception("Failed recording legacy sync attempt (command_id=%s)", cmd.id)
+
+            result_payload = dict(execution.result or {})
+            step = AgentStep(
+                run_pk=run.id,
+                step_index=step_index,
+                kind=cmd.command_type,
+                started_at=step_started,
+                ended_at=step_ended,
+                duration_ms=int(duration_ms),
+                ok=bool(execution.ok),
+                severity=_severity_from_result(result_payload),
+                error=execution.error,
+                candidates_json=None,
+                chosen_index=None,
+                chosen_json={
+                    "command_id": int(cmd.id),
+                    "command_type": cmd.command_type,
+                    "attempts": int(cmd.attempts),
+                    "max_attempts": int(cmd.max_attempts),
+                    "payload": dict(cmd.payload or {}),
+                },
+                prompt_json=execution.prompt,
+                response_json=execution.response,
+                tool_calls_json=None,
+                tool_results_json=[result_payload],
+                state_before_json=state_before,
+                state_after_json=state_after,
+            )
+            db.add(step)
+            db.commit()
+    except Exception:
+        logger.exception("Failed to persist command step (command_id=%s)", cmd.id)
+
+
 def _process_one_command(*, agent_id: str, run_id: str) -> bool:
+    assert_main_thread("supervisor._process_one_command")
     cmd = _claim_next_command(agent_id=agent_id, run_id=run_id)
     if cmd is None:
         return False
@@ -3589,12 +5262,33 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
                 run_id=run_id,
                 command_id=int(cmd.id),
             )
+        elif cmd.command_type == COMMAND_ASSESS_TACKLE_RESULTS:
+            execution = _run_tackle_results_assess(
+                payload=cmd.payload,
+                agent_id=agent_id,
+                run_id=run_id,
+                command_id=int(cmd.id),
+            )
+        elif cmd.command_type == COMMAND_RUN_TACKLE_PROMPT:
+            execution = _run_tackle_prompt_freeform(
+                payload=cmd.payload,
+                agent_id=agent_id,
+                run_id=run_id,
+                command_id=int(cmd.id),
+            )
         elif cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
             execution = _run_orchestrator_tick(
                 payload=cmd.payload,
                 agent_id=agent_id,
                 run_id=run_id,
                 command_id=cmd.id,
+            )
+        elif cmd.command_type == COMMAND_SUPPORT_CHAT_TURN:
+            execution = _run_support_chat_turn(
+                payload=cmd.payload,
+                agent_id=agent_id,
+                run_id=run_id,
+                command_id=int(cmd.id),
             )
         elif cmd.command_type == COMMAND_REVIEW_SUPPORT_SESSION:
             execution = _run_support_session_review(
@@ -3609,6 +5303,8 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
             execution = _run_legacy_sync_all(cmd.payload)
         elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
             execution = _run_slack_post_message(cmd.payload)
+        elif cmd.command_type == COMMAND_DEV_RESTART_SERVICES:
+            execution = _run_dev_restart_services(cmd.payload)
         else:
             error = f"Unknown command_type: {cmd.command_type}"
             execution = CommandExecution(
@@ -3627,133 +5323,15 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
     duration_ms = int((time.monotonic() - step_monotonic) * 1000)
     step_ended = utcnow()
 
-    status_label = "deferred" if execution.defer_seconds is not None else ("succeeded" if execution.ok else "failed")
-    extra_parts: list[str] = []
-    if cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
-        decision = execution.result.get("decision") if isinstance(execution.result, dict) else None
-        scheduled = execution.result.get("scheduled") if isinstance(execution.result, dict) else None
-        tick_seconds = None
-        if isinstance(decision, dict):
-            tick_seconds = decision.get("next_tick_seconds")
-        if isinstance(tick_seconds, (int, float)):
-            extra_parts.append(f"next_tick={int(tick_seconds)}s")
-        if isinstance(scheduled, list):
-            extra_parts.append(f"scheduled={len(scheduled)}")
-    elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
-        channel = cmd.payload.get("channel")
-        if isinstance(channel, str) and channel.strip():
-            extra_parts.append(f"channel={channel.strip()}")
-        schedule = cmd.payload.get("schedule")
-        if isinstance(schedule, dict):
-            schedule_name = schedule.get("name")
-            if isinstance(schedule_name, str) and schedule_name.strip():
-                extra_parts.append(f"schedule={schedule_name.strip()}")
-
-    defer_seconds = execution.defer_seconds
-    if isinstance(defer_seconds, int):
-        extra_parts.append(f"defer_seconds={defer_seconds}")
-    if isinstance(execution.error, str) and execution.error.strip():
-        extra_parts.append(f"error={_truncate_text(execution.error, limit=200)}")
-
-    extra_text = ""
-    if extra_parts:
-        extra_text = " " + " ".join(extra_parts[:8])
-    logger.info(
-        "Command done id=%s type=%s status=%s ok=%s duration_ms=%s%s",
-        cmd.id,
-        cmd.command_type,
-        status_label,
-        bool(execution.ok),
-        duration_ms,
-        extra_text,
+    _log_command_done(cmd=cmd, execution=execution, duration_ms=duration_ms)
+    _persist_command_execution(
+        cmd=cmd,
+        execution=execution,
+        run_id=run_id,
+        step_started=step_started,
+        step_ended=step_ended,
+        duration_ms=duration_ms,
     )
-
-    if execution.defer_seconds is not None:
-        _defer_command(
-            command_id=cmd.id,
-            delay_seconds=int(execution.defer_seconds),
-            result=dict(execution.result or {}),
-            error=execution.error,
-        )
-    else:
-        _finish_command(
-            command_id=cmd.id,
-            ok=bool(execution.ok),
-            result=dict(execution.result or {}),
-            error=execution.error,
-        )
-
-    try:
-        with get_agent_session() as db:
-            run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
-            step_index = int(run.step_index or 0)
-
-            state_before = dict(run.state_json or {})
-            state_after = dict(state_before)
-            state_after["last_command"] = {
-                "id": int(cmd.id),
-                "command_type": cmd.command_type,
-                "ok": bool(execution.ok),
-                "ended_at": step_ended.isoformat(),
-            }
-            run.state_json = state_after
-            run.step_index = step_index + 1
-            run.updated_at = step_ended
-            run.last_error = execution.error
-            run.status_bar = _format_status_bar(state_after)
-
-            if cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
-                try:
-                    _record_slack_schedule_attempt(
-                        run=run,
-                        payload=dict(cmd.payload or {}),
-                        execution=execution,
-                        ended_at=step_ended,
-                    )
-                except Exception:
-                    logger.exception("Failed recording Slack schedule attempt (command_id=%s)", cmd.id)
-            elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
-                try:
-                    _record_legacy_sync_attempt(
-                        run=run,
-                        command_id=int(cmd.id),
-                        execution=execution,
-                        ended_at=step_ended,
-                    )
-                except Exception:
-                    logger.exception("Failed recording legacy sync attempt (command_id=%s)", cmd.id)
-
-            result_payload = dict(execution.result or {})
-            step = AgentStep(
-                run_pk=run.id,
-                step_index=step_index,
-                kind=cmd.command_type,
-                started_at=step_started,
-                ended_at=step_ended,
-                duration_ms=duration_ms,
-                ok=bool(execution.ok),
-                severity=_severity_from_result(result_payload),
-                error=execution.error,
-                candidates_json=None,
-                chosen_index=None,
-                chosen_json={
-                    "command_id": int(cmd.id),
-                    "command_type": cmd.command_type,
-                    "attempts": int(cmd.attempts),
-                    "max_attempts": int(cmd.max_attempts),
-                    "payload": dict(cmd.payload or {}),
-                },
-                prompt_json=execution.prompt,
-                response_json=execution.response,
-                tool_calls_json=None,
-                tool_results_json=[result_payload],
-                state_before_json=state_before,
-                state_after_json=state_after,
-            )
-            db.add(step)
-            db.commit()
-    except Exception:
-        logger.exception("Failed to persist command step (command_id=%s)", cmd.id)
 
     return True
 
@@ -3765,6 +5343,415 @@ class SupervisorConfig:
     frontend_url: str
     interval_seconds: int
     timeout_seconds: float
+
+
+_LLM_COMMAND_TYPES = {
+    COMMAND_ORCHESTRATOR_TICK,
+    COMMAND_REVIEW_SUPPORT_SESSION,
+    COMMAND_BUILD_SUPPORT_DIGEST,
+    COMMAND_REVIEW_REPO,
+    COMMAND_ASSESS_TACKLE_RESULTS,
+    COMMAND_RUN_TACKLE_PROMPT,
+}
+
+
+def _llm_task_for_command(*, cmd: ClaimedCommand, agent_id: str, run_id: str) -> LLMTask | None:
+    if cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
+        return _task_orchestrator_tick(payload=cmd.payload, agent_id=agent_id, run_id=run_id, command_id=int(cmd.id))
+    if cmd.command_type == COMMAND_REVIEW_SUPPORT_SESSION:
+        return _task_support_session_review(
+            payload=cmd.payload,
+            agent_id=agent_id,
+            run_id=run_id,
+            command_id=int(cmd.id),
+        )
+    if cmd.command_type == COMMAND_BUILD_SUPPORT_DIGEST:
+        return _task_support_digest(
+            payload=cmd.payload,
+            agent_id=agent_id,
+            run_id=run_id,
+            command_id=int(cmd.id),
+        )
+    if cmd.command_type == COMMAND_REVIEW_REPO:
+        return _task_repo_review(payload=cmd.payload, agent_id=agent_id, run_id=run_id)
+    if cmd.command_type == COMMAND_ASSESS_TACKLE_RESULTS:
+        return _task_tackle_results_assess(
+            payload=cmd.payload,
+            agent_id=agent_id,
+            run_id=run_id,
+            command_id=int(cmd.id),
+        )
+    if cmd.command_type == COMMAND_RUN_TACKLE_PROMPT:
+        return _task_tackle_prompt_freeform(
+            payload=cmd.payload,
+            agent_id=agent_id,
+            run_id=run_id,
+            command_id=int(cmd.id),
+        )
+    return None
+
+
+@dataclass
+class _InflightInference:
+    cmd: ClaimedCommand
+    task: LLMTask
+    step_started: datetime
+    step_monotonic: float
+    job_id: str
+
+
+class _SupervisorCommandProcessor:
+    """Supervisor command processor with optional inference broker.
+
+    When `broker` is enabled, LLM calls are executed on a dedicated thread and
+    the main supervisor thread stays responsive (heartbeats, non-LLM commands,
+    and inference result finalization).
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        run_id: str,
+        broker: InferenceBroker | None,
+    ) -> None:
+        self._agent_id = agent_id
+        self._run_id = run_id
+        self._broker = broker
+        self._inflight: _InflightInference | None = None
+
+        heartbeat_seconds = float(_supervisor_heartbeat_seconds())
+        now_mono = time.monotonic()
+        self._heartbeat_seconds = heartbeat_seconds
+        self._heartbeat_due_at = now_mono + heartbeat_seconds
+        self._command_touch_due_at = now_mono + min(heartbeat_seconds, 10.0)
+
+    @property
+    def inflight(self) -> _InflightInference | None:
+        return self._inflight
+
+    def start(self) -> None:
+        if self._broker is not None:
+            self._broker.start()
+
+    def stop(self) -> None:
+        if self._broker is not None:
+            self._broker.stop()
+
+    def _maybe_heartbeat(self) -> None:
+        now_mono = time.monotonic()
+        if now_mono >= self._heartbeat_due_at:
+            _touch_supervisor_run(run_id=self._run_id)
+            self._heartbeat_due_at = now_mono + float(self._heartbeat_seconds)
+        if self._inflight is not None and now_mono >= self._command_touch_due_at:
+            _touch_command_updated_at(command_id=int(self._inflight.cmd.id))
+            self._command_touch_due_at = now_mono + min(float(self._heartbeat_seconds), 10.0)
+
+    def _finalize_command(
+        self,
+        *,
+        cmd: ClaimedCommand,
+        execution: CommandExecution,
+        step_started: datetime,
+        step_monotonic: float,
+    ) -> None:
+        duration_ms = int((time.monotonic() - step_monotonic) * 1000)
+        step_ended = utcnow()
+        _log_command_done(cmd=cmd, execution=execution, duration_ms=duration_ms)
+        _persist_command_execution(
+            cmd=cmd,
+            execution=execution,
+            run_id=self._run_id,
+            step_started=step_started,
+            step_ended=step_ended,
+            duration_ms=duration_ms,
+        )
+
+    def _handle_claimed_non_llm(self, cmd: ClaimedCommand) -> None:
+        step_started = utcnow()
+        step_monotonic = time.monotonic()
+
+        execution: CommandExecution
+        try:
+            if cmd.command_type == COMMAND_COMPACT_SESSION_MEMORY:
+                ok, result, error = _compact_session_memory(cmd.payload)
+                execution = CommandExecution(ok=bool(ok), result=dict(result or {}), error=error)
+                if (
+                    error == "messages_not_ready"
+                    and int(cmd.max_attempts) > 0
+                    and int(cmd.attempts) < int(cmd.max_attempts)
+                ):
+                    execution = CommandExecution(
+                        ok=True,
+                        result={
+                            "ok": True,
+                            "deferred": True,
+                            "reason": "messages_not_ready",
+                            "command_id": int(cmd.id),
+                            "attempts": int(cmd.attempts),
+                            "max_attempts": int(cmd.max_attempts),
+                            "details": dict(result or {}),
+                        },
+                        error=None,
+                        defer_seconds=2,
+                    )
+                elif error == "messages_not_ready":
+                    try:
+                        payload = dict(cmd.payload or {})
+                        session_id = str(payload.get("session_id") or "").strip()
+                        session_pk = _safe_int(payload.get("session_pk"))
+                        with get_assistant_session() as db:
+                            session = None
+                            if session_pk is not None:
+                                session = db.query(SupportSession).filter(SupportSession.id == int(session_pk)).first()
+                            if session is None and session_id:
+                                session = db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+                            if session is not None:
+                                state = _load_json_dict(getattr(session, "state_json", None))
+                                state["conversation_memory_last_error"] = "messages_not_ready"
+                                state["conversation_memory_requested_up_to_id"] = int(
+                                    _safe_int(state.get("conversation_memory_up_to_id")) or 0
+                                )
+                                state["conversation_memory_updated_at"] = utcnow().isoformat()
+                                session.state_json = _dump_json(state)
+                                session.updated_at = utcnow()
+                    except Exception:
+                        logger.exception(
+                            "Failed resetting compaction request after messages_not_ready (command_id=%s)",
+                            cmd.id,
+                        )
+            elif cmd.command_type == COMMAND_SUPPORT_CHAT_TURN:
+                execution = _run_support_chat_turn(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
+            elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
+                execution = _run_legacy_sync_all(cmd.payload)
+            elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
+                execution = _run_slack_post_message(cmd.payload)
+            elif cmd.command_type == COMMAND_DEV_RESTART_SERVICES:
+                execution = _run_dev_restart_services(cmd.payload)
+            else:
+                error = f"Unknown command_type: {cmd.command_type}"
+                execution = CommandExecution(
+                    ok=False,
+                    result={"ok": False, "error": error, "command_type": cmd.command_type},
+                    error=error,
+                )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            execution = CommandExecution(
+                ok=False,
+                result={"ok": False, "error": error, "command_type": cmd.command_type},
+                error=error,
+            )
+
+        self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+
+    def _handle_claimed_llm_sync(self, cmd: ClaimedCommand) -> None:
+        step_started = utcnow()
+        step_monotonic = time.monotonic()
+
+        execution: CommandExecution
+        try:
+            if cmd.command_type == COMMAND_BUILD_SUPPORT_DIGEST:
+                execution = _run_support_digest(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
+            elif cmd.command_type == COMMAND_ASSESS_TACKLE_RESULTS:
+                execution = _run_tackle_results_assess(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
+            elif cmd.command_type == COMMAND_RUN_TACKLE_PROMPT:
+                execution = _run_tackle_prompt_freeform(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
+            elif cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
+                execution = _run_orchestrator_tick(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
+            elif cmd.command_type == COMMAND_REVIEW_SUPPORT_SESSION:
+                execution = _run_support_session_review(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
+            elif cmd.command_type == COMMAND_REVIEW_REPO:
+                execution = _run_repo_review(payload=cmd.payload, agent_id=self._agent_id, run_id=self._run_id)
+            else:
+                error = f"Unknown command_type: {cmd.command_type}"
+                execution = CommandExecution(
+                    ok=False,
+                    result={"ok": False, "error": error, "command_type": cmd.command_type},
+                    error=error,
+                )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            execution = CommandExecution(
+                ok=False,
+                result={"ok": False, "error": error, "command_type": cmd.command_type},
+                error=error,
+            )
+
+        self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+
+    def _start_claimed_llm(self, cmd: ClaimedCommand) -> None:
+        step_started = utcnow()
+        step_monotonic = time.monotonic()
+
+        task = _llm_task_for_command(cmd=cmd, agent_id=self._agent_id, run_id=self._run_id)
+        if task is None or self._broker is None:
+            error = "LLM task not available or broker disabled."
+            execution = CommandExecution(ok=False, result={"ok": False, "error": error}, error="llm_task_missing")
+            self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+            return
+
+        try:
+            request = next(task)
+        except StopIteration as stop:
+            value = stop.value
+            execution = value if isinstance(value, CommandExecution) else CommandExecution(
+                ok=False,
+                result={"ok": False, "error": "LLM task returned invalid result type."},
+                error="invalid_llm_task_result",
+            )
+            self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+            return
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            execution = CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
+            self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+            return
+
+        if not isinstance(request, InferenceRequest):
+            execution = CommandExecution(
+                ok=False,
+                result={"ok": False, "error": "LLM task yielded invalid request type."},
+                error="invalid_llm_task_request",
+            )
+            self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+            return
+
+        job_id = self._broker.submit(command_id=int(cmd.id), request=request)
+        self._inflight = _InflightInference(
+            cmd=cmd,
+            task=task,
+            step_started=step_started,
+            step_monotonic=step_monotonic,
+            job_id=str(job_id),
+        )
+
+    def _poll_inflight_result(self) -> bool:
+        if self._inflight is None or self._broker is None:
+            return False
+        result = self._broker.poll_result()
+        if result is None:
+            return False
+        if str(result.job_id) != str(self._inflight.job_id) or int(result.command_id) != int(self._inflight.cmd.id):
+            logger.warning(
+                "Dropping unexpected inference result job_id=%s command_id=%s inflight_job_id=%s inflight_command_id=%s",
+                result.job_id,
+                result.command_id,
+                self._inflight.job_id,
+                self._inflight.cmd.id,
+            )
+            return True
+
+        cmd = self._inflight.cmd
+        task = self._inflight.task
+        step_started = self._inflight.step_started
+        step_monotonic = self._inflight.step_monotonic
+        reply = result.reply
+
+        try:
+            next_item = task.send(reply)
+        except StopIteration as stop:
+            value = stop.value
+            execution = value if isinstance(value, CommandExecution) else CommandExecution(
+                ok=False,
+                result={"ok": False, "error": "LLM task returned invalid result type."},
+                error="invalid_llm_task_result",
+            )
+            self._inflight = None
+            self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+            return True
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            execution = CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
+            self._inflight = None
+            self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+            return True
+
+        if not isinstance(next_item, InferenceRequest):
+            execution = CommandExecution(
+                ok=False,
+                result={"ok": False, "error": "LLM task yielded invalid request type."},
+                error="invalid_llm_task_request",
+            )
+            self._inflight = None
+            self._finalize_command(cmd=cmd, execution=execution, step_started=step_started, step_monotonic=step_monotonic)
+            return True
+
+        job_id = self._broker.submit(command_id=int(cmd.id), request=next_item)
+        self._inflight = _InflightInference(
+            cmd=cmd,
+            task=task,
+            step_started=step_started,
+            step_monotonic=step_monotonic,
+            job_id=str(job_id),
+        )
+        return True
+
+    def tick(self) -> bool:
+        """Return True if we did any work (command claimed, result finalized, etc)."""
+
+        assert_main_thread("supervisor.processor.tick")
+        self._maybe_heartbeat()
+
+        if self._inflight is not None and self._broker is not None:
+            if self._poll_inflight_result():
+                return True
+
+        exclude = _LLM_COMMAND_TYPES if (self._inflight is not None and self._broker is not None) else None
+        cmd = _claim_next_command(agent_id=self._agent_id, run_id=self._run_id, exclude_command_types=exclude)
+        if cmd is None:
+            return False
+
+        payload_summary = _summarize_command_payload(cmd.command_type, cmd.payload)
+        payload_summary = f" {payload_summary}" if payload_summary else ""
+        logger.info(
+            "Command start id=%s type=%s attempts=%s/%s%s",
+            cmd.id,
+            cmd.command_type,
+            cmd.attempts,
+            cmd.max_attempts,
+            payload_summary,
+        )
+
+        if cmd.command_type in _LLM_COMMAND_TYPES:
+            if self._broker is not None:
+                self._start_claimed_llm(cmd)
+            else:
+                self._handle_claimed_llm_sync(cmd)
+            return True
+
+        self._handle_claimed_non_llm(cmd)
+        return True
 
 
 def _default_agent_id() -> str:
@@ -3807,6 +5794,214 @@ def _format_status_bar(state: dict[str, Any]) -> str:
     )
 
 
+def _supervisor_idle_max_seconds(base_interval_seconds: int) -> int:
+    raw = (os.getenv("ISPEC_SUPERVISOR_IDLE_MAX_SECONDS") or "").strip()
+    default_max = max(300, int(base_interval_seconds) * 12)
+    if not raw:
+        return int(default_max)
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return int(default_max)
+    return _clamp_int(parsed, min_value=max(1, int(base_interval_seconds)), max_value=86400)
+
+
+def _supervisor_has_check_failures(state: dict[str, Any]) -> bool:
+    checks = state.get("checks") if isinstance(state, dict) else None
+    if not isinstance(checks, dict):
+        return False
+    for payload in checks.values():
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            return True
+    return False
+
+
+def _seconds_until_next_queued_command(*, db, now: datetime) -> int | None:
+    row = (
+        db.query(AgentCommand)
+        .filter(AgentCommand.status == "queued")
+        .order_by(AgentCommand.available_at.asc(), AgentCommand.id.asc())
+        .first()
+    )
+    if row is None:
+        return None
+    available_at = _as_utc_datetime(getattr(row, "available_at", None))
+    if not isinstance(available_at, datetime):
+        return None
+    delta = int((available_at - now).total_seconds())
+    if delta <= 0:
+        return 0
+    return int(delta)
+
+
+def _supervisor_command_poll_seconds(*, base_interval_seconds: int) -> float:
+    """Polling interval for checking queued commands during long sleeps."""
+
+    raw = (os.getenv("ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS") or "").strip()
+    default_value = 0.5
+    if not raw:
+        return _clamp_float(float(default_value), min_value=0.1, max_value=max(0.1, float(base_interval_seconds)))
+    try:
+        return _clamp_float(float(raw), min_value=0.1, max_value=60.0)
+    except ValueError:
+        return float(default_value)
+
+
+def _supervisor_heartbeat_seconds() -> float:
+    """How often to touch supervisor.updated_at while idle.
+
+    The API uses the supervisor heartbeat to decide whether it can safely route
+    work to the command queue. Without a heartbeat, long idle sleeps make the
+    supervisor look "dead" even though it's running.
+    """
+
+    raw = (os.getenv("ISPEC_SUPERVISOR_HEARTBEAT_SECONDS") or "").strip()
+    if not raw:
+        return 15.0
+    try:
+        return _clamp_float(float(raw), min_value=1.0, max_value=300.0)
+    except ValueError:
+        return 15.0
+
+
+def _touch_supervisor_run(*, run_id: str) -> None:
+    if not isinstance(run_id, str) or not run_id.strip():
+        return
+    assert_main_thread("supervisor._touch_supervisor_run")
+    try:
+        now = utcnow()
+        with get_agent_session() as db:
+            run = db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
+            if run is None:
+                return
+            status = str(getattr(run, "status", "") or "").strip().lower()
+            if status != "running":
+                return
+            run.updated_at = now
+            db.commit()
+    except Exception:
+        logger.exception("Failed touching supervisor heartbeat (run_id=%s)", run_id)
+
+
+def _supervisor_sleep_with_command_polling(
+    *,
+    run_id: str,
+    sleep_seconds: int,
+    base_interval_seconds: int,
+    process_one_command: Callable[[], bool],
+) -> None:
+    """Sleep for up to ``sleep_seconds``, but keep polling for queued commands.
+
+    This bounds end-to-end latency for queue-backed chat (and other commands)
+    even when the supervisor is configured to back off health checks aggressively.
+    """
+
+    total = max(0, int(sleep_seconds))
+    if total <= 0:
+        return
+
+    # Fast path: if work showed up right before we were about to sleep, handle
+    # it immediately without waiting for the first poll tick.
+    if process_one_command():
+        return
+
+    poll_seconds = float(_supervisor_command_poll_seconds(base_interval_seconds=int(base_interval_seconds)))
+    heartbeat_seconds = float(_supervisor_heartbeat_seconds())
+    heartbeat_due_at = time.monotonic() + heartbeat_seconds
+
+    deadline = time.monotonic() + float(total)
+    while True:
+        remaining = float(deadline - time.monotonic())
+        if remaining <= 0:
+            return
+
+        step = min(float(remaining), float(poll_seconds))
+        # Avoid a tight loop if poll_seconds is misconfigured.
+        time.sleep(max(0.05, float(step)))
+
+        if process_one_command():
+            return
+
+        now_mono = time.monotonic()
+        if now_mono >= heartbeat_due_at:
+            _touch_supervisor_run(run_id=run_id)
+            heartbeat_due_at = now_mono + heartbeat_seconds
+
+
+def _supervisor_dynamic_idle_sleep_seconds(
+    *,
+    run: AgentRun,
+    state_after: dict[str, Any],
+    base_interval_seconds: int,
+    now: datetime,
+    db,
+) -> int:
+    base = max(1, int(base_interval_seconds))
+    max_idle = _supervisor_idle_max_seconds(base)
+
+    sleep_seconds = base
+    if _supervisor_has_check_failures(state_after):
+        # When something is down, we still want to re-check quickly at first,
+        # but we shouldn't spam the DB forever at the base interval.
+        failure_streak = _safe_int(state_after.get("check_failure_streak")) or 1
+        raw_failure_max = (os.getenv("ISPEC_SUPERVISOR_FAILURE_MAX_SECONDS") or "").strip()
+        failure_max_default = min(int(max_idle), max(60, int(base) * 12))
+        failure_max = failure_max_default
+        if raw_failure_max:
+            try:
+                failure_max = _clamp_int(int(raw_failure_max), min_value=base, max_value=max_idle)
+            except ValueError:
+                failure_max = failure_max_default
+
+        sleep_seconds = int(
+            backoff_exponential_current(
+                int(failure_streak),
+                base_seconds=float(base),
+                start_step=1,
+                max_exp=4,
+                cap_seconds=float(failure_max),
+            )
+        )
+    else:
+        summary = run.summary_json if isinstance(run.summary_json, dict) else {}
+        orchestrator = summary.get("orchestrator")
+        if isinstance(orchestrator, dict):
+            reason = str(orchestrator.get("next_tick_reason") or "").strip().lower()
+            idle_streak = _safe_int(orchestrator.get("idle_streak")) or 0
+            next_tick_seconds = _safe_int(orchestrator.get("next_tick_seconds")) or 0
+
+            if reason == "idle_backoff" and idle_streak > 0:
+                sleep_seconds = int(
+                    backoff_exponential_current(
+                        int(idle_streak),
+                        base_seconds=float(base),
+                        start_step=1,
+                        max_exp=6,
+                    )
+                )
+                if next_tick_seconds > base:
+                    sleep_seconds = max(sleep_seconds, max(base, int(next_tick_seconds // 4)))
+            elif reason in {"work", "review_backlog", "work_inflight"}:
+                sleep_seconds = base
+            elif idle_streak > 0:
+                sleep_seconds = int(
+                    backoff_exponential_current(
+                        int(idle_streak),
+                        base_seconds=float(base),
+                        start_step=1,
+                        max_exp=4,
+                    )
+                    )
+
+    sleep_seconds = _clamp_int(int(sleep_seconds), min_value=base, max_value=max_idle)
+
+    due_in = _seconds_until_next_queued_command(db=db, now=now)
+    if due_in is not None:
+        sleep_seconds = min(int(sleep_seconds), max(1, int(due_in)))
+
+    return max(1, int(sleep_seconds))
+
+
 def _build_actions(config: SupervisorConfig) -> list[dict[str, Any]]:
     return [
         {"id": "backend", "description": "Check iSPEC /status"},
@@ -3835,8 +6030,56 @@ def _action_funcs(config: SupervisorConfig) -> dict[str, Callable[[], dict[str, 
 def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
     """Run the supervisor loop, returning the new run_id."""
 
+    prev_thread_name = threading.current_thread().name
+    try:
+        threading.current_thread().name = "supervisor-main"
+    except Exception:
+        pass
+
+    # Declare the main thread before any DB writes so invariant checks can
+    # reliably fail fast if we ever run orchestration code on a worker thread.
+    set_main_thread(owner="supervisor")
+    thread_main = main_thread_info()
+
     run_id = uuid.uuid4().hex
     started_at = utcnow()
+    pid_path = _write_supervisor_pid()
+    broker_enabled, broker_error = _inference_broker_enabled_status()
+    if broker_error:
+        logger.warning("Inference broker disabled: %s", broker_error)
+    broker: InferenceBroker | None = None
+    if broker_enabled:
+        broker = InferenceBroker()
+        broker.start()
+    inference_broker_info: dict[str, Any] = {
+        "enabled": bool(broker_enabled),
+        "error": broker_error,
+        "thread": (
+            {
+                "name": str(broker.thread.name),
+                "ident": int(broker.thread.ident) if broker.thread.ident is not None else None,
+            }
+            if broker is not None
+            else None
+        ),
+    }
+    _write_supervisor_state(
+        {
+            "schema_version": 1,
+            "kind": "supervisor",
+            "status": "running",
+            "run_id": run_id,
+            "agent_id": config.agent_id,
+            "pid": os.getpid(),
+            "thread_main": thread_main,
+            "inference_broker": inference_broker_info,
+            "started_at": started_at.isoformat(),
+            "backend_base_url": config.backend_base_url,
+            "frontend_url": config.frontend_url,
+            "interval_seconds": int(config.interval_seconds),
+            "timeout_seconds": float(config.timeout_seconds),
+        }
+    )
     with get_agent_session() as db:
         previous_orchestrator: dict[str, Any] | None = None
         previous_scheduler: dict[str, Any] | None = None
@@ -3872,6 +6115,9 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
             created_at=started_at,
             updated_at=started_at,
             config_json={
+                "pid": os.getpid(),
+                "thread_main": thread_main,
+                "inference_broker": inference_broker_info,
                 "backend_base_url": config.backend_base_url,
                 "frontend_url": config.frontend_url,
                 "interval_seconds": config.interval_seconds,
@@ -3886,9 +6132,18 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
 
     actions = _build_actions(config)
     funcs = _action_funcs(config)
+    processor = _SupervisorCommandProcessor(agent_id=config.agent_id, run_id=run_id, broker=broker)
 
     logger.info("Supervisor run started (run_id=%s, agent_id=%s)", run_id, config.agent_id)
-    seeded_id = _seed_orchestrator_tick(delay_seconds=5)
+    stale_recovery = _recover_stale_running_commands(agent_id=config.agent_id, run_id=run_id)
+    if int(stale_recovery.get("recovered") or 0) > 0:
+        logger.warning(
+            "Recovered stale running commands recovered=%s running_total=%s stale_seconds=%s",
+            stale_recovery.get("recovered"),
+            stale_recovery.get("running_total"),
+            stale_recovery.get("stale_seconds"),
+        )
+    seeded_id = _seed_orchestrator_tick(delay_seconds=5, agent_id=config.agent_id, run_id=run_id)
     if seeded_id is not None:
         logger.info("Seeded orchestrator tick (command_id=%s)", seeded_id)
 
@@ -3904,11 +6159,13 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
         max_value=3600,
     )
     last_legacy_sync_poll_at: datetime | None = None
+    once_command_started = False
 
     final_status = "stopped"
     final_error: str | None = None
     try:
         while True:
+            assert_main_thread("supervisor.loop")
             now = utcnow()
             if last_schedule_poll_at is None or (now - last_schedule_poll_at).total_seconds() >= schedule_poll_seconds:
                 try:
@@ -3938,13 +6195,21 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                     logger.exception("Failed ensuring legacy sync commands")
                 last_legacy_sync_poll_at = now
 
-            if _process_one_command(agent_id=config.agent_id, run_id=run_id):
+            did_command_work = processor.tick()
+            if did_command_work:
                 if once:
-                    break
+                    once_command_started = True
+                    if processor.inflight is None:
+                        break
+                continue
+            if processor.inflight is not None and broker is not None:
+                # Keep the main loop responsive while inference is running.
+                time.sleep(0.05)
                 continue
 
             step_started = utcnow()
             step_monotonic = time.monotonic()
+            sleep_seconds = max(1, int(config.interval_seconds))
             with get_agent_session() as db:
                 run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
                 step_index = int(run.step_index or 0)
@@ -3982,6 +6247,11 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                     checks = {}
                 checks[action_id] = {"checked_at": step_ended.isoformat(), **result}
                 state_after = {**state_before, "checks": checks, "last_action": action_id}
+                prev_failure_streak = _safe_int(state_before.get("check_failure_streak")) or 0
+                if _supervisor_has_check_failures(state_after):
+                    state_after["check_failure_streak"] = int(prev_failure_streak) + 1
+                else:
+                    state_after["check_failure_streak"] = 0
 
                 run.state_json = state_after
                 run.step_index = step_index + 1
@@ -4031,11 +6301,23 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                     ),
                 )
                 db.add(event)
+                sleep_seconds = _supervisor_dynamic_idle_sleep_seconds(
+                    run=run,
+                    state_after=state_after,
+                    base_interval_seconds=int(config.interval_seconds),
+                    now=step_ended,
+                    db=db,
+                )
                 db.commit()
 
             if once:
                 break
-            time.sleep(max(1, int(config.interval_seconds)))
+            _supervisor_sleep_with_command_polling(
+                run_id=run_id,
+                sleep_seconds=max(1, int(sleep_seconds)),
+                base_interval_seconds=int(config.interval_seconds),
+                process_one_command=processor.tick,
+            )
     except KeyboardInterrupt:
         logger.info("Supervisor interrupted (run_id=%s)", run_id)
     except Exception as exc:
@@ -4045,6 +6327,12 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
         raise
     finally:
         try:
+            processor.stop()
+        except Exception:
+            logger.exception("Failed stopping inference broker (run_id=%s)", run_id)
+
+        try:
+            assert_main_thread("supervisor.shutdown")
             ended_at = utcnow()
             with get_agent_session() as db:
                 run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
@@ -4056,6 +6344,31 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                 db.commit()
         except Exception:
             logger.exception("Failed to mark supervisor run stopped (run_id=%s)", run_id)
+
+        _write_supervisor_state(
+            {
+                "schema_version": 1,
+                "kind": "supervisor",
+                "status": final_status,
+                "run_id": run_id,
+                "agent_id": config.agent_id,
+                "pid": os.getpid(),
+                "thread_main": thread_main,
+                "inference_broker": inference_broker_info,
+                "started_at": started_at.isoformat(),
+                "ended_at": utcnow().isoformat(),
+                "error": final_error,
+                "backend_base_url": config.backend_base_url,
+                "frontend_url": config.frontend_url,
+                "interval_seconds": int(config.interval_seconds),
+                "timeout_seconds": float(config.timeout_seconds),
+            }
+        )
+        _remove_supervisor_pid(pid_path)
+        try:
+            threading.current_thread().name = prev_thread_name
+        except Exception:
+            pass
 
     logger.info("Supervisor run stopped (run_id=%s)", run_id)
     return run_id

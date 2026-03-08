@@ -4,27 +4,24 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from ispec.config.paths import resolve_config_dir, resolve_log_config_path
 
 
 def _default_config_dir() -> Path:
     """Return the default config directory, honoring env overrides."""
 
-    raw = os.environ.get("ISPEC_CONFIG_DIR")
-    if raw and raw.strip():
-        return Path(raw).expanduser()
-    return Path.home() / ".ispec"
+    resolved = resolve_config_dir()
+    return Path(resolved.path or resolved.value)
 
 
 def _default_config_path() -> Path:
     """Return the default logging config path, honoring env overrides."""
 
-    raw = os.environ.get("ISPEC_LOG_CONFIG")
-    if raw and raw.strip():
-        return Path(raw).expanduser()
-    return _default_config_dir() / "logging.json"
+    resolved = resolve_log_config_path()
+    return Path(resolved.path or resolved.value)
 
 
 def _resolve_config_path(config_file: Optional[os.PathLike[str] | str] = None) -> Path:

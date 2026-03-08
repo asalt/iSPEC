@@ -50,6 +50,44 @@ def _compact_project_results_summary(summary: Mapping[str, Any]) -> dict[str, An
     return out
 
 
+def _add_analysis_database_args(parser, *, required: bool = False) -> None:
+    parser.add_argument(
+        "--analysis-database",
+        dest="analysis_database",
+        required=required,
+        help=(
+            "SQLite database URL or filesystem path for analysis-family omics rows "
+            "(E2G, volcano, GSEA). Defaults to ISPEC_ANALYSIS_DB_PATH or a sibling "
+            "`ispec-analysis.db` next to the core DB."
+        ),
+    )
+    parser.add_argument(
+        "--omics-database",
+        dest="analysis_database",
+        help="Deprecated alias for --analysis-database.",
+    )
+
+
+def _add_psm_database_args(parser, *, required: bool = False) -> None:
+    parser.add_argument(
+        "--psm-database",
+        dest="psm_database",
+        required=required,
+        help=(
+            "SQLite database URL or filesystem path for PSM rows. Defaults to "
+            "ISPEC_PSM_DB_PATH or a sibling `ispec-psm.db` next to the core DB."
+        ),
+    )
+
+
+def _analysis_database_arg_value(args: Any) -> str | None:
+    return getattr(args, "analysis_database", None) or getattr(args, "omics_database", None)
+
+
+def _psm_database_arg_value(args: Any) -> str | None:
+    return getattr(args, "psm_database", None) or getattr(args, "omics_database", None)
+
+
 def register_subcommands(subparsers):
     """Attach database subcommands to an ``argparse`` parser.
 
@@ -116,11 +154,7 @@ def register_subcommands(subparsers):
         dest="database",
         help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
     )
-    import_e2g_parser.add_argument(
-        "--omics-database",
-        dest="omics_database",
-        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
-    )
+    _add_analysis_database_args(import_e2g_parser)
     import_e2g_parser.add_argument(
         "--create-missing-runs",
         dest="create_missing_runs",
@@ -194,11 +228,7 @@ def register_subcommands(subparsers):
         dest="database",
         help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
     )
-    import_volcano_parser.add_argument(
-        "--omics-database",
-        dest="omics_database",
-        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
-    )
+    _add_analysis_database_args(import_volcano_parser)
     import_volcano_parser.add_argument(
         "--name",
         help="Optional analysis name (only supported for a single --file; defaults to the file stem).",
@@ -259,11 +289,7 @@ def register_subcommands(subparsers):
         dest="database",
         help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
     )
-    import_gsea_parser.add_argument(
-        "--omics-database",
-        dest="omics_database",
-        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
-    )
+    _add_analysis_database_args(import_gsea_parser)
     import_gsea_parser.add_argument(
         "--name",
         help="Optional analysis name (only supported for a single --file; defaults to the file stem).",
@@ -321,11 +347,7 @@ def register_subcommands(subparsers):
         dest="database",
         help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
     )
-    import_results_parser.add_argument(
-        "--omics-database",
-        dest="omics_database",
-        help="SQLite database URL or filesystem path for the omics DB (defaults to ISPEC_OMICS_DB_PATH/derived).",
-    )
+    _add_analysis_database_args(import_results_parser)
     import_results_parser.add_argument(
         "--prefix",
         help="Prefix to apply to stored attachment filenames (default: results dir basename).",
@@ -363,7 +385,7 @@ def register_subcommands(subparsers):
         dest="import_volcano",
         action="store_false",
         default=True,
-        help="Disable importing volcano TSVs into the omics database.",
+        help="Disable importing volcano TSVs into the analysis database.",
     )
     import_results_parser.add_argument(
         "--include-ext",
@@ -378,6 +400,102 @@ def register_subcommands(subparsers):
         action="append",
         default=None,
         help="File extension(s) to skip (repeatable or comma-separated). Default: sqlite,rds",
+    )
+
+    import_psm_parser = subparsers.add_parser(
+        "import-psm", help="Import peptide-spectrum-match TSV/CSV tables"
+    )
+    import_psm_parser.add_argument(
+        "--file",
+        dest="paths",
+        action="append",
+        default=[],
+        required=True,
+        help="Path to a PSM TSV/CSV file (repeatable)",
+    )
+    import_psm_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to write to (defaults to ISPEC_DB_PATH/default)",
+    )
+    _add_psm_database_args(import_psm_parser)
+    import_psm_parser.add_argument(
+        "--experiment-run-id",
+        dest="experiment_run_id",
+        type=int,
+        help="Explicit experiment_run.id target (overrides file columns).",
+    )
+    import_psm_parser.add_argument(
+        "--experiment-id",
+        dest="experiment_id",
+        type=int,
+        help="Experiment id target when the file does not include EXPRecNo.",
+    )
+    import_psm_parser.add_argument(
+        "--run-no",
+        dest="run_no",
+        type=int,
+        help="Run number target when the file does not include EXPRunNo.",
+    )
+    import_psm_parser.add_argument(
+        "--search-no",
+        dest="search_no",
+        type=int,
+        help="Search number target when the file does not include EXPSearchNo.",
+    )
+    import_psm_parser.add_argument(
+        "--label",
+        dest="label",
+        help="Label target when the file does not include LabelFLAG (default: 0).",
+    )
+    import_psm_parser.add_argument(
+        "--create-missing-runs",
+        dest="create_missing_runs",
+        action="store_true",
+        default=True,
+        help="Create missing ExperimentRun rows when needed (default: enabled).",
+    )
+    import_psm_parser.add_argument(
+        "--no-create-missing-runs",
+        dest="create_missing_runs",
+        action="store_false",
+        help="Disable creating missing ExperimentRun rows.",
+    )
+    import_psm_parser.add_argument(
+        "--create-missing-experiments",
+        dest="create_missing_experiments",
+        action="store_true",
+        default=True,
+        help="Create missing Experiment rows when needed (default: enabled).",
+    )
+    import_psm_parser.add_argument(
+        "--no-create-missing-experiments",
+        dest="create_missing_experiments",
+        action="store_false",
+        help="Disable creating missing Experiment rows.",
+    )
+    import_psm_parser.add_argument(
+        "--store-metadata",
+        action="store_true",
+        help="Store non-core columns in metadata_json.",
+    )
+    import_psm_parser.add_argument(
+        "--skip-imported",
+        dest="skip_imported",
+        action="store_true",
+        default=True,
+        help="Skip importing when that run already has PSM rows populated (default: enabled).",
+    )
+    import_psm_parser.add_argument(
+        "--no-skip-imported",
+        dest="skip_imported",
+        action="store_false",
+        help="Do not skip; upsert into existing rows.",
+    )
+    import_psm_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Delete existing PSM rows for affected ExperimentRuns and re-import.",
     )
 
     scaffold_import_script_parser = subparsers.add_parser(
@@ -861,6 +979,43 @@ def register_subcommands(subparsers):
         help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
     )
 
+    audit_parser = subparsers.add_parser(
+        "audit-imports",
+        help="Write DB/import audit artifacts (JSON + legacy gap matrix TSV).",
+    )
+    audit_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to inspect (defaults to the resolved core DB target).",
+    )
+    _add_analysis_database_args(audit_parser)
+    _add_psm_database_args(audit_parser)
+    audit_parser.add_argument(
+        "--legacy-schema",
+        dest="legacy_schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json).",
+    )
+    audit_parser.add_argument(
+        "--legacy-mapping",
+        dest="legacy_mapping",
+        help="Path to legacy-mapping.json (default: iSPEC/data/legacy-mapping.json).",
+    )
+    audit_parser.add_argument(
+        "--legacy-tables-file",
+        dest="legacy_tables_file",
+        help="Path to ispec-legacy-tables.tsv (default: iSPEC/data/ispec-legacy-tables.tsv).",
+    )
+    audit_parser.add_argument(
+        "--scripts-dir",
+        dest="scripts_dir",
+        help="Directory containing helper import scripts (default: iSPEC/scripts).",
+    )
+    audit_parser.add_argument(
+        "--out-dir",
+        dest="out_dir",
+        help="Directory for the generated audit artifacts (default: iSPEC/data).",
+    )
+
 
 def dispatch(args):
     """Run the database operation associated with ``args.subcommand``.
@@ -904,7 +1059,7 @@ def dispatch(args):
             qual_paths=list(getattr(args, "qual_paths", []) or []),
             quant_paths=list(getattr(args, "quant_paths", []) or []),
             db_file_path=getattr(args, "database", None),
-            omics_db_file_path=getattr(args, "omics_database", None),
+            omics_db_file_path=_analysis_database_arg_value(args),
             create_missing_runs=bool(getattr(args, "create_missing_runs", True)),
             create_missing_experiments=bool(getattr(args, "create_missing_experiments", True)),
             store_metadata=bool(getattr(args, "store_metadata", False)),
@@ -917,7 +1072,7 @@ def dispatch(args):
             project_id=int(getattr(args, "project_id")),
             paths=list(getattr(args, "paths", []) or []),
             db_file_path=getattr(args, "database", None),
-            omics_db_file_path=getattr(args, "omics_database", None),
+            omics_db_file_path=_analysis_database_arg_value(args),
             name=getattr(args, "name", None),
             contrast=getattr(args, "contrast", None),
             kind=getattr(args, "kind", None),
@@ -931,7 +1086,7 @@ def dispatch(args):
             project_id=int(getattr(args, "project_id")),
             paths=list(getattr(args, "paths", []) or []),
             db_file_path=getattr(args, "database", None),
-            omics_db_file_path=getattr(args, "omics_database", None),
+            omics_db_file_path=_analysis_database_arg_value(args),
             name=getattr(args, "name", None),
             contrast=getattr(args, "contrast", None),
             collection=getattr(args, "collection", None),
@@ -945,7 +1100,7 @@ def dispatch(args):
             project_id=int(getattr(args, "project_id")),
             results_dir=str(getattr(args, "results_dir")),
             db_file_path=getattr(args, "database", None),
-            omics_db_file_path=getattr(args, "omics_database", None),
+            omics_db_file_path=_analysis_database_arg_value(args),
             prefix=getattr(args, "prefix", None),
             added_by=getattr(args, "added_by", None),
             skip_existing=bool(getattr(args, "skip_existing", True)),
@@ -956,6 +1111,23 @@ def dispatch(args):
             exclude_exts=list(getattr(args, "exclude_exts", None) or []) or None,
         )
         logger.info("Project results import summary: %s", _compact_project_results_summary(summary))
+    elif args.subcommand == "import-psm":
+        summary = operations.import_psms(
+            paths=list(getattr(args, "paths", []) or []),
+            db_file_path=getattr(args, "database", None),
+            omics_db_file_path=_psm_database_arg_value(args),
+            experiment_run_id=getattr(args, "experiment_run_id", None),
+            experiment_id=getattr(args, "experiment_id", None),
+            run_no=getattr(args, "run_no", None),
+            search_no=getattr(args, "search_no", None),
+            label=getattr(args, "label", None),
+            create_missing_runs=bool(getattr(args, "create_missing_runs", True)),
+            create_missing_experiments=bool(getattr(args, "create_missing_experiments", True)),
+            store_metadata=bool(getattr(args, "store_metadata", False)),
+            skip_imported=bool(getattr(args, "skip_imported", True)),
+            force=bool(getattr(args, "force", False)),
+        )
+        logger.info("PSM import summary: %s", summary)
     elif args.subcommand == "scaffold-import-script":
         from ispec.cli.scaffold_import_script import scaffold_import_results_script
 
@@ -1101,6 +1273,18 @@ def dispatch(args):
             dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy sync-all summary: %s", summary)
+    elif args.subcommand == "audit-imports":
+        summary = operations.audit_imports(
+            db_file_path=getattr(args, "database", None),
+            analysis_db_file_path=_analysis_database_arg_value(args),
+            psm_db_file_path=_psm_database_arg_value(args),
+            legacy_schema_path=getattr(args, "legacy_schema", None),
+            legacy_mapping_path=getattr(args, "legacy_mapping", None),
+            legacy_tables_file_path=getattr(args, "legacy_tables_file", None),
+            scripts_dir=getattr(args, "scripts_dir", None),
+            out_dir=getattr(args, "out_dir", None),
+        )
+        logger.info("DB/import audit summary: %s", summary)
     else:
         logger.info("no dispatched function provided for %s", args.subcommand)
 

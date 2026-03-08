@@ -1,10 +1,8 @@
 # ispec/db/connect.py
 
-import os
 from functools import lru_cache
 from pathlib import Path
 from contextlib import contextmanager
-from datetime import datetime
 from typing import Iterator
 
 from sqlalchemy.orm import sessionmaker, Session
@@ -12,13 +10,14 @@ from sqlalchemy.engine import Engine
 
 
 from ispec.db.models import sqlite_engine, initialize_db
+from ispec.config.paths import resolve_db_dir, resolve_db_location
 from ispec.logging import get_logger
 
 logger = get_logger(__file__)
 
 @lru_cache(maxsize=None)
 def get_db_dir() -> Path:
-    db_dir = Path(os.environ.get("ISPEC_DB_DIR", Path.home() / "ispec"))
+    db_dir = Path(resolve_db_dir().path or (Path.home() / "ispec"))
     db_dir.mkdir(parents=True, exist_ok=True)
     logger.info("setting db_dir to %s", str(db_dir))
     return db_dir
@@ -41,12 +40,11 @@ def get_db_path(file: str | Path | None = None) -> str:
         SQLite URI pointing to the database file.
     """
 
-    if file is None:
-        db_path = get_db_dir()
-        db_file = db_path / "ispec.db"
-    else:
-        db_file = Path(file)
-    db_uri = "sqlite:///" + str(db_file)
+    resolved = resolve_db_location("core", file=file)
+    db_file = Path(resolved.path) if resolved.path is not None else None
+    if db_file is not None:
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+    db_uri = resolved.uri or str(resolved.value)
     logger.info("setting db_path to %s", db_uri)
     return db_uri
 
@@ -92,13 +90,10 @@ def get_session(file_path: str | Path | None = None) -> Session:
         :func:`get_db_path` is used.
     """
 
-    db_path = os.getenv("ISPEC_DB_PATH") if file_path is None else file_path
-    if db_path is None:
-        db_path = get_db_path()
-    # ensure sqlite URI prefix
-    db_uri = str(db_path)
-    if not str(db_uri).startswith("sqlite"):
-        db_uri = "sqlite:///" + str(db_uri)
+    resolved = resolve_db_location("core", file=file_path)
+    if resolved.path is not None:
+        Path(resolved.path).parent.mkdir(parents=True, exist_ok=True)
+    db_uri = resolved.uri or str(resolved.value)
 
     engine = sqlite_engine(db_uri)
     initialize_db(engine=engine)

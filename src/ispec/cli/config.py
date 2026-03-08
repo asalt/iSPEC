@@ -7,6 +7,7 @@ from rich.console import Console
 
 from ispec.config.audit import audit_environment, init_env_files, render_env_file
 from ispec.config.contract import default_contract, spec_to_dict
+from ispec.config.paths import resolved_path_catalog
 from ispec.cli.env import parse_env_file_text
 
 
@@ -56,6 +57,9 @@ def register_subcommands(subparsers):
     contract = subparsers.add_parser("contract", help="Print the config contract.")
     contract.add_argument("--format", default="json", choices=["json"])
 
+    paths = subparsers.add_parser("paths", help="Show resolved storage/log/state paths.")
+    paths.add_argument("--format", default="human", choices=["human", "json"])
+
 
 def _human_print_report(report, *, console: Console) -> None:
     console.print(f"Profile: [bold]{report.profile}[/bold]")
@@ -74,11 +78,41 @@ def _human_print_report(report, *, console: Console) -> None:
             console.print(f"  - {warn}")
 
 
+def _human_print_paths(*, console: Console) -> None:
+    catalog = resolved_path_catalog()
+    for group_name, items in catalog.items():
+        console.print(f"[bold]{group_name.title()}[/bold]")
+        for _, resolved in items.items():
+            line = f"- {resolved.name}: {resolved.value}"
+            details: list[str] = [resolved.source]
+            if resolved.env_var:
+                details.append(resolved.env_var)
+            if resolved.deprecated_env_var:
+                details.append(f"deprecated={resolved.deprecated_env_var}")
+            if resolved.uri and resolved.uri != resolved.value:
+                details.append(f"uri={resolved.uri}")
+            console.print(f"{line} [{' ; '.join(details)}]")
+            for note in resolved.notes:
+                console.print(f"  note: {note}")
+        console.print("")
+
+
 def dispatch(args) -> None:
     console = Console()
     if args.subcommand == "contract":
         payload = [spec_to_dict(spec) for spec in default_contract()]
         console.print_json(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        return
+
+    if args.subcommand == "paths":
+        payload = {
+            group: {name: resolved.as_dict() for name, resolved in items.items()}
+            for group, items in resolved_path_catalog().items()
+        }
+        if args.format == "json":
+            console.print_json(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        else:
+            _human_print_paths(console=console)
         return
 
     if args.subcommand == "audit":

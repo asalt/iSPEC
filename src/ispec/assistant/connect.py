@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from ispec.config.paths import resolve_db_location
 from ispec.db.models import sqlite_engine
 from ispec.logging import get_logger
 
@@ -40,28 +40,10 @@ def get_assistant_db_uri(file: str | Path | None = None) -> str:
       4) fallback to ``ISPEC_DB_DIR`` (via :func:`ispec.db.connect.get_db_dir`)
     """
 
-    if file is not None:
-        return _sqlite_uri(file)
-
-    env_path = (os.getenv("ISPEC_ASSISTANT_DB_PATH") or "").strip()
-    if env_path:
-        return _sqlite_uri(env_path)
-
-    main_path = (os.getenv("ISPEC_DB_PATH") or "").strip()
-    candidate: Path | None = None
-    if main_path:
-        if main_path.startswith("sqlite:///"):
-            candidate = Path(main_path.removeprefix("sqlite:///"))
-        elif "://" not in main_path:
-            candidate = Path(main_path)
-
-    if candidate is not None:
-        assistant_file = candidate.expanduser().resolve().parent / "ispec-assistant.db"
-        return _sqlite_uri(assistant_file)
-
-    from ispec.db.connect import get_db_dir
-
-    return _sqlite_uri(get_db_dir() / "ispec-assistant.db")
+    resolved = resolve_db_location("assistant", file=file)
+    if resolved.path is not None:
+        Path(resolved.path).parent.mkdir(parents=True, exist_ok=True)
+    return resolved.uri or str(resolved.value)
 
 
 @lru_cache(maxsize=None)

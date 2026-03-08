@@ -159,9 +159,12 @@ def audit_environment(
             if profile in spec.recommended_in:
                 warns.append("Missing recommended value.")
 
+        if spec.replaced_by and present:
+            warns.append(f"Deprecated; prefer {spec.replaced_by}.")
+
         if spec.kind == "path" and present:
             val = str(raw).strip()
-            if not val.startswith("sqlite") and not Path(val).is_absolute():
+            if not val.startswith("sqlite") and not Path(val).expanduser().is_absolute():
                 warns.append("Relative path; prefer absolute in production.")
 
         if spec.key == "ISPEC_DEV_DEFAULT_ADMIN" and profile == "prod":
@@ -295,6 +298,9 @@ def init_env_files(
         current = _normalize_raw(store.get(spec.key))
         default = _default_for(spec, profile)
         required = _required(spec, env_view, profile)
+
+        if spec.replaced_by and current is None:
+            continue
 
         if current is None and default is not None:
             current = default

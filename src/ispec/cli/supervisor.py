@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import signal
 import sys
+import time
 
+from ispec.config.paths import resolve_supervisor_state_file
 from ispec.logging import get_logger
 from ispec.supervisor.loop import SupervisorConfig, _default_agent_id, run_supervisor
 from ispec.supervisor.smoke import (
@@ -15,6 +19,42 @@ from ispec.supervisor.smoke import (
     seed_support_session_for_review,
     wait_for_support_session_review,
 )
+
+def _state_file_path() -> Path:
+    resolved = resolve_supervisor_state_file()
+    return Path(resolved.path or resolved.value)
+
+
+def _read_state_payload(*, logger) -> dict[str, object] | None:
+    path = _state_file_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.debug("Unable to read supervisor state from %s: %s", path, exc)
+        return None
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("Ignoring corrupt supervisor state file %s: %s", path, exc)
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we can't signal it; treat as running.
+        return True
+    return True
 
 
 def register_subcommands(subparsers) -> None:
@@ -47,6 +87,21 @@ def register_subcommands(subparsers) -> None:
         help="HTTP timeout seconds (default: 2.0)",
     )
     run_parser.add_argument("--once", action="store_true", help="Run one step then exit")
+
+    status_parser = subparsers.add_parser("status", help="Show supervisor state (pid/run_id)")
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print raw JSON state payload instead of a human summary.",
+    )
+
+    stop_parser = subparsers.add_parser("stop", help="Stop the supervisor process using its PID")
+    stop_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for shutdown after signaling (default: 5.0)",
+    )
 
     smoke_parser = subparsers.add_parser(
         "smoke",
@@ -97,13 +152,86 @@ def register_subcommands(subparsers) -> None:
 
 
 def dispatch(args) -> None:
-    if args.subcommand != "run":
-        if args.subcommand == "smoke":
-            _run_smoke(args)
-            return
+    if args.subcommand not in {"run", "smoke", "status", "stop"}:
         raise SystemExit(f"Unknown supervisor subcommand: {args.subcommand}")
 
     logger = get_logger(__file__)
+
+    if args.subcommand == "status":
+        payload = _read_state_payload(logger=logger)
+        if payload is None:
+            logger.info("Supervisor is not running (no state file at %s).", _state_file_path())
+            return
+        if getattr(args, "json", False):
+            sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            return
+
+        pid = payload.get("pid")
+        pid_int: int | None = None
+        if isinstance(pid, int) and pid > 0:
+            pid_int = int(pid)
+        elif isinstance(pid, str) and pid.strip().isdigit():
+            pid_int = int(pid.strip())
+        run_id = payload.get("run_id")
+        agent_id = payload.get("agent_id")
+        status = payload.get("status")
+        started_at = payload.get("started_at")
+        ended_at = payload.get("ended_at")
+
+        running = bool(pid_int is not None and _pid_is_running(pid_int))
+        logger.info(
+            "Supervisor status=%s running=%s pid=%s run_id=%s agent_id=%s started_at=%s ended_at=%s",
+            status,
+            running,
+            pid_int,
+            run_id,
+            agent_id,
+            started_at,
+            ended_at,
+        )
+        return
+
+    if args.subcommand == "stop":
+        payload = _read_state_payload(logger=logger)
+        if payload is None:
+            logger.info("Supervisor is not running.")
+            return
+        pid = payload.get("pid")
+        pid_int: int | None = None
+        if isinstance(pid, int) and pid > 0:
+            pid_int = int(pid)
+        elif isinstance(pid, str) and pid.strip().isdigit():
+            pid_int = int(pid.strip())
+        if pid_int is None:
+            logger.warning("Supervisor state file did not include a pid; cannot stop.")
+            return
+        if not _pid_is_running(pid_int):
+            logger.info("Supervisor process is already gone (pid=%s).", pid_int)
+            return
+
+        logger.info("Stopping supervisor pid=%s ...", pid_int)
+        try:
+            os.kill(pid_int, signal.SIGTERM)
+        except ProcessLookupError:
+            logger.info("Supervisor process is already gone (pid=%s).", pid_int)
+            return
+        except PermissionError as exc:
+            logger.error("Permission denied signaling pid=%s: %s", pid_int, exc)
+            raise SystemExit(2) from exc
+
+        deadline = time.monotonic() + float(getattr(args, "timeout_seconds", 5.0) or 0.0)
+        while time.monotonic() < deadline:
+            if not _pid_is_running(pid_int):
+                logger.info("Supervisor stopped.")
+                return
+            time.sleep(0.2)
+
+        logger.warning("Timed out waiting for supervisor shutdown (pid=%s).", pid_int)
+        return
+
+    if args.subcommand == "smoke":
+        _run_smoke(args)
+        return
 
     agent_id = (args.agent_id or "").strip() or _default_agent_id()
 

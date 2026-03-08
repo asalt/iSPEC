@@ -1,10 +1,13 @@
 import logging
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import inspect, text
 import pandas as pd
 import numpy as np
 
+from ispec.config.paths import resolve_db_location
 from ispec.db.init import initialize_db
 from ispec.db.connect import get_session, get_db_path
 from ispec.logging import get_logger
@@ -23,37 +26,81 @@ def _log_info(message: str, *args: Any) -> None:
 
 def _resolve_omics_db_file_path(
     *,
+    logical_name: str,
     db_file_path: str | None,
     omics_db_file_path: str | None,
 ) -> str | None:
-    """Resolve an omics DB path, preferring the supplied core DB location.
-
-    The CLI often provides `--database` without `--omics-database`. In that
-    case we derive `ispec-omics.db` next to the core DB file, instead of
-    falling back to `~/ispec/ispec-omics.db` (which may be unwritable in some
-    environments).
-    """
-
     if omics_db_file_path:
         return omics_db_file_path
-    if not db_file_path:
+
+    resolved = resolve_db_location(logical_name)
+    if resolved.source in {"env", "compat_env"}:
+        return resolved.uri or str(resolved.value)
+
+    core_path = _sqlite_path(db_file_path)
+    if core_path is not None:
+        filename = {
+            "analysis": "ispec-analysis.db",
+            "psm": "ispec-psm.db",
+        }.get(logical_name)
+        if filename is not None:
+            return str(core_path.parent / filename)
+
+    return resolved.uri or str(resolved.value)
+
+
+def _sqlite_path(value: str | None) -> Path | None:
+    if value is None:
         return None
-
-    from pathlib import Path
-
-    raw = str(db_file_path).strip()
+    raw = str(value).strip()
     if not raw:
         return None
-
     if raw.startswith("sqlite:///"):
-        candidate = Path(raw.removeprefix("sqlite:///"))
-    elif "://" in raw:
+        return Path(raw.removeprefix("sqlite:///")).expanduser().resolve(strict=False)
+    if "://" in raw:
         return None
-    else:
-        candidate = Path(raw)
+    return Path(raw).expanduser().resolve(strict=False)
 
-    candidate = candidate.expanduser().resolve()
-    return str(candidate.parent / "ispec-omics.db")
+
+def _same_database_target(*, db_file_path: str | None, omics_db_file_path: str | None) -> bool:
+    core_path = _sqlite_path(db_file_path)
+    omics_path = _sqlite_path(omics_db_file_path)
+    return core_path is not None and omics_path is not None and core_path == omics_path
+
+
+@contextmanager
+def _get_import_omics_session(
+    *,
+    core_session,
+    db_file_path: str | None,
+    logical_name: str,
+    omics_db_file_path: str | None,
+):
+    resolved_omics_db_file_path = _resolve_omics_db_file_path(
+        logical_name=logical_name,
+        db_file_path=db_file_path,
+        omics_db_file_path=omics_db_file_path,
+    )
+
+    if _same_database_target(
+        db_file_path=db_file_path,
+        omics_db_file_path=resolved_omics_db_file_path,
+    ):
+        from ispec.omics.models import OmicsBase
+
+        conn = core_session.connection()
+        OmicsBase.metadata.create_all(bind=conn)
+        yield core_session
+        return
+
+    from ispec.omics.connect import get_omics_session
+
+    with get_omics_session(
+        file_path=resolved_omics_db_file_path,
+        core_session=core_session,
+        logical_name=logical_name,
+    ) as omics_session:
+        yield omics_session
 
 
 def check_status():
@@ -627,9 +674,6 @@ def import_e2g(
         When True, delete existing E2G rows for affected ExperimentRuns and re-import.
     """
 
-    from pathlib import Path
-
-    from ispec.omics.connect import get_omics_session
     from ispec.omics.e2g_import import discover_e2g_tsvs, import_e2g_files
 
     sources = [bool(data_dir), bool(qual_paths), bool(quant_paths)]
@@ -676,15 +720,12 @@ def import_e2g(
         bool(store_metadata),
     )
 
-    resolved_omics_db_file_path = _resolve_omics_db_file_path(
-        db_file_path=db_file_path,
-        omics_db_file_path=omics_db_file_path,
-    )
-
     with get_session(file_path=db_file_path) as core_session:
-        with get_omics_session(
-            file_path=resolved_omics_db_file_path,
+        with _get_import_omics_session(
             core_session=core_session,
+            db_file_path=db_file_path,
+            logical_name="analysis",
+            omics_db_file_path=omics_db_file_path,
         ) as omics_session:
             return import_e2g_files(
                 core_session=core_session,
@@ -715,9 +756,7 @@ def import_gene_contrasts(
     """Import gene-level contrast stats TSVs (e.g. a volcano table per contrast)."""
 
     from dataclasses import asdict
-    from pathlib import Path
 
-    from ispec.omics.connect import get_omics_session
     from ispec.omics.gene_contrast_import import import_gene_contrast_file
 
     if not paths:
@@ -739,15 +778,12 @@ def import_gene_contrasts(
     )
 
     results: list[dict[str, Any]] = []
-    resolved_omics_db_file_path = _resolve_omics_db_file_path(
-        db_file_path=db_file_path,
-        omics_db_file_path=omics_db_file_path,
-    )
-
     with get_session(file_path=db_file_path) as core_session:
-        with get_omics_session(
-            file_path=resolved_omics_db_file_path,
+        with _get_import_omics_session(
             core_session=core_session,
+            db_file_path=db_file_path,
+            logical_name="analysis",
+            omics_db_file_path=omics_db_file_path,
         ) as omics_session:
             for path in resolved:
                 result = import_gene_contrast_file(
@@ -790,9 +826,7 @@ def import_gsea(
     """Import GSEA TSV tables (one file per project/contrast/collection)."""
 
     from dataclasses import asdict
-    from pathlib import Path
 
-    from ispec.omics.connect import get_omics_session
     from ispec.omics.gsea_import import import_gsea_file
 
     if not paths:
@@ -814,15 +848,12 @@ def import_gsea(
     )
 
     results: list[dict[str, Any]] = []
-    resolved_omics_db_file_path = _resolve_omics_db_file_path(
-        db_file_path=db_file_path,
-        omics_db_file_path=omics_db_file_path,
-    )
-
     with get_session(file_path=db_file_path) as core_session:
-        with get_omics_session(
-            file_path=resolved_omics_db_file_path,
+        with _get_import_omics_session(
             core_session=core_session,
+            db_file_path=db_file_path,
+            logical_name="analysis",
+            omics_db_file_path=omics_db_file_path,
         ) as omics_session:
             for path in resolved:
                 result = import_gsea_file(
@@ -849,6 +880,106 @@ def import_gsea(
     }
 
 
+def import_psms(
+    *,
+    paths: list[str],
+    db_file_path: str | None = None,
+    omics_db_file_path: str | None = None,
+    experiment_run_id: int | None = None,
+    experiment_id: int | None = None,
+    run_no: int | None = None,
+    search_no: int | None = None,
+    label: str | None = None,
+    create_missing_runs: bool = True,
+    create_missing_experiments: bool = True,
+    store_metadata: bool = False,
+    skip_imported: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Import peptide-spectrum-match tables into the PSM database."""
+
+    from ispec.omics.psm_import import import_psm_files
+
+    if not paths:
+        raise ValueError("Provide one or more PSM TSV/CSV paths.")
+
+    resolved = [Path(p).expanduser().resolve() for p in paths if str(p).strip()]
+    if not resolved:
+        raise ValueError("Provide one or more PSM TSV/CSV paths.")
+
+    _log_info(
+        "importing PSM tables: files=%d, experiment_run_id=%s, experiment_id=%s, run_no=%s, search_no=%s, label=%s, skip_imported=%s, force=%s, store_metadata=%s",
+        len(resolved),
+        experiment_run_id,
+        experiment_id,
+        run_no,
+        search_no,
+        label,
+        bool(skip_imported),
+        bool(force),
+        bool(store_metadata),
+    )
+
+    with get_session(file_path=db_file_path) as core_session:
+        with _get_import_omics_session(
+            core_session=core_session,
+            db_file_path=db_file_path,
+            logical_name="psm",
+            omics_db_file_path=omics_db_file_path,
+        ) as omics_session:
+            return import_psm_files(
+                core_session=core_session,
+                omics_session=omics_session,
+                paths=resolved,
+                experiment_run_id=experiment_run_id,
+                experiment_id=experiment_id,
+                run_no=run_no,
+                search_no=search_no,
+                label=label,
+                create_missing_runs=create_missing_runs,
+                create_missing_experiments=create_missing_experiments,
+                store_metadata=store_metadata,
+                skip_imported=skip_imported,
+                force=force,
+            )
+
+
+def audit_imports(
+    *,
+    db_file_path: str | None = None,
+    analysis_db_file_path: str | None = None,
+    psm_db_file_path: str | None = None,
+    omics_db_file_path: str | None = None,
+    legacy_schema_path: str | None = None,
+    legacy_mapping_path: str | None = None,
+    legacy_tables_file_path: str | None = None,
+    scripts_dir: str | None = None,
+    out_dir: str | None = None,
+) -> dict[str, Any]:
+    """Write a DB/import audit JSON file and legacy gap-matrix TSV."""
+
+    from ispec.db.audit import write_import_audit_artifacts
+
+    return write_import_audit_artifacts(
+        db_file_path=db_file_path,
+        analysis_db_file_path=_resolve_omics_db_file_path(
+            logical_name="analysis",
+            db_file_path=db_file_path,
+            omics_db_file_path=analysis_db_file_path or omics_db_file_path,
+        ),
+        psm_db_file_path=_resolve_omics_db_file_path(
+            logical_name="psm",
+            db_file_path=db_file_path,
+            omics_db_file_path=psm_db_file_path,
+        ),
+        legacy_schema_path=legacy_schema_path,
+        legacy_mapping_path=legacy_mapping_path,
+        legacy_tables_file_path=legacy_tables_file_path,
+        scripts_dir=scripts_dir,
+        out_dir=out_dir,
+    )
+
+
 def import_project_results(
     *,
     project_id: int,
@@ -869,7 +1000,7 @@ def import_project_results(
     Currently this performs two actions:
       1) Attach every file under ``results_dir`` to ``project_file``.
       2) Import volcano-style TSVs (files with a ``GeneID`` column) into the
-         omics database via :func:`import_gene_contrasts`.
+         analysis database via :func:`import_gene_contrasts`.
 
     The attachment filenames are derived from the relative path under
     ``results_dir`` (path separators replaced with ``__``), optionally prefixed

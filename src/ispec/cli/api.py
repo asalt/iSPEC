@@ -10,27 +10,54 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
+import time
 
 import requests
 
+from ispec.config.paths import resolve_api_pid_file, resolve_api_state_file
 from ispec.logging import get_logger
 
 _STATUS_ENDPOINT = "/status"
-_STATE_FILE_ENV = "ISPEC_API_STATE_FILE"
-_STATE_DIR_ENV = "ISPEC_STATE_DIR"
-_STATE_FILENAME = "api_server.json"
 _REQUEST_TIMEOUT = 2.0
 
 
 def _state_file_path() -> Path:
     """Return the filesystem path used to persist API server state."""
 
-    override = os.environ.get(_STATE_FILE_ENV)
-    if override:
-        return Path(override)
+    resolved = resolve_api_state_file()
+    return Path(resolved.path or resolved.value)
 
-    base_dir = Path(os.environ.get(_STATE_DIR_ENV, Path.home() / ".ispec"))
-    return base_dir / _STATE_FILENAME
+
+def _pid_file_path() -> Path:
+    """Return the filesystem path used to persist the API server PID."""
+
+    resolved = resolve_api_pid_file()
+    return Path(resolved.path or resolved.value)
+
+
+def _write_pid_file(*, logger) -> Path | None:
+    path = _pid_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{os.getpid()}\n")
+        logger.debug("Recorded API server pid in %s", path)
+        return path
+    except OSError as exc:
+        logger.warning("Unable to record API server pid in %s: %s", path, exc)
+        return None
+
+
+def _remove_pid_file(path: Path | None, *, logger) -> None:
+    if path is None:
+        path = _pid_file_path()
+    try:
+        path.unlink()
+        logger.debug("Removed API server pid file %s", path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Unable to remove API server pid file %s: %s", path, exc)
 
 
 def _write_state(host: str, port: int, *, logger) -> Path | None:
@@ -93,6 +120,46 @@ def _read_state(*, logger) -> tuple[str, int] | None:
         return None
 
     return host, port_int
+
+
+def _read_state_payload(*, logger) -> dict[str, object] | None:
+    """Return the stored state payload if available and valid."""
+
+    path = _state_file_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.debug("Unable to read API server state from %s: %s", path, exc)
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("Ignoring corrupt API server state file %s: %s", path, exc)
+        return None
+
+    host = data.get("host")
+    port = data.get("port")
+    pid = data.get("pid")
+    if not isinstance(host, str) or not host:
+        logger.warning("State file %s missing 'host'; treating API as stopped", path)
+        return None
+
+    try:
+        port_int = int(port)
+    except (TypeError, ValueError):
+        logger.warning("State file %s missing valid 'port'; treating API as stopped", path)
+        return None
+
+    payload: dict[str, object] = {"host": host, "port": port_int}
+    try:
+        if pid is not None:
+            payload["pid"] = int(pid)
+    except (TypeError, ValueError):
+        pass
+    return payload
 
 
 def _probe_host(host: str) -> str:
@@ -162,6 +229,13 @@ def register_subcommands(subparsers):
     starter_parser.add_argument(
         "--port", type=int, default=8000, help="Port to run the API server on"
     )
+    stopper_parser = subparsers.add_parser("stop", help="Stop the API server")
+    stopper_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for shutdown after signaling (default: 5.0)",
+    )
 
 
 def dispatch(args):
@@ -201,6 +275,45 @@ def dispatch(args):
             logger.info("API server is not running at %s:%s", host, port)
         return
 
+    if args.subcommand == "stop":
+        payload = _read_state_payload(logger=logger)
+        if payload is None:
+            logger.info("API server is not running.")
+            return
+
+        host = str(payload.get("host") or "")
+        port = int(payload.get("port") or 0)
+        pid = payload.get("pid")
+        pid_int = int(pid) if isinstance(pid, int) and pid > 0 else None
+
+        if pid_int is None:
+            logger.warning("API state file did not include a pid; cannot stop cleanly.")
+            return
+
+        logger.info("Stopping API server pid=%s (host=%s port=%s)", pid_int, host, port)
+        try:
+            os.kill(pid_int, signal.SIGTERM)
+        except ProcessLookupError:
+            logger.info("API server process is already gone (pid=%s).", pid_int)
+            _remove_state(None, logger=logger)
+            _remove_pid_file(None, logger=logger)
+            return
+        except PermissionError as exc:
+            logger.error("Permission denied signaling pid=%s: %s", pid_int, exc)
+            raise SystemExit(2) from exc
+
+        deadline = time.monotonic() + float(getattr(args, "timeout_seconds", 5.0) or 0.0)
+        while time.monotonic() < deadline:
+            if not _is_server_running(host, port, logger=logger):
+                _remove_state(None, logger=logger)
+                _remove_pid_file(None, logger=logger)
+                logger.info("API server stopped.")
+                return
+            time.sleep(0.2)
+
+        logger.warning("Timed out waiting for API shutdown (pid=%s).", pid_int)
+        return
+
     if args.subcommand == "start":
         api_key = (os.environ.get("ISPEC_API_KEY") or "").strip()
         if not _is_local_bind_host(args.host) and not api_key:
@@ -216,10 +329,12 @@ def dispatch(args):
 
         logger.info("Starting API server at %s:%s", args.host, args.port)
         state_path = _write_state(args.host, args.port, logger=logger)
+        pid_path = _write_pid_file(logger=logger)
         try:
             uvicorn.run(app, host=args.host, port=args.port)
         finally:
             _remove_state(state_path, logger=logger)
+            _remove_pid_file(pid_path, logger=logger)
         return
 
     logger.error(f"No handler for subcommand: {args.subcommand}")

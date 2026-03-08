@@ -128,7 +128,7 @@ set -euo pipefail
 # Notes:
 # - Only "user-facing" artifacts are attached to project files by default:
 #   PNG/PDF/TSV/TAB/GCT, excluding cache files like SQLITE/RDS.
-# - Volcano-style TSVs (with a GeneID column) can also be imported into the omics DB.
+# - Volcano-style TSVs (with a GeneID column) can also be imported into the analysis DB.
 """
 
     gct_block = ""
@@ -163,7 +163,7 @@ INCLUDE_EXTS="${{INCLUDE_EXTS:-{_bash_escape(include_exts)}}}"
 EXCLUDE_EXTS="${{EXCLUDE_EXTS:-{_bash_escape(exclude_exts)}}}"
 
 DATABASE=""
-OMICS_DATABASE=""
+ANALYSIS_DATABASE=""
 DRY_RUN=0
 FORCE=0
 ADDED_BY="${{ADDED_BY:-}}"
@@ -175,10 +175,10 @@ Usage: $(basename "$0") --database <db_path> [options]
 
 Options:
   --database <path>        SQLite DB path/URI to write to (required)
-  --omics-database <path>  SQLite omics DB path/URI (defaults to ISPEC_OMICS_DB_PATH/derived)
+  --analysis-database <path>  SQLite analysis DB path/URI (defaults to a sibling ispec-analysis.db next to --database)
   --prefix <name>          Prefix for stored filenames in project_file (default: ${{PREFIX}})
 {usage_gct}  --added-by <username>    Record in prjfile_AddedBy for attachments
-  --no-volcano             Do not import volcano TSVs into the omics DB
+  --no-volcano             Do not import volcano TSVs into the analysis DB
   --dry-run                Do not write; report what would be imported
   --force                  Overwrite attachments that share the same stored name
 
@@ -195,8 +195,8 @@ while [[ $# -gt 0 ]]; do
       DATABASE="${{2:-}}"
       shift 2
       ;;
-    --omics-database)
-      OMICS_DATABASE="${{2:-}}"
+    --analysis-database|--omics-database)
+      ANALYSIS_DATABASE="${{2:-}}"
       shift 2
       ;;
     --prefix)
@@ -273,8 +273,8 @@ COMMON_ARGS=(
   --include-ext "$INCLUDE_EXTS"
   --exclude-ext "$EXCLUDE_EXTS"
 )
-if [[ -n "$OMICS_DATABASE" ]]; then
-  COMMON_ARGS+=(--omics-database "$OMICS_DATABASE")
+if [[ -n "$ANALYSIS_DATABASE" ]]; then
+  COMMON_ARGS+=(--analysis-database "$ANALYSIS_DATABASE")
 fi
 if [[ -n "$ADDED_BY" ]]; then
   COMMON_ARGS+=(--added-by "$ADDED_BY")
@@ -299,8 +299,8 @@ echo "Database:      ${{DATABASE}}"
 if [[ -n "$ISPEC_ENV_FILE" ]]; then
   echo "Env file:      ${{ISPEC_ENV_FILE}}"
 fi
-if [[ -n "$OMICS_DATABASE" ]]; then
-  echo "Omics DB:      ${{OMICS_DATABASE}}"
+if [[ -n "$ANALYSIS_DATABASE" ]]; then
+  echo "Analysis DB:   ${{ANALYSIS_DATABASE}}"
 fi
 echo "Results dir:   ${{RESULTS_DIR}}"
 echo "Prefix:        ${{PREFIX}}"
@@ -334,8 +334,8 @@ if [[ -n "$RESULTS_GCT_DIR" ]] && [[ -d "$RESULTS_GCT_DIR" ]]; then
     --exclude-ext "$EXCLUDE_EXTS"
     --no-import-volcano
   )
-  if [[ -n "$OMICS_DATABASE" ]]; then
-    GCT_ARGS+=(--omics-database "$OMICS_DATABASE")
+  if [[ -n "$ANALYSIS_DATABASE" ]]; then
+    GCT_ARGS+=(--analysis-database "$ANALYSIS_DATABASE")
   fi
   if [[ -n "$ADDED_BY" ]]; then
     GCT_ARGS+=(--added-by "$ADDED_BY")
@@ -376,4 +376,3 @@ fi
         script_name=suggested_name,
         gct_dir=resolved_gct_dir,
     )
-

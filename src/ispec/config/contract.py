@@ -38,6 +38,7 @@ class VarSpec:
     max_value: int | None = None
     min_length: int | None = None
     forbid_values: tuple[str, ...] = ()
+    replaced_by: str | None = None
 
     def default_for(self, profile: Profile) -> str | None:
         raw = (self.default_by_profile.get(profile) or "").strip()
@@ -61,6 +62,7 @@ def spec_to_dict(spec: VarSpec) -> dict[str, Any]:
         "max_value": spec.max_value,
         "min_length": spec.min_length,
         "forbid_values": list(spec.forbid_values),
+        "replaced_by": spec.replaced_by,
     }
     if spec.required_if is not None:
         payload["required_if"] = {"key": spec.required_if.key, "equals": spec.required_if.equals}
@@ -106,32 +108,62 @@ def default_contract() -> tuple[VarSpec, ...]:
             max_value=65535,
         ),
         VarSpec(
+            key="ISPEC_DB_DIR",
+            kind="path",
+            group="Paths",
+            description="Base directory for sibling SQLite database defaults.",
+            default_by_profile={"dev": "~/ispec", "prod": "/var/lib/ispec"},
+        ),
+        VarSpec(
             key="ISPEC_DB_PATH",
             kind="path",
             group="Database",
             description="Primary SQLite DB path or sqlite:/// URI.",
-            default_by_profile={"dev": "iSPEC/data/ispec-import.db", "prod": "/var/lib/ispec/ispec.db"},
+            default_by_profile={"dev": "~/ispec/ispec.db", "prod": "/var/lib/ispec/ispec.db"},
+        ),
+        VarSpec(
+            key="ISPEC_ANALYSIS_DB_PATH",
+            kind="path",
+            group="Database",
+            description="Analysis SQLite DB path/URI for E2G, volcano, GSEA, and similar derived tables.",
+            default_by_profile={
+                "dev": "~/ispec/ispec-analysis.db",
+                "prod": "/var/lib/ispec/ispec-analysis.db",
+            },
+        ),
+        VarSpec(
+            key="ISPEC_PSM_DB_PATH",
+            kind="path",
+            group="Database",
+            description="PSM SQLite DB path/URI for large peptide-spectrum-match tables.",
+            default_by_profile={"dev": "~/ispec/ispec-psm.db", "prod": "/var/lib/ispec/ispec-psm.db"},
         ),
         VarSpec(
             key="ISPEC_SCHEDULE_DB_PATH",
             kind="path",
             group="Database",
             description="Schedule SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
-            default_by_profile={"dev": "iSPEC/data/ispec-schedule.db", "prod": "/var/lib/ispec/ispec-schedule.db"},
+            default_by_profile={
+                "dev": "~/ispec/ispec-schedule.db",
+                "prod": "/var/lib/ispec/ispec-schedule.db",
+            },
         ),
         VarSpec(
             key="ISPEC_OMICS_DB_PATH",
             kind="path",
             group="Database",
-            description="Omics SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
-            default_by_profile={"dev": "iSPEC/data/ispec-omics.db", "prod": "/var/lib/ispec/ispec-omics.db"},
+            description="Deprecated alias for ISPEC_ANALYSIS_DB_PATH.",
+            replaced_by="ISPEC_ANALYSIS_DB_PATH",
         ),
         VarSpec(
             key="ISPEC_ASSISTANT_DB_PATH",
             kind="path",
             group="Database",
             description="Support assistant SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
-            default_by_profile={"dev": "iSPEC/data/ispec-assistant.db", "prod": "/var/lib/ispec/ispec-assistant.db"},
+            default_by_profile={
+                "dev": "~/ispec/ispec-assistant.db",
+                "prod": "/var/lib/ispec/ispec-assistant.db",
+            },
         ),
         VarSpec(
             key="ISPEC_AGENT_DB_PATH",
@@ -139,9 +171,61 @@ def default_contract() -> tuple[VarSpec, ...]:
             group="Database",
             description="Agent telemetry SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
             default_by_profile={
-                "dev": "iSPEC/data/ispec-agent.db",
+                "dev": "~/ispec/ispec-agent.db",
                 "prod": "/var/lib/ispec/ispec-agent.db",
             },
+        ),
+        VarSpec(
+            key="ISPEC_STATE_DIR",
+            kind="path",
+            group="Paths",
+            description="Base directory for API/supervisor state and pid files.",
+            default_by_profile={"dev": "~/.ispec", "prod": "/var/lib/ispec/state"},
+        ),
+        VarSpec(
+            key="ISPEC_API_STATE_FILE",
+            kind="path",
+            group="Paths",
+            description="Optional explicit API state JSON file path.",
+        ),
+        VarSpec(
+            key="ISPEC_API_PID_FILE",
+            kind="path",
+            group="Paths",
+            description="Optional explicit API pid file path.",
+        ),
+        VarSpec(
+            key="ISPEC_SUPERVISOR_STATE_FILE",
+            kind="path",
+            group="Paths",
+            description="Optional explicit supervisor state JSON file path.",
+        ),
+        VarSpec(
+            key="ISPEC_SUPERVISOR_PID_FILE",
+            kind="path",
+            group="Paths",
+            description="Optional explicit supervisor pid file path.",
+        ),
+        VarSpec(
+            key="ISPEC_LOG_DIR",
+            kind="path",
+            group="Paths",
+            description="Directory for iSPEC log files.",
+            default_by_profile={"dev": "~/.ispec/logs", "prod": "/var/log/ispec"},
+        ),
+        VarSpec(
+            key="ISPEC_CONFIG_DIR",
+            kind="path",
+            group="Paths",
+            description="Directory for persisted configuration files such as logging.json.",
+            default_by_profile={"dev": "~/.ispec", "prod": "/etc/ispec"},
+        ),
+        VarSpec(
+            key="ISPEC_LOG_CONFIG",
+            kind="path",
+            group="Paths",
+            description="Optional explicit path to the logging JSON config file.",
+            default_by_profile={"dev": "~/.ispec/logging.json", "prod": "/etc/ispec/logging.json"},
         ),
         VarSpec(
             key="ISPEC_API_KEY",
@@ -230,10 +314,11 @@ def default_contract() -> tuple[VarSpec, ...]:
         ),
         VarSpec(
             key="ISPEC_ASSISTANT_ENABLE_PROMPT_HEADER",
-            kind="bool",
+            kind="string",
             group="Assistant",
-            description="Enable compact @h1 prompt header injection (first LLM round only).",
-            default_by_profile={"dev": "0", "prod": "0"},
+            description="Enable compact @h1 prompt header injection (first LLM round only). Tri-state: 0/1/auto.",
+            default_by_profile={"dev": "auto", "prod": "0"},
+            choices=("0", "1", "auto"),
         ),
         VarSpec(
             key="ISPEC_VLLM_URL",

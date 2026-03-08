@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -11,14 +10,16 @@ from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from ispec.db.connect import get_db_dir
+from ispec.config.paths import resolve_db_location
 from ispec.db.models import OmicsDatabaseRegistry, sqlite_engine
 from ispec.logging import get_logger
 from ispec.omics.models import OmicsBase
 
 logger = get_logger(__file__)
 
-DEFAULT_OMICS_LOGICAL_NAME = "primary"
+DEFAULT_OMICS_LOGICAL_NAME = "analysis"
+LEGACY_OMICS_LOGICAL_NAME = "primary"
+PSM_OMICS_LOGICAL_NAME = "psm"
 
 
 class OmicsDatabaseUnavailableError(RuntimeError):
@@ -29,44 +30,29 @@ def _utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _sqlite_uri(db_path: str | Path) -> str:
-    raw = str(db_path).strip()
-    if raw.startswith("sqlite"):
-        return raw
-    path = Path(raw).expanduser()
-    return "sqlite:///" + str(path)
+def _normalize_logical_name(logical_name: str) -> str:
+    normalized = (logical_name or DEFAULT_OMICS_LOGICAL_NAME).strip().lower()
+    if normalized == LEGACY_OMICS_LOGICAL_NAME:
+        return DEFAULT_OMICS_LOGICAL_NAME
+    return normalized or DEFAULT_OMICS_LOGICAL_NAME
 
 
-def get_omics_db_uri(file: str | Path | None = None) -> str:
+def get_omics_db_uri(
+    file: str | Path | None = None,
+    *,
+    logical_name: str = DEFAULT_OMICS_LOGICAL_NAME,
+) -> str:
     """Return a SQLite URI string for the omics DB.
 
     Resolution order:
       1) explicit ``file`` argument
-      2) env ``ISPEC_OMICS_DB_PATH``
-      3) alongside ``ISPEC_DB_PATH`` (same dir, ``ispec-omics.db``)
-      4) fallback to ``ISPEC_DB_DIR`` (via :func:`ispec.db.connect.get_db_dir`)
+      2) env for the requested logical DB (analysis or psm)
+      3) compatibility alias (analysis only: ``ISPEC_OMICS_DB_PATH``)
+      4) sibling file next to ``ISPEC_DB_PATH``
     """
 
-    if file is not None:
-        return _sqlite_uri(file)
-
-    env_path = (os.getenv("ISPEC_OMICS_DB_PATH") or "").strip()
-    if env_path:
-        return _sqlite_uri(env_path)
-
-    main_path = (os.getenv("ISPEC_DB_PATH") or "").strip()
-    candidate: Path | None = None
-    if main_path:
-        if main_path.startswith("sqlite:///"):
-            candidate = Path(main_path.removeprefix("sqlite:///"))
-        elif "://" not in main_path:
-            candidate = Path(main_path)
-
-    if candidate is not None:
-        omics_file = candidate.expanduser().resolve().parent / "ispec-omics.db"
-        return _sqlite_uri(omics_file)
-
-    return _sqlite_uri(get_db_dir() / "ispec-omics.db")
+    resolved = resolve_db_location(_normalize_logical_name(logical_name), file=file)
+    return resolved.uri or str(resolved.value)
 
 
 def _sqlite_path_from_uri(db_uri: str) -> Path | None:
@@ -84,10 +70,19 @@ def _get_registry_row(
     *,
     logical_name: str,
 ) -> OmicsDatabaseRegistry | None:
+    normalized_name = _normalize_logical_name(logical_name)
     stmt = select(OmicsDatabaseRegistry).where(
-        OmicsDatabaseRegistry.omdb_LogicalName == logical_name
+        OmicsDatabaseRegistry.omdb_LogicalName == normalized_name
     )
-    return core_session.execute(stmt).scalar_one_or_none()
+    row = core_session.execute(stmt).scalar_one_or_none()
+    if row is not None:
+        return row
+    if normalized_name != DEFAULT_OMICS_LOGICAL_NAME:
+        return None
+    legacy_stmt = select(OmicsDatabaseRegistry).where(
+        OmicsDatabaseRegistry.omdb_LogicalName == LEGACY_OMICS_LOGICAL_NAME
+    )
+    return core_session.execute(legacy_stmt).scalar_one_or_none()
 
 
 @lru_cache(maxsize=None)
@@ -113,15 +108,25 @@ def get_omics_session(
 ) -> Iterator[Session]:
     """Context-managed SQLAlchemy session for the omics DB."""
 
-    db_uri = get_omics_db_uri(file_path)
+    normalized_name = _normalize_logical_name(logical_name)
+    db_uri = get_omics_db_uri(file_path, logical_name=normalized_name)
     sqlite_path = _sqlite_path_from_uri(db_uri)
     registry_row: OmicsDatabaseRegistry | None = None
+    reuse_core_session = False
 
     if core_session is not None:
-        registry_row = _get_registry_row(core_session, logical_name=logical_name)
+        core_db_path = _sqlite_path_from_uri(str(core_session.bind.url))
+        if (
+            sqlite_path is not None
+            and core_db_path is not None
+            and core_db_path.resolve() == sqlite_path.resolve()
+        ):
+            reuse_core_session = True
+
+        registry_row = _get_registry_row(core_session, logical_name=normalized_name)
         if registry_row is None:
             registry_row = OmicsDatabaseRegistry(
-                omdb_LogicalName=logical_name,
+                omdb_LogicalName=normalized_name,
                 omdb_DBURI=db_uri,
                 omdb_DBPath=str(sqlite_path) if sqlite_path is not None else None,
                 omdb_Status="unknown",
@@ -129,6 +134,8 @@ def get_omics_session(
             core_session.add(registry_row)
             core_session.flush()
         else:
+            if registry_row.omdb_LogicalName != normalized_name:
+                registry_row.omdb_LogicalName = normalized_name
             registry_row.omdb_DBURI = db_uri
             registry_row.omdb_DBPath = str(sqlite_path) if sqlite_path is not None else None
 
@@ -144,6 +151,18 @@ def get_omics_session(
             )
             logger.warning(msg)
             raise OmicsDatabaseUnavailableError(msg)
+
+    if reuse_core_session and core_session is not None:
+        OmicsBase.metadata.create_all(bind=core_session.connection())
+        if registry_row is not None:
+            now = _utcnow_naive()
+            registry_row.omdb_Status = "available"
+            registry_row.omdb_LastCheckedTS = now
+            registry_row.omdb_LastAvailableTS = now
+            registry_row.omdb_LastError = None
+            core_session.flush()
+        yield core_session
+        return
 
     if sqlite_path is not None and not sqlite_path.exists():
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,13 +1,13 @@
-# ispec/logging/logging.py
-import os
 import logging
 import sys
 from pathlib import Path
 # from functools import lru_cache
 
+from ispec.config.paths import resolve_log_dir
+
 from .config import load_log_level
 
-_DEFAULT_LOG_DIR = Path(os.environ.get("ISPEC_LOG_DIR", Path.home() / ".ispec" / "logs"))
+_DEFAULT_LOG_DIR = Path(resolve_log_dir().path or resolve_log_dir().value)
 _DEFAULT_LOG_FILE = _DEFAULT_LOG_DIR / "ispec.log"
 # Singleton record to track which loggers are already configured
 _LOGGER_INITIALIZED = {}
@@ -15,7 +15,8 @@ _LOGGER_INITIALIZED = {}
 def _resolve_log_dir(log_dir=None):
     if log_dir is not None:
         return Path(log_dir)
-    return Path(os.environ.get("ISPEC_LOG_DIR", Path.home() / ".ispec" / "logs"))
+    resolved = resolve_log_dir()
+    return Path(resolved.path or resolved.value)
 
 def _resolve_log_file(log_file=None, log_dir=None):
     if log_file is not None:
