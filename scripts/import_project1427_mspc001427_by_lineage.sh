@@ -15,7 +15,7 @@ set -euo pipefail
 # Notes:
 # - Only "user-facing" artifacts are attached to project files:
 #   PNG/PDF/TSV/TAB (default), excluding cache files like SQLITE/RDS.
-# - Volcano-style TSVs (with a GeneID column) are also imported into the omics DB.
+# - Volcano-style TSVs (with a GeneID column) are also imported into the analysis DB.
 #
 # Usage (recommended: write to a DB copy first):
 #   cp iSPEC/data/ispec-import.db iSPEC/data/ispec-import-1427.db
@@ -52,7 +52,7 @@ Usage: $(basename "$0") --database <db_path> [options]
 
 Options:
   --database <path>        SQLite DB path/URI to write to (required)
-  --omics-database <path>  SQLite omics DB path/URI (defaults to ISPEC_OMICS_DB_PATH/derived)
+  --analysis-database <path>  SQLite analysis DB path/URI (defaults to a sibling ispec-analysis.db next to --database)
   --added-by <username>    Record in prjfile_AddedBy for attachments
   --dry-run                Do not write; report what would be imported
   --force                  Overwrite attachments that share the same stored name
@@ -72,7 +72,7 @@ while [[ $# -gt 0 ]]; do
       DATABASE="${2:-}"
       shift 2
       ;;
-    --omics-database)
+    --analysis-database|--omics-database)
       OMICS_DATABASE="${2:-}"
       shift 2
       ;;
@@ -143,7 +143,7 @@ COMMON_ARGS=(
   --exclude-ext "$EXCLUDE_EXTS"
 )
 if [[ -n "$OMICS_DATABASE" ]]; then
-  COMMON_ARGS+=(--omics-database "$OMICS_DATABASE")
+  COMMON_ARGS+=(--analysis-database "$OMICS_DATABASE")
 fi
 if [[ -n "$ADDED_BY" ]]; then
   COMMON_ARGS+=(--added-by "$ADDED_BY")

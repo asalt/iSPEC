@@ -84,9 +84,9 @@ Usage: $(basename "$0") --database <db_path> [options]
 
 Options:
   --database <path>        SQLite DB path/URI to write to (required)
-  --omics-database <path>  SQLite omics DB path/URI (defaults to ISPEC_OMICS_DB_PATH/derived)
+  --analysis-database <path>  SQLite analysis DB path/URI (defaults to a sibling ispec-analysis.db next to --database)
   --added-by <username>    Record in prjfile_AddedBy for attachments
-  --no-volcano             Do not import volcano TSVs into the omics DB
+  --no-volcano             Do not import volcano TSVs into the analysis DB
   --skip-prof              Skip proteomics imports
   --skip-phos              Skip phospho imports
   --skip-gsea              Skip GSEA imports
@@ -118,7 +118,7 @@ while [[ $# -gt 0 ]]; do
       DATABASE="${2:-}"
       shift 2
       ;;
-    --omics-database)
+    --analysis-database|--omics-database)
       OMICS_DATABASE="${2:-}"
       shift 2
       ;;
@@ -205,7 +205,7 @@ COMMON_ARGS=(
   --exclude-ext "$EXCLUDE_EXTS"
 )
 if [[ -n "$OMICS_DATABASE" ]]; then
-  COMMON_ARGS+=(--omics-database "$OMICS_DATABASE")
+  COMMON_ARGS+=(--analysis-database "$OMICS_DATABASE")
 fi
 if [[ -n "$ADDED_BY" ]]; then
   COMMON_ARGS+=(--added-by "$ADDED_BY")

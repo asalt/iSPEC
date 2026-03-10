@@ -38,7 +38,7 @@ Usage: $(basename "$0") --database <db_path> [options]
 
 Options:
   --database <path>     SQLite DB path/URI to write to (required)
-  --omics-database <path>  SQLite omics DB path/URI (defaults to ISPEC_OMICS_DB_PATH/derived)
+  --analysis-database <path>  SQLite analysis DB path/URI (defaults to a sibling ispec-analysis.db next to --database)
   --dry-run             Print commands without executing
   --force               Clear + re-import where supported
   --no-metadata          Do not store metadata_json extras
@@ -57,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       DATABASE="${2:-}"
       shift 2
       ;;
-    --omics-database)
+    --analysis-database|--omics-database)
       OMICS_DATABASE="${2:-}"
       shift 2
       ;;
@@ -152,7 +152,7 @@ if [[ "$FORCE" -eq 1 ]]; then
   E2G_ARGS+=(--force)
 fi
 if [[ -n "$OMICS_DATABASE" ]]; then
-  E2G_ARGS+=(--omics-database "$OMICS_DATABASE")
+  E2G_ARGS+=(--analysis-database "$OMICS_DATABASE")
 fi
 
 VOLCANO_ARGS=()
@@ -163,7 +163,7 @@ if [[ "$FORCE" -eq 1 ]]; then
   VOLCANO_ARGS+=(--force)
 fi
 if [[ -n "$OMICS_DATABASE" ]]; then
-  VOLCANO_ARGS+=(--omics-database "$OMICS_DATABASE")
+  VOLCANO_ARGS+=(--analysis-database "$OMICS_DATABASE")
 fi
 
 GSEA_ARGS=()
@@ -174,7 +174,7 @@ if [[ "$FORCE" -eq 1 ]]; then
   GSEA_ARGS+=(--force)
 fi
 if [[ -n "$OMICS_DATABASE" ]]; then
-  GSEA_ARGS+=(--omics-database "$OMICS_DATABASE")
+  GSEA_ARGS+=(--analysis-database "$OMICS_DATABASE")
 fi
 
 echo "== Import: E2G (QUAL/QUANT) =="

@@ -123,3 +123,41 @@ def test_import_project_results_attaches_files_and_imports_volcano(tmp_path):
             .count()
             == 5
         )
+
+
+def test_import_project_results_defaults_analysis_to_sibling_db(tmp_path):
+    results_dir = tmp_path / "Dec2025"
+    _write_text(
+        results_dir / "volcano" / "limma" / "contrast.tsv",
+        "GeneID\tlog2_FC\tpValue\tpAdj\tGeneSymbol\tGeneDescription\n"
+        "1\t0.1\t0.5\t0.5\tGeneA\tDescA\n",
+    )
+
+    core_db = tmp_path / "core.db"
+    with get_session(file_path=str(core_db)) as session:
+        session.add(
+            Project(
+                id=1545,
+                prj_AddedBy="tester",
+                prj_ProjectTitle="Same DB Project",
+                prj_ProjectBackground="bg",
+            )
+        )
+
+    summary = operations.import_project_results(
+        project_id=1545,
+        results_dir=str(results_dir),
+        db_file_path=str(core_db),
+        prefix="Dec2025",
+        import_volcano=True,
+    )
+
+    assert summary["volcano"] is not None
+    assert summary["volcano"]["inserted_total"] == 1
+
+    analysis_db = tmp_path / "ispec-analysis.db"
+    with get_omics_session(file_path=str(analysis_db), logical_name="analysis") as session:
+        contrast = session.query(GeneContrast).filter(GeneContrast.project_id == 1545).one()
+        assert session.query(GeneContrastStat).filter(
+            GeneContrastStat.gene_contrast_id == contrast.id
+        ).count() == 1
