@@ -17,10 +17,10 @@ def _make_user(username: str, *, role: UserRole) -> AuthUser:
     )
 
 
-def test_create_project_comment_tool_hidden_for_viewer():
+def test_create_project_comment_tool_visible_for_viewer():
     user = _make_user("viewer", role=UserRole.viewer)
     tool_names = {tool["function"]["name"] for tool in openai_tools_for_user(user)}
-    assert "create_project_comment" not in tool_names
+    assert "create_project_comment" in tool_names
 
 
 def test_create_project_comment_tool_visible_for_client():

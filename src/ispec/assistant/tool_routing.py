@@ -71,10 +71,16 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
         tool_names=("repo_list_files", "repo_search", "repo_read_file"),
     ),
     ToolGroup(
+        name="devops",
+        description="Dev service controls (restart backend/supervisor/frontend/vLLM/Slack via tmux/make).",
+        tool_names=("assistant_enqueue_dev_restart_services",),
+    ),
+    ToolGroup(
         name="assistant",
         description="Assistant retrieval tools (search support chat logs, internal agent logs, and review state).",
         tool_names=(
             "assistant_stats",
+            "assistant_list_tools",
             "assistant_recent_sessions",
             "assistant_get_session_review",
             "assistant_prompt_header",

@@ -23,8 +23,19 @@ _PERSON_ID_RE = re.compile(r"\b(?:person|ppl)\s*#?\s*(\d{1,9})\b", re.IGNORECASE
 _SINGULAR_PROJECT_RE = re.compile(r"\bproject\b", re.IGNORECASE)
 _PLURAL_PROJECTS_RE = re.compile(r"\bprojects\b", re.IGNORECASE)
 _THIS_PROJECT_RE = re.compile(r"\b(this|current|that|the)\s+project\b", re.IGNORECASE)
+_PROJECT_FOLLOWUP_HINT_RE = re.compile(
+    r"\b("
+    r"results?|directory|directories|folder|folders|bad\s+samples?|filtered|removed|"
+    r"geno(?:type)?s?|genders?|mmps?|proteins?|sample(?:s)?|qc|pca|cluster(?:ing)?|"
+    r"volcano|gsea|analysis|meeting|prepare|prep|focus|important"
+    r")\b",
+    re.IGNORECASE,
+)
 _FILE_HINT_RE = re.compile(
-    r"\b(files?|plots?|pcaplots?|pca|biplot|cluster(?:plot)?s?|heatmap|pdfs?|images?)\b",
+    r"\b("
+    r"files?|results?|directory|directories|folder|folders|plots?|pcaplots?|pca|"
+    r"biplot|cluster(?:plot)?s?|heatmap|pdfs?|images?|removed|filtered"
+    r")\b",
     re.IGNORECASE,
 )
 _PCA_HINT_RE = re.compile(r"\bpca\b|pc1|pc2|biplot|pcaplot", re.IGNORECASE)
@@ -86,10 +97,13 @@ def project_summary(
     project: Project,
     *,
     include_comments: bool = True,
+    include_details: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": int(project.id),
+        "display_id": project.prj_PRJ_DisplayID,
         "title": project.prj_ProjectTitle,
+        "display_title": project.prj_PRJ_DisplayTitle,
         "status": project.prj_Status,
         "current": bool(project.prj_Current_FLAG),
         "to_be_billed": bool(project.prj_Billing_ReadyToBill),
@@ -104,6 +118,18 @@ def project_summary(
             "api": f"/api/projects/{project.id}",
         },
     }
+
+    if include_details:
+        detail_fields = {
+            "question": _truncate(project.prj_ProjectQuestions, 280),
+            "background": _truncate(project.prj_ProjectBackground, 420),
+            "samples": _truncate(project.prj_ProjectSamples, 280),
+            "core_tasks": _truncate(project.prj_ProjectCoreTasks, 420),
+            "suggestions": _truncate(project.prj_ProjectSuggestions2Customer, 420),
+        }
+        for key, value in detail_fields.items():
+            if value:
+                payload[key] = value
 
     if include_comments:
         comment_count = (
@@ -276,7 +302,12 @@ def build_ispec_context(
             missing_project_ids.append(project_id)
             continue
         resolved_projects.append(
-            project_summary(db, project, include_comments=include_project_comments)
+            project_summary(
+                db,
+                project,
+                include_comments=include_project_comments,
+                include_details=True,
+            )
         )
     if resolved_projects:
         context["projects"] = resolved_projects
@@ -288,13 +319,17 @@ def build_ispec_context(
         mentions_singular = bool(_SINGULAR_PROJECT_RE.search(message or "")) and not bool(
             _PLURAL_PROJECTS_RE.search(message or "")
         )
-        if wants_this_project or mentions_singular:
+        followup_hint = bool(_PROJECT_FOLLOWUP_HINT_RE.search(message or ""))
+        if wants_this_project or mentions_singular or followup_hint:
             project = get_project(focused_project_id)
             if project is None:
                 context["missing_current_project"] = focused_project_id
             else:
                 context["current_project"] = project_summary(
-                    db, project, include_comments=include_project_comments
+                    db,
+                    project,
+                    include_comments=include_project_comments,
+                    include_details=True,
                 )
 
     if "current" in lowered and "project" in lowered:

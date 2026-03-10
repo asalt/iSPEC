@@ -4,7 +4,8 @@ from functools import cache
 import os
 import re
 import json
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -14,9 +15,10 @@ from sqlalchemy.orm import Session
 
 from ispec.api.security import require_access, require_assistant_access
 from ispec.agent.connect import get_agent_session_dep
-from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY
-from ispec.agent.models import AgentCommand
+from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY, COMMAND_ORCHESTRATOR_TICK, COMMAND_SUPPORT_CHAT_TURN
+from ispec.agent.models import AgentCommand, AgentRun
 from ispec.assistant.context import build_ispec_context, extract_project_ids
+from ispec.assistant.compaction import normalize_conversation_memory
 from ispec.assistant.connect import get_assistant_session_dep
 from ispec.assistant.formatting import split_compare_finals, split_plan_final
 from ispec.assistant.memory import update_state_from_message
@@ -40,6 +42,7 @@ from ispec.assistant.tools import (
     extract_tool_call_line,
     format_tool_result_message,
     openai_tools_for_user,
+    openai_tool_names_all,
     parse_tool_call,
     run_tool,
 )
@@ -75,7 +78,26 @@ _LIST_MY_PROJECTS_RE = re.compile(
     r"|\b(?:what|which|show|list)\s+(?:projects?|prjs?|projs?)\b",
     re.IGNORECASE,
 )
+_FILE_ROUTER_HINT_RE = re.compile(
+    r"\b("
+    r"files?|results?|directory|directories|folder|folders|plots?|pca|biplot|"
+    r"cluster(?:plot)?s?|heatmap|volcano|pdfs?|images?|removed|filtered"
+    r")\b",
+    re.IGNORECASE,
+)
+_PROJECT_ROUTER_HINT_RE = re.compile(
+    r"\b("
+    r"meeting|prepare|prep|important|focus|understand|background|question|goal|summary|"
+    r"sample(?:s)?|geno(?:type)?s?|genders?|mmps?|proteins?|analysis|results?"
+    r")\b",
+    re.IGNORECASE,
+)
+_PROJECT_DETAIL_REQUEST_RE = re.compile(
+    r"\b(tell me about|what do i need to know|what should i know|meeting|internal meeting|background|focus)\b",
+    re.IGNORECASE,
+)
 _TRUTHY_ENV = {"1", "true", "yes", "y", "on"}
+_FALSY_ENV = {"0", "false", "no", "n", "off"}
 
 
 @cache
@@ -85,6 +107,34 @@ def _truthy_value(raw: str) -> bool:
 
 def _env_truthy(key: str) -> bool:
     return _truthy_value(os.getenv(key) or "")
+
+
+def _env_tristate_bool(key: str) -> bool | None:
+    raw = os.getenv(key)
+    if raw is None:
+        return None
+    text = str(raw).strip().lower()
+    if not text or text == "auto":
+        return None
+    if text in _TRUTHY_ENV:
+        return True
+    if text in _FALSY_ENV:
+        return False
+    # Invalid values are treated as "auto" for safety/forward compatibility.
+    return None
+
+
+def _state_dir_is_dev() -> bool:
+    raw = (os.getenv("ISPEC_STATE_DIR") or "").strip()
+    if not raw:
+        return False
+    try:
+        from pathlib import Path
+
+        path = Path(raw).expanduser().resolve()
+    except Exception:
+        return False
+    return path.name == ".pids"
 
 
 @cache
@@ -107,6 +157,37 @@ def _policy_tool_for_message(message: str) -> str | None:
     if _LIST_MY_PROJECTS_RE.search(message or ""):
         return "my_projects"
     return None
+
+
+def _hinted_tool_groups_for_message(*, message: str, focused_project_id: int | None) -> set[str]:
+    hinted: set[str] = set()
+    text = message or ""
+
+    if extract_project_ids(text):
+        hinted.add("projects")
+
+    if isinstance(focused_project_id, int) and focused_project_id > 0:
+        if _PROJECT_ROUTER_HINT_RE.search(text):
+            hinted.add("projects")
+        if _FILE_ROUTER_HINT_RE.search(text):
+            hinted.update({"projects", "files"})
+
+    return hinted
+
+
+def _project_specific_tool_choice(
+    *,
+    message: str,
+    openai_tool_names: set[str],
+) -> dict[str, Any] | None:
+    if "get_project" not in openai_tool_names:
+        return None
+    project_ids = extract_project_ids(message)
+    if len(project_ids) != 1:
+        return None
+    if not _PROJECT_DETAIL_REQUEST_RE.search(message or ""):
+        return None
+    return {"type": "function", "function": {"name": "get_project"}}
 
 
 def _truncate(value: str | None, limit: int = 400) -> str | None:
@@ -184,6 +265,27 @@ def _suggested_tool_from_text(text: str | None, *, candidates: set[str]) -> str 
     if len(found) == 1:
         return found[0]
     return None
+
+
+def _requested_tool_names_from_text(
+    text: str | None,
+    *,
+    candidates: set[str],
+    max_items: int = 5,
+) -> list[str]:
+    """Return tool names (from candidates) that appear verbatim in text."""
+
+    if not text or not candidates:
+        return []
+    found: list[str] = []
+    for name in sorted(candidates):
+        if not name:
+            continue
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text):
+            found.append(name)
+            if len(found) >= max(1, int(max_items)):
+                break
+    return found
 
 
 def utcnow() -> datetime:
@@ -293,19 +395,35 @@ def _is_truthy(value: str | None) -> bool:
 
 
 def _self_review_enabled() -> bool:
-    return _is_truthy(os.getenv("ISPEC_ASSISTANT_SELF_REVIEW"))
+    parsed = _env_tristate_bool("ISPEC_ASSISTANT_SELF_REVIEW")
+    if parsed is not None:
+        return bool(parsed)
+    # Auto-enable self-review in the dev `.pids` tmux workflow when using vLLM.
+    return _state_dir_is_dev() and _assistant_provider() == "vllm"
 
 
 def _self_review_decider_enabled() -> bool:
-    return _is_truthy(os.getenv("ISPEC_ASSISTANT_SELF_REVIEW_DECIDER"))
+    parsed = _env_tristate_bool("ISPEC_ASSISTANT_SELF_REVIEW_DECIDER")
+    if parsed is not None:
+        return bool(parsed)
+    # Auto-enable the decider only when self-review is enabled and we're using vLLM.
+    return _self_review_enabled() and _assistant_provider() == "vllm"
 
 
 def _compare_mode_enabled() -> bool:
-    return _is_truthy(os.getenv("ISPEC_ASSISTANT_COMPARE_MODE"))
+    parsed = _env_tristate_bool("ISPEC_ASSISTANT_COMPARE_MODE")
+    if parsed is not None:
+        return bool(parsed)
+    # Compare mode changes the UI response shape; keep it off by default.
+    return False
 
 
 def _compaction_enabled() -> bool:
-    return _is_truthy(os.getenv("ISPEC_ASSISTANT_COMPACTION_ENABLED") or "1")
+    parsed = _env_tristate_bool("ISPEC_ASSISTANT_COMPACTION_ENABLED")
+    if parsed is not None:
+        return bool(parsed)
+    # Default to enabled (it's only used for vLLM anyway).
+    return True
 
 
 def _compaction_keep_last() -> int:
@@ -316,6 +434,81 @@ def _compaction_keep_last() -> int:
 def _compaction_min_new_messages() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_COMPACTION_MIN_NEW_MESSAGES") or "").strip()
     return _parse_int_setting(raw, 8, 1)
+
+
+def _chat_queue_enabled() -> bool:
+    parsed = _env_tristate_bool("ISPEC_ASSISTANT_CHAT_QUEUE_ENABLED")
+    if parsed is not None:
+        return bool(parsed)
+    # Default to enabling queue-mode in the top-level dev Makefile (.pids) layout
+    # so the supervisor can pick up work quickly, while remaining off by default
+    # in production-style deployments.
+    return _state_dir_is_dev()
+
+
+def _chat_queue_wait_seconds() -> float:
+    raw = (os.getenv("ISPEC_ASSISTANT_CHAT_QUEUE_WAIT_SECONDS") or "").strip()
+    if not raw:
+        return 120.0
+    try:
+        return max(1.0, min(600.0, float(raw)))
+    except ValueError:
+        return 120.0
+
+
+def _chat_queue_poll_seconds() -> float:
+    raw = (os.getenv("ISPEC_ASSISTANT_CHAT_QUEUE_POLL_SECONDS") or "").strip()
+    if not raw:
+        return 0.5
+    try:
+        return max(0.1, min(5.0, float(raw)))
+    except ValueError:
+        return 0.5
+
+
+def _queue_force_inline(payload: ChatRequest) -> bool:
+    meta = payload.meta if isinstance(payload.meta, dict) else {}
+    return bool(meta.get("_queue_force_inline"))
+
+
+def _chat_queue_supervisor_max_age_seconds() -> float:
+    raw = (os.getenv("ISPEC_ASSISTANT_CHAT_QUEUE_SUPERVISOR_MAX_AGE_SECONDS") or "").strip()
+    if not raw:
+        return 60.0
+    try:
+        return max(1.0, min(3600.0, float(raw)))
+    except ValueError:
+        return 60.0
+
+
+def _as_utc_datetime(value: datetime | None) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    try:
+        return value.astimezone(UTC)
+    except Exception:
+        return value
+
+
+def _supervisor_heartbeat_ok(*, agent_db: Session) -> bool:
+    row = (
+        agent_db.query(AgentRun)
+        .filter(AgentRun.kind == "supervisor")
+        .order_by(AgentRun.updated_at.desc(), AgentRun.id.desc())
+        .first()
+    )
+    if row is None:
+        return False
+    status = str(getattr(row, "status", "") or "").strip().lower()
+    if status != "running":
+        return False
+    updated_at = _as_utc_datetime(getattr(row, "updated_at", None))
+    if updated_at is None:
+        return False
+    max_age = _chat_queue_supervisor_max_age_seconds()
+    return (utcnow() - updated_at).total_seconds() <= float(max_age)
 
 
 def _decide_if_dualchoice(*, payload: ChatRequest) -> bool:
@@ -649,6 +842,160 @@ def _enforce_session_access(session: SupportSession, user: AuthUser | None) -> N
         raise HTTPException(status_code=403, detail="Session belongs to another user.")
 
 
+def _enqueue_chat_turn_command(*, agent_db: Session, payload: ChatRequest, user: AuthUser | None) -> int:
+    queue_payload = {
+        "schema_version": 1,
+        "chat_request": payload.model_dump(mode="json"),
+        "user_id": int(user.id) if user is not None else None,
+        "enqueued_at": utcnow().isoformat(),
+        "source": "api_support_chat",
+    }
+    cmd = AgentCommand(
+        command_type=COMMAND_SUPPORT_CHAT_TURN,
+        status="queued",
+        priority=5,
+        payload_json=queue_payload,
+        result_json={},
+    )
+    agent_db.add(cmd)
+    agent_db.commit()
+    agent_db.refresh(cmd)
+    return int(cmd.id)
+
+
+def _poke_orchestrator_tick_now(
+    *,
+    agent_db: Session,
+    source: str,
+    session_id: str | None = None,
+    delay_seconds: float = 0.0,
+) -> int | None:
+    """Bring the next orchestrator tick forward so session reviews kick off quickly.
+
+    This is an event-driven "nudge": it does not change what the orchestrator decides,
+    it just makes sure it runs promptly after new assistant work lands.
+    """
+
+    now = utcnow()
+    try:
+        delay_seconds = float(delay_seconds)
+    except Exception:
+        delay_seconds = 0.0
+    delay_seconds = max(0.0, min(60.0, delay_seconds))
+    target_available_at = now + timedelta(seconds=delay_seconds)
+
+    # If a tick is already queued soon enough, leave it alone.
+    existing = (
+        agent_db.query(AgentCommand)
+        .filter(AgentCommand.command_type == COMMAND_ORCHESTRATOR_TICK)
+        .filter(AgentCommand.status == "queued")
+        .order_by(AgentCommand.available_at.asc(), AgentCommand.id.asc())
+        .first()
+    )
+    if existing is not None:
+        available_at = getattr(existing, "available_at", None)
+        if isinstance(available_at, datetime) and available_at <= target_available_at:
+            return int(existing.id)
+        existing.available_at = target_available_at
+        existing.updated_at = now
+        payload = dict(existing.payload_json or {})
+        payload["source"] = payload.get("source") or "api_poke"
+        payload["poke_source"] = str(source or "").strip() or "unknown"
+        payload["poked_at"] = now.isoformat()
+        if isinstance(session_id, str) and session_id.strip():
+            payload["session_id"] = session_id.strip()
+        existing.payload_json = payload
+        agent_db.commit()
+        return int(existing.id)
+
+    cmd_payload: dict[str, Any] = {
+        "source": "api_poke",
+        "poke_source": str(source or "").strip() or "unknown",
+        "poked_at": now.isoformat(),
+    }
+    if isinstance(session_id, str) and session_id.strip():
+        cmd_payload["session_id"] = session_id.strip()
+
+    cmd = AgentCommand(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        status="queued",
+        priority=-5,
+        payload_json=cmd_payload,
+        result_json={},
+    )
+    cmd.available_at = target_available_at
+    agent_db.add(cmd)
+    agent_db.commit()
+    agent_db.refresh(cmd)
+    return int(cmd.id)
+
+
+def _wait_for_queued_chat_response(
+    *,
+    agent_db: Session,
+    command_id: int,
+    wait_seconds: float,
+    poll_seconds: float,
+) -> ChatResponse:
+    deadline = time.monotonic() + max(1.0, float(wait_seconds))
+    while True:
+        # Start each poll in a fresh transaction so we can observe updates
+        # from the supervisor process.
+        agent_db.rollback()
+        row = agent_db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+        if row is None:
+            raise HTTPException(status_code=500, detail=f"Queued chat command {command_id} not found.")
+
+        status = str(row.status or "").strip().lower()
+        if status == "succeeded":
+            result_payload = row.result_json if isinstance(row.result_json, dict) else {}
+            response_payload = result_payload.get("chat_response")
+            if not isinstance(response_payload, dict):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Queued chat command {command_id} completed without chat_response payload.",
+                )
+            try:
+                return ChatResponse.model_validate(response_payload)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Queued chat command {command_id} returned invalid response: {type(exc).__name__}.",
+                ) from exc
+
+        if status == "failed":
+            error_text = str(row.error or "").strip() or "queued_chat_failed"
+            raise HTTPException(
+                status_code=500,
+                detail=f"Queued chat command {command_id} failed: {error_text}",
+            )
+
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Timed out waiting for queued chat command {command_id}.",
+            )
+        time.sleep(max(0.1, float(poll_seconds)))
+
+
+def _chat_via_queue(*, payload: ChatRequest, assistant_db: Session, agent_db: Session, user: AuthUser | None) -> ChatResponse:
+    existing = (
+        assistant_db.query(SupportSession)
+        .filter(SupportSession.session_id == payload.sessionId)
+        .first()
+    )
+    if existing is not None:
+        _enforce_session_access(existing, user)
+
+    command_id = _enqueue_chat_turn_command(agent_db=agent_db, payload=payload, user=user)
+    return _wait_for_queued_chat_response(
+        agent_db=agent_db,
+        command_id=command_id,
+        wait_seconds=_chat_queue_wait_seconds(),
+        poll_seconds=_chat_queue_poll_seconds(),
+    )
+
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(
     payload: ChatRequest,
@@ -660,6 +1007,21 @@ def chat(
     schedule_db: Session = Depends(get_schedule_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ):
+    if _chat_queue_enabled() and not _queue_force_inline(payload) and _supervisor_heartbeat_ok(agent_db=agent_db):
+        response = _chat_via_queue(payload=payload, assistant_db=assistant_db, agent_db=agent_db, user=user)
+        if response.messageId is not None:
+            # Queue mode: assistant message is committed by the supervisor, so we can poke immediately.
+            try:
+                _poke_orchestrator_tick_now(
+                    agent_db=agent_db,
+                    source="support_chat_queue",
+                    session_id=payload.sessionId,
+                    delay_seconds=0,
+                )
+            except Exception:
+                pass
+        return response
+
     api_schema: dict[str, Any] | None = None
     if request is not None:
         try:
@@ -684,6 +1046,12 @@ def chat(
 
     state = _load_state(getattr(session, "state_json", None))
     state, state_changed = update_state_from_message(state, payload.message)
+
+    if isinstance(state.get("conversation_memory"), dict):
+        normalized_memory = normalize_conversation_memory(state.get("conversation_memory"))
+        if normalized_memory != state.get("conversation_memory"):
+            state["conversation_memory"] = normalized_memory
+            state_changed = True
 
     ui_payload: dict[str, Any] | None = None
     ui_project_id: int | None = None
@@ -768,6 +1136,10 @@ def chat(
     tools_enabled_initial = tools_enabled
     tool_router: dict[str, Any] | None = None
     tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
+    known_tool_names = openai_tool_names_all() if tool_protocol == "openai" and tools_enabled else set()
+    requested_tool_names_known = (
+        _requested_tool_names_from_text(payload.message, candidates=known_tool_names) if known_tool_names else []
+    )
 
     confirmation_reply = _is_confirmation_reply(payload.message)
     compare_mode_enabled = _compare_mode_enabled()
@@ -783,31 +1155,82 @@ def chat(
         and not confirmation_reply
     ):
         available_tool_names = _openai_tool_names(tool_schemas)
-        groups = tool_groups_for_available_tools(available_tool_names)
-        decision, router_reply = route_tool_groups_vllm(
-            user_message=payload.message,
-            groups=groups,
-            generate_reply_fn=generate_reply,
+        requested_tool_names_available = _requested_tool_names_from_text(
+            payload.message, candidates=available_tool_names
         )
-        tool_router = {
-            "ok": bool(router_reply.ok),
-            "provider": router_reply.provider,
-            "model": router_reply.model,
-            "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
-            "decision": decision,
-        }
-        if router_reply.meta:
-            tool_router["provider_meta"] = router_reply.meta
-
-        if decision:
-            selected_tool_names = tool_names_for_groups(
-                groups=groups,
-                primary=str(decision["primary"]),
-                secondary=list(decision["secondary"]),
+        explicit_tool_request = bool(_EXPLICIT_TOOL_REQUEST_RE.search(payload.message or ""))
+        if explicit_tool_request and requested_tool_names_available:
+            selected_tool_names = set(requested_tool_names_available) | {
+                "assistant_prompt_header",
+                "assistant_list_tools",
+            }
+            filtered: list[dict[str, Any]] = []
+            for spec in tool_schemas:
+                func_obj = spec.get("function") if isinstance(spec, dict) else None
+                name = func_obj.get("name") if isinstance(func_obj, dict) else None
+                if isinstance(name, str) and name.strip() in selected_tool_names:
+                    filtered.append(spec)
+            if filtered:
+                tool_schemas = filtered
+            tool_router = {
+                "ok": True,
+                "skipped": True,
+                "reason": "explicit_tool_name_request",
+                "explicit_requested_tool_names": requested_tool_names_available,
+                "selected_tool_names": sorted(selected_tool_names),
+            }
+        else:
+            groups = tool_groups_for_available_tools(available_tool_names)
+            hinted_group_names = _hinted_tool_groups_for_message(
+                message=payload.message,
+                focused_project_id=focused_project_id,
             )
-            selected_tool_names |= {"assistant_prompt_header"}
-            if selected_tool_names:
-                filtered: list[dict[str, Any]] = []
+            decision, router_reply = route_tool_groups_vllm(
+                user_message=payload.message,
+                groups=groups,
+                generate_reply_fn=generate_reply,
+            )
+            tool_router = {
+                "ok": bool(router_reply.ok),
+                "provider": router_reply.provider,
+                "model": router_reply.model,
+                "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
+                "decision": decision,
+            }
+            if requested_tool_names_available:
+                tool_router["explicit_requested_tool_names"] = requested_tool_names_available
+            if router_reply.meta:
+                tool_router["provider_meta"] = router_reply.meta
+            if hinted_group_names:
+                tool_router["hinted_group_names"] = sorted(hinted_group_names)
+
+            grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
+            if decision:
+                selected_tool_names = tool_names_for_groups(
+                    groups=groups,
+                    primary=str(decision["primary"]),
+                    secondary=list(decision["secondary"]),
+                )
+                for group_name in hinted_group_names:
+                    selected_tool_names |= grouped_tool_names.get(group_name, set())
+                selected_tool_names |= {"assistant_prompt_header", "assistant_list_tools"}
+                if requested_tool_names_available:
+                    selected_tool_names |= set(requested_tool_names_available)
+                if selected_tool_names:
+                    filtered: list[dict[str, Any]] = []
+                    for spec in tool_schemas:
+                        func_obj = spec.get("function") if isinstance(spec, dict) else None
+                        name = func_obj.get("name") if isinstance(func_obj, dict) else None
+                        if isinstance(name, str) and name.strip() in selected_tool_names:
+                            filtered.append(spec)
+                    if filtered:
+                        tool_schemas = filtered
+                        tool_router["selected_tool_names"] = sorted(selected_tool_names)
+            elif hinted_group_names:
+                selected_tool_names = {"assistant_prompt_header", "assistant_list_tools"}
+                for group_name in hinted_group_names:
+                    selected_tool_names |= grouped_tool_names.get(group_name, set())
+                filtered = []
                 for spec in tool_schemas:
                     func_obj = spec.get("function") if isinstance(spec, dict) else None
                     name = func_obj.get("name") if isinstance(func_obj, dict) else None
@@ -829,6 +1252,29 @@ def chat(
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
     openai_tool_names = _openai_tool_names(tool_schemas)
     openai_no_arg_tool_names = _openai_no_arg_tool_names(tool_schemas)
+    requested_tool_names_provided = [
+        name for name in requested_tool_names_known if isinstance(name, str) and name.strip() in openai_tool_names
+    ]
+    missing_requested_tool_names = [
+        name for name in requested_tool_names_known if isinstance(name, str) and name.strip() not in openai_tool_names
+    ]
+    tool_availability_messages: list[dict[str, Any]] = []
+    if missing_requested_tool_names:
+        tool_availability_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "NOTE: The user requested tool(s) by name that are not available for this turn: "
+                    + ", ".join(missing_requested_tool_names)
+                    + ". Do not claim you called them or invent their outputs; explain that the tool is unavailable "
+                    "(permissions/config) and ask to enable it if needed."
+                ),
+            }
+        ]
+    if tool_router is not None and requested_tool_names_known:
+        tool_router["requested_tool_names"] = requested_tool_names_known
+        if missing_requested_tool_names:
+            tool_router["missing_requested_tool_names"] = missing_requested_tool_names
 
     compare_mode_requested = compare_mode_enabled and _decide_if_dualchoice(payload=payload)
     response_format = "compare" if compare_mode_requested else "single"
@@ -849,6 +1295,10 @@ def chat(
     # Iterate twice to account for summary growth impacting the budget.
     for _ in range(2):
         summary_up_to_id = _safe_int_from_state(state.get("conversation_summary_up_to_id")) or 0
+        memory_up_to_id = 0
+        if isinstance(state.get("conversation_memory"), dict) and state.get("conversation_memory"):
+            memory_up_to_id = _safe_int_from_state(state.get("conversation_memory_up_to_id")) or 0
+        history_cutoff_id = max(summary_up_to_id, memory_up_to_id)
 
         candidate_rows = (
             assistant_db.query(SupportMessage)
@@ -862,7 +1312,7 @@ def chat(
             row
             for row in candidate_rows
             if row.id != user_message.id
-            and row.id > summary_up_to_id
+            and row.id > history_cutoff_id
             and row.role in {"user", "assistant", "system"}
             and row.content
         ]
@@ -904,6 +1354,7 @@ def chat(
         base_messages = [
             {"role": "system", "content": prompt_for_budget},
             {"role": "system", "content": context_message},
+            *tool_availability_messages,
             {"role": "user", "content": payload.message},
         ]
         tokens = estimate_tokens_for_messages(base_messages)
@@ -968,6 +1419,32 @@ def chat(
         )
         if _assistant_requested_project_history_save(last_assistant_text):
             forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
+
+    # If the user explicitly asked for a specific tool by name (and it's available),
+    # force that tool instead of a generic "required" choice. If the user requested
+    # any missing tool names, do not force tool use (it would encourage irrelevant
+    # tool calls and hallucinated follow-ups).
+    if tool_protocol == "openai" and isinstance(forced_tool_choice, str) and forced_tool_choice == "required":
+        if missing_requested_tool_names:
+            forced_tool_choice = None
+        elif len(requested_tool_names_provided) == 1:
+            requested_name = requested_tool_names_provided[0]
+            # Some tool names overlap with common English words (e.g. "projects").
+            # Only force a specific tool choice when the user appears to have
+            # referenced a "tool-like" name (snake_case/prefixed), otherwise keep
+            # the generic "required" choice.
+            if "_" in requested_name or requested_name.startswith(("assistant_", "repo_")):
+                forced_tool_choice = {
+                    "type": "function",
+                    "function": {"name": requested_name},
+                }
+    if tool_protocol == "openai" and forced_tool_choice is None and not confirmation_reply:
+        project_tool_choice = _project_specific_tool_choice(
+            message=payload.message,
+            openai_tool_names=openai_tool_names,
+        )
+        if project_tool_choice is not None:
+            forced_tool_choice = project_tool_choice
     policy_tool_name = _policy_tool_for_message(payload.message)
     if policy_tool_name and policy_tool_name not in openai_no_arg_tool_names:
         policy_tool_name = None
@@ -987,7 +1464,9 @@ def chat(
                 tool_protocol=str(tool_protocol or ""),
                 compare_mode=bool(compare_mode_requested),
                 forced_tool_choice=forced_tool_choice is not None,
-                repo_tools_enabled=_env_truthy("ISPEC_ASSISTANT_ENABLE_REPO_TOOLS"),
+                # Reflect tools actually available for this turn (tool routing may
+                # restrict the schemas we pass to the model).
+                repo_tools_enabled=bool(any(name.startswith("repo_") for name in openai_tool_names)),
             )
         except Exception as exc:
             prompt_header_error = f"{type(exc).__name__}: {exc}"
@@ -1013,6 +1492,7 @@ def chat(
             {"role": "system", "content": system_prompt},
             *header_message,
             {"role": "system", "content": context_message},
+            *tool_availability_messages,
             {"role": "user", "content": payload.message},
             *tool_messages,
         ]
@@ -1031,6 +1511,7 @@ def chat(
             {"role": "system", "content": system_prompt},
             *header_message,
             {"role": "system", "content": context_message},
+            *tool_availability_messages,
             *trimmed_history,
             {"role": "user", "content": payload.message},
             *tool_messages,
@@ -1320,6 +1801,7 @@ def chat(
             messages=[
                 {"role": "system", "content": answer_prompt},
                 {"role": "system", "content": context_message},
+                *tool_availability_messages,
                 *history_payload,
                 {"role": "user", "content": payload.message},
                 *tool_messages,
@@ -1459,6 +1941,8 @@ def chat(
         "max_tool_calls": max_tool_calls,
         "used_tool_calls": used_tool_calls,
         "forced_tool_choice": forced_tool_choice,
+        "requested_tool_names": requested_tool_names_known,
+        "missing_requested_tool_names": missing_requested_tool_names,
     }
     if tool_router:
         meta["tool_router"] = tool_router
@@ -1581,6 +2065,18 @@ def chat(
         session.state_json = _dump_state(state)
         assistant_db.flush()
 
+    try:
+        # Inline chat: assistant message commits after the handler returns (FastAPI dependency),
+        # so add a tiny delay to avoid racing the supervisor snapshot.
+        _poke_orchestrator_tick_now(
+            agent_db=agent_db,
+            source="support_chat_inline",
+            session_id=session.session_id,
+            delay_seconds=1,
+        )
+    except Exception:
+        pass
+
     return ChatResponse(
         sessionId=session.session_id,
         messageId=int(assistant_message.id),
@@ -1696,6 +2192,16 @@ def choose(
     if enqueued:
         session.state_json = _dump_state(state)
         assistant_db.flush()
+
+    try:
+        _poke_orchestrator_tick_now(
+            agent_db=agent_db,
+            source="support_chat_choose",
+            session_id=session.session_id,
+            delay_seconds=1,
+        )
+    except Exception:
+        pass
 
     return ChooseResponse(
         sessionId=session.session_id,

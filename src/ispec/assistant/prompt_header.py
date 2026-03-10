@@ -8,6 +8,7 @@ from typing import Any
 from ispec.db.models import UserRole
 
 _TRUTHY = {"1", "true", "yes", "y", "on"}
+_FALSY = {"0", "false", "no", "n", "off"}
 
 PROMPT_HEADER_ENV = "ISPEC_ASSISTANT_ENABLE_PROMPT_HEADER"
 PROMPT_HEADER_LEGEND_VERSION = 1
@@ -16,7 +17,30 @@ PROMPT_HEADER_VERSION = 1
 
 def prompt_header_enabled() -> bool:
     raw = (os.getenv(PROMPT_HEADER_ENV) or "").strip()
-    return raw.lower() in _TRUTHY
+    if not raw:
+        # Auto-enable in the dev `.pids` workflow; default off elsewhere.
+        return _state_dir_is_dev()
+    lowered = raw.lower()
+    if lowered == "auto":
+        return _state_dir_is_dev()
+    if lowered in _TRUTHY:
+        return True
+    if lowered in _FALSY:
+        return False
+    return False
+
+
+def _state_dir_is_dev() -> bool:
+    raw = (os.getenv("ISPEC_STATE_DIR") or "").strip()
+    if not raw:
+        return False
+    try:
+        from pathlib import Path
+
+        path = Path(raw).expanduser().resolve()
+    except Exception:
+        return False
+    return path.name == ".pids"
 
 
 def _role_abbrev(role: Any | None) -> str:
@@ -186,4 +210,3 @@ def build_prompt_header(
         fields=fields,
         line=line,
     )
-

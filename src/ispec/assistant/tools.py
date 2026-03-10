@@ -23,6 +23,7 @@ from ispec.assistant.models import (
     SupportSessionReview,
 )
 from ispec.assistant.prompt_header import build_prompt_header, header_legend
+from ispec.agent.commands import COMMAND_DEV_RESTART_SERVICES
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.db.models import (
     AuthUser,
@@ -63,6 +64,8 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "billing_category_counts": ToolScope.staff,
     "db_file_stats": ToolScope.staff,
     "assistant_stats": ToolScope.staff,
+    "assistant_list_tools": ToolScope.staff,
+    "assistant_enqueue_dev_restart_services": ToolScope.admin,
     "assistant_recent_sessions": ToolScope.staff,
     "assistant_get_session_review": ToolScope.staff,
     "assistant_prompt_header": ToolScope.staff,
@@ -113,6 +116,7 @@ _WRITE_TOOL_NAMES: set[str] = {"create_project_comment"}
 
 _REPO_TOOLS_ENV = "ISPEC_ASSISTANT_ENABLE_REPO_TOOLS"
 _REPO_ROOT_ENV = "ISPEC_ASSISTANT_REPO_ROOT"
+_DEV_RESTART_ENABLED_ENV = "ISPEC_DEV_RESTART_ENABLED"
 _REPO_TOOL_DEFAULT_PATH = "iSPEC/src"
 _REPO_TOOL_DEFAULT_PATH_STANDALONE = "src"
 _REPO_MAX_FILE_BYTES = 250_000
@@ -137,14 +141,151 @@ _REPO_DENY_SUFFIXES = {
 }
 
 
+_TRUTHY = {"1", "true", "yes", "y", "on"}
+_FALSY = {"0", "false", "no", "n", "off"}
+
+
 def _is_truthy(value: str | None) -> bool:
     if value is None:
         return False
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return value.strip().lower() in _TRUTHY
+
+
+def _parse_env_tristate_bool(raw: str | None, *, key: str) -> tuple[bool | None, str | None]:
+    """Parse a tri-state boolean env var.
+
+    Returns (value, error):
+    - value=True/False when explicitly set
+    - value=None when unset/empty/"auto"
+    - error is non-null when the value is present but invalid
+    """
+
+    if raw is None:
+        return None, None
+    text = str(raw).strip()
+    if not text:
+        return None, None
+    lowered = text.lower()
+    if lowered == "auto":
+        return None, None
+    if lowered in _TRUTHY:
+        return True, None
+    if lowered in _FALSY:
+        return False, None
+    return None, f"Invalid value for {key}: {text!r} (expected 0/1/true/false or unset/auto)."
+
+
+def _state_dir_is_dev() -> bool:
+    raw = (os.getenv("ISPEC_STATE_DIR") or "").strip()
+    if not raw:
+        return False
+    try:
+        path = Path(raw).expanduser().resolve()
+    except Exception:
+        return False
+    return path.name == ".pids"
+
+
+def _dev_restart_auto_enabled(*, tmux_session: str | None = None, make_root: str | None = None) -> tuple[bool, str | None]:
+    """Return (enabled, reason) for dev restart tool auto-detection."""
+
+    if shutil.which("tmux") is None:
+        return False, "tmux is not installed."
+
+    try:
+        from ispec.cli import dev as dev_cli
+    except Exception as exc:
+        return False, f"Failed importing ispec.cli.dev ({type(exc).__name__})."
+
+    make_root_path: Path | None = None
+    if make_root:
+        try:
+            make_root_path = Path(make_root).expanduser().resolve()
+        except Exception:
+            make_root_path = None
+    if make_root_path is None:
+        make_root_path = dev_cli._find_make_root(start=Path(__file__).resolve().parent)  # type: ignore[attr-defined]
+    if make_root_path is None:
+        return False, "Top-level Makefile not found (run from within the ispec-full repo or pass make_root)."
+
+    # Heuristic: enable in dev when either the tmux session exists or the state
+    # dir looks like the dev `.pids` layout exported by the top-level Makefile.
+    state_dir = (os.getenv("ISPEC_STATE_DIR") or "").strip()
+    state_dir_path: Path | None = None
+    if state_dir:
+        try:
+            state_dir_path = Path(state_dir).expanduser().resolve()
+        except Exception:
+            state_dir_path = None
+    state_dir_is_dev = bool(
+        state_dir_path is not None
+        and (state_dir_path.name == ".pids" or state_dir_path == (make_root_path / ".pids").resolve())
+    )
+
+    session = dev_cli._tmux_session_name(tmux_session)  # type: ignore[attr-defined]
+    tmux_session_exists = dev_cli._tmux_has_session(session)  # type: ignore[attr-defined]
+
+    if not state_dir_is_dev and not tmux_session_exists:
+        return (
+            False,
+            "Auto-detect did not find a dev tmux session (set DEV_TMUX_SESSION) and ISPEC_STATE_DIR is not .pids.",
+        )
+
+    return True, None
+
+
+def _dev_restart_enabled_status(*, tmux_session: str | None = None, make_root: str | None = None) -> tuple[bool, str | None]:
+    """Return (enabled, reason) for dev restart tools.
+
+    ISPEC_DEV_RESTART_ENABLED tri-state:
+    - unset/empty/"auto": auto-detect availability
+    - 0/false: disabled
+    - 1/true: enabled
+    """
+
+    raw = os.getenv(_DEV_RESTART_ENABLED_ENV)
+    parsed, err = _parse_env_tristate_bool(raw, key=_DEV_RESTART_ENABLED_ENV)
+    if err:
+        return False, err
+    if parsed is True:
+        return True, None
+    if parsed is False:
+        return False, f"{_DEV_RESTART_ENABLED_ENV}=0 (forced off)."
+    return _dev_restart_auto_enabled(tmux_session=tmux_session, make_root=make_root)
+
+
+def _repo_tools_auto_enabled() -> tuple[bool, str | None]:
+    repo_root = _assistant_repo_root()
+    if repo_root is None:
+        return False, f"Repo root not found (set {_REPO_ROOT_ENV}=...)."
+    if not _state_dir_is_dev():
+        return False, "Auto-disabled outside dev (.pids) environment."
+    return True, None
+
+
+def _repo_tools_enabled_status() -> tuple[bool, str | None]:
+    """Return (enabled, reason) for repo tools.
+
+    ISPEC_ASSISTANT_ENABLE_REPO_TOOLS tri-state:
+    - unset/empty/"auto": auto-detect in dev (.pids) environments
+    - 0/false: disabled
+    - 1/true: enabled
+    """
+
+    raw = os.getenv(_REPO_TOOLS_ENV)
+    parsed, err = _parse_env_tristate_bool(raw, key=_REPO_TOOLS_ENV)
+    if err:
+        return False, err
+    if parsed is True:
+        return True, None
+    if parsed is False:
+        return False, f"{_REPO_TOOLS_ENV}=0 (forced off)."
+    return _repo_tools_auto_enabled()
 
 
 def _repo_tools_enabled() -> bool:
-    return _is_truthy(os.getenv(_REPO_TOOLS_ENV))
+    enabled, _ = _repo_tools_enabled_status()
+    return enabled
 
 
 def _assistant_repo_root() -> Path | None:
@@ -484,14 +625,12 @@ def _scope_error(scope: ToolScope, user: AuthUser | None) -> str | None:
         return None
     if scope == ToolScope.user:
         return None
-    if scope == ToolScope.staff:
-        if user.role in {UserRole.viewer, UserRole.editor, UserRole.admin}:
-            return None
+    # For now we treat all internal/staff roles as equivalent. The only
+    # restricted role is "client" (external user).
+    if user.role == UserRole.client:
         return "Staff access required."
-    if scope == ToolScope.admin:
-        if user.role == UserRole.admin:
-            return None
-        return "Admin access required."
+    if scope in {ToolScope.staff, ToolScope.admin}:
+        return None
     return "Access denied."
 
 
@@ -506,6 +645,9 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     if tool_names:
         allowed = {name.strip() for name in tool_names if isinstance(name, str) and name.strip()}
 
+    repo_enabled = _repo_tools_enabled()
+    dev_restart_enabled, _ = _dev_restart_enabled_status()
+
     lines = [
         "Available tools:",
         "- (Most tools are read-only; create_project_comment writes project history.)",
@@ -514,7 +656,9 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     def add(tool_name: str, line: str) -> None:
         if allowed is not None and tool_name not in allowed:
             return
-        if tool_name.startswith("repo_") and not _repo_tools_enabled():
+        if tool_name.startswith("repo_") and not repo_enabled:
+            return
+        if tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
             return
         lines.append(line)
 
@@ -523,6 +667,14 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add("billing_category_counts", "- billing_category_counts(current_only: bool = false, limit: int = 20)")
     add("db_file_stats", "- db_file_stats()  # show sqlite DB file sizes")
     add("assistant_stats", "- assistant_stats()  # assistant DB stats and review backlog")
+    add(
+        "assistant_list_tools",
+        "- assistant_list_tools(query: str | None = None, include_unavailable: bool = false, limit: int = 30)  # tool catalog (meta)",
+    )
+    add(
+        "assistant_enqueue_dev_restart_services",
+        "- assistant_enqueue_dev_restart_services(services: list[str] | None = None, tmux_session: str | None = None, make_root: str | None = None, delay_seconds: int = 0, priority: int = 50, reason: str | None = None, confirm: bool)  # internal-only (dev) restarts services",
+    )
     add("assistant_recent_sessions", "- assistant_recent_sessions(limit: int = 10)")
     add("assistant_get_session_review", "- assistant_get_session_review(session_id: str)")
     add(
@@ -531,41 +683,41 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     )
     add(
         "assistant_search_messages",
-        "- assistant_search_messages(query: str, limit: int = 20, role: str | None = None, session_id: str | None = None, user_id: int | None = None)  # admin-only",
+        "- assistant_search_messages(query: str, limit: int = 20, role: str | None = None, session_id: str | None = None, user_id: int | None = None)  # internal-only",
     )
     add(
         "assistant_get_message_context",
-        "- assistant_get_message_context(message_id: int, before: int = 3, after: int = 3, max_chars: int = 800)  # admin-only",
+        "- assistant_get_message_context(message_id: int, before: int = 3, after: int = 3, max_chars: int = 800)  # internal-only",
     )
     add(
         "assistant_list_digests",
-        "- assistant_list_digests(limit: int = 10, key: str | None = 'global', user_id: int | None = None)  # admin-only",
+        "- assistant_list_digests(limit: int = 10, key: str | None = 'global', user_id: int | None = None)  # internal-only",
     )
-    add("assistant_get_digest", "- assistant_get_digest(digest_id: int)  # admin-only")
+    add("assistant_get_digest", "- assistant_get_digest(digest_id: int)  # internal-only")
     add(
         "assistant_search_digests",
-        "- assistant_search_digests(query: str, limit: int = 20, key: str | None = None, user_id: int | None = None)  # admin-only",
+        "- assistant_search_digests(query: str, limit: int = 20, key: str | None = None, user_id: int | None = None)  # internal-only",
     )
     add(
         "assistant_search_internal_logs",
-        "- assistant_search_internal_logs(query: str, limit: int = 20)  # admin-only; searches agent runs/steps/commands/events",
+        "- assistant_search_internal_logs(query: str, limit: int = 20)  # internal-only; searches agent runs/steps/commands/events",
     )
     add(
         "assistant_recent_agent_commands",
-        "- assistant_recent_agent_commands(limit: int = 20, statuses: list[str] | None = None, command_types: list[str] | None = None, after_id: int | None = None)  # admin-only",
+        "- assistant_recent_agent_commands(limit: int = 20, statuses: list[str] | None = None, command_types: list[str] | None = None, after_id: int | None = None)  # internal-only",
     )
     add(
         "assistant_recent_agent_steps",
-        "- assistant_recent_agent_steps(limit: int = 20, kinds: list[str] | None = None, run_id: str | None = None, ok: bool | None = None, after_id: int | None = None)  # admin-only",
+        "- assistant_recent_agent_steps(limit: int = 20, kinds: list[str] | None = None, run_id: str | None = None, ok: bool | None = None, after_id: int | None = None)  # internal-only",
     )
     add(
         "assistant_recent_session_reviews",
-        "- assistant_recent_session_reviews(limit: int = 20, session_id: str | None = None, user_id: int | None = None, after_id: int | None = None)  # admin-only",
+        "- assistant_recent_session_reviews(limit: int = 20, session_id: str | None = None, user_id: int | None = None, after_id: int | None = None)  # internal-only",
     )
-    add("assistant_get_agent_step", "- assistant_get_agent_step(step_id: int)  # admin-only")
-    add("assistant_get_agent_command", "- assistant_get_agent_command(command_id: int)  # admin-only")
-    add("assistant_get_agent_run", "- assistant_get_agent_run(run_id: str)  # admin-only")
-    add("assistant_list_users", "- assistant_list_users(limit: int = 50, include_anonymous: bool = true)  # admin-only")
+    add("assistant_get_agent_step", "- assistant_get_agent_step(step_id: int)  # internal-only")
+    add("assistant_get_agent_command", "- assistant_get_agent_command(command_id: int)  # internal-only")
+    add("assistant_get_agent_run", "- assistant_get_agent_run(run_id: str)  # internal-only")
+    add("assistant_list_users", "- assistant_list_users(limit: int = 50, include_anonymous: bool = true)  # internal-only")
     add("count_all_projects", "- count_all_projects()  # total projects across all statuses/flags")
     add("count_current_projects", "- count_current_projects()  # current projects only")
     add("project_status_counts", "- project_status_counts(current_only: bool = false)")
@@ -613,9 +765,9 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     )
     add(
         "list_schedule_requests",
-        "- list_schedule_requests(limit: int = 20, status: str | None = None)  # admin-only",
+        "- list_schedule_requests(limit: int = 20, status: str | None = None)  # internal-only",
     )
-    add("get_schedule_request", "- get_schedule_request(id: int)  # admin-only")
+    add("get_schedule_request", "- get_schedule_request(id: int)  # internal-only")
 
     return "\n".join(lines) + "\n"
 
@@ -648,6 +800,170 @@ def _clamp_int(value: int | None, *, default: int, min_value: int, max_value: in
     if value is None:
         return default
     return max(min_value, min(max_value, value))
+
+
+def _assistant_list_tools_payload(
+    *,
+    query: str | None,
+    limit: int,
+    include_unavailable: bool,
+    user: AuthUser | None,
+) -> dict[str, Any]:
+    """Return a compact catalog of tools and their availability for this user.
+
+    This is intentionally small + deterministic: it's meant to help the agent
+    discover what it can do without relying on users knowing tool names.
+    """
+
+    query_clean = str(query or "").strip()
+    query_tokens = [tok for tok in re.findall(r"[a-z0-9]+", query_clean.lower()) if tok] if query_clean else []
+
+    # Don't leak internal-only tool names to client roles if this ever becomes
+    # user-facing. Today this is primarily for internal/staff use.
+    role = getattr(user, "role", None)
+    include_unavailable_effective = bool(include_unavailable) and (
+        user is None or role in {UserRole.viewer, UserRole.editor, UserRole.admin}
+    )
+
+    repo_enabled, repo_reason = _repo_tools_enabled_status()
+    dev_restart_enabled, dev_restart_reason = _dev_restart_enabled_status()
+
+    items: list[dict[str, Any]] = []
+    available_total = 0
+    unavailable_total = 0
+    matched_total = 0
+    matched_unavailable_total = 0
+
+    for tool_name, spec in sorted(_OPENAI_TOOL_SPECS.items(), key=lambda pair: str(pair[0])):
+        func_obj = spec.get("function") if isinstance(spec, dict) else None
+        desc = ""
+        params: dict[str, Any] = {}
+        if isinstance(func_obj, dict):
+            desc = str(func_obj.get("description") or "").strip()
+            params_obj = func_obj.get("parameters")
+            if isinstance(params_obj, dict):
+                params = params_obj
+
+        scope = _TOOL_SCOPES.get(tool_name, ToolScope.staff)
+        scope_err = _scope_error(scope, user)
+
+        unavailable_reason: str | None = None
+        if tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
+            unavailable_reason = (
+                f"Dev restart tools are unavailable ({dev_restart_reason or 'disabled'})."
+            )
+        elif tool_name.startswith("repo_") and not repo_enabled:
+            unavailable_reason = (
+                f"Repo tools are unavailable ({repo_reason or 'disabled'})."
+            )
+        elif tool_name in _WRITE_TOOL_NAMES:
+            if user is None:
+                unavailable_reason = "Authentication required for write tools."
+            elif role == UserRole.client and tool_name != "create_project_comment":
+                unavailable_reason = "Write access required."
+
+        if unavailable_reason is None and scope_err:
+            unavailable_reason = str(scope_err)
+
+        available = unavailable_reason is None
+        if available:
+            available_total += 1
+        else:
+            unavailable_total += 1
+
+        haystack = f"{tool_name} {desc}".lower()
+        score = 0
+        if query_tokens:
+            if query_clean.lower() in haystack:
+                score += 10
+            for tok in query_tokens:
+                if tok in haystack:
+                    score += 1
+        else:
+            score = 1
+
+        if query_tokens and score <= 0:
+            continue
+
+        matched_total += 1
+        if not available:
+            matched_unavailable_total += 1
+
+        prop_obj = params.get("properties")
+        prop_names: list[str] = sorted(prop_obj.keys()) if isinstance(prop_obj, dict) else []
+        required_obj = params.get("required")
+        required_names = [x for x in required_obj if isinstance(x, str) and x.strip()] if isinstance(required_obj, list) else []
+
+        item = {
+            "name": tool_name,
+            "description": desc,
+            "scope": str(scope.value),
+            "writes": bool(tool_name in _WRITE_TOOL_NAMES),
+            "available": bool(available),
+            "params": prop_names,
+            "required": required_names,
+            "score": int(score),
+        }
+        if unavailable_reason is not None and include_unavailable_effective:
+            item["unavailable_reason"] = unavailable_reason
+
+        items.append(item)
+
+    # If we're not allowed to expose unavailable tools, filter them out here
+    # but still return counts so the agent can explain the limitation.
+    if not include_unavailable_effective:
+        items = [item for item in items if bool(item.get("available"))]
+
+    available_tools = [item for item in items if bool(item.get("available"))]
+    unavailable_tools = [item for item in items if not bool(item.get("available"))]
+
+    # Rank within each list by match score, then name. We keep the limit per-list
+    # so include_unavailable doesn't "starve" unavailable results behind many
+    # available tools.
+    available_tools.sort(
+        key=lambda item: (
+            -int(item.get("score") or 0),
+            str(item.get("name") or ""),
+        )
+    )
+    unavailable_tools.sort(
+        key=lambda item: (
+            -int(item.get("score") or 0),
+            str(item.get("name") or ""),
+        )
+    )
+
+    if len(available_tools) > int(limit):
+        available_tools = available_tools[: int(limit)]
+    if include_unavailable_effective and len(unavailable_tools) > int(limit):
+        unavailable_tools = unavailable_tools[: int(limit)]
+    if not include_unavailable_effective:
+        unavailable_tools = []
+
+    # Hide internal ranking from the model by default; keep it only for debugging.
+    for item in available_tools:
+        item.pop("score", None)
+    for item in unavailable_tools:
+        item.pop("score", None)
+
+    result: dict[str, Any] = {
+        "query": query_clean or None,
+        "limit": int(limit),
+        "include_unavailable": bool(include_unavailable_effective),
+        "counts": {
+            "total": int(len(_OPENAI_TOOL_SPECS)),
+            "available_total": int(available_total),
+            "unavailable_total": int(unavailable_total),
+            "matched_total": int(matched_total),
+            "matched_unavailable_total": int(matched_unavailable_total),
+            "returned_total": int(len(available_tools) + len(unavailable_tools)),
+        },
+        "available_tools": available_tools,
+    }
+    if include_unavailable_effective:
+        result["unavailable_tools"] = unavailable_tools
+
+    return result
 
 
 def _snippet_for_query(text: str | None, query: str, *, window: int = 80, max_len: int = 320) -> str:
@@ -711,8 +1027,8 @@ def _range_bounds_local(start: date, end: date) -> tuple[datetime, datetime]:
 def _require_admin(user: AuthUser | None) -> str | None:
     if user is None:
         return "Not authenticated."
-    if user.role != UserRole.admin:
-        return "Admin access required."
+    if user.role == UserRole.client:
+        return "Staff access required."
     return None
 
 
@@ -1037,6 +1353,26 @@ def run_tool(
                 max_lines=max_lines,
             )
 
+        if name == "assistant_list_tools":
+            query = _safe_str(args.get("query"), max_len=256)
+            include_unavailable = bool(args.get("include_unavailable") or False)
+            limit = _clamp_int(
+                _safe_int(args.get("limit")),
+                default=30,
+                min_value=1,
+                max_value=200,
+            )
+            return {
+                "ok": True,
+                "tool": name,
+                "result": _assistant_list_tools_payload(
+                    query=query,
+                    limit=int(limit),
+                    include_unavailable=bool(include_unavailable),
+                    user=user,
+                ),
+            }
+
         if name == "project_counts_snapshot":
             max_categories = _clamp_int(
                 _safe_int(args.get("max_categories")),
@@ -1146,8 +1482,6 @@ def run_tool(
         if name == "create_project_comment":
             if user is None:
                 return {"ok": False, "tool": name, "error": "Not authenticated."}
-            if user.role == UserRole.viewer and not bool(getattr(user, "can_write_project_comments", False)):
-                return {"ok": False, "tool": name, "error": "Write access required."}
 
             is_client_user = user.role == UserRole.client
 
@@ -1677,6 +2011,116 @@ def run_tool(
                     }
                     if last_run is not None
                     else None,
+                },
+            }
+
+        if name == "assistant_enqueue_dev_restart_services":
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
+
+            if args.get("confirm") is not True:
+                return {"ok": False, "tool": name, "error": "confirm=true is required to enqueue a restart."}
+
+            tmux_session = _safe_str(args.get("tmux_session"), max_len=64)
+            make_root = _safe_str(args.get("make_root"), max_len=512)
+            dev_restart_enabled, dev_restart_reason = _dev_restart_enabled_status(
+                tmux_session=tmux_session,
+                make_root=make_root,
+            )
+            if not dev_restart_enabled:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "Dev restart tools are unavailable.",
+                    "hint": dev_restart_reason or None,
+                }
+
+            services_raw = args.get("services")
+            services: list[str] = []
+            if isinstance(services_raw, str):
+                tokens = [tok.strip() for tok in re.split(r"[\\s,]+", services_raw.strip()) if tok.strip()]
+                services = [tok.lower() for tok in tokens if tok]
+            elif isinstance(services_raw, list):
+                services = [str(item).strip().lower() for item in services_raw if str(item).strip()]
+
+            # Default behavior mirrors make dev-restart (backend + supervisor).
+            if not services:
+                services = ["backend", "supervisor"]
+
+            normalized: list[str] = []
+            seen: set[str] = set()
+            for svc in services:
+                if svc in {"api"}:
+                    svc = "backend"
+                if svc not in seen:
+                    normalized.append(svc)
+                    seen.add(svc)
+
+            allowed_services = {"backend", "supervisor", "frontend", "vllm", "slack"}
+            unknown = sorted({svc for svc in normalized if svc not in allowed_services})
+            if unknown:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": f"Unknown services: {unknown}. Allowed: {sorted(allowed_services)}",
+                }
+
+            reason = _safe_str(args.get("reason"), max_len=240)
+
+            delay_seconds = _safe_int(args.get("delay_seconds")) or 0
+            delay_seconds = max(0, min(3600, int(delay_seconds)))
+
+            priority = _safe_int(args.get("priority"))
+            priority_int = int(priority) if priority is not None else 50
+            priority_int = max(0, min(1000, int(priority_int)))
+
+            now = datetime.now(UTC_TZ)
+            available_at = now + timedelta(seconds=delay_seconds) if delay_seconds > 0 else now
+
+            command_payload: dict[str, Any] = {
+                "confirm": True,
+                "services": normalized,
+            }
+            if tmux_session:
+                command_payload["tmux_session"] = tmux_session
+            if make_root:
+                command_payload["make_root"] = make_root
+            if reason:
+                command_payload["reason"] = reason
+
+            if user is not None:
+                command_payload["requested_by"] = {
+                    "user_id": int(getattr(user, "id", 0) or 0),
+                    "username": getattr(user, "username", None),
+                    "role": str(getattr(user, "role", "")),
+                }
+            if isinstance(user_message, str) and user_message.strip():
+                command_payload["requested_via_message"] = user_message.strip()[:240]
+
+            cmd = AgentCommand(
+                command_type=COMMAND_DEV_RESTART_SERVICES,
+                status="queued",
+                priority=int(priority_int),
+                available_at=available_at,
+                attempts=0,
+                max_attempts=1,
+                payload_json=command_payload,
+                result_json={},
+            )
+            agent_db.add(cmd)
+            agent_db.commit()
+            agent_db.refresh(cmd)
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "queued": True,
+                    "command_id": int(cmd.id),
+                    "command_type": COMMAND_DEV_RESTART_SERVICES,
+                    "services": normalized,
+                    "available_at": available_at.isoformat(),
+                    "priority": int(priority_int),
                 },
             }
 
@@ -3308,7 +3752,11 @@ def run_tool(
             project = core_db.get(Project, project_id)
             if project is None:
                 return {"ok": False, "tool": name, "error": f"Project {project_id} not found."}
-            return {"ok": True, "tool": name, "result": project_summary(core_db, project)}
+            return {
+                "ok": True,
+                "tool": name,
+                "result": project_summary(core_db, project, include_details=True),
+            }
 
         if name == "search_projects":
             query = _safe_str(args.get("query"), max_len=200)
@@ -3830,6 +4278,67 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "name": "assistant_stats",
             "description": "Return internal assistant/support-session stats (sessions, messages, memory, review queue).",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    "assistant_list_tools": {
+        "type": "function",
+        "function": {
+            "name": "assistant_list_tools",
+            "description": "Meta: list/search tool availability for the current user (and optionally show unavailable tools with reasons).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Optional search query for tool name/description."},
+                    "include_unavailable": {
+                        "type": "boolean",
+                        "description": "If true, include tools that exist but are not currently available (e.g. permissions/config).",
+                    },
+                    "limit": {"type": "integer", "description": "Max tools to return (default 30)."},
+                },
+            },
+        },
+    },
+    "assistant_enqueue_dev_restart_services": {
+        "type": "function",
+        "function": {
+            "name": "assistant_enqueue_dev_restart_services",
+            "description": (
+                "Internal-only (dev): enqueue a tmux/make restart of local services "
+                "(backend/supervisor/frontend/vllm/slack). Requires confirm=true. "
+                "Controlled by ISPEC_DEV_RESTART_ENABLED (unset/auto=auto-detect, 0=off, 1=on)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "services": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Services to restart. Options: backend, supervisor, frontend, vllm, slack. Default: backend+supervisor.",
+                    },
+                    "tmux_session": {
+                        "type": "string",
+                        "description": "tmux session name (default: $DEV_TMUX_SESSION or ispecfull).",
+                    },
+                    "make_root": {
+                        "type": "string",
+                        "description": "Path to the directory containing the top-level Makefile (auto-detected if omitted).",
+                    },
+                    "delay_seconds": {
+                        "type": "integer",
+                        "description": "Optional delay before the queued command becomes runnable (default: 0).",
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "description": "Agent command priority (default: 50).",
+                    },
+                    "reason": {"type": "string", "description": "Short reason to store in the command payload."},
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to enqueue a restart (safety latch).",
+                    },
+                },
+                "required": ["confirm"],
+            },
         },
     },
     "assistant_recent_sessions": {
@@ -4471,7 +4980,7 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "list_schedule_requests",
-            "description": "Admin-only: list schedule requests.",
+            "description": "Internal-only: list schedule requests.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -4488,7 +4997,7 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "get_schedule_request",
-            "description": "Admin-only: fetch a schedule request by id.",
+            "description": "Internal-only: fetch a schedule request by id.",
             "parameters": {
                 "type": "object",
                 "properties": {"id": {"type": "integer", "description": "Request id."}},
@@ -4504,23 +5013,27 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
 
     tools: list[dict[str, Any]] = []
     repo_enabled = _repo_tools_enabled()
+    dev_restart_enabled, _ = _dev_restart_enabled_status()
     for name, spec in _OPENAI_TOOL_SPECS.items():
+        if name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
+            continue
         if name.startswith("repo_") and not repo_enabled:
             continue
         if name in _WRITE_TOOL_NAMES:
             if user is None:
                 continue
-            if user.role == UserRole.viewer:
-                if name != "create_project_comment" or not bool(
-                    getattr(user, "can_write_project_comments", False)
-                ):
-                    continue
             if user.role == UserRole.client and name != "create_project_comment":
                 continue
         scope = _TOOL_SCOPES.get(name, ToolScope.staff)
         if _scope_error(scope, user) is None:
             tools.append(spec)
     return tools
+
+
+def openai_tool_names_all() -> set[str]:
+    """Return all OpenAI tool names (including internal-only tools)."""
+
+    return {name for name in _OPENAI_TOOL_SPECS.keys() if isinstance(name, str) and name.strip()}
 
 
 _OPENAPI_METHODS = {

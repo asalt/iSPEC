@@ -95,3 +95,29 @@ def test_my_projects_allows_api_key_mode_user_none(db_session):
     assert payload["ok"] is True
     assert payload["result"]["count"] == 2
     assert any(p.get("to_be_billed") is True for p in payload["result"]["projects"])
+
+
+def test_get_project_includes_detail_fields(db_session):
+    project = Project(
+        prj_AddedBy="test",
+        prj_ProjectTitle="Detailed Tool Project",
+        prj_ProjectQuestions="What is the main biology question?",
+        prj_ProjectBackground="A focused background block for the project.",
+    )
+    db_session.add(project)
+    db_session.commit()
+    db_session.refresh(project)
+
+    payload = run_tool(
+        name="get_project",
+        args={"id": int(project.id)},
+        core_db=db_session,
+        schedule_db=None,
+        user=None,
+        api_schema=None,
+    )
+
+    assert payload["ok"] is True
+    assert payload["result"]["title"] == "Detailed Tool Project"
+    assert payload["result"]["question"] == "What is the main biology question?"
+    assert "focused background" in payload["result"]["background"]

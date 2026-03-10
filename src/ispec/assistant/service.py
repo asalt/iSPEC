@@ -223,9 +223,14 @@ def _system_prompt_planner(
         tool_use_lines.append(
             "- For code searches in the iSPEC repo (dev-only), use repo_search/repo_list_files/repo_read_file."
         )
+    if has("assistant_list_tools"):
+        tool_use_lines.append(
+            "- If you're unsure which tool can solve a request, call assistant_list_tools(query=...)."
+        )
     tool_use_lines.extend(
         [
             "- If the user explicitly asks you to use a tool, call the appropriate tool.",
+            "- If the user requests a specific tool by name but it is not listed under Available tools, say you cannot call it (unavailable/permissions/config) and ask to enable it. Do not substitute a different tool silently.",
             "- Do not tell the user to run CLI commands or use the web app to run tools; you can call tools directly.",
             "- When answering from a TOOL_RESULT, restate the scope (e.g. total vs current). Do not call a subset count 'total'.",
         ]

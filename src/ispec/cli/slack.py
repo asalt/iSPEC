@@ -112,6 +112,72 @@ def _headers(api_key: str) -> dict[str, str]:
     return headers
 
 
+def _normalize_slack_speaker(value: str | None) -> str:
+    text = str(value or "").replace("\n", " ").replace("\r", " ").strip()
+    if not text:
+        return ""
+    return text[:64]
+
+
+def _slack_user_summary(
+    *,
+    client: Any,
+    user_cache: dict[str, dict[str, str]],
+    user_id: str,
+) -> dict[str, str]:
+    user_id = (user_id or "").strip()
+    if not user_id:
+        return {}
+
+    cached = user_cache.get(user_id)
+    if isinstance(cached, dict) and cached:
+        return cached
+
+    summary: dict[str, str] = {"user_id": user_id}
+    try:
+        info = client.users_info(user=user_id)
+        user_obj = info.get("user") if isinstance(info, dict) else None
+        if isinstance(user_obj, dict):
+            name = str(user_obj.get("name") or "").strip()
+            if name:
+                summary["user_name"] = name
+
+            profile = user_obj.get("profile") if isinstance(user_obj.get("profile"), dict) else {}
+            display = (
+                str(profile.get("display_name") or "").strip()
+                or str(profile.get("display_name_normalized") or "").strip()
+            )
+            real_name = (
+                str(profile.get("real_name") or "").strip()
+                or str(profile.get("real_name_normalized") or "").strip()
+                or str(user_obj.get("real_name") or "").strip()
+            )
+            if display:
+                summary["user_display_name"] = display
+            if real_name:
+                summary["user_real_name"] = real_name
+    except Exception:
+        pass
+
+    user_cache[user_id] = summary
+    return summary
+
+
+def _slack_speaker_label(summary: dict[str, str] | None) -> str:
+    if not isinstance(summary, dict):
+        return ""
+    return _normalize_slack_speaker(
+        str(summary.get("user_display_name") or "").strip()
+        or str(summary.get("user_real_name") or "").strip()
+        or str(summary.get("user_name") or "").strip()
+    )
+
+
+def _format_message_for_ispec(*, text: str, slack_user: dict[str, str] | None) -> str:
+    speaker = _slack_speaker_label(slack_user)
+    return f"[{speaker}] {text}" if speaker else text
+
+
 def _post_ispec_chat(
     *,
     server: str,
@@ -310,42 +376,8 @@ def _run_socket_mode(args) -> None:
 
         slack_user_id = str(event.get("user") or "").strip()
 
-        def _slack_user_summary(user_id: str) -> dict[str, str]:
-            user_id = (user_id or "").strip()
-            if not user_id:
-                return {}
-            cached = user_cache.get(user_id)
-            if isinstance(cached, dict) and cached:
-                return cached
-            summary: dict[str, str] = {"user_id": user_id}
-            try:
-                info = client.users_info(user=user_id)
-                user_obj = info.get("user") if isinstance(info, dict) else None
-                if isinstance(user_obj, dict):
-                    name = str(user_obj.get("name") or "").strip()
-                    if name:
-                        summary["user_name"] = name
-                    profile = user_obj.get("profile") if isinstance(user_obj.get("profile"), dict) else {}
-                    display = str(profile.get("display_name") or "").strip()
-                    if not display:
-                        display = str(profile.get("real_name") or "").strip()
-                    if display:
-                        summary["user_display_name"] = display
-            except Exception:
-                pass
-            user_cache[user_id] = summary
-            return summary
-
-        slack_user = _slack_user_summary(slack_user_id)
-        speaker = (
-            str(slack_user.get("user_display_name") or "").strip()
-            or str(slack_user.get("user_name") or "").strip()
-            or slack_user_id
-        )
-        speaker = speaker.replace("\n", " ").replace("\r", " ").strip()
-        if speaker:
-            speaker = speaker[:64]
-        message_for_ispec = f"[{speaker}] {text}" if speaker else text
+        slack_user = _slack_user_summary(client=client, user_cache=user_cache, user_id=slack_user_id)
+        message_for_ispec = _format_message_for_ispec(text=text, slack_user=slack_user)
         meta: dict[str, Any] = {
             "source": "slack",
             "slack": {
@@ -358,6 +390,7 @@ def _run_socket_mode(args) -> None:
                 "user_id": slack_user_id or None,
                 "user_name": slack_user.get("user_name"),
                 "user_display_name": slack_user.get("user_display_name"),
+                "user_real_name": slack_user.get("user_real_name"),
             },
         }
 
@@ -579,38 +612,11 @@ def _run_socket_mode(args) -> None:
 
         slack_user_id = str(event.get("user") or "").strip()
         if slack_user_id:
-            cached = user_cache.get(slack_user_id) or {}
-            if not cached:
-                try:
-                    info = client.users_info(user=slack_user_id)
-                    user_obj = info.get("user") if isinstance(info, dict) else None
-                    if isinstance(user_obj, dict):
-                        name = str(user_obj.get("name") or "").strip()
-                        profile = user_obj.get("profile") if isinstance(user_obj.get("profile"), dict) else {}
-                        display = str(profile.get("display_name") or "").strip()
-                        if not display:
-                            display = str(profile.get("real_name") or "").strip()
-                        cached = {
-                            "user_id": slack_user_id,
-                            "user_name": name,
-                            "user_display_name": display,
-                        }
-                except Exception:
-                    cached = {"user_id": slack_user_id}
-                user_cache[slack_user_id] = cached
-            speaker = (
-                str(cached.get("user_display_name") or "").strip()
-                or str(cached.get("user_name") or "").strip()
-                or slack_user_id
-            )
+            cached = _slack_user_summary(client=client, user_cache=user_cache, user_id=slack_user_id)
         else:
             cached = {}
-            speaker = ""
 
-        speaker = speaker.replace("\n", " ").replace("\r", " ").strip()
-        if speaker:
-            speaker = speaker[:64]
-        message_for_ispec = f"[{speaker}] {raw_text}" if speaker else raw_text
+        message_for_ispec = _format_message_for_ispec(text=raw_text, slack_user=cached)
         meta: dict[str, Any] = {
             "source": "slack",
             "slack": {
@@ -623,6 +629,7 @@ def _run_socket_mode(args) -> None:
                 "user_id": slack_user_id or None,
                 "user_name": cached.get("user_name"),
                 "user_display_name": cached.get("user_display_name"),
+                "user_real_name": cached.get("user_real_name"),
             },
         }
 
