@@ -2592,15 +2592,23 @@ def _run_support_chat_turn(
         with get_session() as core_db:
             user = None
             if user_id is not None:
-                from ispec.db.models import AuthUser
+                if int(user_id) == 0:
+                    from ispec.api.security import _ApiKeyServiceUser
 
-                user = core_db.query(AuthUser).filter(AuthUser.id == int(user_id)).first()
-                if user is None:
-                    return CommandExecution(
-                        ok=False,
-                        result={"ok": False, "error": f"User not found for queued chat turn (user_id={user_id})."},
-                        error="chat_user_not_found",
-                    )
+                    # Queue-mode support chats can legitimately carry the synthetic
+                    # API-key assistant user (id=0). Preserve that internal posture
+                    # instead of looking for a real auth_user row.
+                    user = _ApiKeyServiceUser()
+                else:
+                    from ispec.db.models import AuthUser
+
+                    user = core_db.query(AuthUser).filter(AuthUser.id == int(user_id)).first()
+                    if user is None:
+                        return CommandExecution(
+                            ok=False,
+                            result={"ok": False, "error": f"User not found for queued chat turn (user_id={user_id})."},
+                            error="chat_user_not_found",
+                        )
 
             with (
                 get_assistant_session() as assistant_db,

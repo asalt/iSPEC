@@ -3,10 +3,18 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from ispec.agent.commands import COMMAND_SLACK_POST_MESSAGE
 from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand, AgentRun
+from ispec.concurrency.thread_context import set_main_thread
 from ispec.supervisor.loop import _enqueue_command, _ensure_slack_scheduled_commands, _process_one_command
+
+
+@pytest.fixture(autouse=True)
+def _supervisor_main_thread() -> None:
+    set_main_thread(owner="pytest")
 
 
 def test_supervisor_seeds_slack_schedules(tmp_path, monkeypatch):

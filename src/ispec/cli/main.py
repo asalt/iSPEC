@@ -15,6 +15,7 @@ def main():
         agent,
         api,
         auth,
+        dev,
         config as config_cli,
         db,
         logging as logging_cli,
@@ -42,6 +43,10 @@ def main():
     api_parser = subparsers.add_parser("api", help="api control")
     api_subparsers = api_parser.add_subparsers(dest="subcommand", required=True)
     api.register_subcommands(api_subparsers)
+
+    dev_parser = subparsers.add_parser("dev", help="Dev helpers (tmux)")
+    dev_subparsers = dev_parser.add_subparsers(dest="subcommand", required=True)
+    dev.register_subcommands(dev_subparsers)
 
     auth_parser = subparsers.add_parser("auth", help="Authentication/user helpers")
     auth_subparsers = auth_parser.add_subparsers(dest="subcommand", required=True)
@@ -82,6 +87,8 @@ def main():
         db.dispatch(args)
     elif args.command == "api":
         api.dispatch(args)
+    elif args.command == "dev":
+        dev.dispatch(args)
     elif args.command == "auth":
         auth.dispatch(args)
     elif args.command == "logging":

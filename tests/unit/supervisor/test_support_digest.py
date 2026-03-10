@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ispec.agent.commands import COMMAND_BUILD_SUPPORT_DIGEST
 from ispec.agent.models import AgentCommand, AgentRun
 from ispec.assistant.connect import get_assistant_session
@@ -13,7 +15,13 @@ from ispec.assistant.models import (
     SupportSessionReview,
 )
 from ispec.assistant.service import AssistantReply
+from ispec.concurrency.thread_context import set_main_thread
 from ispec.supervisor.loop import _enqueue_command, _process_one_command, utcnow
+
+
+@pytest.fixture(autouse=True)
+def _supervisor_main_thread() -> None:
+    set_main_thread(owner="pytest")
 
 
 def test_supervisor_processes_support_digest_and_writes_memory(tmp_path, monkeypatch):
@@ -115,4 +123,3 @@ def test_supervisor_processes_support_digest_and_writes_memory(tmp_path, monkeyp
             for row in assistant_db.query(SupportMemoryEvidence).filter(SupportMemoryEvidence.memory_id == int(memory.id)).all()
         ]
         assert message_id in evidence_ids
-

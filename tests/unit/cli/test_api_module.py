@@ -20,7 +20,8 @@ def test_register_subcommands_parses_start_command():
     assert args.port == 1234
 
 
-def test_dispatch_start_invokes_uvicorn(monkeypatch):
+def test_dispatch_start_invokes_uvicorn(monkeypatch, tmp_path):
+    monkeypatch.setenv("ISPEC_STATE_DIR", str(tmp_path))
     captured = {}
     dummy_api_main = types.ModuleType("ispec.api.main")
     dummy_api_main.app = object()
@@ -40,7 +41,8 @@ def test_dispatch_start_invokes_uvicorn(monkeypatch):
     assert captured["port"] == 9000
 
 
-def test_dispatch_status_does_not_start_server(monkeypatch):
+def test_dispatch_status_does_not_start_server(monkeypatch, tmp_path):
+    monkeypatch.setenv("ISPEC_STATE_DIR", str(tmp_path))
     run_mock = MagicMock()
     dummy_api_main = types.ModuleType("ispec.api.main")
     dummy_api_main.app = object()

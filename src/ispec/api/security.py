@@ -40,8 +40,8 @@ _DEFAULT_SESSION_COOKIE = "ispec_session"
 class _ApiKeyServiceUser:
     """Synthetic user for API-key-only assistant access.
 
-    This is intentionally read-only (viewer) and used to keep assistant tooling
-    and prompts in an "authenticated staff" posture without requiring a
+    This is a synthetic internal user (viewer role) used to keep assistant tooling
+    and prompts in an "authenticated internal" posture without requiring a
     cookie-backed browser session.
     """
 

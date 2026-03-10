@@ -1,0 +1,4 @@
+interface:
+  display_name: "iSPEC Dev Make"
+  short_description: "Control iSPEC dev services via make/tmux"
+  default_prompt: "Use $ispec-dev-make to start/stop/restart the iSPEC dev stack via make/tmux."

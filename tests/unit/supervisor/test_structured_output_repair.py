@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from ispec.agent.commands import COMMAND_BUILD_SUPPORT_DIGEST, COMMAND_REVIEW_SUPPORT_SESSION
 from ispec.agent.models import AgentCommand, AgentRun
 from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportMemory, SupportMessage, SupportSession, SupportSessionReview
 from ispec.assistant.service import AssistantReply
+from ispec.concurrency.thread_context import set_main_thread
 from ispec.supervisor.loop import _enqueue_command, _process_one_command, utcnow
+
+
+@pytest.fixture(autouse=True)
+def _supervisor_main_thread() -> None:
+    set_main_thread(owner="pytest")
 
 
 def _seed_agent_run(*, agent_db_path):
@@ -196,4 +204,3 @@ def test_supervisor_repairs_support_digest_json(tmp_path, monkeypatch):
         assert isinstance(memory.value_json, str)
 
     assert calls["n"] == 2
-
