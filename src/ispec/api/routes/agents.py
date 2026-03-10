@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import timedelta
 from datetime import UTC, datetime
 from typing import Any
 
@@ -10,8 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from ispec.agent_state.connect import get_agent_state_session_dep
+from ispec.agent_state.store import append_observation, get_schema, list_heads, register_schema_version
+from ispec.agent.commands import COMMAND_ASSESS_TACKLE_RESULTS, COMMAND_RUN_TACKLE_PROMPT
 from ispec.agent.connect import get_agent_session_dep
-from ispec.agent.models import AgentEvent
+from ispec.agent.models import AgentCommand, AgentEvent
 from ispec.db.connect import get_session_dep
 from ispec.db.models import Project
 
@@ -81,6 +85,333 @@ def poll_commands(
     # v0: plumbing-only stub so agents can safely "pull" commands without
     # requiring inbound ports or a full queue implementation yet.
     return CommandPollResponse(commands=[])
+
+
+def _clamp_int(value: int, *, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(value)))
+
+
+def _prune_json_for_storage(
+    value: Any,
+    *,
+    max_depth: int = 6,
+    max_list_items: int = 200,
+    max_dict_items: int = 300,
+    max_str_chars: int = 10_000,
+) -> Any:
+    if max_depth <= 0:
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, str):
+            return value[:max_str_chars]
+        return "<truncated>"
+
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+
+    if isinstance(value, str):
+        return value[:max_str_chars]
+
+    if isinstance(value, list):
+        items = [
+            _prune_json_for_storage(
+                item,
+                max_depth=max_depth - 1,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+                max_str_chars=max_str_chars,
+            )
+            for item in value[: max(0, int(max_list_items))]
+        ]
+        if len(value) > int(max_list_items):
+            items.append(f"<truncated {len(value) - int(max_list_items)} more items>")
+        return items
+
+    if isinstance(value, dict):
+        pruned: dict[str, Any] = {}
+        keys = [k for k in value.keys() if isinstance(k, str)]
+        for key in keys[: max(0, int(max_dict_items))]:
+            pruned[key] = _prune_json_for_storage(
+                value.get(key),
+                max_depth=max_depth - 1,
+                max_list_items=max_list_items,
+                max_dict_items=max_dict_items,
+                max_str_chars=max_str_chars,
+            )
+        if len(keys) > int(max_dict_items):
+            pruned["_truncated_keys"] = int(len(keys) - int(max_dict_items))
+        return pruned
+
+    return str(value)
+
+
+class EnqueueCommandRequest(BaseModel):
+    command_type: str = Field(min_length=1, max_length=64)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    priority: int = 0
+    delay_seconds: int = 0
+    max_attempts: int = 3
+
+
+class EnqueueCommandResponse(BaseModel):
+    command_id: int
+
+
+class AgentCommandOut(BaseModel):
+    id: int
+    command_type: str
+    status: str
+    priority: int
+    available_at: str | None = None
+    updated_at: str | None = None
+    claimed_at: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    attempts: int = 0
+    max_attempts: int = 0
+    error: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentStateSchemaDimIn(BaseModel):
+    dim_index: int = Field(ge=0)
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class AgentStateSchemaUpsertRequest(BaseModel):
+    schema_id: int = Field(ge=1)
+    version: int = Field(ge=1)
+    state_scope: str = Field(min_length=1, max_length=64)
+    codec: str = Field(default="f32le", min_length=1, max_length=32)
+    notes: str | None = Field(default=None, max_length=2000)
+    dims: list[AgentStateSchemaDimIn] = Field(min_length=1, max_length=256)
+
+
+class AgentStateSchemaDimOut(BaseModel):
+    dim_index: int
+    name: str
+    description: str | None = None
+
+
+class AgentStateSchemaOut(BaseModel):
+    schema_id: int
+    version: int
+    state_scope: str
+    dim_count: int
+    codec: str
+    created_at: str | None = None
+    notes: str | None = None
+    dims: list[AgentStateSchemaDimOut] = Field(default_factory=list)
+
+
+class AgentStateObservationRequest(BaseModel):
+    schema_id: int = Field(ge=1)
+    schema_version: int = Field(ge=1)
+    state_scope: str = Field(min_length=1, max_length=64)
+    vector: list[float] = Field(min_length=1, max_length=2048)
+    ts_ms: int | None = Field(default=None, ge=0)
+    agent_id: str | None = Field(default=None, max_length=256)
+    job_id: str | None = Field(default=None, max_length=256)
+    task_id: str | None = Field(default=None, max_length=256)
+    step_index: int | None = Field(default=None, ge=0)
+    reward: float | None = None
+    source_kind: str | None = Field(default=None, max_length=128)
+    source_ref: str | None = Field(default=None, max_length=512)
+    update_head: bool = True
+
+
+class AgentStateHeadOut(BaseModel):
+    agent_id: str
+    state_scope: str
+    schema_id: int
+    schema_version: int
+    ts_ms: int
+    observation_id: int | None = None
+    vector: list[float] = Field(default_factory=list)
+    dim_names: list[str] = Field(default_factory=list)
+
+
+class AgentStateObservationResponse(BaseModel):
+    observation_id: int
+    head_updated: bool
+    schema_info: AgentStateSchemaOut
+    vector: list[float] = Field(default_factory=list)
+    head: AgentStateHeadOut | None = None
+
+
+class AgentStateHeadsResponse(BaseModel):
+    heads: list[AgentStateHeadOut] = Field(default_factory=list)
+
+
+_REMOTE_ALLOWED_COMMANDS = {
+    COMMAND_ASSESS_TACKLE_RESULTS,
+    COMMAND_RUN_TACKLE_PROMPT,
+}
+
+
+@router.post("/commands", response_model=EnqueueCommandResponse)
+def enqueue_command(
+    request: EnqueueCommandRequest,
+    db: Session = Depends(get_agent_session_dep),
+) -> EnqueueCommandResponse:
+    command_type = (request.command_type or "").strip()
+    if command_type not in _REMOTE_ALLOWED_COMMANDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported command_type: {command_type}. Allowed: {sorted(_REMOTE_ALLOWED_COMMANDS)}",
+        )
+
+    now = utcnow()
+    delay_seconds = _clamp_int(int(request.delay_seconds or 0), lo=0, hi=86400)
+    priority = _clamp_int(int(request.priority or 0), lo=-50, hi=100)
+    max_attempts = _clamp_int(int(request.max_attempts or 0), lo=1, hi=10)
+
+    payload = dict(request.payload or {})
+    # Avoid unbounded DB growth when callers send huge structures (e.g. full
+    # limma tables). Store a conservative pruned version; callers can retain
+    # raw artifacts in their own telemetry store.
+    payload = _prune_json_for_storage(payload)
+
+    row = AgentCommand(
+        command_type=command_type,
+        status="queued",
+        priority=int(priority),
+        created_at=now,
+        updated_at=now,
+        available_at=now + timedelta(seconds=int(delay_seconds)),
+        attempts=0,
+        max_attempts=int(max_attempts),
+        payload_json=payload,
+        result_json={},
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return EnqueueCommandResponse(command_id=int(row.id))
+
+
+@router.get("/commands/{command_id}", response_model=AgentCommandOut)
+def get_command(
+    command_id: int,
+    db: Session = Depends(get_agent_session_dep),
+) -> AgentCommandOut:
+    row = db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Command not found.")
+
+    return AgentCommandOut(
+        id=int(row.id),
+        command_type=str(row.command_type or ""),
+        status=str(row.status or ""),
+        priority=int(row.priority or 0),
+        available_at=row.available_at.isoformat() if getattr(row, "available_at", None) else None,
+        updated_at=row.updated_at.isoformat() if getattr(row, "updated_at", None) else None,
+        claimed_at=row.claimed_at.isoformat() if getattr(row, "claimed_at", None) else None,
+        started_at=row.started_at.isoformat() if getattr(row, "started_at", None) else None,
+        ended_at=row.ended_at.isoformat() if getattr(row, "ended_at", None) else None,
+        attempts=int(row.attempts or 0),
+        max_attempts=int(row.max_attempts or 0),
+        error=row.error,
+        payload=dict(row.payload_json or {}),
+        result=dict(row.result_json or {}),
+    )
+
+
+@router.post("/state/schema", response_model=AgentStateSchemaOut)
+def upsert_state_schema(
+    request: AgentStateSchemaUpsertRequest,
+    db: Session = Depends(get_agent_state_session_dep),
+) -> AgentStateSchemaOut:
+    try:
+        payload = register_schema_version(
+            db,
+            schema_id=int(request.schema_id),
+            version=int(request.version),
+            state_scope=str(request.state_scope),
+            codec=str(request.codec),
+            notes=request.notes,
+            dims=[item.model_dump() for item in request.dims],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return AgentStateSchemaOut.model_validate(payload)
+
+
+@router.get("/state/schema/{schema_id}/{version}", response_model=AgentStateSchemaOut)
+def get_state_schema(
+    schema_id: int,
+    version: int,
+    db: Session = Depends(get_agent_state_session_dep),
+) -> AgentStateSchemaOut:
+    payload = get_schema(db, schema_id=int(schema_id), version=int(version))
+    if payload is None:
+        raise HTTPException(status_code=404, detail="State schema not found.")
+    return AgentStateSchemaOut.model_validate(payload)
+
+
+@router.post("/state/observations", response_model=AgentStateObservationResponse)
+def observe_state(
+    request: AgentStateObservationRequest,
+    db: Session = Depends(get_agent_state_session_dep),
+) -> AgentStateObservationResponse:
+    try:
+        payload = append_observation(
+            db,
+            schema_id=int(request.schema_id),
+            schema_version=int(request.schema_version),
+            state_scope=str(request.state_scope),
+            vector=list(request.vector),
+            ts_ms=request.ts_ms,
+            agent_id=request.agent_id,
+            job_id=request.job_id,
+            task_id=request.task_id,
+            step_index=request.step_index,
+            reward=request.reward,
+            source_kind=request.source_kind,
+            source_ref=request.source_ref,
+            update_head=bool(request.update_head),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    head_payload = None
+    if request.update_head and request.agent_id:
+        heads = list_heads(
+            db,
+            agent_id=str(request.agent_id),
+            state_scope=str(request.state_scope),
+            limit=1,
+        )
+        if heads:
+            head_payload = AgentStateHeadOut.model_validate(heads[0])
+
+    return AgentStateObservationResponse(
+        observation_id=int(payload["observation_id"]),
+        head_updated=bool(payload["head_updated"]),
+        schema_info=AgentStateSchemaOut.model_validate(payload["schema"]),
+        vector=list(payload["vector"]),
+        head=head_payload,
+    )
+
+
+@router.get("/state/heads", response_model=AgentStateHeadsResponse)
+def get_state_heads(
+    agent_id: str | None = Query(default=None, max_length=256),
+    state_scope: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=20, ge=1, le=200),
+    db: Session = Depends(get_agent_state_session_dep),
+) -> AgentStateHeadsResponse:
+    payload = list_heads(
+        db,
+        agent_id=agent_id,
+        state_scope=state_scope,
+        limit=int(limit),
+    )
+    return AgentStateHeadsResponse(
+        heads=[AgentStateHeadOut.model_validate(item) for item in payload]
+    )
 
 
 _TOKEN_ID_RE = re.compile(r"^(?P<prefix>[a-zA-Z]+)?0*(?P<num>[0-9]{1,10})$")

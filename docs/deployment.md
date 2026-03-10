@@ -50,11 +50,18 @@ look like this:
 
 ```dotenv
 ISPEC_DB_DIR=/var/lib/ispec
+ISPEC_DB_PATH=/var/lib/ispec/ispec.db
+ISPEC_ANALYSIS_DB_PATH=/var/lib/ispec/ispec-analysis.db
+ISPEC_PSM_DB_PATH=/var/lib/ispec/ispec-psm.db
+ISPEC_AGENT_STATE_DB_PATH=/var/lib/ispec/ispec-agent-state.db
 ISPEC_LOG_DIR=/var/log/ispec
 ISPEC_CONFIG_DIR=/etc/ispec
 ISPEC_LOG_CONFIG=/etc/ispec/logging.json
 ISPEC_STATE_DIR=/var/lib/ispec/state
 ```
+
+Use `ispec config paths` after loading the env file to verify the resolved DB,
+state, and logging locations before starting services.
 
 Load the variables when using the CLI or service process. Two common approaches
 are:

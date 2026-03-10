@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ispec.agent_state.connect import get_agent_state_session_dep
+from ispec.agent_state.store import list_heads
 from ispec.db.connect import get_session_dep
 from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.commands import COMMAND_LEGACY_SYNC_ALL
@@ -90,6 +92,7 @@ class AgentSnapshot(BaseModel):
     latest_commands: list[AgentCommandItem] = Field(default_factory=list)
     latest_steps: list[AgentStepItem] = Field(default_factory=list)
     latest_supervisor_run: dict[str, Any] | None = None
+    state_heads: list[dict[str, Any]] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="allow")
 
@@ -105,6 +108,7 @@ class OpsSnapshotResponse(BaseModel):
 def snapshot(
     assistant_db: Session = Depends(get_assistant_session_dep),
     agent_db: Session = Depends(get_agent_session_dep),
+    agent_state_db: Session = Depends(get_agent_state_session_dep),
     core_db: Session = Depends(get_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ) -> OpsSnapshotResponse:
@@ -269,8 +273,25 @@ def snapshot(
     latest_supervisor_run = None
     if run_row is not None:
         orchestrator_state = None
+        orchestrator_action_summary = None
+        orchestrator_thought = None
         if isinstance(run_row.summary_json, dict):
             orchestrator_state = run_row.summary_json.get("orchestrator")
+            if isinstance(orchestrator_state, dict):
+                action_obj = orchestrator_state.get("last_action")
+                if isinstance(action_obj, dict):
+                    orchestrator_action_summary = action_obj
+                action_text = orchestrator_state.get("last_action_summary")
+                if isinstance(action_text, str) and action_text.strip():
+                    if not isinstance(orchestrator_action_summary, dict):
+                        orchestrator_action_summary = {}
+                    orchestrator_action_summary = {
+                        **orchestrator_action_summary,
+                        "summary": action_text.strip(),
+                    }
+                thought_text = orchestrator_state.get("last_thought")
+                if isinstance(thought_text, str) and thought_text.strip():
+                    orchestrator_thought = thought_text.strip()
         latest_supervisor_run = {
             "run_id": getattr(run_row, "run_id", None),
             "agent_id": getattr(run_row, "agent_id", None),
@@ -278,6 +299,8 @@ def snapshot(
             "updated_at": getattr(run_row, "updated_at", None).isoformat() if getattr(run_row, "updated_at", None) else None,
             "status_bar": getattr(run_row, "status_bar", None),
             "orchestrator": orchestrator_state,
+            "orchestrator_action_summary": orchestrator_action_summary,
+            "orchestrator_thought_advisory": orchestrator_thought,
             "checks": run_row.state_json.get("checks") if isinstance(run_row.state_json, dict) else None,
         }
         try:
@@ -331,6 +354,12 @@ def snapshot(
     except Exception:
         latest_legacy_sync = None
 
+    state_heads: list[dict[str, Any]] = []
+    try:
+        state_heads = list_heads(agent_state_db, limit=12)
+    except Exception:
+        state_heads = []
+
     return OpsSnapshotResponse(
         ok=True,
         ts=now,
@@ -350,6 +379,7 @@ def snapshot(
             latest_commands=latest_commands,
             latest_steps=latest_steps,
             latest_supervisor_run=latest_supervisor_run,
+            state_heads=state_heads,
             legacy_sync_cursors=legacy_cursors,
             latest_legacy_sync=latest_legacy_sync,
         ),

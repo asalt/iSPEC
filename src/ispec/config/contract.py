@@ -176,6 +176,16 @@ def default_contract() -> tuple[VarSpec, ...]:
             },
         ),
         VarSpec(
+            key="ISPEC_AGENT_STATE_DB_PATH",
+            kind="path",
+            group="Database",
+            description="Agent state SQLite DB path or sqlite:/// URI for versioned mood/state vectors.",
+            default_by_profile={
+                "dev": "~/ispec/ispec-agent-state.db",
+                "prod": "/var/lib/ispec/ispec-agent-state.db",
+            },
+        ),
+        VarSpec(
             key="ISPEC_STATE_DIR",
             kind="path",
             group="Paths",

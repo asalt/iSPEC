@@ -17,6 +17,7 @@ _DB_ENV_KEYS: dict[str, str] = {
     "psm": "ISPEC_PSM_DB_PATH",
     "assistant": "ISPEC_ASSISTANT_DB_PATH",
     "agent": "ISPEC_AGENT_DB_PATH",
+    "agent_state": "ISPEC_AGENT_STATE_DB_PATH",
     "schedule": "ISPEC_SCHEDULE_DB_PATH",
 }
 
@@ -26,6 +27,7 @@ _DB_DEFAULT_FILENAMES: dict[str, str] = {
     "psm": "ispec-psm.db",
     "assistant": "ispec-assistant.db",
     "agent": "ispec-agent.db",
+    "agent_state": "ispec-agent-state.db",
     "schedule": "ispec-schedule.db",
 }
 
@@ -408,6 +410,7 @@ def resolved_path_catalog() -> dict[str, dict[str, ResolvedLocation]]:
             "psm": resolve_db_location("psm"),
             "assistant": resolve_db_location("assistant"),
             "agent": resolve_db_location("agent"),
+            "agent_state": resolve_db_location("agent_state"),
             "schedule": resolve_db_location("schedule"),
         },
         "state": {
