@@ -11,6 +11,8 @@ def make_timestamp_mixin(prefix: str):
 
     def utcnow() -> datetime:
         return datetime.now(UTC)
+        # TODO test this proper timezone serialization:
+        # return datetime.now(UTC).isoformat()
 
     fields = {
         f"{prefix}_CreationTS": mapped_column(DateTime, default=utcnow),
