@@ -1,0 +1,4 @@
+interface:
+  display_name: "iSPEC Legacy Sync"
+  short_description: "Refresh the local iSPEC DB from legacy safely"
+  default_prompt: "Use $ispec-legacy-sync to refresh the local iSPEC import DB from legacy sources, inspect sync state, and plan targeted project-comment hydration."

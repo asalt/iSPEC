@@ -2,9 +2,18 @@ from __future__ import annotations
 
 from ispec.config.paths import (
     resolve_api_pid_file,
+    resolve_db_dir,
     resolve_db_location,
 )
 from ispec.config.audit import audit_environment
+
+
+def test_resolve_db_dir_defaults_under_dot_ispec_db():
+    resolved = resolve_db_dir()
+
+    assert resolved.path is not None
+    assert resolved.path.endswith("/.ispec/db")
+    assert resolved.source == "default"
 
 
 def test_resolve_analysis_db_defaults_to_sibling_of_core_db(tmp_path, monkeypatch):

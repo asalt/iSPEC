@@ -17,7 +17,7 @@ logger = get_logger(__file__)
 
 @lru_cache(maxsize=None)
 def get_db_dir() -> Path:
-    db_dir = Path(resolve_db_dir().path or (Path.home() / "ispec"))
+    db_dir = Path(resolve_db_dir().path or (Path.home() / ".ispec" / "db"))
     db_dir.mkdir(parents=True, exist_ok=True)
     logger.info("setting db_dir to %s", str(db_dir))
     return db_dir

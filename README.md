@@ -105,10 +105,10 @@ iSPEC/
 
 ### Database location
 
-By default iSPEC stores its SQLite database in `~/ispec/ispec.db`. You can
+By default iSPEC stores its SQLite database in `~/.ispec/db/ispec.db`. You can
 control where the data lives with environment variables:
 
-- `ISPEC_DB_DIR` – root directory for databases (defaults to `~/ispec`).
+- `ISPEC_DB_DIR` – root directory for databases (defaults to `~/.ispec/db`).
 - `ISPEC_DB_PATH` – full SQLite path/URI used by session helpers and tests.
 - `ISPEC_ANALYSIS_DB_PATH` – SQLite path/URI for E2G, volcano, GSEA, and similar derived-analysis tables (defaults to `ispec-analysis.db` alongside `ISPEC_DB_PATH`).
 - `ISPEC_PSM_DB_PATH` – SQLite path/URI for PSM rows (defaults to `ispec-psm.db` alongside `ISPEC_DB_PATH`).

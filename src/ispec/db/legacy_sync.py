@@ -29,6 +29,53 @@ logger = get_logger(__file__)
 
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 
+_PROJECT_COMMENT_TABLE_CANDIDATES = (
+    "iSPEC_ProjectHistory",
+    "ProjectHistory",
+    "iSPEC_ProjectComments",
+    "ProjectComments",
+)
+_PROJECT_COMMENT_PROJECT_FIELD_CANDIDATES = (
+    "prh_PRJRecNo",
+    "prjc_PRJRecNo",
+    "prjcom_PRJRecNo",
+    "project_PRJRecNo",
+    "ProjectRecNo",
+    "PRJRecNo",
+)
+_PROJECT_COMMENT_NOTE_FIELD_CANDIDATES = (
+    "prh_Comment",
+    "prjc_Comment",
+    "prjc_Note",
+    "prjcom_Comment",
+    "prjcom_Note",
+    "Comment",
+    "Note",
+)
+_PROJECT_COMMENT_AUTHOR_FIELD_CANDIDATES = (
+    "prh_AddedBy",
+    "prjc_EnteredBy",
+    "prjc_User",
+    "prjcom_EnteredBy",
+    "prjcom_User",
+    "EnteredBy",
+    "User",
+)
+_PROJECT_COMMENT_CREATED_TS_FIELD_CANDIDATES = (
+    "prh_CreationTS",
+    "prh_ModificationTS",
+    "prjc_CreatedTS",
+    "prjc_ModificationTS",
+    "prjcom_CreatedTS",
+    "prjcom_ModificationTS",
+    "CreatedTS",
+    "ModificationTS",
+)
+_PROJECT_COMMENT_TYPE_FIELD_CANDIDATES = (
+    "prh_CommentType",
+    "CommentType",
+)
+
 
 def _repo_ispec_dir() -> Path:
     return Path(__file__).resolve().parents[3]
@@ -344,6 +391,16 @@ class LegacyTablePlan:
     field_map: dict[str, str]
 
 
+@dataclass(frozen=True)
+class LegacyProjectCommentSource:
+    table: str
+    project_field: str
+    note_field: str
+    author_field: str | None
+    created_ts_field: str | None
+    comment_type_field: str | None
+
+
 def _load_projects_plan(mapping_path: Path) -> LegacyTablePlan:
     return _load_table_plan(mapping_path, legacy_table="iSPEC_Projects")
 
@@ -404,6 +461,367 @@ def _resolve_legacy_url(*, legacy_url: str | None, schema_path: Path) -> str:
     raise ValueError(
         "missing legacy base url (set ISPEC_LEGACY_API_URL, pass --legacy-url, or configure ~/.ispec/ispec.conf)"
     )
+
+
+def _legacy_get_json(url: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    resp = requests.get(
+        url,
+        params=params,
+        headers=_legacy_headers(),
+        auth=_legacy_basic_auth(),
+        timeout=190,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise ValueError(f"Legacy API returned a non-object payload for {url}")
+    if payload.get("ok") is False:
+        raise ValueError(str(payload.get("error") or f"Legacy API request failed for {url}"))
+    return payload
+
+
+def _legacy_post_json(url: str, *, payload: dict[str, Any]) -> dict[str, Any]:
+    resp = requests.post(
+        url,
+        json=payload,
+        headers=_legacy_headers(),
+        auth=_legacy_basic_auth(),
+        timeout=190,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if not isinstance(body, dict):
+        raise ValueError(f"Legacy API returned a non-object payload for {url}")
+    if body.get("ok") is False:
+        raise ValueError(str(body.get("error") or f"Legacy API request failed for {url}"))
+    return body
+
+
+def _resolve_first_available_field(
+    available_fields: list[str],
+    candidates: tuple[str, ...],
+) -> str | None:
+    field_lookup = {
+        str(name).strip().lower(): str(name)
+        for name in available_fields
+        if str(name).strip()
+    }
+    for candidate in candidates:
+        match = field_lookup.get(str(candidate).strip().lower())
+        if match:
+            return match
+    return None
+
+
+def _normalize_project_comment_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    return text or None
+
+
+def _project_comment_compare_timestamp(value: Any) -> str | None:
+    dt = _normalize_datetime(_coerce_datetime(value))
+    if dt is None:
+        return None
+    return dt.replace(microsecond=0).isoformat(sep=" ")
+
+
+def _project_comment_key(
+    *,
+    project_id: int,
+    note: str | None,
+    created_ts: str | None,
+) -> tuple[int, str, str | None] | None:
+    normalized_note = _normalize_project_comment_text(note)
+    if normalized_note is None:
+        return None
+    return (int(project_id), normalized_note, created_ts)
+
+
+def _person_display_label(person: Person | None) -> str | None:
+    if person is None:
+        return None
+    first = (getattr(person, "ppl_Name_First", "") or "").strip()
+    last = (getattr(person, "ppl_Name_Last", "") or "").strip()
+    label = f"{last}, {first}".strip().strip(",")
+    return label or None
+
+
+def _resolve_legacy_project_comment_source(base_url: str) -> LegacyProjectCommentSource:
+    errors: list[str] = []
+    for table_candidate in _PROJECT_COMMENT_TABLE_CANDIDATES:
+        url = f"{base_url}/api/v2/legacy/tables/{table_candidate}/rows"
+        try:
+            payload = _legacy_get_json(url, params={"limit": 1})
+        except Exception as exc:
+            errors.append(f"{table_candidate}: {exc}")
+            continue
+
+        available_fields = [str(name) for name in (payload.get("fields") or []) if str(name).strip()]
+        if not available_fields:
+            errors.append(f"{table_candidate}: no fields returned")
+            continue
+
+        project_field = _resolve_first_available_field(
+            available_fields,
+            _PROJECT_COMMENT_PROJECT_FIELD_CANDIDATES,
+        )
+        note_field = _resolve_first_available_field(
+            available_fields,
+            _PROJECT_COMMENT_NOTE_FIELD_CANDIDATES,
+        )
+        if project_field is None or note_field is None:
+            errors.append(
+                f"{table_candidate}: unable to infer required fields from {available_fields}"
+            )
+            continue
+
+        return LegacyProjectCommentSource(
+            table=str(payload.get("table") or table_candidate),
+            project_field=project_field,
+            note_field=note_field,
+            author_field=_resolve_first_available_field(
+                available_fields,
+                _PROJECT_COMMENT_AUTHOR_FIELD_CANDIDATES,
+            ),
+            created_ts_field=_resolve_first_available_field(
+                available_fields,
+                _PROJECT_COMMENT_CREATED_TS_FIELD_CANDIDATES,
+            ),
+            comment_type_field=_resolve_first_available_field(
+                available_fields,
+                _PROJECT_COMMENT_TYPE_FIELD_CANDIDATES,
+            ),
+        )
+
+    joined = "; ".join(errors) if errors else "no candidates attempted"
+    raise ValueError(f"Unable to resolve legacy ProjectComments source: {joined}")
+
+
+def _preferred_project_comment_author(
+    *,
+    comment: ProjectComment,
+    person: Person | None,
+) -> str | None:
+    label = _person_display_label(person)
+    if label and label != "System, System":
+        return label
+    return _normalize_project_comment_text(getattr(comment, "com_AddedBy", None))
+
+
+def _fetch_legacy_project_comment_keys(
+    *,
+    base_url: str,
+    source: LegacyProjectCommentSource,
+    project_id: int,
+    limit: int,
+) -> tuple[set[tuple[int, str, str | None]], int]:
+    fields = [source.project_field, source.note_field]
+    if source.author_field:
+        fields.append(source.author_field)
+    if source.created_ts_field:
+        fields.append(source.created_ts_field)
+
+    merge_key_fields = [source.project_field, source.note_field]
+    if source.created_ts_field:
+        merge_key_fields.append(source.created_ts_field)
+    if source.author_field:
+        merge_key_fields.append(source.author_field)
+
+    url = f"{base_url}/api/v2/legacy/tables/{source.table}/rows"
+    params: dict[str, Any] = {
+        "pk_field": source.project_field,
+        "id": int(project_id),
+        "limit": int(limit),
+    }
+    if source.created_ts_field:
+        params["order_by"] = f"-{source.created_ts_field}"
+
+    payload, _fields_mode = _fetch_legacy_rows_best_effort(
+        url=url,
+        params=params,
+        modes=["repeat", "csv", "none"],
+        fields=list(fields),
+        expected_fields=set(fields),
+        required_fields=[source.project_field, source.note_field],
+        merge_key_fields=merge_key_fields,
+        threshold_missing=max(1, len(fields) // 2),
+        log_label="legacy project comments",
+    )
+
+    raw_items = payload.get("items") or payload.get("rows") or []
+    items: list[dict[str, Any]] = [item for item in raw_items if isinstance(item, dict)]
+    keys: set[tuple[int, str, str | None]] = set()
+    for item in items:
+        raw_project_id = item.get(source.project_field)
+        try:
+            legacy_project_id = int(raw_project_id)
+        except Exception:
+            continue
+        if legacy_project_id != int(project_id):
+            continue
+        key = _project_comment_key(
+            project_id=legacy_project_id,
+            note=item.get(source.note_field),
+            created_ts=_project_comment_compare_timestamp(
+                item.get(source.created_ts_field) if source.created_ts_field else None
+            ),
+        )
+        if key is not None:
+            keys.add(key)
+    return keys, len(items)
+
+
+def sync_project_comments_to_legacy(
+    *,
+    legacy_url: str | None = None,
+    schema_path: str | Path | None = None,
+    db_file_path: str | None = None,
+    project_id: int | None = None,
+    limit: int = 5000,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Push local non-System project comments to the legacy comment/history API."""
+
+    if not db_file_path:
+        db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
+
+    selected_rows = 0
+    skipped_blank = 0
+    skipped_system = 0
+    duplicates_skipped = 0
+    local_candidates: list[dict[str, Any]] = []
+    seen_local_keys: set[tuple[int, str, str | None]] = set()
+
+    with get_session(file_path=db_file_path) as session:
+        query = (
+            session.query(ProjectComment, Person)
+            .outerjoin(Person, ProjectComment.person_id == Person.id)
+            .order_by(ProjectComment.project_id.asc(), ProjectComment.com_CreationTS.asc(), ProjectComment.id.asc())
+        )
+        if project_id is not None:
+            query = query.filter(ProjectComment.project_id == int(project_id))
+
+        rows = query.all()
+        selected_rows = len(rows)
+
+        for comment, person in rows:
+            person_label = _person_display_label(person)
+            if int(getattr(comment, "person_id", 0) or 0) == 0 or person_label == "System, System":
+                skipped_system += 1
+                continue
+
+            note = _normalize_project_comment_text(getattr(comment, "com_Comment", None))
+            if note is None:
+                skipped_blank += 1
+                continue
+
+            created_key = _project_comment_compare_timestamp(getattr(comment, "com_CreationTS", None))
+            key = _project_comment_key(
+                project_id=int(comment.project_id),
+                note=note,
+                created_ts=created_key,
+            )
+            if key is None:
+                skipped_blank += 1
+                continue
+            if key in seen_local_keys:
+                duplicates_skipped += 1
+                continue
+            seen_local_keys.add(key)
+
+            local_candidates.append(
+                {
+                    "key": key,
+                    "project_id": int(comment.project_id),
+                    "comment_id": int(comment.id),
+                    "note": note,
+                    "author": _preferred_project_comment_author(comment=comment, person=person),
+                    "created_ts": _normalize_datetime(_coerce_datetime(getattr(comment, "com_CreationTS", None))),
+                    "comment_type": _normalize_project_comment_text(getattr(comment, "com_CommentType", None)),
+                }
+            )
+
+    if not local_candidates:
+        return {
+            "selected": selected_rows,
+            "candidate_comments": 0,
+            "projects": 0,
+            "legacy_table": None,
+            "legacy_existing_items": 0,
+            "already_present": 0,
+            "would_insert": 0,
+            "inserted": 0,
+            "skipped_blank": skipped_blank,
+            "skipped_system": skipped_system,
+            "duplicates_skipped": duplicates_skipped,
+            "dry_run": bool(dry_run),
+        }
+
+    resolved_schema = Path(schema_path).expanduser().resolve() if schema_path else default_schema_path()
+    base_url = _resolve_legacy_url(legacy_url=legacy_url, schema_path=resolved_schema)
+    source = _resolve_legacy_project_comment_source(base_url)
+    by_project: dict[int, list[dict[str, Any]]] = {}
+    for candidate in local_candidates:
+        by_project.setdefault(int(candidate["project_id"]), []).append(candidate)
+
+    legacy_existing_items = 0
+    already_present = 0
+    would_insert = 0
+    inserted = 0
+
+    post_url = f"{base_url}/api/v2/legacy/project-comments"
+
+    for candidate_project_id in sorted(by_project):
+        legacy_keys, fetched_count = _fetch_legacy_project_comment_keys(
+            base_url=base_url,
+            source=source,
+            project_id=int(candidate_project_id),
+            limit=int(limit),
+        )
+        legacy_existing_items += fetched_count
+
+        for candidate in by_project[candidate_project_id]:
+            key = candidate["key"]
+            if key in legacy_keys:
+                already_present += 1
+                continue
+
+            payload: dict[str, Any] = {
+                "project_recno": int(candidate["project_id"]),
+                "note": str(candidate["note"]),
+            }
+            author = candidate.get("author")
+            if author:
+                payload["author"] = str(author)
+            created_ts = candidate.get("created_ts")
+            if created_ts is not None:
+                payload["created_ts"] = _normalize_datetime(created_ts).isoformat(sep=" ")
+            comment_type = candidate.get("comment_type")
+            if comment_type:
+                payload["comment_type"] = str(comment_type)
+
+            would_insert += 1
+            if not dry_run:
+                _legacy_post_json(post_url, payload=payload)
+                inserted += 1
+            legacy_keys.add(key)
+
+    return {
+        "selected": selected_rows,
+        "candidate_comments": len(local_candidates),
+        "projects": len(by_project),
+        "legacy_table": source.table,
+        "legacy_existing_items": legacy_existing_items,
+        "already_present": already_present,
+        "would_insert": would_insert,
+        "inserted": inserted,
+        "skipped_blank": skipped_blank,
+        "skipped_system": skipped_system,
+        "duplicates_skipped": duplicates_skipped,
+        "dry_run": bool(dry_run),
+    }
 
 
 def _plan_fields_to_fetch(plan: LegacyTablePlan) -> list[str]:

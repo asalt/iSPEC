@@ -112,14 +112,14 @@ def default_contract() -> tuple[VarSpec, ...]:
             kind="path",
             group="Paths",
             description="Base directory for sibling SQLite database defaults.",
-            default_by_profile={"dev": "~/ispec", "prod": "/var/lib/ispec"},
+            default_by_profile={"dev": "~/.ispec/db", "prod": "/var/lib/ispec"},
         ),
         VarSpec(
             key="ISPEC_DB_PATH",
             kind="path",
             group="Database",
             description="Primary SQLite DB path or sqlite:/// URI.",
-            default_by_profile={"dev": "~/ispec/ispec.db", "prod": "/var/lib/ispec/ispec.db"},
+            default_by_profile={"dev": "~/.ispec/db/ispec.db", "prod": "/var/lib/ispec/ispec.db"},
         ),
         VarSpec(
             key="ISPEC_ANALYSIS_DB_PATH",
@@ -127,7 +127,7 @@ def default_contract() -> tuple[VarSpec, ...]:
             group="Database",
             description="Analysis SQLite DB path/URI for E2G, volcano, GSEA, and similar derived tables.",
             default_by_profile={
-                "dev": "~/ispec/ispec-analysis.db",
+                "dev": "~/.ispec/db/ispec-analysis.db",
                 "prod": "/var/lib/ispec/ispec-analysis.db",
             },
         ),
@@ -136,7 +136,7 @@ def default_contract() -> tuple[VarSpec, ...]:
             kind="path",
             group="Database",
             description="PSM SQLite DB path/URI for large peptide-spectrum-match tables.",
-            default_by_profile={"dev": "~/ispec/ispec-psm.db", "prod": "/var/lib/ispec/ispec-psm.db"},
+            default_by_profile={"dev": "~/.ispec/db/ispec-psm.db", "prod": "/var/lib/ispec/ispec-psm.db"},
         ),
         VarSpec(
             key="ISPEC_SCHEDULE_DB_PATH",
@@ -144,7 +144,7 @@ def default_contract() -> tuple[VarSpec, ...]:
             group="Database",
             description="Schedule SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
             default_by_profile={
-                "dev": "~/ispec/ispec-schedule.db",
+                "dev": "~/.ispec/db/ispec-schedule.db",
                 "prod": "/var/lib/ispec/ispec-schedule.db",
             },
         ),
@@ -161,7 +161,7 @@ def default_contract() -> tuple[VarSpec, ...]:
             group="Database",
             description="Support assistant SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
             default_by_profile={
-                "dev": "~/ispec/ispec-assistant.db",
+                "dev": "~/.ispec/db/ispec-assistant.db",
                 "prod": "/var/lib/ispec/ispec-assistant.db",
             },
         ),
@@ -171,7 +171,7 @@ def default_contract() -> tuple[VarSpec, ...]:
             group="Database",
             description="Agent telemetry SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
             default_by_profile={
-                "dev": "~/ispec/ispec-agent.db",
+                "dev": "~/.ispec/db/ispec-agent.db",
                 "prod": "/var/lib/ispec/ispec-agent.db",
             },
         ),
@@ -181,7 +181,7 @@ def default_contract() -> tuple[VarSpec, ...]:
             group="Database",
             description="Agent state SQLite DB path or sqlite:/// URI for versioned mood/state vectors.",
             default_by_profile={
-                "dev": "~/ispec/ispec-agent-state.db",
+                "dev": "~/.ispec/db/ispec-agent-state.db",
                 "prod": "/var/lib/ispec/ispec-agent-state.db",
             },
         ),

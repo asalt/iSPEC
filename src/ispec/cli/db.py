@@ -804,6 +804,43 @@ def register_subcommands(subparsers):
         help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
     )
 
+    push_project_comments_parser = subparsers.add_parser(
+        "sync-project-comments-to-legacy",
+        help="Push local non-System project comments to the legacy comment/history API",
+    )
+    push_project_comments_parser.add_argument(
+        "--database",
+        dest="database",
+        help="SQLite database URL or filesystem path to read from (defaults to ISPEC_DB_PATH/default)",
+    )
+    push_project_comments_parser.add_argument(
+        "--legacy-url",
+        dest="legacy_url",
+        help="Legacy API base URL (defaults to ISPEC_LEGACY_API_URL or iSPEC/data/ispec-legacy-schema.json base_url)",
+    )
+    push_project_comments_parser.add_argument(
+        "--schema",
+        dest="schema",
+        help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
+    )
+    push_project_comments_parser.add_argument(
+        "--project-id",
+        dest="project_id",
+        type=int,
+        help="Restrict compare/push to a single local project id.",
+    )
+    push_project_comments_parser.add_argument(
+        "--limit",
+        type=int,
+        default=5000,
+        help="Maximum legacy comment rows to fetch per project for compare-before-insert.",
+    )
+    push_project_comments_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compare local comments against legacy and report what would be inserted without posting.",
+    )
+
     sync_experiments_parser = subparsers.add_parser(
         "sync-legacy-experiments",
         help="Sync legacy iSPEC Experiments via the legacy API",
@@ -1221,6 +1258,18 @@ def dispatch(args):
             dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy project comments sync summary: %s", summary)
+    elif args.subcommand == "sync-project-comments-to-legacy":
+        from ispec.db.legacy_sync import sync_project_comments_to_legacy
+
+        summary = sync_project_comments_to_legacy(
+            legacy_url=getattr(args, "legacy_url", None),
+            schema_path=getattr(args, "schema", None),
+            db_file_path=getattr(args, "database", None),
+            project_id=getattr(args, "project_id", None),
+            limit=int(getattr(args, "limit", 5000)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+        logger.info("local project comments push summary: %s", summary)
     elif args.subcommand == "sync-legacy-experiments":
         from ispec.db.legacy_sync import sync_legacy_experiments
 

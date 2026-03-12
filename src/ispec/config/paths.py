@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-_DEFAULT_DB_DIR = Path.home() / "ispec"
+_DEFAULT_DB_DIR = Path.home() / ".ispec" / "db"
 _DEFAULT_STATE_DIR = Path.home() / ".ispec"
 _DEFAULT_LOG_DIR = Path.home() / ".ispec" / "logs"
 _DEFAULT_CONFIG_DIR = Path.home() / ".ispec"
