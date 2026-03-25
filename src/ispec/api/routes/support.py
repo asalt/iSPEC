@@ -10,6 +10,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ispec.api.security import require_access, require_assistant_access
@@ -25,6 +26,10 @@ from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
+from ispec.assistant.response_contracts import (
+    response_contracts_enabled,
+    run_response_contract_pipeline,
+)
 from ispec.assistant.service import (
     _system_prompt_answer,
     _system_prompt_planner,
@@ -404,6 +409,22 @@ class SupportDebugMessageItem(BaseModel):
     toolCalls: list[dict[str, Any]] | None = None
     llmTrace: list[dict[str, Any]] | None = None
     promptHeader: dict[str, Any] | None = None
+
+
+class SupportDebugContextItem(BaseModel):
+    messageId: int
+    role: str
+    message: str
+    createdAt: datetime
+    provider: str | None = None
+    model: str | None = None
+    isSelected: bool = False
+
+
+class SupportDebugMessageDetail(SupportDebugMessageItem):
+    sessionState: dict[str, Any] | None = None
+    sessionMessageCount: int | None = None
+    contextMessages: list[SupportDebugContextItem] = Field(default_factory=list)
 
 
 def _rating_value(rating: str) -> int:
@@ -1974,6 +1995,34 @@ def chat(
     final_reply = reply
     final_raw_reply_content = draft_raw_reply_content
 
+    response_contract_enabled = response_contracts_enabled()
+    response_contract_meta: dict[str, Any] = {
+        "enabled": response_contract_enabled,
+        "applied": False,
+    }
+    response_contract_applied = False
+    if response_contract_enabled:
+        if compare_choices is not None:
+            response_contract_meta["skipped_reason"] = "compare_mode"
+        elif not final_reply.ok:
+            response_contract_meta["skipped_reason"] = "draft_reply_error"
+        elif not assistant_content.strip():
+            response_contract_meta["skipped_reason"] = "empty_draft"
+        else:
+            response_contract_result = run_response_contract_pipeline(
+                generate_reply_fn=generate_reply,
+                context_message=context_message,
+                history_messages=history_for_llm,
+                user_message=payload.message,
+                tool_result_messages=tool_result_messages,
+                draft_answer=assistant_content,
+                request_meta=payload.meta if isinstance(payload.meta, dict) else None,
+            )
+            response_contract_meta = response_contract_result.as_meta()
+            if response_contract_result.ok and response_contract_result.rendered_content:
+                assistant_content = response_contract_result.rendered_content
+                response_contract_applied = True
+
     self_review_changed = False
     self_review_error: str | None = None
     self_review_mode: str | None = None
@@ -1983,8 +2032,11 @@ def chat(
         and compare_choices is None
         and final_reply.ok
         and assistant_content.strip()
+        and not response_contract_applied
     )
-    if should_self_review and used_tool_calls <= 0:
+    if self_review_enabled and response_contract_applied:
+        self_review_mode = "skipped_response_contract"
+    elif should_self_review and used_tool_calls <= 0:
         self_review_mode = "skipped_no_tool_calls"
     elif should_self_review:
         self_review_mode = "rewrite"
@@ -2111,6 +2163,7 @@ def chat(
         "requested_tool_names": requested_tool_names_known,
         "missing_requested_tool_names": missing_requested_tool_names,
     }
+    meta["response_contract"] = response_contract_meta
     if tool_router:
         meta["tool_router"] = tool_router
     if comment_intent_decision is not None or comment_intent_reply is not None:
@@ -2398,6 +2451,103 @@ def choose(
     )
 
 
+def _debug_session_user_map(*, core_db: Session, rows: list[tuple[SupportMessage, SupportSession]]) -> dict[int, dict[str, Any]]:
+    session_user_ids = {
+        int(session.user_id)
+        for _message, session in rows
+        if isinstance(session.user_id, int) and session.user_id > 0
+    }
+    user_map: dict[int, dict[str, Any]] = {}
+    if session_user_ids:
+        auth_rows = core_db.query(AuthUser).filter(AuthUser.id.in_(session_user_ids)).all()
+        for auth_user in auth_rows:
+            user_map[int(auth_user.id)] = _support_user_summary(auth_user) or {}
+    return user_map
+
+
+def _build_support_debug_message_item(
+    *,
+    assistant_db: Session,
+    message: SupportMessage,
+    session: SupportSession,
+    session_user: dict[str, Any] | None,
+) -> SupportDebugMessageItem:
+    meta = _load_state(getattr(message, "meta_json", None))
+    prev_user = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session.id)
+        .filter(SupportMessage.role == "user")
+        .filter(SupportMessage.id < int(message.id))
+        .order_by(SupportMessage.id.desc())
+        .first()
+    )
+    prev_meta = _load_state(getattr(prev_user, "meta_json", None) if prev_user is not None else None)
+    ui = prev_meta.get("ui") if isinstance(prev_meta.get("ui"), dict) else {}
+    tool_calls = meta.get("tool_calls") if isinstance(meta.get("tool_calls"), list) else None
+    llm_trace = meta.get("llm_trace") if isinstance(meta.get("llm_trace"), list) else None
+
+    return SupportDebugMessageItem(
+        sessionId=session.session_id,
+        sessionUser=session_user,
+        messageId=int(message.id),
+        role=str(message.role or ""),
+        message=message.content,
+        createdAt=message.created_at,
+        provider=message.provider,
+        model=message.model,
+        uiPath=str(ui.get("path") or "") or None,
+        uiName=str(ui.get("name") or "") or None,
+        previousUserMessageId=int(prev_user.id) if prev_user is not None else None,
+        previousUserMessage=prev_user.content if prev_user is not None else None,
+        previousUserMeta=prev_meta or None,
+        messageMeta=meta or None,
+        toolRouter=meta.get("tool_router") if isinstance(meta.get("tool_router"), dict) else None,
+        tooling=meta.get("tooling") if isinstance(meta.get("tooling"), dict) else None,
+        toolCalls=tool_calls,
+        llmTrace=llm_trace,
+        promptHeader=meta.get("prompt_header") if isinstance(meta.get("prompt_header"), dict) else None,
+    )
+
+
+def _build_support_debug_context_messages(
+    *,
+    assistant_db: Session,
+    session_pk: int,
+    message: SupportMessage,
+    before: int,
+    after: int,
+) -> list[SupportDebugContextItem]:
+    before_rows = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session_pk)
+        .filter(SupportMessage.id < int(message.id))
+        .order_by(SupportMessage.id.desc())
+        .limit(before)
+        .all()
+    )
+    after_rows = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session_pk)
+        .filter(SupportMessage.id > int(message.id))
+        .order_by(SupportMessage.id.asc())
+        .limit(after)
+        .all()
+    )
+    ordered_rows = list(reversed(before_rows)) + [message] + after_rows
+    return [
+        SupportDebugContextItem(
+            messageId=int(row.id),
+            role=str(row.role or ""),
+            message=row.content,
+            createdAt=row.created_at,
+            provider=row.provider,
+            model=row.model,
+            isSelected=int(row.id) == int(message.id),
+        )
+        for row in ordered_rows
+    ]
+
+
 @router.get("/messages", response_model=list[SupportDebugMessageItem])
 def list_messages(
     response: Response,
@@ -2433,59 +2583,74 @@ def list_messages(
     )
     response.headers["X-Total-Count"] = str(total)
 
-    session_user_ids = {
-        int(session.user_id)
-        for _message, session in rows
-        if isinstance(session.user_id, int) and session.user_id > 0
-    }
-    user_map: dict[int, dict[str, Any]] = {}
-    if session_user_ids:
-        auth_rows = core_db.query(AuthUser).filter(AuthUser.id.in_(session_user_ids)).all()
-        for auth_user in auth_rows:
-            user_map[int(auth_user.id)] = _support_user_summary(auth_user) or {}
+    user_map = _debug_session_user_map(core_db=core_db, rows=rows)
 
     payload: list[SupportDebugMessageItem] = []
     for message, session in rows:
-        meta = _load_state(getattr(message, "meta_json", None))
-        prev_user = (
-            assistant_db.query(SupportMessage)
-            .filter(SupportMessage.session_pk == session.id)
-            .filter(SupportMessage.role == "user")
-            .filter(SupportMessage.id < int(message.id))
-            .order_by(SupportMessage.id.desc())
-            .first()
-        )
-        prev_meta = _load_state(getattr(prev_user, "meta_json", None) if prev_user is not None else None)
-        ui = prev_meta.get("ui") if isinstance(prev_meta.get("ui"), dict) else {}
         session_user = user_map.get(int(session.user_id)) if isinstance(session.user_id, int) else None
-        tool_calls = meta.get("tool_calls") if isinstance(meta.get("tool_calls"), list) else None
-        llm_trace = meta.get("llm_trace") if isinstance(meta.get("llm_trace"), list) else None
-
         payload.append(
-            SupportDebugMessageItem(
-                sessionId=session.session_id,
-                sessionUser=session_user,
-                messageId=int(message.id),
-                role=str(message.role or ""),
-                message=message.content,
-                createdAt=message.created_at,
-                provider=message.provider,
-                model=message.model,
-                uiPath=str(ui.get("path") or "") or None,
-                uiName=str(ui.get("name") or "") or None,
-                previousUserMessageId=int(prev_user.id) if prev_user is not None else None,
-                previousUserMessage=prev_user.content if prev_user is not None else None,
-                previousUserMeta=prev_meta or None,
-                messageMeta=meta or None,
-                toolRouter=meta.get("tool_router") if isinstance(meta.get("tool_router"), dict) else None,
-                tooling=meta.get("tooling") if isinstance(meta.get("tooling"), dict) else None,
-                toolCalls=tool_calls,
-                llmTrace=llm_trace,
-                promptHeader=meta.get("prompt_header") if isinstance(meta.get("prompt_header"), dict) else None,
+            _build_support_debug_message_item(
+                assistant_db=assistant_db,
+                message=message,
+                session=session,
+                session_user=session_user,
             )
         )
 
     return payload
+
+
+@router.get("/messages/{message_id}", response_model=SupportDebugMessageDetail)
+def get_message_detail(
+    message_id: int,
+    before: int = Query(default=6, ge=0, le=50),
+    after: int = Query(default=6, ge=0, le=50),
+    assistant_db: Session = Depends(get_assistant_session_dep),
+    core_db: Session = Depends(get_session_dep),
+    user: AuthUser | None = Depends(require_access),
+):
+    if user is None or user.role not in {UserRole.admin, UserRole.editor}:
+        raise HTTPException(status_code=403, detail="Admin or editor access required.")
+
+    row = (
+        assistant_db.query(SupportMessage, SupportSession)
+        .join(SupportSession, SupportMessage.session_pk == SupportSession.id)
+        .filter(SupportMessage.id == message_id)
+        .first()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Message not found.")
+
+    message, session = row
+    user_map = _debug_session_user_map(core_db=core_db, rows=[row])
+    session_user = user_map.get(int(session.user_id)) if isinstance(session.user_id, int) else None
+    item = _build_support_debug_message_item(
+        assistant_db=assistant_db,
+        message=message,
+        session=session,
+        session_user=session_user,
+    )
+    context_messages = _build_support_debug_context_messages(
+        assistant_db=assistant_db,
+        session_pk=int(session.id),
+        message=message,
+        before=int(before),
+        after=int(after),
+    )
+    session_message_count = int(
+        assistant_db.query(func.count(SupportMessage.id))
+        .filter(SupportMessage.session_pk == int(session.id))
+        .scalar()
+        or 0
+    )
+    session_state = _load_state(getattr(session, "state_json", None)) or None
+
+    return SupportDebugMessageDetail(
+        **item.model_dump(),
+        sessionState=session_state,
+        sessionMessageCount=session_message_count,
+        contextMessages=context_messages,
+    )
 
 
 @router.post("/feedback")

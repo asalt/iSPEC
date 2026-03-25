@@ -1,0 +1,18 @@
+{{ answer }}
+
+Key points:
+{% for point in points %}
+- {{ point }}
+{% endfor %}
+{% if example %}
+
+Example: {{ example }}
+{% endif %}
+{% if caveat %}
+
+Caveat: {{ caveat }}
+{% endif %}
+{% if next_step %}
+
+Next step: {{ next_step }}
+{% endif %}
