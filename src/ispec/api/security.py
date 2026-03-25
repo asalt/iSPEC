@@ -50,6 +50,7 @@ class _ApiKeyServiceUser:
     role: UserRole = UserRole.viewer
     is_active: bool = True
     must_change_password: bool = False
+    assistant_brief: str | None = None
     can_write_project_comments: bool = False
 
 

@@ -100,3 +100,29 @@ def test_get_omics_db_uri_uses_psm_database_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ISPEC_PSM_DB_PATH", str(psm_db_path))
 
     assert omics_connect.get_omics_db_uri(logical_name="psm") == f"sqlite:///{psm_db_path}"
+
+
+def test_omics_sqlite_journal_mode_prefers_analysis_specific_override(monkeypatch):
+    monkeypatch.setenv("ISPEC_ANALYSIS_SQLITE_JOURNAL_MODE", "delete")
+    monkeypatch.setenv("ISPEC_OMICS_SQLITE_JOURNAL_MODE", "wal")
+
+    assert omics_connect._omics_sqlite_journal_mode(logical_name="analysis") == "DELETE"
+
+
+def test_omics_sqlite_journal_mode_supports_legacy_analysis_alias(monkeypatch):
+    monkeypatch.delenv("ISPEC_ANALYSIS_SQLITE_JOURNAL_MODE", raising=False)
+    monkeypatch.setenv("ISPEC_OMICS_SQLITE_JOURNAL_MODE", "truncate")
+
+    assert omics_connect._omics_sqlite_journal_mode(logical_name="analysis") == "TRUNCATE"
+
+
+def test_omics_sqlite_journal_mode_supports_psm_override(monkeypatch):
+    monkeypatch.setenv("ISPEC_PSM_SQLITE_JOURNAL_MODE", "delete")
+
+    assert omics_connect._omics_sqlite_journal_mode(logical_name="psm") == "DELETE"
+
+
+def test_omics_sqlite_journal_mode_ignores_invalid_override(monkeypatch):
+    monkeypatch.setenv("ISPEC_ANALYSIS_SQLITE_JOURNAL_MODE", "bogus")
+
+    assert omics_connect._omics_sqlite_journal_mode(logical_name="analysis") is None

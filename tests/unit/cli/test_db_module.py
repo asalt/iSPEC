@@ -117,6 +117,34 @@ def test_register_subcommands_parses_audit_imports_command():
     assert args.out_dir == "data"
 
 
+def test_register_subcommands_parses_archive_agent_logs_command():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    db.register_subcommands(subparsers)
+    args = parser.parse_args(
+        [
+            "archive-agent-logs",
+            "--agent-database",
+            "agent.sqlite",
+            "--archive-database",
+            "agent-archive.sqlite",
+            "--older-than-days",
+            "30",
+            "--batch-size",
+            "100",
+            "--no-prune-live",
+            "--no-events",
+        ]
+    )
+    assert args.subcommand == "archive-agent-logs"
+    assert args.agent_database == "agent.sqlite"
+    assert args.archive_database == "agent-archive.sqlite"
+    assert args.older_than_days == 30
+    assert args.batch_size == 100
+    assert args.prune_live is False
+    assert args.archive_events is False
+
+
 def test_dispatch_calls_correct_operations(monkeypatch):
     init_mock = MagicMock()
     status_mock = MagicMock()
@@ -224,6 +252,41 @@ def test_dispatch_audit_imports_calls_operations(monkeypatch):
         legacy_tables_file_path=None,
         scripts_dir=None,
         out_dir="data",
+    )
+
+
+def test_dispatch_archive_agent_logs_calls_helper(monkeypatch):
+    archive_mock = MagicMock(return_value={"ok": True})
+    monkeypatch.setattr("ispec.agent.archive.archive_agent_logs", archive_mock)
+
+    db.dispatch(
+        types.SimpleNamespace(
+            subcommand="archive-agent-logs",
+            agent_database="agent.sqlite",
+            archive_database="archive.sqlite",
+            older_than_days=30,
+            batch_size=100,
+            max_batches=5,
+            dry_run=False,
+            prune_live=True,
+            archive_steps=True,
+            archive_events=True,
+            archive_commands=False,
+            archive_journal_mode="DELETE",
+        )
+    )
+    archive_mock.assert_called_once_with(
+        agent_db_file_path="agent.sqlite",
+        archive_db_file_path="archive.sqlite",
+        older_than_days=30,
+        batch_size=100,
+        max_batches=5,
+        dry_run=False,
+        prune_live=True,
+        archive_steps=True,
+        archive_events=True,
+        archive_commands=False,
+        archive_journal_mode="DELETE",
     )
 
 

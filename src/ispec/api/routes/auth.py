@@ -31,6 +31,7 @@ class UserOut(BaseModel):
     role: UserRole
     is_active: bool
     must_change_password: bool
+    assistant_brief: str | None = None
 
 
 class BootstrapRequest(BaseModel):
@@ -60,6 +61,10 @@ class ResetPasswordRequest(BaseModel):
     must_change_password: bool = True
 
 
+class UserAssistantBriefUpdate(BaseModel):
+    assistant_brief: str | None = Field(default=None, max_length=500)
+
+
 class UserProjectsOut(BaseModel):
     user_id: int
     project_ids: list[int]
@@ -69,6 +74,11 @@ class UserProjectsUpdate(BaseModel):
     project_ids: list[int] = Field(default_factory=list)
 
 
+def _normalize_assistant_brief(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
 def _user_out(user: AuthUser) -> UserOut:
     return UserOut(
         id=user.id,
@@ -76,6 +86,7 @@ def _user_out(user: AuthUser) -> UserOut:
         role=user.role,
         is_active=user.is_active,
         must_change_password=bool(getattr(user, "must_change_password", False)),
+        assistant_brief=_normalize_assistant_brief(getattr(user, "assistant_brief", None)),
     )
 
 
@@ -220,6 +231,24 @@ def reset_password(
     user.must_change_password = bool(payload.must_change_password)
     user.password_changed_at = datetime.now(UTC)
     _invalidate_user_sessions(db, user_id=user.id)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _user_out(user)
+
+
+@router.put("/users/{user_id}/assistant-brief", response_model=UserOut)
+def update_user_assistant_brief(
+    user_id: int,
+    payload: UserAssistantBriefUpdate,
+    _: AuthUser = Depends(require_staff),
+    db: Session = Depends(get_session_dep),
+):
+    user = db.get(AuthUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    user.assistant_brief = _normalize_assistant_brief(payload.assistant_brief)
     db.add(user)
     db.commit()
     db.refresh(user)

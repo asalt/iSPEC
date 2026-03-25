@@ -21,11 +21,14 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from ispec.agent.connect import get_agent_db_uri, get_agent_session
 from ispec.agent.commands import (
+    COMMAND_ARCHIVE_AGENT_LOGS,
     COMMAND_COMPACT_SESSION_MEMORY,
     COMMAND_BUILD_SUPPORT_DIGEST,
+    COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT,
     COMMAND_ASSESS_TACKLE_RESULTS,
     COMMAND_RUN_TACKLE_PROMPT,
     COMMAND_DEV_RESTART_SERVICES,
+    COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
     COMMAND_LEGACY_SYNC_ALL,
     COMMAND_ORCHESTRATOR_TICK,
     COMMAND_REVIEW_REPO,
@@ -37,6 +40,7 @@ from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.agent.policies.primitives.backoff import backoff_exponential_current
 from ispec.assistant.compaction import distill_conversation_memory
 from ispec.assistant.connect import get_assistant_db_uri, get_assistant_session
+from ispec.assistant.formatting import split_plan_final
 from ispec.assistant.models import (
     SupportMemory,
     SupportMemoryEvidence,
@@ -44,7 +48,23 @@ from ispec.assistant.models import (
     SupportSession,
     SupportSessionReview,
 )
-from ispec.assistant.service import AssistantReply, generate_reply
+from ispec.assistant.prompting import estimate_tokens_for_messages
+from ispec.assistant.schedules import (
+    AssistantSchedule,
+    load_assistant_schedules as _load_assistant_schedules,
+    normalize_schedule_tool_names as _normalize_schedule_tool_names,
+    parse_hhmm as _parse_hhmm,
+    parse_weekday as _parse_weekday,
+)
+from ispec.assistant.service import AssistantReply, _system_prompt_planner, generate_reply
+from ispec.assistant.tools import (
+    TOOL_CALL_PREFIX,
+    extract_tool_call_line,
+    format_tool_result_message,
+    openai_tools_for_user,
+    parse_tool_call,
+    run_tool,
+)
 from ispec.concurrency.thread_context import assert_main_thread, main_thread_info, set_main_thread
 from ispec.config.paths import (
     resolve_db_location,
@@ -53,6 +73,7 @@ from ispec.config.paths import (
     resolve_supervisor_state_file,
 )
 from ispec.db.connect import get_session
+from ispec.db.models import UserRole
 from ispec.logging import get_logger
 from ispec.omics.connect import get_omics_session
 from ispec.schedule.connect import get_schedule_db_uri, get_schedule_session
@@ -264,6 +285,19 @@ def _summarize_command_payload(command_type: str, payload: dict[str, Any]) -> st
             queued_session_id = chat_request.get("sessionId")
             if isinstance(queued_session_id, str) and queued_session_id.strip():
                 parts.append(f"session_id={queued_session_id.strip()}")
+    if command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT:
+        job = payload.get("job")
+        if isinstance(job, dict):
+            job_name = job.get("name")
+            if isinstance(job_name, str) and job_name.strip():
+                parts.append(f"job={job_name.strip()}")
+    if command_type == COMMAND_ARCHIVE_AGENT_LOGS:
+        older_than_days = _safe_int(payload.get("older_than_days"))
+        if older_than_days is not None:
+            parts.append(f"older_than_days={older_than_days}")
+        batch_size = _safe_int(payload.get("batch_size"))
+        if batch_size is not None:
+            parts.append(f"batch_size={batch_size}")
 
     session_id = payload.get("session_id")
     if isinstance(session_id, str) and session_id.strip():
@@ -1621,8 +1655,12 @@ def _load_scheduler_state(run: AgentRun) -> dict[str, Any]:
         state = {"schema_version": _SCHEDULER_STATE_VERSION}
     if not isinstance(state.get("slack"), dict):
         state["slack"] = {}
+    if not isinstance(state.get("assistant_jobs"), dict):
+        state["assistant_jobs"] = {}
     if not isinstance(state.get("legacy_sync"), dict):
         state["legacy_sync"] = {}
+    if not isinstance(state.get("agent_log_archive"), dict):
+        state["agent_log_archive"] = {}
     return state
 
 
@@ -2657,6 +2695,446 @@ def _run_support_chat_turn(
     )
 
 
+def _task_scheduled_assistant_prompt(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> LLMTask:
+    job_payload = payload.get("job") if isinstance(payload.get("job"), dict) else payload
+    job_name = str(job_payload.get("name") or "").strip()
+    prompt_text = _truncate_text(str(job_payload.get("prompt") or "").strip(), limit=6000)
+    allowed_tools_raw = job_payload.get("allowed_tools")
+    allowed_tool_names = set(_normalize_schedule_tool_names(allowed_tools_raw))
+    required_tool = str(job_payload.get("required_tool") or "").strip() or None
+    if required_tool and required_tool not in allowed_tool_names:
+        allowed_tool_names.add(required_tool)
+
+    max_tool_calls = _safe_int(job_payload.get("max_tool_calls")) or 4
+    max_tool_calls = _clamp_int(int(max_tool_calls), min_value=1, max_value=12)
+
+    if not prompt_text:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing scheduled assistant prompt.", "job_name": job_name or None},
+            error="missing_scheduled_assistant_prompt",
+        )
+    if not allowed_tool_names:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "No allowed_tools configured.", "job_name": job_name or None},
+            error="missing_scheduled_assistant_tools",
+        )
+
+    scheduled_user = _ScheduledAssistantToolUser()
+    tool_schemas = _filter_openai_tools_by_name(
+        tools=openai_tools_for_user(scheduled_user),
+        allowed_names=allowed_tool_names,
+    )
+    provided_tool_names = {
+        name
+        for name in (_openai_tool_name_from_spec(tool) for tool in tool_schemas)
+        if isinstance(name, str) and name
+    }
+
+    if not provided_tool_names:
+        return CommandExecution(
+            ok=False,
+            result={
+                "ok": False,
+                "error": "No configured scheduled tools are currently available.",
+                "job_name": job_name or None,
+                "allowed_tools": sorted(allowed_tool_names),
+            },
+            error="scheduled_assistant_tools_unavailable",
+        )
+    if required_tool and required_tool not in provided_tool_names:
+        return CommandExecution(
+            ok=False,
+            result={
+                "ok": False,
+                "error": f"Required tool {required_tool} is unavailable.",
+                "job_name": job_name or None,
+                "allowed_tools": sorted(allowed_tool_names),
+                "available_tools": sorted(provided_tool_names),
+            },
+            error="scheduled_assistant_required_tool_unavailable",
+        )
+
+    system_prompt = _scheduled_assistant_system_prompt(
+        allowed_tool_names=provided_tool_names,
+        required_tool=required_tool,
+    )
+    context_payload: dict[str, Any] = {
+        "schema_version": 1,
+        "job": {
+            "name": job_name or None,
+            "schedule": payload.get("schedule") if isinstance(payload.get("schedule"), dict) else None,
+            "required_tool": required_tool,
+            "allowed_tools": sorted(provided_tool_names),
+            "max_tool_calls": int(max_tool_calls),
+        },
+        "agent": {
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "command_id": int(command_id) if command_id is not None else None,
+        },
+    }
+
+    tool_messages: list[dict[str, Any]] = []
+    tool_calls: list[dict[str, Any]] = []
+    llm_trace: list[dict[str, Any]] = []
+    used_tool_calls = 0
+    required_tool_calls = 0
+    queued_command_ids: list[int] = []
+    raw_reply = ""
+    final_text = ""
+    forced_required_tool_round = False
+    max_rounds = max(4, int(max_tool_calls) + 3)
+
+    def execute_tool(tool_name: str, tool_args: dict[str, Any], *, protocol: str) -> dict[str, Any]:
+        nonlocal used_tool_calls, required_tool_calls
+
+        if required_tool and tool_name == required_tool and required_tool_calls >= 1:
+            return {
+                "ok": False,
+                "tool": tool_name,
+                "error": "Required final tool already executed once for this scheduled job.",
+            }
+        if used_tool_calls >= max_tool_calls:
+            return {
+                "ok": False,
+                "tool": tool_name,
+                "error": "Tool call limit exceeded; no further tools executed.",
+            }
+
+        used_tool_calls += 1
+        with (
+            get_session() as core_db,
+            get_assistant_session() as assistant_db,
+            get_agent_session() as agent_db,
+            get_omics_session() as omics_db,
+            get_schedule_session() as schedule_db,
+        ):
+            tool_payload = run_tool(
+                name=tool_name,
+                args=tool_args,
+                core_db=core_db,
+                assistant_db=assistant_db,
+                agent_db=agent_db,
+                schedule_db=schedule_db,
+                omics_db=omics_db,
+                user=scheduled_user,
+                api_schema=None,
+                user_message=prompt_text,
+            )
+
+        if required_tool and tool_name == required_tool and bool(tool_payload.get("ok")):
+            required_tool_calls += 1
+            result_obj = tool_payload.get("result")
+            if isinstance(result_obj, dict):
+                command_id_obj = _safe_int(result_obj.get("command_id"))
+                if command_id_obj is not None and command_id_obj > 0:
+                    queued_command_ids.append(int(command_id_obj))
+
+        tool_calls.append(
+            {
+                "name": tool_name,
+                "arguments": dict(tool_args or {}),
+                "ok": bool(tool_payload.get("ok")),
+                "error": tool_payload.get("error"),
+                "result_preview": _tool_result_preview(tool_payload),
+                "protocol": protocol,
+            }
+        )
+        return tool_payload
+
+    for llm_round in range(1, max_rounds + 1):
+        context_payload["agent"] = {
+            **(context_payload.get("agent") if isinstance(context_payload.get("agent"), dict) else {}),
+            "round": int(llm_round),
+        }
+        context_message = _scheduled_assistant_context_message(payload=context_payload)
+        tools_for_call = tool_schemas
+        tool_choice: str | dict[str, Any] | None = None
+        if forced_required_tool_round and required_tool:
+            tools_for_call = [
+                tool
+                for tool in tool_schemas
+                if _openai_tool_name_from_spec(tool) == required_tool
+            ]
+            tool_choice = {"type": "function", "function": {"name": required_tool}}
+
+        messages_for_llm: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": context_message},
+            {"role": "user", "content": prompt_text},
+            *tool_messages,
+        ]
+
+        reply = yield InferenceRequest(
+            messages=messages_for_llm,
+            tools=tools_for_call,
+            tool_choice=tool_choice,
+            stage="planner",
+        )
+
+        raw_reply = reply.content or ""
+        trace_step: dict[str, Any] = {
+            "round": int(llm_round),
+            "tool_choice": tool_choice,
+            "required_tool_round": bool(forced_required_tool_round),
+            "provider": reply.provider,
+            "model": reply.model,
+            "reply_preview": _truncate_text(raw_reply, limit=400),
+        }
+        if isinstance(reply.meta, dict):
+            trace_step["provider_meta"] = {
+                "elapsed_ms": reply.meta.get("elapsed_ms"),
+                "usage": reply.meta.get("usage"),
+                "fallback": reply.meta.get("fallback"),
+            }
+
+        if reply.tool_calls:
+            tool_messages.append(
+                {
+                    "role": "assistant",
+                    "content": raw_reply,
+                    "tool_calls": reply.tool_calls,
+                }
+            )
+            executed_tools: list[str] = []
+            for tool_call in reply.tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = str(tool_call.get("id") or tool_call.get("tool_call_id") or f"call_{used_tool_calls + 1}")
+                func_obj = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                tool_name = str(func_obj.get("name") or "").strip()
+                args_raw = func_obj.get("arguments")
+                try:
+                    if isinstance(args_raw, str):
+                        parsed_args = json.loads(args_raw) if args_raw.strip() else {}
+                    elif isinstance(args_raw, dict):
+                        parsed_args = args_raw
+                    else:
+                        parsed_args = {}
+                except Exception:
+                    parsed_args = {}
+                if not isinstance(parsed_args, dict):
+                    parsed_args = {}
+                if not tool_name:
+                    continue
+
+                executed_tools.append(tool_name)
+                tool_payload = execute_tool(tool_name, parsed_args, protocol="openai")
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(tool_payload, ensure_ascii=False),
+                    }
+                )
+                tool_messages.append(
+                    {"role": "system", "content": format_tool_result_message(tool_name, tool_payload)}
+                )
+
+            if executed_tools:
+                trace_step["executed_tools"] = executed_tools
+            llm_trace.append(trace_step)
+            forced_required_tool_round = False
+            continue
+
+        tool_call = parse_tool_call(raw_reply)
+        if tool_call is not None:
+            tool_name, tool_args = tool_call
+            tool_payload = execute_tool(tool_name, tool_args, protocol="line")
+            tool_call_line = extract_tool_call_line(raw_reply) or raw_reply.strip()
+            tool_messages.extend(
+                [
+                    {"role": "assistant", "content": tool_call_line},
+                    {"role": "system", "content": format_tool_result_message(tool_name, tool_payload)},
+                ]
+            )
+            trace_step["executed_tools"] = [tool_name]
+            llm_trace.append(trace_step)
+            forced_required_tool_round = False
+            continue
+
+        _, parsed_final = split_plan_final(raw_reply)
+        final_text = parsed_final.strip() or raw_reply.strip()
+        trace_step["final_preview"] = _truncate_text(final_text, limit=400)
+        llm_trace.append(trace_step)
+
+        if required_tool and required_tool_calls <= 0:
+            if forced_required_tool_round:
+                return CommandExecution(
+                    ok=False,
+                    result={
+                        "ok": False,
+                        "error": f"Required tool {required_tool} was not called.",
+                        "job_name": job_name or None,
+                        "final_text": final_text,
+                        "tool_calls": tool_calls,
+                        "required_tool": required_tool,
+                    },
+                    error="scheduled_assistant_required_tool_not_called",
+                    prompt={
+                        "system_prompt": system_prompt,
+                        "context": context_payload,
+                        "required_tool": required_tool,
+                    },
+                    response={"llm_trace": llm_trace, "raw_reply": _truncate_text(raw_reply, limit=2000)},
+                )
+
+            tool_messages.append({"role": "assistant", "content": raw_reply})
+            tool_messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"You must now call {required_tool} exactly once.\n"
+                        "Use confirm=true.\n"
+                        "Put the finalized staff-facing message into the tool call.\n"
+                        "Do not return FINAL until the tool call succeeds.\n"
+                        "Draft message to send:\n"
+                        f"{_truncate_text(final_text, limit=3500)}"
+                    ),
+                }
+            )
+            forced_required_tool_round = True
+            continue
+
+        return CommandExecution(
+            ok=True,
+            result={
+                "ok": True,
+                "job_name": job_name or None,
+                "required_tool": required_tool,
+                "required_tool_called": bool(required_tool_calls > 0) if required_tool else None,
+                "required_tool_call_count": int(required_tool_calls),
+                "queued_command_ids": queued_command_ids,
+                "used_tool_calls": int(used_tool_calls),
+                "tool_calls": tool_calls,
+                "final_text": final_text,
+                "llm": {
+                    "provider": reply.provider,
+                    "model": reply.model,
+                    "meta": reply.meta,
+                },
+            },
+            prompt={
+                "system_prompt": system_prompt,
+                "context": context_payload,
+                "allowed_tools": sorted(provided_tool_names),
+            },
+            response={
+                "llm_trace": llm_trace,
+                "raw_reply": _truncate_text(raw_reply, limit=2000),
+            },
+        )
+
+    return CommandExecution(
+        ok=False,
+        result={
+            "ok": False,
+            "error": "Scheduled assistant prompt exceeded max rounds.",
+            "job_name": job_name or None,
+            "required_tool": required_tool,
+            "required_tool_called": bool(required_tool_calls > 0) if required_tool else None,
+            "tool_calls": tool_calls,
+            "final_text": final_text,
+        },
+        error="scheduled_assistant_max_rounds_exceeded",
+        prompt={
+            "system_prompt": system_prompt,
+            "context": context_payload,
+            "allowed_tools": sorted(provided_tool_names),
+        },
+        response={"llm_trace": llm_trace, "raw_reply": _truncate_text(raw_reply, limit=2000)},
+    )
+
+
+def _run_scheduled_assistant_prompt(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> CommandExecution:
+    return _run_llm_task_sync(
+        _task_scheduled_assistant_prompt(
+            payload=payload,
+            agent_id=agent_id,
+            run_id=run_id,
+            command_id=command_id,
+        )
+    )
+
+
+def _openai_tool_name_from_spec(tool: dict[str, Any]) -> str | None:
+    if not isinstance(tool, dict):
+        return None
+    func_obj = tool.get("function")
+    if not isinstance(func_obj, dict):
+        return None
+    name = func_obj.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return name.strip()
+
+
+def _filter_openai_tools_by_name(*, tools: list[dict[str, Any]], allowed_names: set[str]) -> list[dict[str, Any]]:
+    if not allowed_names:
+        return []
+    filtered: list[dict[str, Any]] = []
+    for tool in tools:
+        name = _openai_tool_name_from_spec(tool)
+        if name and name in allowed_names:
+            filtered.append(tool)
+    return filtered
+
+
+def _tool_result_preview(payload: dict[str, Any], *, max_chars: int = 2000) -> str | None:
+    result = payload.get("result")
+    if result is None:
+        return None
+    try:
+        rendered = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return None
+    if max_chars > 0 and len(rendered) > max_chars:
+        return rendered[:max_chars] + "…"
+    return rendered
+
+
+def _scheduled_assistant_context_message(*, payload: dict[str, Any]) -> str:
+    return "SCHEDULED_ASSISTANT_CONTEXT v1:\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _scheduled_assistant_system_prompt(*, allowed_tool_names: set[str], required_tool: str | None) -> str:
+    base = _system_prompt_planner(
+        tools_available=True,
+        response_format="single",
+        tool_names=allowed_tool_names,
+    ).strip()
+    rules = [
+        "Scheduled job rules:",
+        "- This is an internal scheduled assistant task, not an end-user conversation.",
+        "- Gather live information using the provided tools when needed.",
+        "- Do not ask clarifying questions; make a reasonable best effort from available data.",
+        "- Keep the staff-facing message concise and readable.",
+    ]
+    if required_tool:
+        rules.extend(
+            [
+                f"- After gathering the needed information, call {required_tool} exactly once.",
+                "- Do not stop after drafting the message; complete the required final tool call.",
+                "- If the required tool succeeds, finish with a short FINAL confirming the action.",
+            ]
+        )
+    return base + "\n\n" + "\n".join(rules)
+
+
 def _task_support_session_review(
     *,
     payload: dict[str, Any],
@@ -2936,6 +3414,118 @@ def _run_support_session_review(
     )
 
 
+def _structured_llm_input_token_budget(task: str, *, default: int) -> int:
+    value = _safe_int(os.getenv(f"ISPEC_SUPERVISOR_{task}_MAX_INPUT_TOKENS"))
+    if value is None:
+        value = _safe_int(os.getenv("ISPEC_SUPERVISOR_MAX_INPUT_TOKENS")) or int(default)
+    return _clamp_int(int(value), min_value=512, max_value=32768)
+
+
+def _support_digest_prompt_review_item(item: dict[str, Any], *, compact_level: int = 0) -> dict[str, Any]:
+    review = item.get("review") if isinstance(item.get("review"), dict) else {}
+    level = max(0, int(compact_level))
+    summary_limit = 320 if level <= 0 else (180 if level == 1 else 96)
+    issue_limit = 180 if level <= 0 else (100 if level == 1 else 72)
+    followup_limit = 180 if level <= 0 else (100 if level == 1 else 72)
+    query_limit = 120 if level <= 0 else 80
+    max_issue_items = 3 if level <= 0 else (2 if level == 1 else 1)
+    max_followups = 3 if level <= 0 else (2 if level == 1 else 1)
+    max_queries = 3 if level <= 0 else (1 if level == 1 else 0)
+
+    summary = review.get("summary") if isinstance(review.get("summary"), str) else ""
+    summary = _truncate_text(summary, limit=summary_limit)
+
+    issues: list[str] = []
+    raw_issues = review.get("issues")
+    if isinstance(raw_issues, list):
+        for raw_issue in raw_issues[:max_issue_items]:
+            if not isinstance(raw_issue, dict):
+                continue
+            description = raw_issue.get("description")
+            if not isinstance(description, str) or not description.strip():
+                continue
+            issues.append(_truncate_text(description.strip(), limit=issue_limit))
+
+    followups: list[str] = []
+    raw_followups = review.get("followups")
+    if isinstance(raw_followups, str) and raw_followups.strip():
+        raw_followups = [raw_followups]
+    if isinstance(raw_followups, list):
+        for raw_followup in raw_followups[:max_followups]:
+            if not isinstance(raw_followup, str):
+                continue
+            text = raw_followup.strip()
+            if not text:
+                continue
+            followups.append(_truncate_text(text, limit=followup_limit))
+
+    repo_search_queries: list[str] = []
+    raw_queries = review.get("repo_search_queries")
+    if isinstance(raw_queries, str) and raw_queries.strip():
+        raw_queries = [raw_queries]
+    if isinstance(raw_queries, list):
+        for raw_query in raw_queries[:max_queries]:
+            if not isinstance(raw_query, str):
+                continue
+            text = raw_query.strip()
+            if not text:
+                continue
+            repo_search_queries.append(_truncate_text(text, limit=query_limit))
+
+    issues_count = len(raw_issues) if isinstance(raw_issues, list) else 0
+    return {
+        "review_id": int(item.get("review_id") or 0),
+        "session_id": str(item.get("session_id") or "").strip(),
+        "user_id": int(item.get("user_id")) if isinstance(item.get("user_id"), int) else None,
+        "target_message_id": int(item.get("target_message_id") or 0),
+        "updated_at": item.get("updated_at"),
+        "summary": summary,
+        "issues_count": int(max(0, issues_count)),
+        "top_issues": issues,
+        "followups": followups,
+        "repo_search_queries": repo_search_queries,
+    }
+
+
+def _fit_support_digest_reviews_to_budget(
+    *,
+    review_items: list[dict[str, Any]],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None,
+    cursor_review_id: int,
+    max_input_tokens: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    selected = list(review_items)
+    compact_level = 0
+    prompt_items = [_support_digest_prompt_review_item(item, compact_level=compact_level) for item in selected]
+
+    while True:
+        context = {
+            "schema_version": 1,
+            "agent": {"agent_id": agent_id, "run_id": run_id, "command_id": int(command_id) if command_id else None},
+            "cursor_review_id": int(cursor_review_id),
+            "reviews": prompt_items,
+        }
+        messages = [
+            {"role": "system", "content": _support_digest_system_prompt()},
+            {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
+        ]
+        estimated_tokens = estimate_tokens_for_messages(messages)
+        if estimated_tokens <= int(max_input_tokens) or len(selected) <= 1:
+            if estimated_tokens <= int(max_input_tokens) or len(selected) <= 1 and compact_level >= 2:
+                return selected, prompt_items, int(estimated_tokens)
+            compact_level += 1
+            prompt_items = [
+                _support_digest_prompt_review_item(item, compact_level=compact_level)
+                for item in selected
+            ]
+            continue
+        selected = selected[:-1]
+        compact_level = 0
+        prompt_items = [_support_digest_prompt_review_item(item, compact_level=compact_level) for item in selected]
+
+
 def _support_digest_schema(*, max_sessions: int) -> dict[str, Any]:
     return {
         "type": "object",
@@ -3159,9 +3749,9 @@ def _task_support_digest(
     cursor_review_id = int(cursor_review_id or 0)
 
     max_reviews = _clamp_int(_safe_int(payload.get("max_reviews")) or 20, min_value=1, max_value=100)
+    max_input_tokens = _structured_llm_input_token_budget("SUPPORT_DIGEST", default=5200)
 
     review_items: list[dict[str, Any]] = []
-    evidence_message_ids: list[int] = []
     with get_assistant_session() as assistant_db:
         rows = (
             assistant_db.query(
@@ -3183,8 +3773,6 @@ def _task_support_digest(
             if review_id_int <= 0:
                 continue
             target_message_id_int = int(target_message_id or 0)
-            if target_message_id_int > 0:
-                evidence_message_ids.append(target_message_id_int)
             review_items.append(
                 {
                     "review_id": review_id_int,
@@ -3207,6 +3795,29 @@ def _task_support_digest(
             },
         )
 
+    review_items_prompt, prompt_review_items, prompt_input_tokens = _fit_support_digest_reviews_to_budget(
+        review_items=review_items,
+        agent_id=agent_id,
+        run_id=run_id,
+        command_id=command_id,
+        cursor_review_id=int(cursor_review_id),
+        max_input_tokens=int(max_input_tokens),
+    )
+    if len(review_items_prompt) < len(review_items):
+        logger.info(
+            "Trimmed support digest batch from %s to %s review(s) to fit prompt budget est_tokens=%s budget=%s",
+            len(review_items),
+            len(review_items_prompt),
+            int(prompt_input_tokens),
+            int(max_input_tokens),
+        )
+    review_items = list(review_items_prompt)
+    evidence_message_ids = [
+        int(item["target_message_id"])
+        for item in review_items
+        if int(item.get("target_message_id") or 0) > 0
+    ]
+
     from_review_id = int(review_items[0]["review_id"])
     to_review_id = int(review_items[-1]["review_id"])
 
@@ -3214,7 +3825,7 @@ def _task_support_digest(
         "schema_version": 1,
         "agent": {"agent_id": agent_id, "run_id": run_id, "command_id": int(command_id) if command_id else None},
         "cursor_review_id": int(cursor_review_id),
-        "reviews": review_items,
+        "reviews": prompt_review_items,
     }
 
     schema = _support_digest_schema(max_sessions=len(review_items))
@@ -3336,13 +3947,16 @@ def _task_support_digest(
             "ok": True,
             "digest_id": int(digest_id) if digest_id is not None else None,
             "cursor_review_id": int(cursor_review_id),
-            "from_review_id": from_review_id,
-            "to_review_id": to_review_id,
-            "review_count": len(review_items),
-            "digest": coerced,
-            "llm": {
-                "provider": reply.provider,
-                "model": reply.model,
+                "from_review_id": from_review_id,
+                "to_review_id": to_review_id,
+                "review_count": len(review_items),
+                "reviews_available": len(rows),
+                "reviews_deferred": max(0, len(rows) - len(review_items)),
+                "input_tokens_estimate": int(prompt_input_tokens),
+                "digest": coerced,
+                "llm": {
+                    "provider": reply.provider,
+                    "model": reply.model,
                 "meta": reply.meta,
                 "invalid_output_recovered": bool(recovered),
                 "attempts": len(attempts),
@@ -4525,27 +5139,6 @@ def _run_dev_restart_services(payload: dict[str, Any]) -> CommandExecution:
     return CommandExecution(ok=True, result=result)
 
 
-_WEEKDAY_ALIASES: dict[str, int] = {
-    "mon": 0,
-    "monday": 0,
-    "tue": 1,
-    "tues": 1,
-    "tuesday": 1,
-    "wed": 2,
-    "wednesday": 2,
-    "thu": 3,
-    "thur": 3,
-    "thurs": 3,
-    "thursday": 3,
-    "fri": 4,
-    "friday": 4,
-    "sat": 5,
-    "saturday": 5,
-    "sun": 6,
-    "sunday": 6,
-}
-
-
 @dataclass(frozen=True)
 class SlackSchedule:
     name: str
@@ -4561,42 +5154,15 @@ class SlackSchedule:
     enabled: bool = True
 
 
-def _parse_weekday(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value if 0 <= value <= 6 else None
-    raw = str(value).strip().lower()
-    if not raw:
-        return None
-    if raw.isdigit():
-        try:
-            parsed = int(raw)
-        except ValueError:
-            return None
-        return parsed if 0 <= parsed <= 6 else None
-    return _WEEKDAY_ALIASES.get(raw)
-
-
-def _parse_hhmm(value: Any) -> tuple[int, int] | None:
-    raw = str(value).strip()
-    if not raw:
-        return None
-    if ":" not in raw:
-        return None
-    left, right = raw.split(":", 1)
-    left = left.strip()
-    right = right.strip()
-    if not left or not right:
-        return None
-    try:
-        hour = int(left)
-        minute = int(right)
-    except ValueError:
-        return None
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
-    return hour, minute
+@dataclass(frozen=True)
+class _ScheduledAssistantToolUser:
+    id: int = -1
+    username: str = "scheduled_assistant"
+    role: UserRole = UserRole.admin
+    is_active: bool = True
+    must_change_password: bool = False
+    assistant_brief: str | None = None
+    can_write_project_comments: bool = True
 
 
 def _load_slack_schedule_json() -> list[dict[str, Any]]:
@@ -4668,8 +5234,6 @@ def _load_slack_schedules() -> list[SlackSchedule]:
         )
         seen.add(name)
     return schedules
-
-
 def _slack_schedule_next_occurrence(
     *,
     now: datetime,
@@ -4837,6 +5401,152 @@ def _record_slack_schedule_attempt(
 
     slack_state[name] = schedule_state
     scheduler_state["slack"] = slack_state
+    _save_scheduler_state(run=run, state=scheduler_state)
+
+
+def _ensure_assistant_scheduled_commands(*, agent_id: str, run_id: str) -> dict[str, Any]:
+    schedules = [s for s in _load_assistant_schedules() if s.enabled]
+    if not schedules:
+        return {"ok": True, "scheduled": 0, "skipped": 0}
+
+    now = utcnow()
+    scheduled_count = 0
+    skipped = 0
+    with get_agent_session() as db:
+        run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+        scheduler_state = _load_scheduler_state(run)
+        assistant_state = scheduler_state.get("assistant_jobs")
+        if not isinstance(assistant_state, dict):
+            assistant_state = {}
+
+        existing_keys: set[str] = set()
+        existing_rows = (
+            db.query(AgentCommand)
+            .filter(AgentCommand.command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT)
+            .filter(AgentCommand.status.in_(["queued", "running"]))
+            .all()
+        )
+        for row in existing_rows:
+            payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+            schedule_payload = payload.get("schedule") if isinstance(payload, dict) else None
+            if not isinstance(schedule_payload, dict):
+                continue
+            key = str(schedule_payload.get("key") or "").strip()
+            if key:
+                existing_keys.add(key)
+
+        dirty = False
+        for schedule in schedules:
+            occurrence_utc, available_at_utc, key = _slack_schedule_next_occurrence(now=now, schedule=schedule)
+            existing = assistant_state.get(schedule.name)
+            schedule_state = existing if isinstance(existing, dict) else {}
+            if str(schedule_state.get("last_attempted_key") or "").strip() == key:
+                skipped += 1
+                continue
+            if key in existing_keys:
+                skipped += 1
+                continue
+
+            cmd = AgentCommand(
+                command_type=COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT,
+                status="queued",
+                priority=int(schedule.priority),
+                created_at=now,
+                updated_at=now,
+                available_at=available_at_utc,
+                attempts=0,
+                max_attempts=int(schedule.max_attempts),
+                payload_json={
+                    "job": {
+                        "name": schedule.name,
+                        "prompt": schedule.prompt,
+                        "allowed_tools": list(schedule.allowed_tools),
+                        "required_tool": schedule.required_tool,
+                        "max_tool_calls": int(schedule.max_tool_calls),
+                    },
+                    "schedule": {
+                        "name": schedule.name,
+                        "key": key,
+                        "occurrence_utc": occurrence_utc.isoformat(),
+                        "timezone": schedule.timezone,
+                        "weekday": schedule.weekday,
+                        "time": f"{schedule.hour:02d}:{schedule.minute:02d}",
+                    },
+                    "meta": {"enqueued_by": "supervisor", "agent_id": agent_id, "run_id": run_id},
+                },
+                result_json={},
+            )
+            db.add(cmd)
+            db.flush()
+            existing_keys.add(key)
+            scheduled_count += 1
+            dirty = True
+
+            assistant_state[schedule.name] = {
+                **schedule_state,
+                "next_enqueued_key": key,
+                "next_enqueued_at": now.isoformat(),
+                "next_command_id": int(cmd.id),
+                "next_occurrence_utc": occurrence_utc.isoformat(),
+                "next_available_at_utc": available_at_utc.isoformat(),
+            }
+
+        if dirty:
+            scheduler_state["assistant_jobs"] = assistant_state
+            _save_scheduler_state(run=run, state=scheduler_state)
+            db.commit()
+
+    return {"ok": True, "scheduled": scheduled_count, "skipped": skipped}
+
+
+def _record_assistant_schedule_attempt(
+    *,
+    run: AgentRun,
+    payload: dict[str, Any],
+    execution: CommandExecution,
+    ended_at: datetime,
+) -> None:
+    schedule = payload.get("schedule")
+    if not isinstance(schedule, dict):
+        return
+    name = str(schedule.get("name") or "").strip()
+    key = str(schedule.get("key") or "").strip()
+    if not name or not key:
+        return
+
+    scheduler_state = _load_scheduler_state(run)
+    assistant_state = scheduler_state.get("assistant_jobs")
+    if not isinstance(assistant_state, dict):
+        assistant_state = {}
+
+    existing = assistant_state.get(name)
+    schedule_state = existing if isinstance(existing, dict) else {}
+    schedule_state = dict(schedule_state)
+    schedule_state["last_attempted_key"] = key
+    schedule_state["last_attempted_at"] = ended_at.isoformat()
+    schedule_state["last_attempted_ok"] = bool(execution.ok)
+    if execution.ok:
+        schedule_state["last_completed_key"] = key
+        schedule_state["last_completed_at"] = ended_at.isoformat()
+        result_obj = execution.result if isinstance(execution.result, dict) else {}
+        queued_command_ids = result_obj.get("queued_command_ids")
+        if isinstance(queued_command_ids, list):
+            schedule_state["last_queued_command_ids"] = [
+                int(item) for item in queued_command_ids if isinstance(item, int) and int(item) > 0
+            ]
+    else:
+        schedule_state["last_attempted_error"] = execution.error
+
+    next_key = str(schedule_state.get("next_enqueued_key") or "").strip()
+    if next_key == key:
+        schedule_state.pop("next_enqueued_key", None)
+        schedule_state.pop("next_enqueued_at", None)
+        schedule_state.pop("next_command_id", None)
+        schedule_state.pop("next_occurrence_utc", None)
+        schedule_state.pop("next_available_at_utc", None)
+
+    assistant_state[name] = schedule_state
+    scheduler_state["assistant_jobs"] = assistant_state
     _save_scheduler_state(run=run, state=scheduler_state)
 
 
@@ -5024,6 +5734,402 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
         return CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
 
 
+def _legacy_push_project_comments_enabled() -> bool:
+    return _is_truthy(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_ENABLED"))
+
+
+def _legacy_push_project_comments_interval_seconds() -> int:
+    raw = (os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_INTERVAL_SECONDS") or "").strip()
+    if not raw:
+        return 1800
+    parsed = _safe_int(raw)
+    if parsed is None:
+        return 1800
+    return _clamp_int(int(parsed), min_value=60, max_value=7 * 24 * 3600)
+
+
+def _legacy_push_project_comments_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[str, Any], int]:
+    interval_seconds = _legacy_push_project_comments_interval_seconds()
+    limit = _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_LIMIT")) or 5000
+    limit = _clamp_int(int(limit), min_value=1, max_value=50000)
+    project_id = _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_PROJECT_ID"))
+    if project_id is not None and int(project_id) <= 0:
+        project_id = None
+
+    dry_run_env = os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_DRY_RUN")
+    dry_run = _is_truthy(dry_run_env) if dry_run_env is not None else False
+
+    payload: dict[str, Any] = {
+        "project_id": int(project_id) if isinstance(project_id, int) else None,
+        "limit": int(limit),
+        "dry_run": bool(dry_run),
+        "meta": {"enqueued_by": "supervisor", "agent_id": agent_id, "run_id": run_id},
+    }
+
+    legacy_url = str(os.getenv("ISPEC_LEGACY_API_URL") or "").strip()
+    if legacy_url:
+        payload["legacy_url"] = legacy_url
+
+    schema_path = str(os.getenv("ISPEC_LEGACY_SCHEMA_PATH") or "").strip()
+    if schema_path:
+        payload["schema_path"] = schema_path
+
+    db_file_path = str(os.getenv("ISPEC_DB_PATH") or "").strip()
+    if db_file_path:
+        payload["db_file_path"] = db_file_path
+
+    return payload, interval_seconds
+
+
+def _legacy_push_project_comments_summary(summary: Any) -> dict[str, Any]:
+    if not isinstance(summary, dict):
+        summary = {}
+
+    legacy_table = summary.get("legacy_table")
+    return {
+        "selected": int(_safe_int(summary.get("selected")) or 0),
+        "candidate_comments": int(_safe_int(summary.get("candidate_comments")) or 0),
+        "projects": int(_safe_int(summary.get("projects")) or 0),
+        "legacy_table": str(legacy_table) if legacy_table else None,
+        "legacy_existing_items": int(_safe_int(summary.get("legacy_existing_items")) or 0),
+        "already_present": int(_safe_int(summary.get("already_present")) or 0),
+        "would_insert": int(_safe_int(summary.get("would_insert")) or 0),
+        "inserted": int(_safe_int(summary.get("inserted")) or 0),
+        "skipped_blank": int(_safe_int(summary.get("skipped_blank")) or 0),
+        "skipped_system": int(_safe_int(summary.get("skipped_system")) or 0),
+        "duplicates_skipped": int(_safe_int(summary.get("duplicates_skipped")) or 0),
+        "dry_run": bool(summary.get("dry_run")),
+    }
+
+
+def _ensure_legacy_push_project_comments_scheduled_commands(*, agent_id: str, run_id: str) -> dict[str, Any]:
+    if not _legacy_push_project_comments_enabled():
+        return {"ok": True, "disabled": True}
+
+    now = utcnow()
+    payload, interval_seconds = _legacy_push_project_comments_payload_from_env(agent_id=agent_id, run_id=run_id)
+    max_attempts = _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_MAX_ATTEMPTS")) or 1
+    max_attempts = _clamp_int(int(max_attempts), min_value=1, max_value=10)
+
+    with get_agent_session() as db:
+        run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+        scheduler_state = _load_scheduler_state(run)
+        push_state = scheduler_state.get("legacy_push_project_comments")
+        if not isinstance(push_state, dict):
+            push_state = {}
+        push_state = dict(push_state)
+
+        existing = (
+            db.query(AgentCommand.id)
+            .filter(AgentCommand.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS)
+            .filter(AgentCommand.status.in_(["queued", "running"]))
+            .first()
+        )
+        if existing is not None:
+            return {"ok": True, "scheduled": 0, "skipped": 1, "reason": "already_enqueued"}
+
+        last_attempted_at = _parse_iso_datetime(push_state.get("last_attempted_at"))
+        if last_attempted_at is not None:
+            elapsed = (now - last_attempted_at).total_seconds()
+            if elapsed < float(interval_seconds):
+                return {
+                    "ok": True,
+                    "scheduled": 0,
+                    "skipped": 1,
+                    "reason": "interval_not_elapsed",
+                    "seconds_until_due": int(float(interval_seconds) - elapsed),
+                }
+
+        cmd = AgentCommand(
+            command_type=COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
+            status="queued",
+            priority=0,
+            created_at=now,
+            updated_at=now,
+            available_at=now,
+            attempts=0,
+            max_attempts=int(max_attempts),
+            payload_json=payload,
+            result_json={},
+        )
+        db.add(cmd)
+        db.flush()
+
+        push_state["next_enqueued_at"] = now.isoformat()
+        push_state["next_command_id"] = int(cmd.id)
+        push_state["interval_seconds"] = int(interval_seconds)
+        push_state["project_id"] = _safe_int(payload.get("project_id"))
+        push_state["limit"] = int(_safe_int(payload.get("limit")) or 0)
+        push_state["dry_run"] = bool(payload.get("dry_run"))
+
+        scheduler_state["legacy_push_project_comments"] = push_state
+        _save_scheduler_state(run=run, state=scheduler_state)
+        db.commit()
+
+        return {"ok": True, "scheduled": 1, "command_id": int(cmd.id), "interval_seconds": interval_seconds}
+
+
+def _record_legacy_push_project_comments_attempt(
+    *,
+    run: AgentRun,
+    command_id: int,
+    execution: CommandExecution,
+    ended_at: datetime,
+) -> None:
+    scheduler_state = _load_scheduler_state(run)
+    push_state = scheduler_state.get("legacy_push_project_comments")
+    if not isinstance(push_state, dict):
+        push_state = {}
+
+    push_state = dict(push_state)
+    push_state["last_attempted_at"] = ended_at.isoformat()
+    push_state["last_attempted_ok"] = bool(execution.ok)
+    push_state["last_attempted_error"] = execution.error
+    push_state["last_command_id"] = int(command_id)
+    push_state["last_summary"] = _legacy_push_project_comments_summary(execution.result)
+    if execution.ok:
+        push_state["last_succeeded_at"] = ended_at.isoformat()
+
+    next_id = _safe_int(push_state.get("next_command_id"))
+    if next_id is not None and int(next_id) == int(command_id):
+        push_state.pop("next_enqueued_at", None)
+        push_state.pop("next_command_id", None)
+
+    scheduler_state["legacy_push_project_comments"] = push_state
+    _save_scheduler_state(run=run, state=scheduler_state)
+
+
+def _run_legacy_push_project_comments(payload: dict[str, Any]) -> CommandExecution:
+    try:
+        from ispec.db.legacy_sync import sync_project_comments_to_legacy
+
+        project_id = _safe_int(payload.get("project_id"))
+        if project_id is not None and int(project_id) <= 0:
+            project_id = None
+
+        dry_run_raw = payload.get("dry_run")
+        if isinstance(dry_run_raw, str):
+            dry_run = _is_truthy(dry_run_raw)
+        else:
+            dry_run = bool(dry_run_raw)
+
+        summary = sync_project_comments_to_legacy(
+            legacy_url=payload.get("legacy_url"),
+            schema_path=payload.get("schema_path"),
+            db_file_path=payload.get("db_file_path"),
+            project_id=project_id,
+            limit=int(_safe_int(payload.get("limit")) or 5000),
+            dry_run=bool(dry_run),
+        )
+        return CommandExecution(ok=True, result=dict(summary))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
+
+
+def _agent_log_archive_enabled() -> bool:
+    return _is_truthy(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_ENABLED"))
+
+
+def _agent_log_archive_interval_seconds() -> int:
+    raw = (os.getenv("ISPEC_AGENT_LOG_ARCHIVE_INTERVAL_SECONDS") or "").strip()
+    if not raw:
+        return 6 * 3600
+    parsed = _safe_int(raw)
+    if parsed is None:
+        return 6 * 3600
+    return _clamp_int(int(parsed), min_value=300, max_value=7 * 24 * 3600)
+
+
+def _agent_log_archive_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[str, Any] | None, int]:
+    interval_seconds = _agent_log_archive_interval_seconds()
+    archive_db_file_path = str(os.getenv("ISPEC_AGENT_ARCHIVE_DB_PATH") or "").strip()
+    if not archive_db_file_path:
+        return None, interval_seconds
+
+    older_than_days = _safe_int(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_OLDER_THAN_DAYS")) or 14
+    older_than_days = _clamp_int(int(older_than_days), min_value=1, max_value=3650)
+    batch_size = _safe_int(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_BATCH_SIZE")) or 500
+    batch_size = _clamp_int(int(batch_size), min_value=1, max_value=10_000)
+    max_batches_raw = _safe_int(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_MAX_BATCHES"))
+    max_batches = (
+        None
+        if max_batches_raw is None or int(max_batches_raw) <= 0
+        else _clamp_int(int(max_batches_raw), min_value=1, max_value=10_000)
+    )
+
+    prune_live_env = os.getenv("ISPEC_AGENT_LOG_ARCHIVE_PRUNE_LIVE")
+    prune_live = True if prune_live_env is None else _is_truthy(prune_live_env)
+
+    archive_steps_env = os.getenv("ISPEC_AGENT_LOG_ARCHIVE_INCLUDE_STEPS")
+    archive_steps = True if archive_steps_env is None else _is_truthy(archive_steps_env)
+    archive_events_env = os.getenv("ISPEC_AGENT_LOG_ARCHIVE_INCLUDE_EVENTS")
+    archive_events = True if archive_events_env is None else _is_truthy(archive_events_env)
+    archive_commands_env = os.getenv("ISPEC_AGENT_LOG_ARCHIVE_INCLUDE_COMMANDS")
+    archive_commands = True if archive_commands_env is None else _is_truthy(archive_commands_env)
+
+    payload: dict[str, Any] = {
+        "archive_db_file_path": archive_db_file_path,
+        "older_than_days": int(older_than_days),
+        "batch_size": int(batch_size),
+        "max_batches": max_batches,
+        "prune_live": bool(prune_live),
+        "archive_steps": bool(archive_steps),
+        "archive_events": bool(archive_events),
+        "archive_commands": bool(archive_commands),
+        "meta": {"enqueued_by": "supervisor", "agent_id": agent_id, "run_id": run_id},
+    }
+    return payload, interval_seconds
+
+
+def _agent_log_archive_summary(result: dict[str, Any] | None) -> dict[str, Any]:
+    summary = result if isinstance(result, dict) else {}
+
+    def _counts(key: str) -> dict[str, int]:
+        item = summary.get(key)
+        if not isinstance(item, dict):
+            return {"matched": 0, "archived": 0, "pruned": 0}
+        return {
+            "matched": int(_safe_int(item.get("matched")) or 0),
+            "archived": int(_safe_int(item.get("archived")) or 0),
+            "pruned": int(_safe_int(item.get("pruned")) or 0),
+        }
+
+    return {
+        "older_than_days": int(_safe_int(summary.get("older_than_days")) or 0),
+        "dry_run": bool(summary.get("dry_run")),
+        "prune_live": bool(summary.get("prune_live")),
+        "runs_archived": int(_safe_int(summary.get("runs_archived")) or 0),
+        "steps": _counts("steps"),
+        "events": _counts("events"),
+        "commands": _counts("commands"),
+    }
+
+
+def _ensure_agent_log_archive_scheduled_commands(*, agent_id: str, run_id: str) -> dict[str, Any]:
+    if not _agent_log_archive_enabled():
+        return {"ok": True, "disabled": True}
+
+    now = utcnow()
+    payload, interval_seconds = _agent_log_archive_payload_from_env(agent_id=agent_id, run_id=run_id)
+    if payload is None:
+        return {"ok": False, "scheduled": 0, "error": "missing_archive_database"}
+
+    max_attempts = _safe_int(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_MAX_ATTEMPTS")) or 1
+    max_attempts = _clamp_int(int(max_attempts), min_value=1, max_value=10)
+
+    with get_agent_session() as db:
+        run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+        scheduler_state = _load_scheduler_state(run)
+        archive_state = scheduler_state.get("agent_log_archive")
+        if not isinstance(archive_state, dict):
+            archive_state = {}
+        archive_state = dict(archive_state)
+
+        existing = (
+            db.query(AgentCommand.id)
+            .filter(AgentCommand.command_type == COMMAND_ARCHIVE_AGENT_LOGS)
+            .filter(AgentCommand.status.in_(["queued", "running"]))
+            .first()
+        )
+        if existing is not None:
+            return {"ok": True, "scheduled": 0, "skipped": 1, "reason": "already_enqueued"}
+
+        last_attempted_at = _parse_iso_datetime(archive_state.get("last_attempted_at"))
+        if last_attempted_at is not None:
+            elapsed = (now - last_attempted_at).total_seconds()
+            if elapsed < float(interval_seconds):
+                return {
+                    "ok": True,
+                    "scheduled": 0,
+                    "skipped": 1,
+                    "reason": "interval_not_elapsed",
+                    "seconds_until_due": int(float(interval_seconds) - elapsed),
+                }
+
+        cmd = AgentCommand(
+            command_type=COMMAND_ARCHIVE_AGENT_LOGS,
+            status="queued",
+            priority=-1,
+            created_at=now,
+            updated_at=now,
+            available_at=now,
+            attempts=0,
+            max_attempts=int(max_attempts),
+            payload_json=payload,
+            result_json={},
+        )
+        db.add(cmd)
+        db.flush()
+
+        archive_state["next_enqueued_at"] = now.isoformat()
+        archive_state["next_command_id"] = int(cmd.id)
+        archive_state["interval_seconds"] = int(interval_seconds)
+        archive_state["older_than_days"] = int(_safe_int(payload.get("older_than_days")) or 0)
+        archive_state["batch_size"] = int(_safe_int(payload.get("batch_size")) or 0)
+        archive_state["max_batches"] = _safe_int(payload.get("max_batches"))
+
+        scheduler_state["agent_log_archive"] = archive_state
+        _save_scheduler_state(run=run, state=scheduler_state)
+        db.commit()
+
+        return {"ok": True, "scheduled": 1, "command_id": int(cmd.id), "interval_seconds": interval_seconds}
+
+
+def _record_agent_log_archive_attempt(
+    *,
+    run: AgentRun,
+    command_id: int,
+    execution: CommandExecution,
+    ended_at: datetime,
+) -> None:
+    scheduler_state = _load_scheduler_state(run)
+    archive_state = scheduler_state.get("agent_log_archive")
+    if not isinstance(archive_state, dict):
+        archive_state = {}
+
+    archive_state = dict(archive_state)
+    archive_state["last_attempted_at"] = ended_at.isoformat()
+    archive_state["last_attempted_ok"] = bool(execution.ok)
+    archive_state["last_attempted_error"] = execution.error
+    archive_state["last_command_id"] = int(command_id)
+    archive_state["last_summary"] = _agent_log_archive_summary(execution.result)
+    if execution.ok:
+        archive_state["last_succeeded_at"] = ended_at.isoformat()
+
+    next_id = _safe_int(archive_state.get("next_command_id"))
+    if next_id is not None and int(next_id) == int(command_id):
+        archive_state.pop("next_enqueued_at", None)
+        archive_state.pop("next_command_id", None)
+
+    scheduler_state["agent_log_archive"] = archive_state
+    _save_scheduler_state(run=run, state=scheduler_state)
+
+
+def _run_agent_log_archive(payload: dict[str, Any]) -> CommandExecution:
+    try:
+        from ispec.agent.archive import archive_agent_logs
+
+        summary = archive_agent_logs(
+            archive_db_file_path=payload.get("archive_db_file_path"),
+            older_than_days=int(_safe_int(payload.get("older_than_days")) or 14),
+            batch_size=int(_safe_int(payload.get("batch_size")) or 500),
+            max_batches=_safe_int(payload.get("max_batches")),
+            dry_run=bool(payload.get("dry_run") or False),
+            prune_live=bool(payload.get("prune_live") if payload.get("prune_live") is not None else True),
+            archive_steps=bool(payload.get("archive_steps") if payload.get("archive_steps") is not None else True),
+            archive_events=bool(payload.get("archive_events") if payload.get("archive_events") is not None else True),
+            archive_commands=bool(
+                payload.get("archive_commands") if payload.get("archive_commands") is not None else True
+            ),
+            archive_journal_mode=payload.get("archive_journal_mode"),
+        )
+        return CommandExecution(ok=True, result=dict(summary))
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        return CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
+
+
 def _seed_orchestrator_tick(
     *,
     delay_seconds: int = 5,
@@ -5073,6 +6179,17 @@ def _log_command_done(*, cmd: ClaimedCommand, execution: CommandExecution, durat
         channel = cmd.payload.get("channel")
         if isinstance(channel, str) and channel.strip():
             extra_parts.append(f"channel={channel.strip()}")
+        schedule = cmd.payload.get("schedule")
+        if isinstance(schedule, dict):
+            schedule_name = schedule.get("name")
+            if isinstance(schedule_name, str) and schedule_name.strip():
+                extra_parts.append(f"schedule={schedule_name.strip()}")
+    elif cmd.command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT:
+        job = cmd.payload.get("job")
+        if isinstance(job, dict):
+            job_name = job.get("name")
+            if isinstance(job_name, str) and job_name.strip():
+                extra_parts.append(f"job={job_name.strip()}")
         schedule = cmd.payload.get("schedule")
         if isinstance(schedule, dict):
             schedule_name = schedule.get("name")
@@ -5152,6 +6269,16 @@ def _persist_command_execution(
                     )
                 except Exception:
                     logger.exception("Failed recording Slack schedule attempt (command_id=%s)", cmd.id)
+            elif cmd.command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT:
+                try:
+                    _record_assistant_schedule_attempt(
+                        run=run,
+                        payload=dict(cmd.payload or {}),
+                        execution=execution,
+                        ended_at=step_ended,
+                    )
+                except Exception:
+                    logger.exception("Failed recording assistant schedule attempt (command_id=%s)", cmd.id)
             elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
                 try:
                     _record_legacy_sync_attempt(
@@ -5162,6 +6289,29 @@ def _persist_command_execution(
                     )
                 except Exception:
                     logger.exception("Failed recording legacy sync attempt (command_id=%s)", cmd.id)
+            elif cmd.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS:
+                try:
+                    _record_legacy_push_project_comments_attempt(
+                        run=run,
+                        command_id=int(cmd.id),
+                        execution=execution,
+                        ended_at=step_ended,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed recording legacy project comment writeback attempt (command_id=%s)",
+                        cmd.id,
+                    )
+            elif cmd.command_type == COMMAND_ARCHIVE_AGENT_LOGS:
+                try:
+                    _record_agent_log_archive_attempt(
+                        run=run,
+                        command_id=int(cmd.id),
+                        execution=execution,
+                        ended_at=step_ended,
+                    )
+                except Exception:
+                    logger.exception("Failed recording agent log archive attempt (command_id=%s)", cmd.id)
 
             result_payload = dict(execution.result or {})
             step = AgentStep(
@@ -5284,6 +6434,13 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
                 run_id=run_id,
                 command_id=int(cmd.id),
             )
+        elif cmd.command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT:
+            execution = _run_scheduled_assistant_prompt(
+                payload=cmd.payload,
+                agent_id=agent_id,
+                run_id=run_id,
+                command_id=int(cmd.id),
+            )
         elif cmd.command_type == COMMAND_ORCHESTRATOR_TICK:
             execution = _run_orchestrator_tick(
                 payload=cmd.payload,
@@ -5309,6 +6466,10 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
             execution = _run_repo_review(payload=cmd.payload, agent_id=agent_id, run_id=run_id)
         elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
             execution = _run_legacy_sync_all(cmd.payload)
+        elif cmd.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS:
+            execution = _run_legacy_push_project_comments(cmd.payload)
+        elif cmd.command_type == COMMAND_ARCHIVE_AGENT_LOGS:
+            execution = _run_agent_log_archive(cmd.payload)
         elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
             execution = _run_slack_post_message(cmd.payload)
         elif cmd.command_type == COMMAND_DEV_RESTART_SERVICES:
@@ -5358,6 +6519,7 @@ _LLM_COMMAND_TYPES = {
     COMMAND_REVIEW_SUPPORT_SESSION,
     COMMAND_BUILD_SUPPORT_DIGEST,
     COMMAND_REVIEW_REPO,
+    COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT,
     COMMAND_ASSESS_TACKLE_RESULTS,
     COMMAND_RUN_TACKLE_PROMPT,
 }
@@ -5382,6 +6544,13 @@ def _llm_task_for_command(*, cmd: ClaimedCommand, agent_id: str, run_id: str) ->
         )
     if cmd.command_type == COMMAND_REVIEW_REPO:
         return _task_repo_review(payload=cmd.payload, agent_id=agent_id, run_id=run_id)
+    if cmd.command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT:
+        return _task_scheduled_assistant_prompt(
+            payload=cmd.payload,
+            agent_id=agent_id,
+            run_id=run_id,
+            command_id=int(cmd.id),
+        )
     if cmd.command_type == COMMAND_ASSESS_TACKLE_RESULTS:
         return _task_tackle_results_assess(
             payload=cmd.payload,
@@ -5537,6 +6706,10 @@ class _SupervisorCommandProcessor:
                 )
             elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
                 execution = _run_legacy_sync_all(cmd.payload)
+            elif cmd.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS:
+                execution = _run_legacy_push_project_comments(cmd.payload)
+            elif cmd.command_type == COMMAND_ARCHIVE_AGENT_LOGS:
+                execution = _run_agent_log_archive(cmd.payload)
             elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
                 execution = _run_slack_post_message(cmd.payload)
             elif cmd.command_type == COMMAND_DEV_RESTART_SERVICES:
@@ -5601,6 +6774,13 @@ class _SupervisorCommandProcessor:
                 )
             elif cmd.command_type == COMMAND_REVIEW_REPO:
                 execution = _run_repo_review(payload=cmd.payload, agent_id=self._agent_id, run_id=self._run_id)
+            elif cmd.command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT:
+                execution = _run_scheduled_assistant_prompt(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
             else:
                 error = f"Unknown command_type: {cmd.command_type}"
                 execution = CommandExecution(
@@ -6167,6 +7347,18 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
         max_value=3600,
     )
     last_legacy_sync_poll_at: datetime | None = None
+    legacy_push_project_comments_poll_seconds = _clamp_int(
+        _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_POLL_SECONDS")) or 60,
+        min_value=10,
+        max_value=3600,
+    )
+    last_legacy_push_project_comments_poll_at: datetime | None = None
+    agent_log_archive_poll_seconds = _clamp_int(
+        _safe_int(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_POLL_SECONDS")) or 300,
+        min_value=30,
+        max_value=3600,
+    )
+    last_agent_log_archive_poll_at: datetime | None = None
     once_command_started = False
 
     final_status = "stopped"
@@ -6184,8 +7376,15 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                             seeded.get("scheduled"),
                             seeded.get("skipped"),
                         )
+                    seeded_assistant = _ensure_assistant_scheduled_commands(agent_id=config.agent_id, run_id=run_id)
+                    if int(seeded_assistant.get("scheduled") or 0) > 0:
+                        logger.info(
+                            "Enqueued assistant scheduled jobs scheduled=%s skipped=%s",
+                            seeded_assistant.get("scheduled"),
+                            seeded_assistant.get("skipped"),
+                        )
                 except Exception:
-                    logger.exception("Failed ensuring Slack scheduled commands")
+                    logger.exception("Failed ensuring scheduled commands")
                 last_schedule_poll_at = now
 
             if (
@@ -6202,6 +7401,45 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
                 except Exception:
                     logger.exception("Failed ensuring legacy sync commands")
                 last_legacy_sync_poll_at = now
+
+            if (
+                last_legacy_push_project_comments_poll_at is None
+                or (now - last_legacy_push_project_comments_poll_at).total_seconds()
+                >= legacy_push_project_comments_poll_seconds
+            ):
+                try:
+                    seeded = _ensure_legacy_push_project_comments_scheduled_commands(
+                        agent_id=config.agent_id,
+                        run_id=run_id,
+                    )
+                    if int(seeded.get("scheduled") or 0) > 0:
+                        logger.info(
+                            "Enqueued legacy project comment writeback command scheduled=%s",
+                            seeded.get("scheduled"),
+                        )
+                except Exception:
+                    logger.exception("Failed ensuring legacy project comment writeback commands")
+                last_legacy_push_project_comments_poll_at = now
+
+            if (
+                last_agent_log_archive_poll_at is None
+                or (now - last_agent_log_archive_poll_at).total_seconds() >= agent_log_archive_poll_seconds
+            ):
+                try:
+                    seeded = _ensure_agent_log_archive_scheduled_commands(agent_id=config.agent_id, run_id=run_id)
+                    if int(seeded.get("scheduled") or 0) > 0:
+                        logger.info(
+                            "Enqueued agent log archive command scheduled=%s",
+                            seeded.get("scheduled"),
+                        )
+                    elif seeded.get("error"):
+                        logger.warning(
+                            "Skipped agent log archive scheduling error=%s",
+                            seeded.get("error"),
+                        )
+                except Exception:
+                    logger.exception("Failed ensuring agent log archive commands")
+                last_agent_log_archive_poll_at = now
 
             did_command_work = processor.tick()
             if did_command_work:

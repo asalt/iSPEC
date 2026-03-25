@@ -1,0 +1,4 @@
+interface:
+  display_name: "iSPEC Tmux Monitoring"
+  short_description: "Observe allowed tmux panes via read-only tools"
+  default_prompt: "Use $ispec-tmux-monitoring to inspect allowed tmux panes with the hidden read-only tmux-monitoring assistant tools."

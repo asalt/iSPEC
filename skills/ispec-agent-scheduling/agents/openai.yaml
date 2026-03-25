@@ -1,0 +1,4 @@
+interface:
+  display_name: "iSPEC Agent Scheduling"
+  short_description: "Manage recurring scheduled assistant jobs"
+  default_prompt: "Use $ispec-agent-scheduling to inspect or update scheduled assistant jobs in the local schedule JSON file."

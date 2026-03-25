@@ -61,6 +61,7 @@ def test_assistant_list_tools_can_include_unavailable_for_internal(db_session, m
 
 def test_assistant_list_tools_includes_repo_tools_when_enabled(db_session, monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_REPO_TOOLS", "1")
+    monkeypatch.setattr("ispec.assistant.tools._code_tool_access_status", lambda user: (True, None))
     user = AuthUser(
         username="viewer",
         password_hash="hash",
@@ -107,3 +108,32 @@ def test_assistant_list_tools_query_reports_unavailable_matches(db_session):
     tool_names = {item.get("name") for item in result.get("available_tools") or []}
     assert "assistant_recent_agent_commands" in tool_names
     assert result["counts"]["matched_unavailable_total"] == 0
+
+
+def test_assistant_list_tools_reports_code_tools_unavailable_for_non_allowlisted_user(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_REPO_TOOLS", "1")
+    monkeypatch.setattr(
+        "ispec.assistant.tools._code_tool_access_status",
+        lambda user: (False, "Code tools are unavailable for viewer; add that username to /tmp/assistant-code-tool-users.local.txt."),
+    )
+    user = AuthUser(
+        username="viewer",
+        password_hash="hash",
+        password_salt="salt",
+        password_iterations=1,
+        role=UserRole.viewer,
+        is_active=True,
+    )
+    payload = run_tool(
+        name="assistant_list_tools",
+        args={"include_unavailable": True, "query": "repo"},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="show repo tools",
+    )
+    assert payload["ok"] is True
+    unavailable = payload["result"].get("unavailable_tools") or []
+    repo_search = next(item for item in unavailable if item.get("name") == "repo_search")
+    assert "Code tools are unavailable" in str(repo_search.get("unavailable_reason") or "")

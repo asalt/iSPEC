@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import date, datetime, time, timedelta
 import enum
 import json
@@ -8,12 +9,14 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time as time_module
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import Text, cast, func, or_
 from sqlalchemy.orm import Session, defer
 
+from ispec.agent.archive import get_agent_archive_session_if_available
 from ispec.assistant.context import person_summary, project_summary
 from ispec.assistant.models import (
     SupportMemory,
@@ -23,7 +26,16 @@ from ispec.assistant.models import (
     SupportSessionReview,
 )
 from ispec.assistant.prompt_header import build_prompt_header, header_legend
-from ispec.agent.commands import COMMAND_DEV_RESTART_SERVICES
+from ispec.assistant.schedules import (
+    ASSISTANT_SCHEDULE_PATH_ENV,
+    assistant_schedule_path,
+    canonicalize_schedule_row,
+    list_assistant_schedule_rows,
+    load_assistant_schedule_rows_for_write,
+    parse_weekday,
+    write_assistant_schedule_rows,
+)
+from ispec.agent.commands import COMMAND_DEV_RESTART_SERVICES, COMMAND_ORCHESTRATOR_TICK, COMMAND_SLACK_POST_MESSAGE
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.db.models import (
     AuthUser,
@@ -66,6 +78,13 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_stats": ToolScope.staff,
     "assistant_list_tools": ToolScope.staff,
     "assistant_enqueue_dev_restart_services": ToolScope.admin,
+    "assistant_enqueue_staff_slack_message": ToolScope.admin,
+    "assistant_list_scheduled_jobs": ToolScope.admin,
+    "assistant_upsert_scheduled_job": ToolScope.admin,
+    "assistant_delete_scheduled_job": ToolScope.admin,
+    "assistant_list_tmux_panes": ToolScope.admin,
+    "assistant_capture_tmux_pane": ToolScope.admin,
+    "assistant_compare_tmux_pane": ToolScope.admin,
     "assistant_recent_sessions": ToolScope.staff,
     "assistant_get_session_review": ToolScope.staff,
     "assistant_prompt_header": ToolScope.staff,
@@ -82,6 +101,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_get_agent_command": ToolScope.admin,
     "assistant_get_agent_run": ToolScope.admin,
     "assistant_list_users": ToolScope.admin,
+    "assistant_set_user_brief": ToolScope.admin,
     "count_all_projects": ToolScope.staff,
     "count_current_projects": ToolScope.staff,
     "project_status_counts": ToolScope.staff,
@@ -111,12 +131,82 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "create_project_comment": ToolScope.user,
 }
 
-_WRITE_TOOL_NAMES: set[str] = {"create_project_comment"}
+_WRITE_TOOL_NAMES: set[str] = {
+    "create_project_comment",
+    "assistant_enqueue_staff_slack_message",
+    "assistant_upsert_scheduled_job",
+    "assistant_delete_scheduled_job",
+    "assistant_set_user_brief",
+}
+
+
+def tool_writes_data(name: str | None) -> bool:
+    return str(name or "").strip() in _WRITE_TOOL_NAMES
+
+
+def _normalize_request_text(value: str | None) -> str:
+    text = re.sub(r"[^\w\s]", " ", str(value or "").strip().lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _project_comment_save_requested(user_message: str | None) -> bool:
+    normalized = _normalize_request_text(user_message)
+    if not normalized:
+        return False
+
+    if re.fullmatch(r"(?:yes|y|yeah|yep|yup|ok|okay|sure|confirm)(?: please)?", normalized):
+        return True
+    if normalized in {"go ahead", "do it", "please do", "please do it"}:
+        return True
+
+    tokens = normalized.split()
+    if len(tokens) <= 6:
+        negative = {"no", "n", "nope", "nah"}
+        if any(token in negative for token in tokens):
+            return False
+        affirmative = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm"}
+        persistence = {"save", "add", "log", "record", "commit"}
+        if any(token in affirmative for token in tokens) and any(token in persistence for token in tokens):
+            return True
+        if "commit" in tokens and ("it" in tokens or any(token in affirmative for token in tokens)):
+            return True
+        if normalized in {"commit", "commit it", "please commit", "please commit it"}:
+            return True
+
+    # Drafting or wording requests should stay draft-only unless the user also
+    # explicitly asks to save/add/log the result.
+    if re.search(r"\b(help me|draft|word|wording|rewrite|edit|improve|brainstorm)\b", normalized):
+        return False
+
+    if re.search(r"\b(save|log|record|add|commit)\b", normalized) and re.search(
+        r"\b(history|comment|comments|note|notes|meeting|memo)\b", normalized
+    ):
+        return True
+
+    if re.search(r"\b(make|leave|create)\b", normalized) and re.search(
+        r"\b(comment|comments|note|notes|memo)\b", normalized
+    ):
+        return True
+
+    if (
+        re.search(r"\bwrite\b", normalized)
+        and re.search(r"\b(comment|comments|note|notes|memo)\b", normalized)
+        and re.search(r"\b(project history|history)\b", normalized)
+    ):
+        return True
+
+    return False
 
 
 _REPO_TOOLS_ENV = "ISPEC_ASSISTANT_ENABLE_REPO_TOOLS"
 _REPO_ROOT_ENV = "ISPEC_ASSISTANT_REPO_ROOT"
 _DEV_RESTART_ENABLED_ENV = "ISPEC_DEV_RESTART_ENABLED"
+_STAFF_SLACK_CHANNEL_ENV = "ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL"
+_ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_SCHEDULE_TOOLS_ENABLED"
+_TMUX_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_TMUX_TOOLS_ENABLED"
+_TMUX_TARGET_ALLOWLIST_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST"
+_TMUX_TARGET_ALLOWLIST_PATH_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST_PATH"
+_CODE_TOOL_USER_ALLOWLIST_FILENAME = "assistant-code-tool-users.local.txt"
 _REPO_TOOL_DEFAULT_PATH = "iSPEC/src"
 _REPO_TOOL_DEFAULT_PATH_STANDALONE = "src"
 _REPO_MAX_FILE_BYTES = 250_000
@@ -143,6 +233,15 @@ _REPO_DENY_SUFFIXES = {
 
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 _FALSY = {"0", "false", "no", "n", "off"}
+_CODE_TOOL_NAMES: set[str] = {
+    "assistant_enqueue_dev_restart_services",
+    "assistant_list_tmux_panes",
+    "assistant_capture_tmux_pane",
+    "assistant_compare_tmux_pane",
+    "repo_list_files",
+    "repo_search",
+    "repo_read_file",
+}
 
 
 def _is_truthy(value: str | None) -> bool:
@@ -254,6 +353,673 @@ def _dev_restart_enabled_status(*, tmux_session: str | None = None, make_root: s
     return _dev_restart_auto_enabled(tmux_session=tmux_session, make_root=make_root)
 
 
+def _staff_slack_channel() -> str | None:
+    for key in (_STAFF_SLACK_CHANNEL_ENV, "ISPEC_STAFF_SLACK_CHANNEL", "ISPEC_SLACK_STAFF_CHANNEL"):
+        value = (os.getenv(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _staff_slack_tool_status() -> tuple[bool, str | None]:
+    channel = _staff_slack_channel()
+    if not channel:
+        return False, f"Set {_STAFF_SLACK_CHANNEL_ENV}=<channel-id>."
+    token = (os.getenv("ISPEC_SLACK_BOT_TOKEN") or os.getenv("SLACK_BOT_TOKEN") or "").strip()
+    if not token:
+        return False, "Slack bot token is not configured."
+    return True, None
+
+
+def _assistant_schedule_tools_status() -> tuple[bool, str | None]:
+    raw = os.getenv(_ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV)
+    parsed, err = _parse_env_tristate_bool(raw, key=_ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV)
+    if err:
+        return False, err
+    if parsed is not True:
+        return False, f"Set {_ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV}=1 to enable schedule-management tools."
+    return True, None
+
+
+def _assistant_schedule_write_tools_status() -> tuple[bool, str | None]:
+    enabled, reason = _assistant_schedule_tools_status()
+    if not enabled:
+        return False, reason
+    if assistant_schedule_path() is None:
+        return False, f"Set {ASSISTANT_SCHEDULE_PATH_ENV}=<path> to enable schedule editing."
+    return True, None
+
+
+def _tmux_raw(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["tmux", *args],
+        text=True,
+        capture_output=True,
+    )
+
+
+def _tmux_allowlist_entries() -> list[str]:
+    entries: list[str] = []
+
+    raw = str(os.getenv(_TMUX_TARGET_ALLOWLIST_ENV) or "").strip()
+    if raw:
+        entries.extend(item.strip() for item in re.split(r"[\s,]+", raw) if item.strip())
+
+    path, configured = _tmux_allowlist_path()
+    if configured and path is not None and path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entries.append(line)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in entries:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped
+
+
+def _tmux_allowlist_path() -> tuple[Path | None, bool]:
+    raw = str(os.getenv(_TMUX_TARGET_ALLOWLIST_PATH_ENV) or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve(), True
+
+    try:
+        from ispec.cli import dev as dev_cli
+
+        make_root = dev_cli._find_make_root(start=Path(__file__).resolve().parent)  # type: ignore[attr-defined]
+    except Exception:
+        make_root = None
+    if make_root is None:
+        return None, False
+
+    default_path = Path(make_root) / "configs" / "tmux-pane-allowlist.local.txt"
+    return default_path, default_path.is_file()
+
+
+def _tmux_default_session_name() -> str:
+    try:
+        from ispec.cli import dev as dev_cli
+
+        return dev_cli._tmux_session_name(None)  # type: ignore[attr-defined]
+    except Exception:
+        return str(os.getenv("DEV_TMUX_SESSION") or "").strip() or "ispecfull"
+
+
+def _tmux_pane_number(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if text.startswith("%"):
+        text = text[1:]
+    return _safe_int(text)
+
+
+
+def _tmux_unique_strings(values: list[Any]) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+
+    def add_one(value: Any) -> None:
+        text = ("" if value is None else str(value)).strip()
+        if not text or text in seen:
+            return
+        seen.add(text)
+        items.append(text)
+
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            for nested in value:
+                add_one(nested)
+        else:
+            add_one(value)
+    return items
+
+
+
+def _tmux_capture_target(row: dict[str, Any]) -> str:
+    return (
+        str(row.get("pane_id") or "").strip()
+        or str(row.get("group_target") or "").strip()
+        or str(row.get("target") or "").strip()
+    )
+
+
+
+def _tmux_preferred_alias(row: dict[str, Any]) -> str:
+    return (
+        str(row.get("group_target") or "").strip()
+        or str(row.get("target") or "").strip()
+        or str(row.get("pane_id") or "").strip()
+    )
+
+
+
+def _tmux_row_aliases(row: dict[str, Any]) -> list[str]:
+    return _tmux_unique_strings(
+        [
+            row.get("pane_id"),
+            _tmux_pane_number(row.get("pane_id")),
+            row.get("capture_target"),
+            row.get("preferred_alias"),
+            row.get("target"),
+            row.get("group_target"),
+            row.get("window_target"),
+            row.get("group_window_target"),
+            row.get("session"),
+            row.get("session_group"),
+            row.get("target_aliases"),
+            row.get("window_aliases"),
+            row.get("session_names"),
+        ]
+    )
+
+
+
+def _tmux_pane_summary(row: dict[str, Any]) -> str:
+    pane_id = str(row.get("pane_id") or "").strip()
+    pane_number = _tmux_pane_number(pane_id)
+    preferred_alias = _tmux_preferred_alias(row)
+    session = str(row.get("session") or "").strip() or "unknown"
+    session_group = str(row.get("session_group") or "").strip()
+    session_names = _tmux_unique_strings([row.get("session_names"), session])
+    window_index = int(_safe_int(row.get("window_index")) or 0)
+    pane_index = int(_safe_int(row.get("pane_index")) or 0)
+    window_name = str(row.get("window_name") or "").strip() or "?"
+    pane_title = str(row.get("pane_title") or "").strip()
+    current_command = str(row.get("current_command") or "").strip()
+
+    lead = pane_id or session
+    if pane_number is not None:
+        lead = f"{lead}({pane_number})"
+
+    extras: list[str] = []
+    if preferred_alias:
+        extras.append(f"target=\"{preferred_alias}\"")
+    if len(session_names) > 1:
+        extras.append(f"sessions=\"{','.join(session_names)}\"")
+    elif session_group:
+        extras.append(f"group=\"{session_group}\"")
+    if pane_title:
+        extras.append(f"title=\"{pane_title}\"")
+    if current_command:
+        extras.append(f"cmd=\"{current_command}\"")
+    extra_text = " " + " ".join(extras) if extras else ""
+    return f"{lead} {window_index}.{pane_index} window=\"{window_name}\"{extra_text}"
+
+
+
+def _tmux_list_candidate_panes() -> list[dict[str, Any]]:
+    allowlist = _tmux_allowlist_entries()
+    allowlist_path, allowlist_configured = _tmux_allowlist_path()
+    default_session = _tmux_default_session_name()
+    if allowlist_configured or allowlist:
+        proc = _tmux_raw(
+            "list-panes",
+            "-a",
+            "-F",
+            "#S	#{session_group}	#I	#W	#P	#{pane_id}	#{pane_title}	#{pane_current_command}	#{pane_dead}	#{pane_active}",
+        )
+    else:
+        proc = _tmux_raw(
+            "list-panes",
+            "-t",
+            default_session,
+            "-F",
+            "#S	#{session_group}	#I	#W	#P	#{pane_id}	#{pane_title}	#{pane_current_command}	#{pane_dead}	#{pane_active}",
+        )
+    if proc.returncode != 0:
+        return []
+
+    raw_items: list[dict[str, Any]] = []
+    for raw_line in (proc.stdout or "").splitlines():
+        parts = raw_line.split("	")
+        if len(parts) < 10:
+            continue
+        session, session_group, window_index, window_name, pane_index, pane_id, pane_title, current_command, pane_dead, pane_active = parts[:10]
+        session = str(session or "").strip()
+        session_group = str(session_group or "").strip()
+        window_name = str(window_name or "").strip()
+        window_index_int = _safe_int(window_index)
+        pane_index_int = _safe_int(pane_index)
+        pane_id = str(pane_id or "").strip()
+        pane_title = str(pane_title or "").strip() or None
+        current_command = str(current_command or "").strip() or None
+        target = f"{session}:{window_name}"
+        if pane_index_int is not None:
+            target = f"{target}.{int(pane_index_int)}"
+        window_target = f"{session}:{window_name}"
+        group_window_target = None
+        group_target = None
+        if session_group:
+            group_window_target = f"{session_group}:{window_name}"
+            group_target = group_window_target
+            if pane_index_int is not None:
+                group_target = f"{group_target}.{int(pane_index_int)}"
+        row = {
+            "session": session,
+            "session_group": session_group or None,
+            "session_names": [session],
+            "window_name": window_name,
+            "window_index": int(window_index_int or 0),
+            "pane_index": int(pane_index_int or 0),
+            "pane_id": pane_id,
+            "pane_number": _tmux_pane_number(pane_id),
+            "pane_title": pane_title,
+            "current_command": current_command,
+            "pane_dead": str(pane_dead or "").strip() == "1",
+            "pane_active": str(pane_active or "").strip() == "1",
+            "target": target,
+            "window_target": window_target,
+            "group_window_target": group_window_target,
+            "group_target": group_target,
+            "target_aliases": _tmux_unique_strings([target, group_target]),
+            "window_aliases": _tmux_unique_strings([window_target, group_window_target]),
+        }
+        raw_items.append(row)
+
+    raw_items.sort(key=lambda item: (str(item["session"]), int(item["window_index"]), int(item["pane_index"])))
+
+    merged: list[dict[str, Any]] = []
+    merged_by_key: dict[str, dict[str, Any]] = {}
+    for row in raw_items:
+        key = str(row.get("pane_id") or "").strip() or str(row.get("target") or "").strip()
+        existing = merged_by_key.get(key)
+        if existing is None:
+            existing = dict(row)
+            merged_by_key[key] = existing
+            merged.append(existing)
+        else:
+            existing["session_names"] = _tmux_unique_strings([existing.get("session_names"), row.get("session_names")])
+            existing["target_aliases"] = _tmux_unique_strings([existing.get("target_aliases"), row.get("target_aliases")])
+            existing["window_aliases"] = _tmux_unique_strings([existing.get("window_aliases"), row.get("window_aliases")])
+            if not existing.get("session_group") and row.get("session_group"):
+                existing["session_group"] = row.get("session_group")
+            if not existing.get("group_target") and row.get("group_target"):
+                existing["group_target"] = row.get("group_target")
+            if not existing.get("group_window_target") and row.get("group_window_target"):
+                existing["group_window_target"] = row.get("group_window_target")
+            if not existing.get("pane_title") and row.get("pane_title"):
+                existing["pane_title"] = row.get("pane_title")
+            if not existing.get("current_command") and row.get("current_command"):
+                existing["current_command"] = row.get("current_command")
+            existing["pane_dead"] = bool(existing.get("pane_dead")) and bool(row.get("pane_dead"))
+            existing["pane_active"] = bool(existing.get("pane_active")) or bool(row.get("pane_active"))
+
+    for row in merged:
+        row["preferred_alias"] = _tmux_preferred_alias(row)
+        row["capture_target"] = _tmux_capture_target(row)
+        row["summary"] = _tmux_pane_summary(row)
+    return merged
+
+
+
+def _tmux_is_allowed_pane(row: dict[str, Any]) -> bool:
+    allowlist = _tmux_allowlist_entries()
+    _allowlist_path, allowlist_configured = _tmux_allowlist_path()
+    if not allowlist and allowlist_configured:
+        return False
+    if not allowlist:
+        return str(row.get("session") or "").strip() == _tmux_default_session_name()
+
+    aliases = set(_tmux_row_aliases(row))
+    return any(entry in aliases for entry in allowlist)
+
+
+
+def _tmux_find_allowed_pane(target: str | None) -> dict[str, Any] | None:
+    target_text = str(target or "").strip()
+    if not target_text:
+        return None
+    for row in _tmux_list_allowed_panes():
+        if target_text in set(_tmux_row_aliases(row)):
+            return row
+    return None
+
+
+def _tmux_list_allowed_panes() -> list[dict[str, Any]]:
+    return [row for row in _tmux_list_candidate_panes() if _tmux_is_allowed_pane(row)]
+
+
+def _tmux_tools_status() -> tuple[bool, str | None]:
+    raw = os.getenv(_TMUX_TOOLS_ENABLED_ENV)
+    parsed, err = _parse_env_tristate_bool(raw, key=_TMUX_TOOLS_ENABLED_ENV)
+    if err:
+        return False, err
+    if parsed is not True:
+        return False, f"Set {_TMUX_TOOLS_ENABLED_ENV}=1 to enable tmux monitoring tools."
+    if shutil.which("tmux") is None:
+        return False, "tmux is not installed."
+    allowlist_path, allowlist_configured = _tmux_allowlist_path()
+    allowlist = _tmux_allowlist_entries()
+    if allowlist_configured and not allowlist:
+        if allowlist_path is not None:
+            return False, f"Populate {allowlist_path} (or {_TMUX_TARGET_ALLOWLIST_ENV}) to allow tmux pane reads."
+        return False, f"Populate {_TMUX_TARGET_ALLOWLIST_ENV} to allow tmux pane reads."
+    panes = _tmux_list_allowed_panes()
+    if not panes:
+        if allowlist:
+            return False, f"No readable tmux panes matched {_TMUX_TARGET_ALLOWLIST_ENV}."
+        return False, f"No readable panes found in tmux session {_tmux_default_session_name()!r}."
+    return True, None
+
+
+def _tmux_capture_text(*, target: str, history_lines: int | None = None) -> str:
+    args = ["capture-pane", "-p"]
+    if history_lines is not None and history_lines > 0:
+        args.extend(["-S", f"-{int(history_lines)}"])
+    args.extend(["-t", target])
+    proc = _tmux_raw(*args)
+    if proc.returncode != 0:
+        stderr = str(proc.stderr or "").strip()
+        raise RuntimeError(stderr or f"tmux capture-pane failed for {target!r}.")
+    return str(proc.stdout or "")
+
+
+def _tmux_capture_snapshot(
+    *,
+    pane: dict[str, Any],
+    lines: int,
+    include_history: bool,
+    history_lines: int | None = None,
+) -> dict[str, Any]:
+    lines_int = _clamp_int(_safe_int(lines), default=120, min_value=1, max_value=400)
+    history_limit: int | None = None
+    if include_history:
+        history_limit = _clamp_int(
+            _safe_int(history_lines or max(lines_int * 4, 200)),
+            default=max(lines_int * 4, 200),
+            min_value=lines_int,
+            max_value=5000,
+        )
+    capture_target = str(pane.get("capture_target") or pane.get("pane_id") or pane.get("target") or "")
+    text = _tmux_capture_text(target=capture_target, history_lines=history_limit)
+    all_lines = text.splitlines()
+    visible_lines = all_lines[-lines_int:]
+    last_nonempty_line = None
+    for line in reversed(visible_lines):
+        stripped = line.strip()
+        if stripped:
+            last_nonempty_line = stripped
+            break
+    return {
+        "target": pane.get("target"),
+        "preferred_alias": pane.get("preferred_alias") or _tmux_preferred_alias(pane),
+        "capture_target": capture_target,
+        "target_aliases": _tmux_unique_strings([pane.get("target_aliases")]),
+        "window_aliases": _tmux_unique_strings([pane.get("window_aliases")]),
+        "group_target": pane.get("group_target"),
+        "pane_id": pane.get("pane_id"),
+        "pane_number": _tmux_pane_number(pane.get("pane_id")),
+        "session": pane.get("session"),
+        "session_names": _tmux_unique_strings([pane.get("session_names"), pane.get("session")]),
+        "session_group": pane.get("session_group"),
+        "group_window_target": pane.get("group_window_target"),
+        "window_name": pane.get("window_name"),
+        "window_index": pane.get("window_index"),
+        "pane_index": pane.get("pane_index"),
+        "pane_title": pane.get("pane_title"),
+        "current_command": pane.get("current_command"),
+        "pane_dead": bool(pane.get("pane_dead")),
+        "pane_active": bool(pane.get("pane_active")),
+        "summary": pane.get("summary") or _tmux_pane_summary(pane),
+        "include_history": bool(include_history),
+        "history_lines": int(history_limit) if history_limit is not None else None,
+        "captured_total_lines": len(all_lines),
+        "visible_line_count": len(visible_lines),
+        "last_nonempty_line": last_nonempty_line,
+        "content": "\n".join(visible_lines),
+    }
+
+
+def _tmux_send_text(
+    *,
+    target: str,
+    text: str,
+    press_enter: bool = True,
+) -> dict[str, Any]:
+    pane = _tmux_find_allowed_pane(target)
+    if pane is None:
+        raise RuntimeError("Readable tmux pane not found for target.")
+
+    capture_target = str(pane.get("capture_target") or pane.get("pane_id") or pane.get("target") or "")
+    send_proc = _tmux_raw("send-keys", "-l", "-t", capture_target, text)
+    if send_proc.returncode != 0:
+        stderr = str(send_proc.stderr or "").strip()
+        raise RuntimeError(stderr or f"tmux send-keys failed for {target!r}.")
+
+    if press_enter:
+        enter_proc = _tmux_raw("send-keys", "-t", capture_target, "Enter")
+        if enter_proc.returncode != 0:
+            stderr = str(enter_proc.stderr or "").strip()
+            raise RuntimeError(stderr or f"tmux send-keys Enter failed for {target!r}.")
+
+    return {
+        "target": pane.get("target"),
+        "preferred_alias": pane.get("preferred_alias") or _tmux_preferred_alias(pane),
+        "capture_target": capture_target,
+        "pane_id": pane.get("pane_id"),
+        "pane_number": _tmux_pane_number(pane.get("pane_id")),
+        "text_length": len(text),
+        "press_enter": bool(press_enter),
+    }
+
+
+def _as_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC_TZ)
+        return value.astimezone(UTC_TZ)
+    except Exception:
+        return None
+
+
+def _isoformat_or_none(value: datetime | None) -> str | None:
+    normalized = _as_utc_datetime(value)
+    return normalized.isoformat() if normalized is not None else None
+
+
+def _assistant_supervisor_health_snapshot(
+    *,
+    agent_db: Session,
+    last_run: AgentRun | None,
+    orchestrator_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    now = datetime.now(UTC_TZ)
+    lookback_hours = 24
+    lookback_at = now - timedelta(hours=lookback_hours)
+
+    queued_rows = (
+        agent_db.query(AgentCommand.command_type, func.count(AgentCommand.id))
+        .filter(AgentCommand.status == "queued")
+        .group_by(AgentCommand.command_type)
+        .all()
+    )
+    queued_by_type = {
+        str(command_type): int(count or 0)
+        for command_type, count in queued_rows
+        if isinstance(command_type, str) and command_type
+    }
+
+    running_rows = (
+        agent_db.query(AgentCommand.command_type, func.count(AgentCommand.id))
+        .filter(AgentCommand.status == "running")
+        .group_by(AgentCommand.command_type)
+        .all()
+    )
+    running_by_type = {
+        str(command_type): int(count or 0)
+        for command_type, count in running_rows
+        if isinstance(command_type, str) and command_type
+    }
+
+    oldest_queued = (
+        agent_db.query(AgentCommand)
+        .filter(AgentCommand.status == "queued")
+        .order_by(AgentCommand.available_at.asc(), AgentCommand.id.asc())
+        .first()
+    )
+
+    next_orchestrator_tick = (
+        agent_db.query(AgentCommand)
+        .filter(AgentCommand.command_type == COMMAND_ORCHESTRATOR_TICK)
+        .filter(AgentCommand.status == "queued")
+        .order_by(AgentCommand.available_at.asc(), AgentCommand.id.asc())
+        .first()
+    )
+
+    failure_rows = (
+        agent_db.query(
+            AgentStep.kind,
+            AgentStep.error,
+            func.count(AgentStep.id),
+            func.max(AgentStep.ended_at),
+        )
+        .join(AgentRun, AgentRun.id == AgentStep.run_pk)
+        .filter(AgentRun.kind == "supervisor")
+        .filter(AgentStep.ok.is_(False))
+        .filter(or_(AgentStep.ended_at >= lookback_at, AgentStep.started_at >= lookback_at))
+        .group_by(AgentStep.kind, AgentStep.error)
+        .order_by(func.count(AgentStep.id).desc(), func.max(AgentStep.ended_at).desc())
+        .all()
+    )
+
+    failures_by_kind: dict[str, dict[str, Any]] = {}
+    invalid_output_total = 0
+    failure_total = 0
+    for kind, error, count, latest_at in failure_rows:
+        count_int = int(count or 0)
+        if count_int <= 0:
+            continue
+        failure_total += count_int
+        kind_key = str(kind or "").strip() or "unknown"
+        error_key = str(error or "").strip() or "unknown"
+        if error_key.startswith("invalid_") and error_key.endswith("_output"):
+            invalid_output_total += count_int
+
+        entry = failures_by_kind.setdefault(
+            kind_key,
+            {
+                "kind": kind_key,
+                "count": 0,
+                "latest_at_dt": None,
+                "errors": {},
+            },
+        )
+        entry["count"] = int(entry["count"]) + count_int
+        existing_latest = entry.get("latest_at_dt")
+        latest_dt = _as_utc_datetime(latest_at)
+        existing_latest_dt = _as_utc_datetime(existing_latest if isinstance(existing_latest, datetime) else None)
+        if latest_dt is not None and (existing_latest_dt is None or latest_dt > existing_latest_dt):
+            entry["latest_at_dt"] = latest_dt
+        errors = entry["errors"] if isinstance(entry.get("errors"), dict) else {}
+        errors[error_key] = int(errors.get(error_key, 0) or 0) + count_int
+        entry["errors"] = errors
+
+    failed_steps: list[dict[str, Any]] = []
+    for entry in failures_by_kind.values():
+        latest_dt = entry.get("latest_at_dt")
+        error_items = [
+            {"error": key, "count": int(value or 0)}
+            for key, value in sorted(
+                (entry.get("errors") or {}).items(),
+                key=lambda pair: (-int(pair[1] or 0), str(pair[0])),
+            )
+        ]
+        failed_steps.append(
+            {
+                "kind": str(entry.get("kind") or "unknown"),
+                "count": int(entry.get("count") or 0),
+                "latest_at": _isoformat_or_none(latest_dt if isinstance(latest_dt, datetime) else None),
+                "errors": error_items,
+            }
+        )
+    failed_steps.sort(
+        key=lambda item: (
+            -int(item.get("count") or 0),
+            str(item.get("latest_at") or ""),
+            str(item.get("kind") or ""),
+        )
+    )
+
+    due_at: datetime | None = None
+    next_tick_seconds = None
+    next_tick_reason = None
+    last_run_updated_at = _as_utc_datetime(getattr(last_run, "updated_at", None)) if last_run is not None else None
+    if isinstance(orchestrator_state, dict):
+        next_tick_seconds = _safe_int(orchestrator_state.get("next_tick_seconds"))
+        next_tick_reason = _safe_str(orchestrator_state.get("next_tick_reason"), max_len=120)
+    if last_run_updated_at is not None and next_tick_seconds is not None and next_tick_seconds > 0:
+        due_at = last_run_updated_at + timedelta(seconds=int(next_tick_seconds))
+
+    overdue_seconds = 0
+    is_overdue = False
+    if next_orchestrator_tick is not None and getattr(next_orchestrator_tick, "available_at", None) is not None:
+        available_at = _as_utc_datetime(getattr(next_orchestrator_tick, "available_at", None))
+        if available_at is None:
+            available_at = now
+        overdue_seconds = max(0, int((now - available_at).total_seconds()))
+        is_overdue = overdue_seconds > 0
+    elif due_at is not None:
+        overdue_seconds = max(0, int((now - due_at).total_seconds()))
+        is_overdue = overdue_seconds > 0
+
+    oldest_queued_age_seconds = None
+    oldest_queued_available_at = _as_utc_datetime(getattr(oldest_queued, "available_at", None)) if oldest_queued is not None else None
+    if oldest_queued_available_at is not None:
+        oldest_queued_age_seconds = max(0, int((now - oldest_queued_available_at).total_seconds()))
+
+    next_tick_delay_seconds = None
+    next_orchestrator_available_at = (
+        _as_utc_datetime(getattr(next_orchestrator_tick, "available_at", None)) if next_orchestrator_tick is not None else None
+    )
+    if next_orchestrator_available_at is not None:
+        next_tick_delay_seconds = int((next_orchestrator_available_at - now).total_seconds())
+
+    return {
+        "lookback_hours": int(lookback_hours),
+        "recent_failed_steps": {
+            "total": int(failure_total),
+            "invalid_output_total": int(invalid_output_total),
+            "items": failed_steps[:10],
+        },
+        "commands": {
+            "queued_by_type": queued_by_type,
+            "running_by_type": running_by_type,
+            "oldest_queued_command": {
+                "id": int(getattr(oldest_queued, "id", 0) or 0) if oldest_queued is not None else None,
+                "command_type": getattr(oldest_queued, "command_type", None) if oldest_queued is not None else None,
+                "available_at": _isoformat_or_none(oldest_queued_available_at)
+                if oldest_queued is not None
+                else None,
+                "age_seconds": oldest_queued_age_seconds,
+            },
+        },
+        "orchestrator": {
+            "last_run_updated_at": _isoformat_or_none(last_run_updated_at),
+            "next_tick_reason": next_tick_reason,
+            "next_tick_seconds": int(next_tick_seconds) if next_tick_seconds is not None else None,
+            "due_at": _isoformat_or_none(due_at),
+            "queued_tick": {
+                "command_id": int(getattr(next_orchestrator_tick, "id", 0) or 0) if next_orchestrator_tick is not None else None,
+                "available_at": _isoformat_or_none(next_orchestrator_available_at)
+                if next_orchestrator_tick is not None
+                else None,
+                "delay_seconds": next_tick_delay_seconds,
+            },
+            "is_overdue": bool(is_overdue),
+            "overdue_seconds": int(overdue_seconds),
+        },
+    }
+
+
 def _repo_tools_auto_enabled() -> tuple[bool, str | None]:
     repo_root = _assistant_repo_root()
     if repo_root is None:
@@ -303,6 +1069,58 @@ def _assistant_repo_root() -> Path | None:
         if (parent / "src" / "ispec").is_dir():
             return parent
     return None
+
+
+def _code_tool_allowlist_path() -> Path | None:
+    repo_root = _assistant_repo_root()
+    if repo_root is None:
+        return None
+    return repo_root / "configs" / _CODE_TOOL_USER_ALLOWLIST_FILENAME
+
+
+def _code_tool_allowlist_usernames() -> list[str]:
+    path = _code_tool_allowlist_path()
+    if path is None or not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    usernames: list[str] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lowered = line.lower()
+        if lowered not in seen:
+            usernames.append(lowered)
+            seen.add(lowered)
+    return usernames
+
+
+def _tool_requires_code_access(name: str | None) -> bool:
+    return str(name or "").strip() in _CODE_TOOL_NAMES
+
+
+def _code_tool_access_status(user: AuthUser | None) -> tuple[bool, str | None]:
+    if user is None:
+        return True, None
+
+    allowlist = _code_tool_allowlist_usernames()
+    path = _code_tool_allowlist_path()
+    username = str(getattr(user, "username", "") or "").strip().lower()
+    if username and username in set(allowlist):
+        return True, None
+
+    if path is not None:
+        if not allowlist:
+            return False, f"Code tools are limited to usernames listed in {path}."
+        if username:
+            return False, f"Code tools are unavailable for {username!r}; add that username to {path}."
+        return False, f"Code tools are limited to usernames listed in {path}."
+    return False, "Code tools are limited to whitelisted usernames."
 
 
 def _repo_default_path(repo_root: Path) -> str:
@@ -647,10 +1465,14 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
 
     repo_enabled = _repo_tools_enabled()
     dev_restart_enabled, _ = _dev_restart_enabled_status()
+    staff_slack_enabled, _ = _staff_slack_tool_status()
+    assistant_schedule_tools_enabled, _ = _assistant_schedule_tools_status()
+    assistant_schedule_write_tools_enabled, _ = _assistant_schedule_write_tools_status()
+    tmux_tools_enabled, _ = _tmux_tools_status()
 
     lines = [
         "Available tools:",
-        "- (Most tools are read-only; create_project_comment writes project history.)",
+        "- (Most tools are read-only; create_project_comment plus the internal enqueue/schedule tools perform writes.)",
     ]
 
     def add(tool_name: str, line: str) -> None:
@@ -660,13 +1482,21 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
             return
         if tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
             return
+        if tool_name == "assistant_enqueue_staff_slack_message" and not staff_slack_enabled:
+            return
+        if tool_name == "assistant_list_scheduled_jobs" and not assistant_schedule_tools_enabled:
+            return
+        if tool_name in {"assistant_upsert_scheduled_job", "assistant_delete_scheduled_job"} and not assistant_schedule_write_tools_enabled:
+            return
+        if tool_name in {"assistant_list_tmux_panes", "assistant_capture_tmux_pane", "assistant_compare_tmux_pane"} and not tmux_tools_enabled:
+            return
         lines.append(line)
 
     add("project_counts_snapshot", "- project_counts_snapshot(max_categories: int = 20)")
     add("latest_activity", "- latest_activity(limit: int = 20, kinds: list[str] | None = None, current_only: bool = false)")
     add("billing_category_counts", "- billing_category_counts(current_only: bool = false, limit: int = 20)")
     add("db_file_stats", "- db_file_stats()  # show sqlite DB file sizes")
-    add("assistant_stats", "- assistant_stats()  # assistant DB stats and review backlog")
+    add("assistant_stats", "- assistant_stats()  # assistant DB stats, review backlog, and supervisor loop health")
     add(
         "assistant_list_tools",
         "- assistant_list_tools(query: str | None = None, include_unavailable: bool = false, limit: int = 30)  # tool catalog (meta)",
@@ -674,6 +1504,34 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add(
         "assistant_enqueue_dev_restart_services",
         "- assistant_enqueue_dev_restart_services(services: list[str] | None = None, tmux_session: str | None = None, make_root: str | None = None, delay_seconds: int = 0, priority: int = 50, reason: str | None = None, confirm: bool)  # internal-only (dev) restarts services",
+    )
+    add(
+        "assistant_enqueue_staff_slack_message",
+        f"- assistant_enqueue_staff_slack_message(message: str, thread_ts: str | None = None, delay_seconds: int = 0, priority: int = 50, reason: str | None = None, confirm: bool)  # internal-only; posts to configured staff Slack channel via {_STAFF_SLACK_CHANNEL_ENV}",
+    )
+    add(
+        "assistant_list_scheduled_jobs",
+        f"- assistant_list_scheduled_jobs(query: str | None = None, include_disabled: bool = true, limit: int = 50)  # internal-only; inspect scheduled assistant jobs from {ASSISTANT_SCHEDULE_PATH_ENV}",
+    )
+    add(
+        "assistant_upsert_scheduled_job",
+        f"- assistant_upsert_scheduled_job(name: str, weekday: str | int, time: HH:MM, prompt: str, allowed_tools: list[str], timezone: str | None = None, required_tool: str | None = None, max_tool_calls: int = 4, priority: int = 0, grace_seconds: int = 0, max_attempts: int = 1, enabled: bool = true, confirm: bool)  # internal-only write; create or update a scheduled assistant job",
+    )
+    add(
+        "assistant_delete_scheduled_job",
+        "- assistant_delete_scheduled_job(name: str, confirm: bool)  # internal-only write; delete a scheduled assistant job by name",
+    )
+    add(
+        "assistant_list_tmux_panes",
+        f"- assistant_list_tmux_panes(query: str | None = None, session_name: str | None = None, limit: int = 20)  # internal-only; list readable tmux panes with canonical pane_id/capture_target handles gated by {_TMUX_TOOLS_ENABLED_ENV}",
+    )
+    add(
+        "assistant_capture_tmux_pane",
+        "- assistant_capture_tmux_pane(target: str, lines: int = 120, include_history: bool = false, history_lines: int | None = None)  # internal-only; capture text from one readable tmux pane",
+    )
+    add(
+        "assistant_compare_tmux_pane",
+        "- assistant_compare_tmux_pane(target: str, interval_seconds: int = 3, lines: int = 80, include_history: bool = false, history_lines: int | None = None)  # internal-only; compare whether a tmux pane changed over a short interval",
     )
     add("assistant_recent_sessions", "- assistant_recent_sessions(limit: int = 10)")
     add("assistant_get_session_review", "- assistant_get_session_review(session_id: str)")
@@ -700,15 +1558,15 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     )
     add(
         "assistant_search_internal_logs",
-        "- assistant_search_internal_logs(query: str, limit: int = 20)  # internal-only; searches agent runs/steps/commands/events",
+        "- assistant_search_internal_logs(query: str, limit: int = 20, include_archive: bool = true)  # internal-only; searches agent runs/steps/commands/events",
     )
     add(
         "assistant_recent_agent_commands",
-        "- assistant_recent_agent_commands(limit: int = 20, statuses: list[str] | None = None, command_types: list[str] | None = None, after_id: int | None = None)  # internal-only",
+        "- assistant_recent_agent_commands(limit: int = 20, statuses: list[str] | None = None, command_types: list[str] | None = None, after_id: int | None = None, include_archive: bool = false)  # internal-only",
     )
     add(
         "assistant_recent_agent_steps",
-        "- assistant_recent_agent_steps(limit: int = 20, kinds: list[str] | None = None, run_id: str | None = None, ok: bool | None = None, after_id: int | None = None)  # internal-only",
+        "- assistant_recent_agent_steps(limit: int = 20, kinds: list[str] | None = None, run_id: str | None = None, ok: bool | None = None, after_id: int | None = None, include_archive: bool = false)  # internal-only",
     )
     add(
         "assistant_recent_session_reviews",
@@ -718,6 +1576,7 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add("assistant_get_agent_command", "- assistant_get_agent_command(command_id: int)  # internal-only")
     add("assistant_get_agent_run", "- assistant_get_agent_run(run_id: str)  # internal-only")
     add("assistant_list_users", "- assistant_list_users(limit: int = 50, include_anonymous: bool = true)  # internal-only")
+    add("assistant_set_user_brief", "- assistant_set_user_brief(user_id: int | None = None, username: str | None = None, assistant_brief: str | None = None, confirm: bool)  # internal-only write; set or clear a short assistant-facing brief for a user")
     add("count_all_projects", "- count_all_projects()  # total projects across all statuses/flags")
     add("count_current_projects", "- count_current_projects()  # current projects only")
     add("project_status_counts", "- project_status_counts(current_only: bool = false)")
@@ -802,6 +1661,64 @@ def _clamp_int(value: int | None, *, default: int, min_value: int, max_value: in
     return max(min_value, min(max_value, value))
 
 
+def _assistant_schedule_known_tool_names() -> set[str]:
+    return {
+        name
+        for name in _OPENAI_TOOL_SPECS.keys()
+        if isinstance(name, str) and name.strip()
+    }
+
+
+def _assistant_scheduled_jobs_payload(
+    *,
+    query: str | None,
+    include_disabled: bool,
+    limit: int,
+) -> dict[str, Any]:
+    query_clean = str(query or "").strip().lower()
+    rows, errors, store = list_assistant_schedule_rows(
+        known_tool_names=_assistant_schedule_known_tool_names(),
+    )
+
+    items = rows
+    if not include_disabled:
+        items = [item for item in items if bool(item.get("enabled", True))]
+    if query_clean:
+        tokens = [tok for tok in re.findall(r"[a-z0-9_:-]+", query_clean) if tok]
+        filtered: list[dict[str, Any]] = []
+        for row in items:
+            haystack = " ".join(
+                [
+                    str(row.get("name") or ""),
+                    str(row.get("prompt") or ""),
+                    str(row.get("weekday") or ""),
+                    str(row.get("time") or ""),
+                    str(row.get("timezone") or ""),
+                    " ".join(str(tool) for tool in row.get("allowed_tools") or []),
+                    str(row.get("required_tool") or ""),
+                ]
+            ).lower()
+            if all(token in haystack for token in tokens):
+                filtered.append(row)
+        items = filtered
+
+    limited = items[:limit]
+    return {
+        "storage": {
+            "source": store.source,
+            "path": str(store.path) if store.path is not None else None,
+            "writable": bool(store.writable),
+        },
+        "query": query_clean or None,
+        "include_disabled": bool(include_disabled),
+        "count": len(limited),
+        "total_matches": len(items),
+        "jobs": limited,
+        "errors": errors,
+        "warnings": errors,
+    }
+
+
 def _assistant_list_tools_payload(
     *,
     query: str | None,
@@ -827,6 +1744,11 @@ def _assistant_list_tools_payload(
 
     repo_enabled, repo_reason = _repo_tools_enabled_status()
     dev_restart_enabled, dev_restart_reason = _dev_restart_enabled_status()
+    staff_slack_enabled, staff_slack_reason = _staff_slack_tool_status()
+    assistant_schedule_tools_enabled, assistant_schedule_tools_reason = _assistant_schedule_tools_status()
+    assistant_schedule_write_enabled, assistant_schedule_write_reason = _assistant_schedule_write_tools_status()
+    tmux_tools_enabled, tmux_tools_reason = _tmux_tools_status()
+    code_tools_enabled, code_tools_reason = _code_tool_access_status(user)
 
     items: list[dict[str, Any]] = []
     available_total = 0
@@ -848,9 +1770,27 @@ def _assistant_list_tools_payload(
         scope_err = _scope_error(scope, user)
 
         unavailable_reason: str | None = None
-        if tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
+        if _tool_requires_code_access(tool_name) and not code_tools_enabled:
+            unavailable_reason = code_tools_reason or "Code tools are unavailable."
+        elif tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
             unavailable_reason = (
                 f"Dev restart tools are unavailable ({dev_restart_reason or 'disabled'})."
+            )
+        elif tool_name == "assistant_enqueue_staff_slack_message" and not staff_slack_enabled:
+            unavailable_reason = (
+                f"Staff Slack messaging is unavailable ({staff_slack_reason or 'disabled'})."
+            )
+        elif tool_name == "assistant_list_scheduled_jobs" and not assistant_schedule_tools_enabled:
+            unavailable_reason = (
+                f"Assistant schedule management is unavailable ({assistant_schedule_tools_reason or 'disabled'})."
+            )
+        elif tool_name in {"assistant_upsert_scheduled_job", "assistant_delete_scheduled_job"} and not assistant_schedule_write_enabled:
+            unavailable_reason = (
+                f"Assistant schedule editing is unavailable ({assistant_schedule_write_reason or 'disabled'})."
+            )
+        elif tool_name in {"assistant_list_tmux_panes", "assistant_capture_tmux_pane", "assistant_compare_tmux_pane"} and not tmux_tools_enabled:
+            unavailable_reason = (
+                f"tmux monitoring tools are unavailable ({tmux_tools_reason or 'disabled'})."
             )
         elif tool_name.startswith("repo_") and not repo_enabled:
             unavailable_reason = (
@@ -1098,6 +2038,337 @@ def _coerce_str_list(value: Any, *, max_items: int) -> list[str] | None:
     return None
 
 
+def _sorted_unique_agent_items(
+    items: list[dict[str, Any]],
+    *,
+    id_key: str,
+    order: str,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    reverse = order != "asc"
+    ranked = sorted(
+        items,
+        key=lambda item: (
+            int(_safe_int(item.get(id_key)) or 0),
+            1 if str(item.get("source") or "") == "live" else 0,
+        ),
+        reverse=reverse,
+    )
+    unique: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in ranked:
+        item_id = _safe_int(item.get(id_key))
+        if item_id is None or item_id in seen:
+            continue
+        seen.add(int(item_id))
+        unique.append(item)
+        if limit is not None and len(unique) >= int(limit):
+            break
+    return unique
+
+
+def _recent_agent_commands_from_db(
+    db: Session,
+    *,
+    limit: int,
+    statuses: list[str] | None,
+    command_types: list[str] | None,
+    after_id: int | None,
+    order: str,
+    include_payload: bool,
+    include_result: bool,
+    source: str,
+) -> list[dict[str, Any]]:
+    query = db.query(AgentCommand)
+    if statuses:
+        normalized_statuses = [s.strip().lower() for s in statuses if s.strip()]
+        query = query.filter(AgentCommand.status.in_(normalized_statuses))
+    if command_types:
+        normalized_types = [s.strip() for s in command_types if s.strip()]
+        query = query.filter(AgentCommand.command_type.in_(normalized_types))
+    if after_id is not None and after_id > 0:
+        query = query.filter(AgentCommand.id > int(after_id))
+
+    if order == "asc":
+        query = query.order_by(AgentCommand.id.asc())
+    else:
+        query = query.order_by(AgentCommand.id.desc())
+
+    rows = query.limit(limit).all()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        payload_json = row.payload_json if isinstance(row.payload_json, dict) else {}
+        result_json = row.result_json if isinstance(row.result_json, dict) else {}
+        item: dict[str, Any] = {
+            "id": int(row.id),
+            "source": source,
+            "command_type": row.command_type,
+            "status": row.status,
+            "priority": int(row.priority or 0),
+            "attempts": int(row.attempts or 0),
+            "max_attempts": int(row.max_attempts or 0),
+            "available_at": row.available_at.isoformat() if row.available_at else None,
+            "claimed_at": row.claimed_at.isoformat() if row.claimed_at else None,
+            "claimed_by_agent_id": row.claimed_by_agent_id,
+            "claimed_by_run_id": row.claimed_by_run_id,
+            "started_at": row.started_at.isoformat() if row.started_at else None,
+            "ended_at": row.ended_at.isoformat() if row.ended_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "error": row.error,
+            "payload_keys": sorted(payload_json.keys())[:50],
+            "result_keys": sorted(result_json.keys())[:50],
+        }
+        if include_payload:
+            item["payload_json"] = payload_json
+        if include_result:
+            item["result_json"] = result_json
+        items.append(item)
+    return items
+
+
+def _recent_agent_steps_from_db(
+    db: Session,
+    *,
+    limit: int,
+    kinds: list[str] | None,
+    run_id: str | None,
+    ok_filter: bool | None,
+    after_id: int | None,
+    order: str,
+    include_prompt: bool,
+    include_response: bool,
+    include_state: bool,
+    source: str,
+) -> list[dict[str, Any]]:
+    query = db.query(AgentStep, AgentRun.run_id).join(AgentRun, AgentRun.id == AgentStep.run_pk)
+    if run_id:
+        query = query.filter(AgentRun.run_id == run_id)
+    if kinds:
+        normalized = [k.strip() for k in kinds if k.strip()]
+        query = query.filter(AgentStep.kind.in_(normalized))
+    if ok_filter is not None:
+        query = query.filter(AgentStep.ok.is_(bool(ok_filter)))
+    if after_id is not None and after_id > 0:
+        query = query.filter(AgentStep.id > int(after_id))
+
+    if order == "asc":
+        query = query.order_by(AgentStep.id.asc())
+    else:
+        query = query.order_by(AgentStep.id.desc())
+
+    rows = query.limit(limit).all()
+    items: list[dict[str, Any]] = []
+    for step, step_run_id in rows:
+        chosen = step.chosen_json if isinstance(step.chosen_json, dict) else {}
+        command_id = _safe_int(chosen.get("command_id"))
+        command_type = str(chosen.get("command_type") or "").strip() or None
+        item: dict[str, Any] = {
+            "id": int(step.id),
+            "source": source,
+            "run_id": step_run_id,
+            "run_pk": int(step.run_pk),
+            "step_index": int(step.step_index or 0),
+            "kind": step.kind,
+            "ok": bool(step.ok),
+            "severity": step.severity,
+            "duration_ms": int(step.duration_ms) if step.duration_ms is not None else None,
+            "started_at": step.started_at.isoformat() if step.started_at else None,
+            "ended_at": step.ended_at.isoformat() if step.ended_at else None,
+            "error": step.error,
+            "command_id": command_id,
+            "command_type": command_type,
+        }
+        if include_prompt:
+            item["prompt_json"] = step.prompt_json
+        if include_response:
+            item["response_json"] = step.response_json
+        if include_state:
+            item["state_before_json"] = step.state_before_json
+            item["state_after_json"] = step.state_after_json
+        items.append(item)
+    return items
+
+
+def _search_internal_logs_from_db(
+    db: Session,
+    *,
+    query_text: str,
+    limit: int,
+    source: str,
+) -> dict[str, list[dict[str, Any]]]:
+    pattern = f"%{query_text}%"
+    step_rows = (
+        db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
+        .join(AgentRun, AgentStep.run_pk == AgentRun.id)
+        .filter(
+            or_(
+                AgentStep.kind.ilike(pattern),
+                AgentStep.error.ilike(pattern),
+                cast(AgentStep.prompt_json, Text).ilike(pattern),
+                cast(AgentStep.response_json, Text).ilike(pattern),
+                cast(AgentStep.tool_results_json, Text).ilike(pattern),
+                cast(AgentStep.state_before_json, Text).ilike(pattern),
+                cast(AgentStep.state_after_json, Text).ilike(pattern),
+                cast(AgentStep.summary_before_json, Text).ilike(pattern),
+                cast(AgentStep.summary_after_json, Text).ilike(pattern),
+            )
+        )
+        .order_by(AgentStep.id.desc())
+        .limit(limit)
+        .all()
+    )
+    steps: list[dict[str, Any]] = []
+    for step, run_id, agent_id in step_rows:
+        response_preview = ""
+        if isinstance(step.response_json, dict):
+            response_preview = _snippet_for_query(json.dumps(step.response_json, ensure_ascii=False), query_text)
+        steps.append(
+            {
+                "step_id": int(step.id),
+                "source": source,
+                "run_id": run_id,
+                "agent_id": agent_id,
+                "kind": step.kind,
+                "step_index": int(step.step_index or 0),
+                "ok": bool(step.ok),
+                "severity": step.severity,
+                "error": step.error,
+                "started_at": step.started_at.isoformat() if getattr(step, "started_at", None) else None,
+                "ended_at": step.ended_at.isoformat() if getattr(step, "ended_at", None) else None,
+                "response_preview": response_preview,
+            }
+        )
+
+    command_rows = (
+        db.query(AgentCommand)
+        .filter(
+            or_(
+                AgentCommand.command_type.ilike(pattern),
+                AgentCommand.status.ilike(pattern),
+                AgentCommand.error.ilike(pattern),
+                cast(AgentCommand.payload_json, Text).ilike(pattern),
+                cast(AgentCommand.result_json, Text).ilike(pattern),
+            )
+        )
+        .order_by(AgentCommand.id.desc())
+        .limit(limit)
+        .all()
+    )
+    commands: list[dict[str, Any]] = []
+    for cmd in command_rows:
+        payload_preview = ""
+        if isinstance(cmd.payload_json, dict):
+            payload_preview = _snippet_for_query(json.dumps(cmd.payload_json, ensure_ascii=False), query_text)
+        result_preview = ""
+        if isinstance(cmd.result_json, dict):
+            result_preview = _snippet_for_query(json.dumps(cmd.result_json, ensure_ascii=False), query_text)
+        commands.append(
+            {
+                "command_id": int(cmd.id),
+                "source": source,
+                "command_type": cmd.command_type,
+                "status": cmd.status,
+                "priority": int(cmd.priority or 0),
+                "available_at": cmd.available_at.isoformat() if getattr(cmd, "available_at", None) else None,
+                "claimed_by_run_id": cmd.claimed_by_run_id,
+                "error": cmd.error,
+                "payload_preview": payload_preview,
+                "result_preview": result_preview,
+            }
+        )
+
+    event_rows = (
+        db.query(AgentEvent)
+        .filter(
+            or_(
+                AgentEvent.agent_id.ilike(pattern),
+                AgentEvent.event_type.ilike(pattern),
+                AgentEvent.name.ilike(pattern),
+                AgentEvent.severity.ilike(pattern),
+                AgentEvent.payload_json.ilike(pattern),
+            )
+        )
+        .order_by(AgentEvent.id.desc())
+        .limit(limit)
+        .all()
+    )
+    events: list[dict[str, Any]] = []
+    for event in event_rows:
+        payload_preview = _snippet_for_query(event.payload_json, query_text)
+        events.append(
+            {
+                "event_id": int(event.id),
+                "source": source,
+                "agent_id": event.agent_id,
+                "event_type": event.event_type,
+                "name": event.name,
+                "severity": event.severity,
+                "ts": event.ts.isoformat() if getattr(event, "ts", None) else None,
+                "payload_preview": payload_preview,
+            }
+        )
+
+    return {"steps": steps, "commands": commands, "events": events}
+
+
+def _get_agent_step_payload(db: Session, *, step_id: int, source: str) -> dict[str, Any] | None:
+    row = (
+        db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
+        .join(AgentRun, AgentStep.run_pk == AgentRun.id)
+        .filter(AgentStep.id == int(step_id))
+        .first()
+    )
+    if row is None:
+        return None
+    step, run_id, agent_id = row
+    return {
+        "step_id": int(step.id),
+        "source": source,
+        "run_id": run_id,
+        "agent_id": agent_id,
+        "kind": step.kind,
+        "step_index": int(step.step_index or 0),
+        "started_at": step.started_at.isoformat() if getattr(step, "started_at", None) else None,
+        "ended_at": step.ended_at.isoformat() if getattr(step, "ended_at", None) else None,
+        "duration_ms": int(step.duration_ms) if step.duration_ms is not None else None,
+        "ok": bool(step.ok),
+        "severity": step.severity,
+        "error": step.error,
+        "prompt_json": step.prompt_json,
+        "response_json": step.response_json,
+        "tool_calls_json": step.tool_calls_json,
+        "tool_results_json": step.tool_results_json,
+        "state_before_json": step.state_before_json,
+        "state_after_json": step.state_after_json,
+    }
+
+
+def _get_agent_command_payload(db: Session, *, command_id: int, source: str) -> dict[str, Any] | None:
+    cmd = db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
+    if cmd is None:
+        return None
+    return {
+        "command_id": int(cmd.id),
+        "source": source,
+        "command_type": cmd.command_type,
+        "status": cmd.status,
+        "priority": int(cmd.priority or 0),
+        "created_at": cmd.created_at.isoformat() if cmd.created_at else None,
+        "attempts": int(cmd.attempts or 0),
+        "max_attempts": int(cmd.max_attempts or 0),
+        "available_at": cmd.available_at.isoformat() if cmd.available_at else None,
+        "claimed_at": cmd.claimed_at.isoformat() if cmd.claimed_at else None,
+        "claimed_by_agent_id": cmd.claimed_by_agent_id,
+        "claimed_by_run_id": cmd.claimed_by_run_id,
+        "started_at": cmd.started_at.isoformat() if cmd.started_at else None,
+        "ended_at": cmd.ended_at.isoformat() if cmd.ended_at else None,
+        "updated_at": cmd.updated_at.isoformat() if cmd.updated_at else None,
+        "error": cmd.error,
+        "payload_json": cmd.payload_json if isinstance(cmd.payload_json, dict) else {},
+        "result_json": cmd.result_json if isinstance(cmd.result_json, dict) else {},
+    }
+
+
 def _extract_fenced_block(text: str, *, label: str) -> str | None:
     """Return the first fenced code block matching ``label`` (without the fences)."""
 
@@ -1310,6 +2581,14 @@ def run_tool(
         scope_error = _scope_error(scope, user)
         if scope_error:
             return {"ok": False, "tool": name, "error": scope_error}
+        if _tool_requires_code_access(name):
+            code_tools_enabled, code_tools_reason = _code_tool_access_status(user)
+            if not code_tools_enabled:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": code_tools_reason or "Code tools are unavailable.",
+                }
 
         if name in {"repo_list_files", "repo_search", "repo_read_file"}:
             if not _repo_tools_enabled():
@@ -1353,6 +2632,37 @@ def run_tool(
                 max_lines=max_lines,
             )
 
+        if name in {
+            "assistant_list_scheduled_jobs",
+            "assistant_upsert_scheduled_job",
+            "assistant_delete_scheduled_job",
+        }:
+            if name == "assistant_list_scheduled_jobs":
+                enabled, reason = _assistant_schedule_tools_status()
+            else:
+                enabled, reason = _assistant_schedule_write_tools_status()
+            if not enabled:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": reason or "Assistant schedule-management tools are unavailable.",
+                    "hint": reason or None,
+                }
+
+        if name in {
+            "assistant_list_tmux_panes",
+            "assistant_capture_tmux_pane",
+            "assistant_compare_tmux_pane",
+        }:
+            enabled, reason = _tmux_tools_status()
+            if not enabled:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": reason or "tmux monitoring tools are unavailable.",
+                    "hint": reason or None,
+                }
+
         if name == "assistant_list_tools":
             query = _safe_str(args.get("query"), max_len=256)
             include_unavailable = bool(args.get("include_unavailable") or False)
@@ -1371,6 +2681,285 @@ def run_tool(
                     include_unavailable=bool(include_unavailable),
                     user=user,
                 ),
+            }
+
+        if name == "assistant_list_scheduled_jobs":
+            query = _safe_str(args.get("query"), max_len=256)
+            include_disabled = True if args.get("include_disabled") is None else bool(args.get("include_disabled"))
+            limit = _clamp_int(
+                _safe_int(args.get("limit")),
+                default=50,
+                min_value=1,
+                max_value=200,
+            )
+            return {
+                "ok": True,
+                "tool": name,
+                "result": _assistant_scheduled_jobs_payload(
+                    query=query,
+                    include_disabled=bool(include_disabled),
+                    limit=int(limit),
+                ),
+            }
+
+        if name == "assistant_upsert_scheduled_job":
+            if args.get("confirm") is not True:
+                return {"ok": False, "tool": name, "error": "confirm=true is required to write schedule configuration."}
+
+            schedule_name = _safe_str(args.get("name"), max_len=200)
+            prompt_text = _safe_str(args.get("prompt"), max_len=16_000)
+            timezone_name = _safe_str(args.get("timezone"), max_len=128)
+            required_tool = _safe_str(args.get("required_tool"), max_len=128)
+            allowed_tools_raw = args.get("allowed_tools")
+            if allowed_tools_raw is None:
+                allowed_tools_raw = args.get("tools")
+
+            candidate_row: dict[str, Any] = {
+                "name": schedule_name,
+                "weekday": args.get("weekday"),
+                "time": args.get("time"),
+                "timezone": timezone_name,
+                "prompt": prompt_text,
+                "allowed_tools": allowed_tools_raw,
+                "required_tool": required_tool,
+                "max_tool_calls": args.get("max_tool_calls"),
+                "priority": args.get("priority"),
+                "grace_seconds": args.get("grace_seconds"),
+                "max_attempts": args.get("max_attempts"),
+                "enabled": True if args.get("enabled") is None else bool(args.get("enabled")),
+            }
+            canonical, validation_errors = canonicalize_schedule_row(
+                candidate_row,
+                known_tool_names=_assistant_schedule_known_tool_names(),
+            )
+            if canonical is None:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "; ".join(validation_errors) or "Invalid scheduled job payload.",
+                }
+
+            rows, row_errors, path = load_assistant_schedule_rows_for_write(
+                known_tool_names=_assistant_schedule_known_tool_names(),
+            )
+            if row_errors:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "; ".join(row_errors[:3]),
+                    "details": row_errors,
+                }
+            if path is None:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": f"Set {ASSISTANT_SCHEDULE_PATH_ENV}=<path> to enable schedule editing.",
+                }
+
+            action = "created"
+            updated_rows: list[dict[str, Any]] = []
+            replaced = False
+            for row in rows:
+                if str(row.get("name") or "").strip() == str(canonical.get("name") or "").strip():
+                    updated_rows.append(canonical)
+                    replaced = True
+                else:
+                    updated_rows.append(row)
+            if not replaced:
+                updated_rows.append(canonical)
+            else:
+                action = "updated"
+            updated_rows.sort(
+                key=lambda item: (
+                    parse_weekday(item.get("weekday")) or 99,
+                    str(item.get("time") or ""),
+                    str(item.get("name") or ""),
+                )
+            )
+
+            write_assistant_schedule_rows(updated_rows, path=path)
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "action": action,
+                    "path": str(path),
+                    "job": canonical,
+                    "total_jobs": len(updated_rows),
+                },
+            }
+
+        if name == "assistant_delete_scheduled_job":
+            if args.get("confirm") is not True:
+                return {"ok": False, "tool": name, "error": "confirm=true is required to delete a scheduled job."}
+
+            schedule_name = _safe_str(args.get("name"), max_len=200)
+            if schedule_name is None:
+                return {"ok": False, "tool": name, "error": "name is required."}
+
+            rows, row_errors, path = load_assistant_schedule_rows_for_write(
+                known_tool_names=_assistant_schedule_known_tool_names(),
+            )
+            if row_errors:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "; ".join(row_errors[:3]),
+                    "details": row_errors,
+                }
+            if path is None:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": f"Set {ASSISTANT_SCHEDULE_PATH_ENV}=<path> to enable schedule editing.",
+                }
+
+            remaining_rows = [row for row in rows if str(row.get("name") or "").strip() != schedule_name]
+            if len(remaining_rows) == len(rows):
+                return {"ok": False, "tool": name, "error": f"Scheduled job {schedule_name!r} was not found."}
+
+            write_assistant_schedule_rows(remaining_rows, path=path)
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "deleted": True,
+                    "name": schedule_name,
+                    "path": str(path),
+                    "remaining_jobs": len(remaining_rows),
+                },
+            }
+
+        if name == "assistant_list_tmux_panes":
+            query = _safe_str(args.get("query"), max_len=256)
+            session_name = _safe_str(args.get("session_name"), max_len=128)
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=100)
+            query_tokens = _tokenize(query or "")
+            session_filter = str(session_name or "").strip().lower()
+            panes = _tmux_list_allowed_panes()
+            items: list[dict[str, Any]] = []
+            for pane in panes:
+                pane_session_names = {
+                    value.lower()
+                    for value in _tmux_unique_strings([pane.get("session_names"), pane.get("session"), pane.get("session_group")])
+                    if value
+                }
+                if session_filter and session_filter not in pane_session_names:
+                    continue
+                haystack = " ".join(
+                    [
+                        str(pane.get("target") or ""),
+                        str(pane.get("preferred_alias") or ""),
+                        str(pane.get("capture_target") or ""),
+                        str(pane.get("group_target") or ""),
+                        str(pane.get("session") or ""),
+                        str(pane.get("session_group") or ""),
+                        " ".join(_tmux_unique_strings([pane.get("session_names")])),
+                        " ".join(_tmux_unique_strings([pane.get("target_aliases")])),
+                        " ".join(_tmux_unique_strings([pane.get("window_aliases")])),
+                        str(pane.get("window_name") or ""),
+                        str(pane.get("pane_id") or ""),
+                        str(pane.get("pane_title") or ""),
+                        str(pane.get("current_command") or ""),
+                    ]
+                ).lower()
+                if query_tokens and not all(token in haystack for token in query_tokens):
+                    continue
+                items.append(
+                    {
+                        "target": pane.get("target") or _tmux_preferred_alias(pane),
+                        "preferred_alias": pane.get("preferred_alias") or _tmux_preferred_alias(pane),
+                        "capture_target": pane.get("capture_target") or _tmux_capture_target(pane),
+                        "target_aliases": _tmux_unique_strings([pane.get("target_aliases")]),
+                        "window_aliases": _tmux_unique_strings([pane.get("window_aliases")]),
+                        "group_target": pane.get("group_target"),
+                        "window_target": pane.get("window_target"),
+                        "group_window_target": pane.get("group_window_target"),
+                        "pane_id": pane.get("pane_id"),
+                        "pane_number": _tmux_pane_number(pane.get("pane_id")),
+                        "session": pane.get("session"),
+                        "session_names": _tmux_unique_strings([pane.get("session_names"), pane.get("session")]),
+                        "session_group": pane.get("session_group"),
+                        "window_name": pane.get("window_name"),
+                        "window_index": pane.get("window_index"),
+                        "pane_index": pane.get("pane_index"),
+                        "pane_title": pane.get("pane_title"),
+                        "current_command": pane.get("current_command"),
+                        "pane_dead": bool(pane.get("pane_dead")),
+                        "pane_active": bool(pane.get("pane_active")),
+                        "summary": pane.get("summary") or _tmux_pane_summary(pane),
+                    }
+                )
+                if len(items) >= int(limit):
+                    break
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "count": len(items),
+                    "query": query,
+                    "session_name": session_name,
+                    "allowlist": _tmux_allowlist_entries() or [f"session:{_tmux_default_session_name()}"],
+                    "items": items,
+                },
+            }
+
+        if name == "assistant_capture_tmux_pane":
+            target = _safe_str(args.get("target"), max_len=128)
+            if target is None:
+                target = _safe_str(args.get("pane"), max_len=128)
+            pane = _tmux_find_allowed_pane(target)
+            if pane is None:
+                return {"ok": False, "tool": name, "error": "Readable tmux pane not found for target."}
+
+            lines = _clamp_int(_safe_int(args.get("lines")), default=120, min_value=1, max_value=400)
+            include_history = bool(args.get("include_history"))
+            history_lines = _safe_int(args.get("history_lines"))
+            snapshot = _tmux_capture_snapshot(
+                pane=pane,
+                lines=int(lines),
+                include_history=bool(include_history),
+                history_lines=int(history_lines) if history_lines is not None else None,
+            )
+            return {"ok": True, "tool": name, "result": snapshot}
+
+        if name == "assistant_compare_tmux_pane":
+            target = _safe_str(args.get("target"), max_len=128)
+            if target is None:
+                target = _safe_str(args.get("pane"), max_len=128)
+            pane = _tmux_find_allowed_pane(target)
+            if pane is None:
+                return {"ok": False, "tool": name, "error": "Readable tmux pane not found for target."}
+
+            lines = _clamp_int(_safe_int(args.get("lines")), default=80, min_value=1, max_value=400)
+            include_history = bool(args.get("include_history"))
+            history_lines = _safe_int(args.get("history_lines"))
+            interval_seconds = _clamp_int(_safe_int(args.get("interval_seconds")), default=3, min_value=1, max_value=30)
+
+            before = _tmux_capture_snapshot(
+                pane=pane,
+                lines=int(lines),
+                include_history=bool(include_history),
+                history_lines=int(history_lines) if history_lines is not None else None,
+            )
+            time_module.sleep(float(interval_seconds))
+            after = _tmux_capture_snapshot(
+                pane=pane,
+                lines=int(lines),
+                include_history=bool(include_history),
+                history_lines=int(history_lines) if history_lines is not None else None,
+            )
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "target": pane.get("target"),
+                    "pane_id": pane.get("pane_id"),
+                    "interval_seconds": int(interval_seconds),
+                    "changed": before.get("content") != after.get("content"),
+                    "before": before,
+                    "after": after,
+                },
             }
 
         if name == "project_counts_snapshot":
@@ -1499,32 +3088,7 @@ def run_tool(
                     "tool": name,
                     "error": "User requested not to save yet.",
                 }
-            explicit = False
-            if user_msg:
-                verbs = r"(?:save|log|record|add|write|create|make|leave|commit)"
-                nouns = r"(?:history|comment|comments|note|notes|meeting|memo)"
-                if re.search(rf"\b{verbs}\b", user_msg) and re.search(rf"\b{nouns}\b", user_msg):
-                    explicit = True
-                else:
-                    normalized = re.sub(r"[^\w\s]", "", user_msg)
-                    normalized = re.sub(r"\s+", " ", normalized).strip()
-                    if re.fullmatch(r"(?:yes|y|yeah|yep|yup|ok|okay|sure|confirm)(?: please)?", normalized):
-                        explicit = True
-                    elif normalized in {"go ahead", "do it", "please do", "please do it"}:
-                        explicit = True
-                    else:
-                        tokens = normalized.split()
-                        if len(tokens) <= 6:
-                            negative = {"no", "n", "nope", "nah"}
-                            if any(token in negative for token in tokens):
-                                explicit = False
-                            else:
-                                affirmative = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm"}
-                                if "commit" in tokens and ("it" in tokens or any(token in affirmative for token in tokens)):
-                                    explicit = True
-                                elif normalized in {"commit", "commit it", "please commit", "please commit it"}:
-                                    explicit = True
-            if not explicit:
+            if not _project_comment_save_requested(user_msg):
                 return {
                     "ok": False,
                     "tool": name,
@@ -1986,6 +3550,14 @@ def run_tool(
                 if last_run is not None and isinstance(last_run.summary_json, dict):
                     orchestrator_state = last_run.summary_json.get("orchestrator")
 
+            supervisor_health = None
+            if agent_db is not None:
+                supervisor_health = _assistant_supervisor_health_snapshot(
+                    agent_db=agent_db,
+                    last_run=last_run,
+                    orchestrator_state=orchestrator_state if isinstance(orchestrator_state, dict) else None,
+                )
+
             return {
                 "ok": True,
                 "tool": name,
@@ -2011,6 +3583,7 @@ def run_tool(
                     }
                     if last_run is not None
                     else None,
+                    "supervisor_health": supervisor_health,
                 },
             }
 
@@ -2124,6 +3697,99 @@ def run_tool(
                 },
             }
 
+        if name == "assistant_enqueue_staff_slack_message":
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
+
+            if args.get("confirm") is not True:
+                return {"ok": False, "tool": name, "error": "confirm=true is required to enqueue a Slack post."}
+
+            staff_slack_enabled, staff_slack_reason = _staff_slack_tool_status()
+            if not staff_slack_enabled:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "Staff Slack messaging is unavailable.",
+                    "hint": staff_slack_reason or None,
+                }
+
+            channel = _staff_slack_channel()
+            if not channel:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "Missing configured staff Slack channel.",
+                }
+
+            message_text = _safe_str(args.get("message"), max_len=4000)
+            if message_text is None:
+                message_text = _safe_str(args.get("text"), max_len=4000)
+            if message_text is None:
+                return {"ok": False, "tool": name, "error": "Missing argument: message (or text)"}
+
+            thread_ts = _safe_str(args.get("thread_ts"), max_len=64)
+            reason = _safe_str(args.get("reason"), max_len=240)
+
+            delay_seconds = _safe_int(args.get("delay_seconds")) or 0
+            delay_seconds = max(0, min(3600, int(delay_seconds)))
+
+            priority = _safe_int(args.get("priority"))
+            priority_int = int(priority) if priority is not None else 50
+            priority_int = max(0, min(1000, int(priority_int)))
+
+            now = datetime.now(UTC_TZ)
+            available_at = now + timedelta(seconds=delay_seconds) if delay_seconds > 0 else now
+
+            command_payload: dict[str, Any] = {
+                "channel": channel,
+                "text": message_text,
+                "meta": {
+                    "source": "assistant_enqueue_staff_slack_message",
+                    "channel_env": _STAFF_SLACK_CHANNEL_ENV,
+                },
+            }
+            if thread_ts:
+                command_payload["thread_ts"] = thread_ts
+            if reason:
+                command_payload["reason"] = reason
+
+            if user is not None:
+                command_payload["requested_by"] = {
+                    "user_id": int(getattr(user, "id", 0) or 0),
+                    "username": getattr(user, "username", None),
+                    "role": str(getattr(user, "role", "")),
+                }
+            if isinstance(user_message, str) and user_message.strip():
+                command_payload["requested_via_message"] = user_message.strip()[:240]
+
+            cmd = AgentCommand(
+                command_type=COMMAND_SLACK_POST_MESSAGE,
+                status="queued",
+                priority=int(priority_int),
+                available_at=available_at,
+                attempts=0,
+                max_attempts=3,
+                payload_json=command_payload,
+                result_json={},
+            )
+            agent_db.add(cmd)
+            agent_db.commit()
+            agent_db.refresh(cmd)
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "queued": True,
+                    "command_id": int(cmd.id),
+                    "command_type": COMMAND_SLACK_POST_MESSAGE,
+                    "channel": channel,
+                    "thread_ts": thread_ts,
+                    "available_at": available_at.isoformat(),
+                    "priority": int(priority_int),
+                },
+            }
+
         if name == "assistant_recent_agent_commands":
             if agent_db is None:
                 return {"ok": False, "tool": name, "error": "agent_db is required."}
@@ -2137,50 +3803,37 @@ def run_tool(
                 return {"ok": False, "tool": name, "error": "order must be 'asc' or 'desc'."}
             include_payload = bool(args.get("include_payload"))
             include_result = bool(args.get("include_result"))
+            include_archive = bool(args.get("include_archive"))
 
-            query = agent_db.query(AgentCommand)
-            if statuses:
-                normalized_statuses = [s.strip().lower() for s in statuses if s.strip()]
-                query = query.filter(AgentCommand.status.in_(normalized_statuses))
-            if command_types:
-                normalized_types = [s.strip() for s in command_types if s.strip()]
-                query = query.filter(AgentCommand.command_type.in_(normalized_types))
-            if after_id is not None and after_id > 0:
-                query = query.filter(AgentCommand.id > int(after_id))
-
-            if order == "asc":
-                query = query.order_by(AgentCommand.id.asc())
-            else:
-                query = query.order_by(AgentCommand.id.desc())
-
-            rows = query.limit(limit).all()
-            items: list[dict[str, Any]] = []
-            for row in rows:
-                payload_json = row.payload_json if isinstance(row.payload_json, dict) else {}
-                result_json = row.result_json if isinstance(row.result_json, dict) else {}
-                item: dict[str, Any] = {
-                    "id": int(row.id),
-                    "command_type": row.command_type,
-                    "status": row.status,
-                    "priority": int(row.priority or 0),
-                    "attempts": int(row.attempts or 0),
-                    "max_attempts": int(row.max_attempts or 0),
-                    "available_at": row.available_at.isoformat() if row.available_at else None,
-                    "claimed_at": row.claimed_at.isoformat() if row.claimed_at else None,
-                    "claimed_by_agent_id": row.claimed_by_agent_id,
-                    "claimed_by_run_id": row.claimed_by_run_id,
-                    "started_at": row.started_at.isoformat() if row.started_at else None,
-                    "ended_at": row.ended_at.isoformat() if row.ended_at else None,
-                    "updated_at": row.updated_at.isoformat() if row.updated_at else None,
-                    "error": row.error,
-                    "payload_keys": sorted(payload_json.keys())[:50],
-                    "result_keys": sorted(result_json.keys())[:50],
-                }
-                if include_payload:
-                    item["payload_json"] = payload_json
-                if include_result:
-                    item["result_json"] = result_json
-                items.append(item)
+            items = _recent_agent_commands_from_db(
+                agent_db,
+                limit=limit,
+                statuses=statuses,
+                command_types=command_types,
+                after_id=after_id,
+                order=order,
+                include_payload=include_payload,
+                include_result=include_result,
+                source="live",
+            )
+            archive_cm = get_agent_archive_session_if_available() if include_archive else nullcontext(None)
+            with archive_cm as archive_db:
+                archive_available = archive_db is not None
+                if archive_db is not None:
+                    items.extend(
+                        _recent_agent_commands_from_db(
+                            archive_db,
+                            limit=limit,
+                            statuses=statuses,
+                            command_types=command_types,
+                            after_id=after_id,
+                            order=order,
+                            include_payload=include_payload,
+                            include_result=include_result,
+                            source="archive",
+                        )
+                    )
+            items = _sorted_unique_agent_items(items, id_key="id", order=order, limit=limit)
 
             return {
                 "ok": True,
@@ -2189,6 +3842,8 @@ def run_tool(
                     "limit": limit,
                     "order": order,
                     "after_id": after_id,
+                    "include_archive": bool(include_archive),
+                    "archive_available": bool(archive_available if include_archive else False),
                     "filters": {"statuses": statuses, "command_types": command_types},
                     "count": len(items),
                     "commands": items,
@@ -2212,52 +3867,41 @@ def run_tool(
             include_prompt = bool(args.get("include_prompt"))
             include_response = bool(args.get("include_response"))
             include_state = bool(args.get("include_state"))
+            include_archive = bool(args.get("include_archive"))
 
-            query = agent_db.query(AgentStep, AgentRun.run_id).join(AgentRun, AgentRun.id == AgentStep.run_pk)
-            if run_id:
-                query = query.filter(AgentRun.run_id == run_id)
-            if kinds:
-                normalized = [k.strip() for k in kinds if k.strip()]
-                query = query.filter(AgentStep.kind.in_(normalized))
-            if ok_filter is not None:
-                query = query.filter(AgentStep.ok.is_(bool(ok_filter)))
-            if after_id is not None and after_id > 0:
-                query = query.filter(AgentStep.id > int(after_id))
-
-            if order == "asc":
-                query = query.order_by(AgentStep.id.asc())
-            else:
-                query = query.order_by(AgentStep.id.desc())
-
-            rows = query.limit(limit).all()
-            items: list[dict[str, Any]] = []
-            for step, step_run_id in rows:
-                chosen = step.chosen_json if isinstance(step.chosen_json, dict) else {}
-                command_id = _safe_int(chosen.get("command_id"))
-                command_type = str(chosen.get("command_type") or "").strip() or None
-                item: dict[str, Any] = {
-                    "id": int(step.id),
-                    "run_id": step_run_id,
-                    "run_pk": int(step.run_pk),
-                    "step_index": int(step.step_index or 0),
-                    "kind": step.kind,
-                    "ok": bool(step.ok),
-                    "severity": step.severity,
-                    "duration_ms": int(step.duration_ms) if step.duration_ms is not None else None,
-                    "started_at": step.started_at.isoformat() if step.started_at else None,
-                    "ended_at": step.ended_at.isoformat() if step.ended_at else None,
-                    "error": step.error,
-                    "command_id": command_id,
-                    "command_type": command_type,
-                }
-                if include_prompt:
-                    item["prompt_json"] = step.prompt_json
-                if include_response:
-                    item["response_json"] = step.response_json
-                if include_state:
-                    item["state_before_json"] = step.state_before_json
-                    item["state_after_json"] = step.state_after_json
-                items.append(item)
+            items = _recent_agent_steps_from_db(
+                agent_db,
+                limit=limit,
+                kinds=kinds,
+                run_id=run_id,
+                ok_filter=ok_filter,
+                after_id=after_id,
+                order=order,
+                include_prompt=include_prompt,
+                include_response=include_response,
+                include_state=include_state,
+                source="live",
+            )
+            archive_cm = get_agent_archive_session_if_available() if include_archive else nullcontext(None)
+            with archive_cm as archive_db:
+                archive_available = archive_db is not None
+                if archive_db is not None:
+                    items.extend(
+                        _recent_agent_steps_from_db(
+                            archive_db,
+                            limit=limit,
+                            kinds=kinds,
+                            run_id=run_id,
+                            ok_filter=ok_filter,
+                            after_id=after_id,
+                            order=order,
+                            include_prompt=include_prompt,
+                            include_response=include_response,
+                            include_state=include_state,
+                            source="archive",
+                        )
+                    )
+            items = _sorted_unique_agent_items(items, id_key="id", order=order, limit=limit)
 
             return {
                 "ok": True,
@@ -2266,6 +3910,8 @@ def run_tool(
                     "limit": limit,
                     "order": order,
                     "after_id": after_id,
+                    "include_archive": bool(include_archive),
+                    "archive_available": bool(archive_available if include_archive else False),
                     "filters": {"kinds": kinds, "run_id": run_id, "ok": ok_filter},
                     "count": len(items),
                     "steps": items,
@@ -2913,11 +4559,17 @@ def run_tool(
                 route_items = [{"route": route, "count": cnt} for route, cnt in route_counts.items()]
                 route_items.sort(key=lambda item: (-int(item["count"]), str(item["route"])))
 
+                assistant_brief = None
+                if auth_user is not None:
+                    raw_brief = str(getattr(auth_user, "assistant_brief", "") or "").strip()
+                    assistant_brief = raw_brief or None
+
                 users.append(
                     {
                         "user_id": key,
                         "username": getattr(auth_user, "username", None) if auth_user is not None else None,
                         "role": str(getattr(auth_user, "role", "")) if auth_user is not None else None,
+                        "assistant_brief": assistant_brief,
                         "sessions_count": int(sessions_count or 0),
                         "messages_count": message_counts.get(key, {}),
                         "last_session_updated_at": last_updated_at.isoformat() if last_updated_at else None,
@@ -2941,6 +4593,41 @@ def run_tool(
                 },
             }
 
+        if name == "assistant_set_user_brief":
+            if not bool(args.get("confirm")):
+                return {"ok": False, "tool": name, "error": "confirm=true is required."}
+
+            user_id = _safe_int(args.get("user_id"))
+            username = _safe_str(args.get("username"), max_len=128)
+            if user_id is None and not username:
+                return {"ok": False, "tool": name, "error": "Provide user_id or username."}
+
+            target_user = None
+            if user_id is not None:
+                target_user = core_db.get(AuthUser, int(user_id))
+            elif username:
+                target_user = core_db.query(AuthUser).filter(AuthUser.username == username).first()
+
+            if target_user is None:
+                return {"ok": False, "tool": name, "error": "User not found."}
+
+            normalized_brief = str(args.get("assistant_brief") or "").strip() or None
+            target_user.assistant_brief = normalized_brief
+            core_db.add(target_user)
+            core_db.commit()
+            core_db.refresh(target_user)
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "user_id": int(target_user.id),
+                    "username": str(target_user.username or "") or None,
+                    "role": str(getattr(target_user.role, "value", target_user.role) or "") or None,
+                    "assistant_brief": normalized_brief,
+                },
+            }
+
         if name == "assistant_search_internal_logs":
             if agent_db is None:
                 return {"ok": False, "tool": name, "error": "agent_db is required."}
@@ -2948,85 +4635,13 @@ def run_tool(
             if not query_text:
                 return {"ok": False, "tool": name, "error": "Missing argument: query"}
             limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=100)
+            include_archive = True if args.get("include_archive") is None else bool(args.get("include_archive"))
 
             pattern = f"%{query_text}%"
-            step_rows = (
-                agent_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
-                .join(AgentRun, AgentStep.run_pk == AgentRun.id)
-                .filter(
-                    or_(
-                        AgentStep.kind.ilike(pattern),
-                        AgentStep.error.ilike(pattern),
-                        cast(AgentStep.prompt_json, Text).ilike(pattern),
-                        cast(AgentStep.response_json, Text).ilike(pattern),
-                        cast(AgentStep.tool_results_json, Text).ilike(pattern),
-                        cast(AgentStep.state_before_json, Text).ilike(pattern),
-                        cast(AgentStep.state_after_json, Text).ilike(pattern),
-                        cast(AgentStep.summary_before_json, Text).ilike(pattern),
-                        cast(AgentStep.summary_after_json, Text).ilike(pattern),
-                    )
-                )
-                .order_by(AgentStep.id.desc())
-                .limit(limit)
-                .all()
-            )
-            steps: list[dict[str, Any]] = []
-            for step, run_id, agent_id in step_rows:
-                response_preview = ""
-                if isinstance(step.response_json, dict):
-                    response_preview = _snippet_for_query(json.dumps(step.response_json, ensure_ascii=False), query_text)
-                steps.append(
-                    {
-                        "step_id": int(step.id),
-                        "run_id": run_id,
-                        "agent_id": agent_id,
-                        "kind": step.kind,
-                        "step_index": int(step.step_index or 0),
-                        "ok": bool(step.ok),
-                        "severity": step.severity,
-                        "error": step.error,
-                        "started_at": step.started_at.isoformat() if getattr(step, "started_at", None) else None,
-                        "ended_at": step.ended_at.isoformat() if getattr(step, "ended_at", None) else None,
-                        "response_preview": response_preview,
-                    }
-                )
-
-            command_rows = (
-                agent_db.query(AgentCommand)
-                .filter(
-                    or_(
-                        AgentCommand.command_type.ilike(pattern),
-                        AgentCommand.status.ilike(pattern),
-                        AgentCommand.error.ilike(pattern),
-                        cast(AgentCommand.payload_json, Text).ilike(pattern),
-                        cast(AgentCommand.result_json, Text).ilike(pattern),
-                    )
-                )
-                .order_by(AgentCommand.id.desc())
-                .limit(limit)
-                .all()
-            )
-            commands: list[dict[str, Any]] = []
-            for cmd in command_rows:
-                payload_preview = ""
-                if isinstance(cmd.payload_json, dict):
-                    payload_preview = _snippet_for_query(json.dumps(cmd.payload_json, ensure_ascii=False), query_text)
-                result_preview = ""
-                if isinstance(cmd.result_json, dict):
-                    result_preview = _snippet_for_query(json.dumps(cmd.result_json, ensure_ascii=False), query_text)
-                commands.append(
-                    {
-                        "command_id": int(cmd.id),
-                        "command_type": cmd.command_type,
-                        "status": cmd.status,
-                        "priority": int(cmd.priority or 0),
-                        "available_at": cmd.available_at.isoformat() if getattr(cmd, "available_at", None) else None,
-                        "claimed_by_run_id": cmd.claimed_by_run_id,
-                        "error": cmd.error,
-                        "payload_preview": payload_preview,
-                        "result_preview": result_preview,
-                    }
-                )
+            live_hits = _search_internal_logs_from_db(agent_db, query_text=query_text, limit=limit, source="live")
+            steps = list(live_hits["steps"])
+            commands = list(live_hits["commands"])
+            events = list(live_hits["events"])
 
             run_rows = (
                 agent_db.query(AgentRun)
@@ -3065,35 +4680,23 @@ def run_tool(
                     }
                 )
 
-            event_rows = (
-                agent_db.query(AgentEvent)
-                .filter(
-                    or_(
-                        AgentEvent.agent_id.ilike(pattern),
-                        AgentEvent.event_type.ilike(pattern),
-                        AgentEvent.name.ilike(pattern),
-                        AgentEvent.severity.ilike(pattern),
-                        AgentEvent.payload_json.ilike(pattern),
+            archive_cm = get_agent_archive_session_if_available() if include_archive else nullcontext(None)
+            with archive_cm as archive_db:
+                archive_available = archive_db is not None
+                if archive_db is not None:
+                    archive_hits = _search_internal_logs_from_db(
+                        archive_db,
+                        query_text=query_text,
+                        limit=limit,
+                        source="archive",
                     )
-                )
-                .order_by(AgentEvent.id.desc())
-                .limit(limit)
-                .all()
-            )
-            events: list[dict[str, Any]] = []
-            for event in event_rows:
-                payload_preview = _snippet_for_query(event.payload_json, query_text)
-                events.append(
-                    {
-                        "event_id": int(event.id),
-                        "agent_id": event.agent_id,
-                        "event_type": event.event_type,
-                        "name": event.name,
-                        "severity": event.severity,
-                        "ts": event.ts.isoformat() if getattr(event, "ts", None) else None,
-                        "payload_preview": payload_preview,
-                    }
-                )
+                    steps.extend(archive_hits["steps"])
+                    commands.extend(archive_hits["commands"])
+                    events.extend(archive_hits["events"])
+
+            steps = _sorted_unique_agent_items(steps, id_key="step_id", order="desc", limit=limit)
+            commands = _sorted_unique_agent_items(commands, id_key="command_id", order="desc", limit=limit)
+            events = _sorted_unique_agent_items(events, id_key="event_id", order="desc", limit=limit)
 
             return {
                 "ok": True,
@@ -3101,6 +4704,8 @@ def run_tool(
                 "result": {
                     "query": query_text,
                     "limit": limit,
+                    "include_archive": bool(include_archive),
+                    "archive_available": bool(archive_available if include_archive else False),
                     "steps": steps,
                     "commands": commands,
                     "runs": runs,
@@ -3117,37 +4722,17 @@ def run_tool(
             if step_id is None:
                 return {"ok": False, "tool": name, "error": "Missing integer argument: step_id (or id)"}
 
-            row = (
-                agent_db.query(AgentStep, AgentRun.run_id, AgentRun.agent_id)
-                .join(AgentRun, AgentStep.run_pk == AgentRun.id)
-                .filter(AgentStep.id == int(step_id))
-                .first()
-            )
-            if row is None:
+            payload = _get_agent_step_payload(agent_db, step_id=int(step_id), source="live")
+            if payload is None:
+                with get_agent_archive_session_if_available() as archive_db:
+                    if archive_db is not None:
+                        payload = _get_agent_step_payload(archive_db, step_id=int(step_id), source="archive")
+            if payload is None:
                 return {"ok": False, "tool": name, "error": "Agent step not found.", "step_id": int(step_id)}
-            step, run_id, agent_id = row
             return {
                 "ok": True,
                 "tool": name,
-                "result": {
-                    "step_id": int(step.id),
-                    "run_id": run_id,
-                    "agent_id": agent_id,
-                    "kind": step.kind,
-                    "step_index": int(step.step_index or 0),
-                    "started_at": step.started_at.isoformat() if getattr(step, "started_at", None) else None,
-                    "ended_at": step.ended_at.isoformat() if getattr(step, "ended_at", None) else None,
-                    "duration_ms": int(step.duration_ms) if step.duration_ms is not None else None,
-                    "ok": bool(step.ok),
-                    "severity": step.severity,
-                    "error": step.error,
-                    "prompt_json": step.prompt_json,
-                    "response_json": step.response_json,
-                    "tool_calls_json": step.tool_calls_json,
-                    "tool_results_json": step.tool_results_json,
-                    "state_before_json": step.state_before_json,
-                    "state_after_json": step.state_after_json,
-                },
+                "result": payload,
             }
 
         if name == "assistant_get_agent_command":
@@ -3159,31 +4744,17 @@ def run_tool(
             if command_id is None:
                 return {"ok": False, "tool": name, "error": "Missing integer argument: command_id (or id)"}
 
-            cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == int(command_id)).first()
-            if cmd is None:
+            payload = _get_agent_command_payload(agent_db, command_id=int(command_id), source="live")
+            if payload is None:
+                with get_agent_archive_session_if_available() as archive_db:
+                    if archive_db is not None:
+                        payload = _get_agent_command_payload(archive_db, command_id=int(command_id), source="archive")
+            if payload is None:
                 return {"ok": False, "tool": name, "error": "Agent command not found.", "command_id": int(command_id)}
             return {
                 "ok": True,
                 "tool": name,
-                "result": {
-                    "command_id": int(cmd.id),
-                    "command_type": cmd.command_type,
-                    "status": cmd.status,
-                    "priority": int(cmd.priority or 0),
-                    "created_at": cmd.created_at.isoformat() if getattr(cmd, "created_at", None) else None,
-                    "updated_at": cmd.updated_at.isoformat() if getattr(cmd, "updated_at", None) else None,
-                    "available_at": cmd.available_at.isoformat() if getattr(cmd, "available_at", None) else None,
-                    "claimed_at": cmd.claimed_at.isoformat() if getattr(cmd, "claimed_at", None) else None,
-                    "claimed_by_agent_id": cmd.claimed_by_agent_id,
-                    "claimed_by_run_id": cmd.claimed_by_run_id,
-                    "started_at": cmd.started_at.isoformat() if getattr(cmd, "started_at", None) else None,
-                    "ended_at": cmd.ended_at.isoformat() if getattr(cmd, "ended_at", None) else None,
-                    "attempts": int(cmd.attempts or 0),
-                    "max_attempts": int(cmd.max_attempts or 0),
-                    "payload_json": cmd.payload_json,
-                    "result_json": cmd.result_json,
-                    "error": cmd.error,
-                },
+                "result": payload,
             }
 
         if name == "assistant_get_agent_run":
@@ -4276,7 +5847,7 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "assistant_stats",
-            "description": "Return internal assistant/support-session stats (sessions, messages, memory, review queue).",
+            "description": "Return internal assistant/support-session stats plus supervisor/orchestrator health.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -4338,6 +5909,192 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     },
                 },
                 "required": ["confirm"],
+            },
+        },
+    },
+    "assistant_enqueue_staff_slack_message": {
+        "type": "function",
+        "function": {
+            "name": "assistant_enqueue_staff_slack_message",
+            "description": (
+                "Internal-only: enqueue a Slack message to the configured staff channel. "
+                f"Uses {_STAFF_SLACK_CHANNEL_ENV} (or fallback staff-channel envs) and requires confirm=true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Slack message text to post."},
+                    "text": {"type": "string", "description": "Alias for message."},
+                    "thread_ts": {
+                        "type": "string",
+                        "description": "Optional Slack thread timestamp to reply within an existing thread.",
+                    },
+                    "delay_seconds": {
+                        "type": "integer",
+                        "description": "Optional delay before the queued command becomes runnable (default: 0).",
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "description": "Agent command priority (default: 50).",
+                    },
+                    "reason": {"type": "string", "description": "Short reason to store in the command payload."},
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to enqueue the Slack post (safety latch).",
+                    },
+                },
+                "required": ["message", "confirm"],
+            },
+        },
+    },
+    "assistant_list_scheduled_jobs": {
+        "type": "function",
+        "function": {
+            "name": "assistant_list_scheduled_jobs",
+            "description": (
+                "Internal-only: list configured scheduled assistant jobs from the assistant schedule JSON source. "
+                f"Hidden by default unless {_ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV}=1."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Optional text filter across job name, prompt, timezone, and tools."},
+                    "include_disabled": {
+                        "type": "boolean",
+                        "description": "If true, include disabled jobs (default true).",
+                    },
+                    "limit": {"type": "integer", "description": "Max jobs to return (default 50)."},
+                },
+            },
+        },
+    },
+    "assistant_upsert_scheduled_job": {
+        "type": "function",
+        "function": {
+            "name": "assistant_upsert_scheduled_job",
+            "description": (
+                "Internal-only write: create or update a scheduled assistant job in the JSON schedule file. "
+                f"Requires confirm=true and {ASSISTANT_SCHEDULE_PATH_ENV} to be set."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Stable schedule job name (used as the unique key)."},
+                    "weekday": {"type": "string", "description": "Weekday name or number (e.g. tue or 1)."},
+                    "time": {"type": "string", "description": "Local scheduled time in HH:MM 24-hour format."},
+                    "timezone": {"type": "string", "description": "IANA timezone name (default from env or UTC)."},
+                    "prompt": {"type": "string", "description": "Prompt/instructions for the scheduled assistant task."},
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tool names the job is allowed to call.",
+                    },
+                    "required_tool": {
+                        "type": "string",
+                        "description": "Optional tool the job must call exactly once before succeeding.",
+                    },
+                    "max_tool_calls": {"type": "integer", "description": "Max tool calls allowed for the job (default 4)."},
+                    "priority": {"type": "integer", "description": "Supervisor command priority, from -10 to 10."},
+                    "grace_seconds": {"type": "integer", "description": "How late the job may be seeded and still run (default 0)."},
+                    "max_attempts": {"type": "integer", "description": "Max command attempts for the scheduled job (default 1)."},
+                    "enabled": {"type": "boolean", "description": "Whether the job is active (default true)."},
+                    "confirm": {"type": "boolean", "description": "Must be true to write schedule configuration."},
+                },
+                "required": ["name", "weekday", "time", "prompt", "allowed_tools", "confirm"],
+            },
+        },
+    },
+    "assistant_delete_scheduled_job": {
+        "type": "function",
+        "function": {
+            "name": "assistant_delete_scheduled_job",
+            "description": (
+                "Internal-only write: delete a scheduled assistant job by name from the JSON schedule file. "
+                f"Requires confirm=true and {ASSISTANT_SCHEDULE_PATH_ENV}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Exact scheduled job name to delete."},
+                    "confirm": {"type": "boolean", "description": "Must be true to delete the scheduled job."},
+                },
+                "required": ["name", "confirm"],
+            },
+        },
+    },
+    "assistant_list_tmux_panes": {
+        "type": "function",
+        "function": {
+            "name": "assistant_list_tmux_panes",
+            "description": (
+                "Internal-only: list readable tmux panes from the configured allowlist or default dev session. Use session_name when the user names a tmux session or session group like ispecfull or ispec. Prefer pane_id/capture_target from the result for follow-up capture or compare calls. "
+                f"Hidden by default unless {_TMUX_TOOLS_ENABLED_ENV}=1."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional filter across target, session, session group, window, pane title, pane id, and current command.",
+                    },
+                    "session_name": {
+                        "type": "string",
+                        "description": "Optional exact session or session-group filter such as ispecfull or ispec.",
+                    },
+                    "limit": {"type": "integer", "description": "Max panes to return (default 20)."},
+                },
+            },
+        },
+    },
+    "assistant_capture_tmux_pane": {
+        "type": "function",
+        "function": {
+            "name": "assistant_capture_tmux_pane",
+            "description": (
+                "Internal-only: capture visible text from one readable tmux pane. "
+                "Use assistant_list_tmux_panes first to pick a target."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Pane handle returned by assistant_list_tmux_panes. Prefer capture_target or pane_id when present; aliases also work."},
+                    "lines": {"type": "integer", "description": "Number of trailing lines to return (default 120)."},
+                    "include_history": {
+                        "type": "boolean",
+                        "description": "If true, include scrollback when capturing before trimming to the requested trailing lines.",
+                    },
+                    "history_lines": {
+                        "type": "integer",
+                        "description": "Optional scrollback depth to read when include_history=true.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    "assistant_compare_tmux_pane": {
+        "type": "function",
+        "function": {
+            "name": "assistant_compare_tmux_pane",
+            "description": (
+                "Internal-only: capture the same readable tmux pane twice with a short delay and report whether it changed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Pane handle returned by assistant_list_tmux_panes. Prefer capture_target or pane_id when present; aliases also work."},
+                    "interval_seconds": {"type": "integer", "description": "Delay between captures in seconds (default 3, max 30)."},
+                    "lines": {"type": "integer", "description": "Number of trailing lines to compare (default 80)."},
+                    "include_history": {
+                        "type": "boolean",
+                        "description": "If true, include scrollback when capturing before trimming to the requested trailing lines.",
+                    },
+                    "history_lines": {
+                        "type": "integer",
+                        "description": "Optional scrollback depth to read when include_history=true.",
+                    },
+                },
+                "required": ["target"],
             },
         },
     },
@@ -4469,7 +6226,7 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "assistant_list_users",
-            "description": "List users who have support sessions, including basic linkage signals (projects/routes) from session state.",
+            "description": "List users who have support sessions, including any stored assistant-facing brief and basic linkage signals (projects/routes) from session state.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -4477,6 +6234,23 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "include_anonymous": {"type": "boolean", "description": "Include sessions with user_id=null (default true)."},
                     "linkage_session_limit": {"type": "integer", "description": "Max sessions per user to scan for linkage (default 50)."},
                 },
+            },
+        },
+    },
+    "assistant_set_user_brief": {
+        "type": "function",
+        "function": {
+            "name": "assistant_set_user_brief",
+            "description": "Set or clear a short assistant-facing brief for a user. Use this to note things like developer/staff role, preferred workflow, or special context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "integer", "description": "Auth user id to update."},
+                    "username": {"type": "string", "description": "Username to update when user_id is not provided."},
+                    "assistant_brief": {"type": "string", "description": "Short assistant-facing brief to store. Pass an empty string to clear it."},
+                    "confirm": {"type": "boolean", "description": "Must be true to perform the update."},
+                },
+                "required": ["confirm"],
             },
         },
     },
@@ -4490,6 +6264,10 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                 "properties": {
                     "query": {"type": "string", "description": "Substring to search for."},
                     "limit": {"type": "integer", "description": "Max matches per table (default 20)."},
+                    "include_archive": {
+                        "type": "boolean",
+                        "description": "Also search the archive agent DB when configured (default true).",
+                    },
                 },
                 "required": ["query"],
             },
@@ -4518,6 +6296,10 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "order": {"type": "string", "description": "asc or desc (default desc)."},
                     "include_payload": {"type": "boolean", "description": "Include payload_json (default false)."},
                     "include_result": {"type": "boolean", "description": "Include result_json (default false)."},
+                    "include_archive": {
+                        "type": "boolean",
+                        "description": "Also include archived terminal command rows (default false).",
+                    },
                 },
             },
         },
@@ -4539,6 +6321,10 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "include_prompt": {"type": "boolean", "description": "Include prompt_json (default false)."},
                     "include_response": {"type": "boolean", "description": "Include response_json (default false)."},
                     "include_state": {"type": "boolean", "description": "Include state_before_json/state_after_json (default false)."},
+                    "include_archive": {
+                        "type": "boolean",
+                        "description": "Also include archived step rows (default false).",
+                    },
                 },
             },
         },
@@ -5014,8 +6800,23 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
     repo_enabled = _repo_tools_enabled()
     dev_restart_enabled, _ = _dev_restart_enabled_status()
+    staff_slack_enabled, _ = _staff_slack_tool_status()
+    assistant_schedule_tools_enabled, _ = _assistant_schedule_tools_status()
+    assistant_schedule_write_enabled, _ = _assistant_schedule_write_tools_status()
+    tmux_tools_enabled, _ = _tmux_tools_status()
+    code_tools_enabled, _ = _code_tool_access_status(user)
     for name, spec in _OPENAI_TOOL_SPECS.items():
+        if _tool_requires_code_access(name) and not code_tools_enabled:
+            continue
         if name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
+            continue
+        if name == "assistant_enqueue_staff_slack_message" and not staff_slack_enabled:
+            continue
+        if name == "assistant_list_scheduled_jobs" and not assistant_schedule_tools_enabled:
+            continue
+        if name in {"assistant_upsert_scheduled_job", "assistant_delete_scheduled_job"} and not assistant_schedule_write_enabled:
+            continue
+        if name in {"assistant_list_tmux_panes", "assistant_capture_tmux_pane", "assistant_compare_tmux_pane"} and not tmux_tools_enabled:
             continue
         if name.startswith("repo_") and not repo_enabled:
             continue

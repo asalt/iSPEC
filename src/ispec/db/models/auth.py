@@ -34,6 +34,7 @@ class AuthUser(AuthTimestamp, Base):
         SAEnum(UserRole, native_enum=True, validate_strings=True),
         default=UserRole.editor,
     )
+    assistant_brief: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

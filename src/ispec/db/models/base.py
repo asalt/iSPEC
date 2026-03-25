@@ -15,6 +15,7 @@ def make_timestamp_mixin(prefix: str):
         # return datetime.now(UTC).isoformat()
 
     fields = {
+        # might need to change the DateTime object to DateTime(timezone=True)
         f"{prefix}_CreationTS": mapped_column(DateTime, default=utcnow),
         f"{prefix}_ModificationTS": mapped_column(
             DateTime, default=utcnow, onupdate=utcnow

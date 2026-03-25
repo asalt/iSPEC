@@ -1053,6 +1053,80 @@ def register_subcommands(subparsers):
         help="Directory for the generated audit artifacts (default: iSPEC/data).",
     )
 
+    archive_agent_logs_parser = subparsers.add_parser(
+        "archive-agent-logs",
+        help="Copy older terminal agent logs to a separate archive DB and optionally prune them from the live DB",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--agent-database",
+        dest="agent_database",
+        help="Live agent SQLite database path/URI (defaults to ISPEC_AGENT_DB_PATH/default).",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--archive-database",
+        dest="archive_database",
+        help="Archive SQLite database path/URI (defaults to ISPEC_AGENT_ARCHIVE_DB_PATH).",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--older-than-days",
+        dest="older_than_days",
+        type=int,
+        default=14,
+        help="Archive terminal rows older than this many days (default: 14).",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--batch-size",
+        dest="batch_size",
+        type=int,
+        default=500,
+        help="Rows to copy/delete per batch per table (default: 500).",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--max-batches",
+        dest="max_batches",
+        type=int,
+        default=20,
+        help="Maximum batches per table in one invocation (default: 20).",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be archived without creating/copying/deleting rows.",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--no-prune-live",
+        dest="prune_live",
+        action="store_false",
+        default=True,
+        help="Copy into the archive DB but leave the live rows in place.",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--no-steps",
+        dest="archive_steps",
+        action="store_false",
+        default=True,
+        help="Do not archive agent_step rows.",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--no-events",
+        dest="archive_events",
+        action="store_false",
+        default=True,
+        help="Do not archive agent_event rows.",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--no-commands",
+        dest="archive_commands",
+        action="store_false",
+        default=True,
+        help="Do not archive terminal agent_command rows.",
+    )
+    archive_agent_logs_parser.add_argument(
+        "--archive-journal-mode",
+        dest="archive_journal_mode",
+        help="Optional journal mode override for the archive DB (e.g. DELETE on removable storage).",
+    )
+
 
 def dispatch(args):
     """Run the database operation associated with ``args.subcommand``.
@@ -1334,6 +1408,23 @@ def dispatch(args):
             out_dir=getattr(args, "out_dir", None),
         )
         logger.info("DB/import audit summary: %s", summary)
+    elif args.subcommand == "archive-agent-logs":
+        from ispec.agent.archive import archive_agent_logs
+
+        summary = archive_agent_logs(
+            agent_db_file_path=getattr(args, "agent_database", None),
+            archive_db_file_path=getattr(args, "archive_database", None),
+            older_than_days=int(getattr(args, "older_than_days", 14)),
+            batch_size=int(getattr(args, "batch_size", 500)),
+            max_batches=getattr(args, "max_batches", None),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            prune_live=bool(getattr(args, "prune_live", True)),
+            archive_steps=bool(getattr(args, "archive_steps", True)),
+            archive_events=bool(getattr(args, "archive_events", True)),
+            archive_commands=bool(getattr(args, "archive_commands", True)),
+            archive_journal_mode=getattr(args, "archive_journal_mode", None),
+        )
+        logger.info("agent log archive summary: %s", summary)
     else:
         logger.info("no dispatched function provided for %s", args.subcommand)
 

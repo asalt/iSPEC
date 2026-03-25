@@ -8,8 +8,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi import Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -17,6 +16,7 @@ from ispec.api.security import require_access, require_assistant_access
 from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY, COMMAND_ORCHESTRATOR_TICK, COMMAND_SUPPORT_CHAT_TURN
 from ispec.agent.models import AgentCommand, AgentRun
+from ispec.assistant.comment_intent import decide_project_comment_intent_vllm
 from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.assistant.compaction import normalize_conversation_memory
 from ispec.assistant.connect import get_assistant_session_dep
@@ -45,6 +45,7 @@ from ispec.assistant.tools import (
     openai_tool_names_all,
     parse_tool_call,
     run_tool,
+    tool_writes_data,
 )
 from ispec.db.connect import get_session_dep
 from ispec.db.models import AuthUser, UserRole
@@ -60,7 +61,6 @@ _PROJECT_ROUTE_RE = re.compile(r"/project/(\d+)", re.IGNORECASE)
 _EXPERIMENT_ROUTE_RE = re.compile(r"/experiment/(\d+)", re.IGNORECASE)
 _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
 _CONTEXT_SCHEMA_VERSION = 1
-_EXPLICIT_TOOL_REQUEST_RE = re.compile(r"\b(use|call|run)\s+(a\s+)?tool\b", re.IGNORECASE)
 _COUNT_PROJECTS_RE = re.compile(
     r"\bhow\s+many\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b"
     r"|\bnumber\s+of\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b"
@@ -92,10 +92,34 @@ _PROJECT_ROUTER_HINT_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_PROJECT_DETAIL_REQUEST_RE = re.compile(
-    r"\b(tell me about|what do i need to know|what should i know|meeting|internal meeting|background|focus)\b",
+_TMUX_ROUTER_HINT_RE = re.compile(
+    r"\b("
+    r"tmux|pane(?:s)?|window(?:s)?|session\s+group|codex"
+    r")\b",
     re.IGNORECASE,
 )
+_TMUX_SESSION_NAME_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9_-]{0,63})\s+tmux\s+(?:session|session\s+group)\b",
+    re.IGNORECASE,
+)
+_PROJECT_COMMENT_INTENT_RE = re.compile(
+    r"\b(comment|note|history|save|draft|rewrite|edit|word|wording|log|record|add|commit)\b",
+    re.IGNORECASE,
+)
+_WRITE_SUCCESS_VERB_RE = re.compile(
+    r"\b(saved|added|logged|recorded|created|written|updated|committed)\b",
+    re.IGNORECASE,
+)
+_WRITE_SUCCESS_NOTE_RE = re.compile(
+    r"\b(?:i|we)\s+(?:have|ve)\s+(?:made|added|saved|logged|recorded|created)\s+(?:a|an|the)?\s*(?:note|comment|entry|memo)\b",
+    re.IGNORECASE,
+)
+_WRITE_SUCCESS_PASSIVE_RE = re.compile(
+    r"\b(?:note|comment|entry|memo)\b.*\b(?:has|have)\s+been\b.*\b(saved|added|logged|recorded|created|written|updated|committed)\b"
+    r"|\bsuccessfully\b.*\b(saved|added|logged|recorded|created|written|updated|committed)\b",
+    re.IGNORECASE,
+)
+_WRITE_RESULT_ID_RE = re.compile(r"\bcomment\s+id\b", re.IGNORECASE)
 _TRUTHY_ENV = {"1", "true", "yes", "y", "on"}
 _FALSY_ENV = {"0", "false", "no", "n", "off"}
 
@@ -156,12 +180,27 @@ def _policy_tool_for_message(message: str) -> str | None:
         )
     if _LIST_MY_PROJECTS_RE.search(message or ""):
         return "my_projects"
+    if re.search(r"\btmux\b", message or "", re.IGNORECASE):
+        return "assistant_list_tmux_panes"
     return None
+
+
+def _policy_tool_args_for_message(*, tool_name: str | None, message: str) -> dict[str, Any]:
+    if tool_name == "assistant_list_tmux_panes":
+        match = _TMUX_SESSION_NAME_RE.search(message or "")
+        if match:
+            session_name = str(match.group(1) or "").strip()
+            if session_name:
+                return {"session_name": session_name}
+    return {}
 
 
 def _hinted_tool_groups_for_message(*, message: str, focused_project_id: int | None) -> set[str]:
     hinted: set[str] = set()
     text = message or ""
+
+    if _TMUX_ROUTER_HINT_RE.search(text):
+        hinted.add("tmux")
 
     if extract_project_ids(text):
         hinted.add("projects")
@@ -173,21 +212,6 @@ def _hinted_tool_groups_for_message(*, message: str, focused_project_id: int | N
             hinted.update({"projects", "files"})
 
     return hinted
-
-
-def _project_specific_tool_choice(
-    *,
-    message: str,
-    openai_tool_names: set[str],
-) -> dict[str, Any] | None:
-    if "get_project" not in openai_tool_names:
-        return None
-    project_ids = extract_project_ids(message)
-    if len(project_ids) != 1:
-        return None
-    if not _PROJECT_DETAIL_REQUEST_RE.search(message or ""):
-        return None
-    return {"type": "function", "function": {"name": "get_project"}}
 
 
 def _truncate(value: str | None, limit: int = 400) -> str | None:
@@ -360,6 +384,28 @@ class FeedbackItem(BaseModel):
     feedbackMeta: dict[str, Any] | None = None
 
 
+class SupportDebugMessageItem(BaseModel):
+    sessionId: str
+    sessionUser: dict[str, Any] | None = None
+    messageId: int
+    role: str
+    message: str
+    createdAt: datetime
+    provider: str | None = None
+    model: str | None = None
+    uiPath: str | None = None
+    uiName: str | None = None
+    previousUserMessageId: int | None = None
+    previousUserMessage: str | None = None
+    previousUserMeta: dict[str, Any] | None = None
+    messageMeta: dict[str, Any] | None = None
+    toolRouter: dict[str, Any] | None = None
+    tooling: dict[str, Any] | None = None
+    toolCalls: list[dict[str, Any]] | None = None
+    llmTrace: list[dict[str, Any]] | None = None
+    promptHeader: dict[str, Any] | None = None
+
+
 def _rating_value(rating: str) -> int:
     normalized = rating.strip().lower()
     if normalized in {"up", "thumbs_up", "1", "+1", "true", "yes", "y"}:
@@ -444,6 +490,13 @@ def _chat_queue_enabled() -> bool:
     # so the supervisor can pick up work quickly, while remaining off by default
     # in production-style deployments.
     return _state_dir_is_dev()
+
+
+def _project_comment_intent_hints_enabled() -> bool:
+    parsed = _env_tristate_bool("ISPEC_ASSISTANT_PROJECT_COMMENT_INTENT_HINTS")
+    if parsed is not None:
+        return bool(parsed)
+    return False
 
 
 def _chat_queue_wait_seconds() -> float:
@@ -536,12 +589,6 @@ def _parse_tool_protocol(raw: str) -> str:
     return normalized if normalized in {"line", "openai"} else "line"
 
 
-def _openai_tool_choice_for_message(message: str) -> str | dict[str, Any] | None:
-    if not _EXPLICIT_TOOL_REQUEST_RE.search(message or ""):
-        return None
-    return "required"
-
-
 def _is_confirmation_reply(message: str | None) -> bool:
     if not message:
         return False
@@ -620,15 +667,40 @@ def _assistant_requested_project_history_save(message: str | None) -> bool:
     text = (message or "").strip().lower()
     if not text:
         return False
-    if "confirm" not in text:
-        return False
     if not any(token in text for token in ("save", "log", "record", "add")):
         return False
     if not any(token in text for token in ("history", "comment", "note", "meeting")):
         return False
+    if any(phrase in text for phrase in ("would you like me to", "should i", "want me to", "confirm")):
+        return True
     if "project history" in text:
         return True
     return "project" in text
+
+
+def _assistant_leaks_tool_protocol(message: str | None) -> bool:
+    text = (message or "").strip()
+    if not text:
+        return False
+    if TOOL_CALL_PREFIX not in text:
+        return False
+    return True
+
+
+def _assistant_claims_write_success(message: str | None) -> bool:
+    text = (message or "").strip()
+    if not text:
+        return False
+    if _WRITE_RESULT_ID_RE.search(text):
+        return True
+    if _WRITE_SUCCESS_NOTE_RE.search(text):
+        return True
+    if _WRITE_SUCCESS_PASSIVE_RE.search(text):
+        return True
+    return bool(
+        _WRITE_SUCCESS_VERB_RE.search(text)
+        and re.search(r"\b(note|comment|history|memo|entry)\b", text, re.IGNORECASE)
+    )
 
 
 def _load_state(raw: str | None) -> dict[str, Any]:
@@ -650,6 +722,22 @@ def _context_message(*, payload: dict[str, Any]) -> str:
     round_value = payload.get("agent", {}).get("round") if isinstance(payload.get("agent"), dict) else None
     suffix = f" - round {round_value}" if isinstance(round_value, int) and round_value > 0 else ""
     return f"CONTEXT v{version} (read-only JSON){suffix}:\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _normalize_assistant_brief(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _support_user_summary(user: Any | None) -> dict[str, Any] | None:
+    if user is None:
+        return None
+    return {
+        "id": int(getattr(user, "id", 0) or 0),
+        "username": str(getattr(user, "username", "") or "") or None,
+        "role": str(getattr(getattr(user, "role", None), "value", getattr(user, "role", None)) or "") or None,
+        "assistant_brief": _normalize_assistant_brief(getattr(user, "assistant_brief", None)),
+    }
 
 
 def _tool_result_preview(payload: dict[str, Any], *, max_chars: int = 2000) -> str | None:
@@ -1158,79 +1246,44 @@ def chat(
         requested_tool_names_available = _requested_tool_names_from_text(
             payload.message, candidates=available_tool_names
         )
-        explicit_tool_request = bool(_EXPLICIT_TOOL_REQUEST_RE.search(payload.message or ""))
-        if explicit_tool_request and requested_tool_names_available:
-            selected_tool_names = set(requested_tool_names_available) | {
-                "assistant_prompt_header",
-                "assistant_list_tools",
-            }
-            filtered: list[dict[str, Any]] = []
-            for spec in tool_schemas:
-                func_obj = spec.get("function") if isinstance(spec, dict) else None
-                name = func_obj.get("name") if isinstance(func_obj, dict) else None
-                if isinstance(name, str) and name.strip() in selected_tool_names:
-                    filtered.append(spec)
-            if filtered:
-                tool_schemas = filtered
-            tool_router = {
-                "ok": True,
-                "skipped": True,
-                "reason": "explicit_tool_name_request",
-                "explicit_requested_tool_names": requested_tool_names_available,
-                "selected_tool_names": sorted(selected_tool_names),
-            }
-        else:
-            groups = tool_groups_for_available_tools(available_tool_names)
-            hinted_group_names = _hinted_tool_groups_for_message(
-                message=payload.message,
-                focused_project_id=focused_project_id,
-            )
-            decision, router_reply = route_tool_groups_vllm(
-                user_message=payload.message,
-                groups=groups,
-                generate_reply_fn=generate_reply,
-            )
-            tool_router = {
-                "ok": bool(router_reply.ok),
-                "provider": router_reply.provider,
-                "model": router_reply.model,
-                "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
-                "decision": decision,
-            }
-            if requested_tool_names_available:
-                tool_router["explicit_requested_tool_names"] = requested_tool_names_available
-            if router_reply.meta:
-                tool_router["provider_meta"] = router_reply.meta
-            if hinted_group_names:
-                tool_router["hinted_group_names"] = sorted(hinted_group_names)
+        groups = tool_groups_for_available_tools(available_tool_names)
+        hinted_group_names = _hinted_tool_groups_for_message(
+            message=payload.message,
+            focused_project_id=focused_project_id,
+        )
+        decision, router_reply = route_tool_groups_vllm(
+            user_message=payload.message,
+            groups=groups,
+            generate_reply_fn=generate_reply,
+        )
+        tool_router = {
+            "ok": bool(router_reply.ok),
+            "provider": router_reply.provider,
+            "model": router_reply.model,
+            "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
+            "decision": decision,
+        }
+        if requested_tool_names_available:
+            tool_router["explicit_requested_tool_names"] = requested_tool_names_available
+        if router_reply.meta:
+            tool_router["provider_meta"] = router_reply.meta
+        if hinted_group_names:
+            tool_router["hinted_group_names"] = sorted(hinted_group_names)
 
-            grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
-            if decision:
-                selected_tool_names = tool_names_for_groups(
-                    groups=groups,
-                    primary=str(decision["primary"]),
-                    secondary=list(decision["secondary"]),
-                )
-                for group_name in hinted_group_names:
-                    selected_tool_names |= grouped_tool_names.get(group_name, set())
-                selected_tool_names |= {"assistant_prompt_header", "assistant_list_tools"}
-                if requested_tool_names_available:
-                    selected_tool_names |= set(requested_tool_names_available)
-                if selected_tool_names:
-                    filtered: list[dict[str, Any]] = []
-                    for spec in tool_schemas:
-                        func_obj = spec.get("function") if isinstance(spec, dict) else None
-                        name = func_obj.get("name") if isinstance(func_obj, dict) else None
-                        if isinstance(name, str) and name.strip() in selected_tool_names:
-                            filtered.append(spec)
-                    if filtered:
-                        tool_schemas = filtered
-                        tool_router["selected_tool_names"] = sorted(selected_tool_names)
-            elif hinted_group_names:
-                selected_tool_names = {"assistant_prompt_header", "assistant_list_tools"}
-                for group_name in hinted_group_names:
-                    selected_tool_names |= grouped_tool_names.get(group_name, set())
-                filtered = []
+        grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
+        if decision:
+            selected_tool_names = tool_names_for_groups(
+                groups=groups,
+                primary=str(decision["primary"]),
+                secondary=list(decision["secondary"]),
+            )
+            for group_name in hinted_group_names:
+                selected_tool_names |= grouped_tool_names.get(group_name, set())
+            selected_tool_names |= {"assistant_prompt_header", "assistant_list_tools"}
+            if requested_tool_names_available:
+                selected_tool_names |= set(requested_tool_names_available)
+            if selected_tool_names:
+                filtered: list[dict[str, Any]] = []
                 for spec in tool_schemas:
                     func_obj = spec.get("function") if isinstance(spec, dict) else None
                     name = func_obj.get("name") if isinstance(func_obj, dict) else None
@@ -1239,6 +1292,19 @@ def chat(
                 if filtered:
                     tool_schemas = filtered
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
+        elif hinted_group_names:
+            selected_tool_names = {"assistant_prompt_header", "assistant_list_tools"}
+            for group_name in hinted_group_names:
+                selected_tool_names |= grouped_tool_names.get(group_name, set())
+            filtered = []
+            for spec in tool_schemas:
+                func_obj = spec.get("function") if isinstance(spec, dict) else None
+                name = func_obj.get("name") if isinstance(func_obj, dict) else None
+                if isinstance(name, str) and name.strip() in selected_tool_names:
+                    filtered.append(spec)
+            if filtered:
+                tool_schemas = filtered
+                tool_router["selected_tool_names"] = sorted(selected_tool_names)
     elif (
         tool_protocol == "openai"
         and tools_enabled
@@ -1252,9 +1318,7 @@ def chat(
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
     openai_tool_names = _openai_tool_names(tool_schemas)
     openai_no_arg_tool_names = _openai_no_arg_tool_names(tool_schemas)
-    requested_tool_names_provided = [
-        name for name in requested_tool_names_known if isinstance(name, str) and name.strip() in openai_tool_names
-    ]
+    available_write_tool_names = sorted(name for name in openai_tool_names if tool_writes_data(name))
     missing_requested_tool_names = [
         name for name in requested_tool_names_known if isinstance(name, str) and name.strip() not in openai_tool_names
     ]
@@ -1339,13 +1403,7 @@ def chat(
             "schema_version": _CONTEXT_SCHEMA_VERSION,
             "agent": {"multi_round": True, "round": 0},
             "session": {"id": session.session_id, "state": state},
-            "user": {
-                "id": int(user.id),
-                "username": user.username,
-                "role": str(user.role),
-            }
-            if user is not None
-            else None,
+            "user": _support_user_summary(user),
             "ispec": ispec_context,
         }
         context_payload["session"]["state"] = state_for_context
@@ -1393,6 +1451,58 @@ def chat(
         for row in selected_history
         if row.role in {"user", "assistant", "system"} and row.content
     ]
+    last_assistant_text = next(
+        (
+            str(item.get("content") or "")
+            for item in reversed(history_payload)
+            if isinstance(item, dict) and item.get("role") == "assistant" and item.get("content")
+        ),
+        "",
+    )
+    comment_intent_decision: dict[str, Any] | None = None
+    comment_intent_reply = None
+    comment_intent_messages: list[dict[str, Any]] = []
+    if (
+        tool_protocol == "openai"
+        and tools_enabled
+        and assistant_provider == "vllm"
+        and _project_comment_intent_hints_enabled()
+        and "create_project_comment" in openai_tool_names
+        and (confirmation_reply or _PROJECT_COMMENT_INTENT_RE.search(payload.message or ""))
+    ):
+        comment_intent_decision, comment_intent_reply = decide_project_comment_intent_vllm(
+            user_message=payload.message,
+            last_assistant_message=last_assistant_text,
+            focused_project_id=focused_project_id,
+            generate_reply_fn=generate_reply,
+        )
+        if isinstance(comment_intent_decision, dict):
+            intent = str(comment_intent_decision.get("intent") or "").strip()
+            confidence = float(comment_intent_decision.get("confidence") or 0.0)
+            reason = _truncate(str(comment_intent_decision.get("reason") or ""), 240)
+            if intent == "draft_only":
+                hint = (
+                    f"NOTE: comment_intent=draft_only (confidence={confidence:.2f}). "
+                    "Treat this as a hint: draft the comment, then ask for confirmation or tweaks before saving."
+                )
+            elif intent == "save_now":
+                hint = (
+                    f"NOTE: comment_intent=save_now (confidence={confidence:.2f}). "
+                    "Treat this as a hint: the user appears to want the note saved now if you have enough content."
+                )
+            elif intent == "confirm_save":
+                hint = (
+                    f"NOTE: comment_intent=confirm_save (confidence={confidence:.2f}). "
+                    "Treat this as a hint: the user appears to be confirming a previously drafted note should be saved now."
+                )
+            else:
+                hint = (
+                    f"NOTE: comment_intent=other (confidence={confidence:.2f}). "
+                    "Treat this as a hint only; do not infer that a project comment write is needed."
+                )
+            if reason:
+                hint += f" Reason: {reason}"
+            comment_intent_messages = [{"role": "system", "content": hint}]
 
     tool_calls: list[dict[str, Any]] = []
     tool_messages: list[dict[str, Any]] = []
@@ -1400,54 +1510,35 @@ def chat(
     llm_trace: list[dict[str, Any]] = []
     reply = None
     history_for_llm: list[dict[str, Any]] = []
-    forced_tool_choice = _openai_tool_choice_for_message(payload.message) if tool_protocol == "openai" else None
+    write_claim_retry_used = False
+    write_claim_guard_triggered = False
+    tool_protocol_retry_used = False
+    tool_protocol_guard_triggered = False
+    forced_tool_choice: str | dict[str, Any] | None = None
     if (
         tool_protocol == "openai"
         and confirmation_reply
+        and not _project_comment_intent_hints_enabled()
         and _is_affirmative_reply(payload.message)
         and isinstance(focused_project_id, int)
         and focused_project_id > 0
         and "create_project_comment" in openai_tool_names
     ):
-        last_assistant_text = next(
-            (
-                str(item.get("content") or "")
-                for item in reversed(history_payload)
-                if isinstance(item, dict) and item.get("role") == "assistant" and item.get("content")
-            ),
-            "",
-        )
         if _assistant_requested_project_history_save(last_assistant_text):
             forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
-
-    # If the user explicitly asked for a specific tool by name (and it's available),
-    # force that tool instead of a generic "required" choice. If the user requested
-    # any missing tool names, do not force tool use (it would encourage irrelevant
-    # tool calls and hallucinated follow-ups).
-    if tool_protocol == "openai" and isinstance(forced_tool_choice, str) and forced_tool_choice == "required":
-        if missing_requested_tool_names:
-            forced_tool_choice = None
-        elif len(requested_tool_names_provided) == 1:
-            requested_name = requested_tool_names_provided[0]
-            # Some tool names overlap with common English words (e.g. "projects").
-            # Only force a specific tool choice when the user appears to have
-            # referenced a "tool-like" name (snake_case/prefixed), otherwise keep
-            # the generic "required" choice.
-            if "_" in requested_name or requested_name.startswith(("assistant_", "repo_")):
-                forced_tool_choice = {
-                    "type": "function",
-                    "function": {"name": requested_name},
-                }
-    if tool_protocol == "openai" and forced_tool_choice is None and not confirmation_reply:
-        project_tool_choice = _project_specific_tool_choice(
-            message=payload.message,
-            openai_tool_names=openai_tool_names,
-        )
-        if project_tool_choice is not None:
-            forced_tool_choice = project_tool_choice
     policy_tool_name = _policy_tool_for_message(payload.message)
+
     if policy_tool_name and policy_tool_name not in openai_no_arg_tool_names:
         policy_tool_name = None
+    policy_tool_args = _policy_tool_args_for_message(tool_name=policy_tool_name, message=payload.message) if policy_tool_name else {}
+
+    if (
+        tool_protocol == "openai"
+        and forced_tool_choice is None
+        and policy_tool_name == "assistant_list_tmux_panes"
+        and policy_tool_name in openai_tool_names
+    ):
+        forced_tool_choice = {"type": "function", "function": {"name": policy_tool_name}}
 
     prompt_header = None
     prompt_header_included_round1 = False
@@ -1493,6 +1584,7 @@ def chat(
             *header_message,
             {"role": "system", "content": context_message},
             *tool_availability_messages,
+            *comment_intent_messages,
             {"role": "user", "content": payload.message},
             *tool_messages,
         ]
@@ -1512,6 +1604,7 @@ def chat(
             *header_message,
             {"role": "system", "content": context_message},
             *tool_availability_messages,
+            *comment_intent_messages,
             *trimmed_history,
             {"role": "user", "content": payload.message},
             *tool_messages,
@@ -1710,7 +1803,7 @@ def chat(
             ):
                 used_tool_calls += 1
                 tool_name = policy_tool_name
-                tool_args: dict[str, Any] = {}
+                tool_args: dict[str, Any] = dict(policy_tool_args)
                 tool_payload = run_tool(
                     name=tool_name,
                     args=tool_args,
@@ -1751,6 +1844,57 @@ def chat(
                 if used_tool_calls >= max_tool_calls:
                     tools_enabled = False
                 continue
+            if _assistant_leaks_tool_protocol(reply.content):
+                if not tool_protocol_retry_used:
+                    tool_messages.extend(
+                        [
+                            {"role": "assistant", "content": reply.content or ""},
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Do not expose the TOOL_CALL protocol or ask the user to paste tool-call JSON. "
+                                    "Either call the tool yourself or answer in normal user-facing language."
+                                ),
+                            },
+                        ]
+                    )
+                    trace_step["action"] = "retry_after_tool_protocol_leak"
+                    trace_step["guardrail"] = "tool_protocol_leak"
+                    tool_protocol_retry_used = True
+                    tool_protocol_guard_triggered = True
+                    continue
+            successful_write_tools = {
+                str(call.get("name") or "").strip()
+                for call in tool_calls
+                if isinstance(call, dict) and call.get("ok") and tool_writes_data(call.get("name"))
+            }
+            if not successful_write_tools and _assistant_claims_write_success(reply.content):
+                if not write_claim_retry_used:
+                    corrective_parts = [
+                        "Your previous draft claimed a successful write/save/update, but no successful write tool call has occurred in this turn.",
+                        "Do not invent saved data, record IDs, or success outcomes.",
+                    ]
+                    if available_write_tool_names:
+                        corrective_parts.append(
+                            "If a write is actually needed, choose the appropriate tool now from: "
+                            + ", ".join(available_write_tool_names)
+                            + "."
+                        )
+                    else:
+                        corrective_parts.append(
+                            "No write tool is available in this turn, so explain that nothing was saved yet."
+                        )
+                    tool_messages.extend(
+                        [
+                            {"role": "assistant", "content": reply.content or ""},
+                            {"role": "system", "content": " ".join(corrective_parts)},
+                        ]
+                    )
+                    trace_step["action"] = "retry_after_unsupported_write_claim"
+                    trace_step["guardrail"] = "unsupported_write_claim"
+                    write_claim_retry_used = True
+                    write_claim_guard_triggered = True
+                    continue
             trace_step["action"] = "final_no_tool"
             break
 
@@ -1924,6 +2068,29 @@ def chat(
                     else:
                         self_review_error = "empty_review_output"
 
+    successful_write_tools_final = {
+        str(call.get("name") or "").strip()
+        for call in tool_calls
+        if isinstance(call, dict) and call.get("ok") and tool_writes_data(call.get("name"))
+    }
+    blocked_unsupported_write_claim = False
+    if not successful_write_tools_final and _assistant_claims_write_success(assistant_content):
+        blocked_unsupported_write_claim = True
+        write_claim_guard_triggered = True
+        assistant_content = (
+            "I can't confirm that I saved that because no write tool actually succeeded. "
+            "I haven't made that change yet."
+        )
+
+    blocked_tool_protocol_leak = False
+    if _assistant_leaks_tool_protocol(assistant_content):
+        blocked_tool_protocol_leak = True
+        tool_protocol_guard_triggered = True
+        assistant_content = (
+            "I can help with that directly. Tell me the draft you want, or ask me to save a project note, "
+            "and I will handle the tool call myself."
+        )
+
     meta: dict[str, Any] = {
         "provider": final_reply.provider,
         "model": final_reply.model,
@@ -1946,6 +2113,13 @@ def chat(
     }
     if tool_router:
         meta["tool_router"] = tool_router
+    if comment_intent_decision is not None or comment_intent_reply is not None:
+        meta["comment_intent"] = {
+            "enabled": _project_comment_intent_hints_enabled(),
+            "decision": comment_intent_decision,
+            "provider": getattr(comment_intent_reply, "provider", None),
+            "model": getattr(comment_intent_reply, "model", None),
+        }
     if final_reply.meta:
         meta["provider_meta"] = final_reply.meta
     meta["tool_calls"] = tool_calls
@@ -1978,6 +2152,20 @@ def chat(
             draft_raw = draft_raw_reply_content.strip()
             if draft_raw and draft_raw != raw_final:
                 meta["draft_raw_content"] = draft_raw
+    if write_claim_guard_triggered:
+        meta["write_claim_guard"] = {
+            "triggered": True,
+            "retried": write_claim_retry_used,
+            "blocked_final_claim": blocked_unsupported_write_claim,
+            "available_write_tools": available_write_tool_names,
+            "successful_write_tools": sorted(successful_write_tools_final),
+        }
+    if tool_protocol_guard_triggered:
+        meta["tool_protocol_guard"] = {
+            "triggered": True,
+            "retried": tool_protocol_retry_used,
+            "blocked_final_leak": blocked_tool_protocol_leak,
+        }
 
     if compare_choices is not None and final_reply.ok and assistant_content.strip():
         answer_a, answer_b = compare_choices
@@ -2010,7 +2198,7 @@ def chat(
         if ui_payload is not None:
             user_meta["ui"] = ui_payload
         if user is not None:
-            user_meta["user"] = {"id": int(user.id), "username": user.username, "role": str(user.role)}
+            user_meta["user"] = _support_user_summary(user)
         user_message.meta_json = json.dumps(
             {**_load_state(getattr(user_message, "meta_json", None)), **user_meta},
             ensure_ascii=False,
@@ -2159,7 +2347,7 @@ def choose(
     if payload.ui is not None:
         compare_selection["ui"] = payload.ui.model_dump()
     if user is not None:
-        compare_selection["user"] = {"id": int(user.id), "username": user.username, "role": str(user.role)}
+        compare_selection["user"] = _support_user_summary(user)
     assistant_meta = {**assistant_meta, "compare_selection": compare_selection}
 
     assistant_message = SupportMessage(
@@ -2210,6 +2398,96 @@ def choose(
     )
 
 
+@router.get("/messages", response_model=list[SupportDebugMessageItem])
+def list_messages(
+    response: Response,
+    role: str | None = None,
+    session_id: str | None = Query(default=None, alias="sessionId"),
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    assistant_db: Session = Depends(get_assistant_session_dep),
+    core_db: Session = Depends(get_session_dep),
+    user: AuthUser | None = Depends(require_access),
+):
+    if user is None or user.role not in {UserRole.admin, UserRole.editor}:
+        raise HTTPException(status_code=403, detail="Admin or editor access required.")
+
+    role_filter = str(role or "").strip().lower() or None
+    if role_filter and role_filter not in {"user", "assistant", "system"}:
+        raise HTTPException(status_code=400, detail="role must be one of user, assistant, system")
+
+    query = assistant_db.query(SupportMessage, SupportSession).join(
+        SupportSession, SupportMessage.session_pk == SupportSession.id
+    )
+    if session_id:
+        query = query.filter(SupportSession.session_id == session_id)
+    if role_filter:
+        query = query.filter(SupportMessage.role == role_filter)
+
+    total = int(query.count())
+    rows = (
+        query.order_by(SupportMessage.created_at.desc(), SupportMessage.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    response.headers["X-Total-Count"] = str(total)
+
+    session_user_ids = {
+        int(session.user_id)
+        for _message, session in rows
+        if isinstance(session.user_id, int) and session.user_id > 0
+    }
+    user_map: dict[int, dict[str, Any]] = {}
+    if session_user_ids:
+        auth_rows = core_db.query(AuthUser).filter(AuthUser.id.in_(session_user_ids)).all()
+        for auth_user in auth_rows:
+            user_map[int(auth_user.id)] = _support_user_summary(auth_user) or {}
+
+    payload: list[SupportDebugMessageItem] = []
+    for message, session in rows:
+        meta = _load_state(getattr(message, "meta_json", None))
+        prev_user = (
+            assistant_db.query(SupportMessage)
+            .filter(SupportMessage.session_pk == session.id)
+            .filter(SupportMessage.role == "user")
+            .filter(SupportMessage.id < int(message.id))
+            .order_by(SupportMessage.id.desc())
+            .first()
+        )
+        prev_meta = _load_state(getattr(prev_user, "meta_json", None) if prev_user is not None else None)
+        ui = prev_meta.get("ui") if isinstance(prev_meta.get("ui"), dict) else {}
+        session_user = user_map.get(int(session.user_id)) if isinstance(session.user_id, int) else None
+        tool_calls = meta.get("tool_calls") if isinstance(meta.get("tool_calls"), list) else None
+        llm_trace = meta.get("llm_trace") if isinstance(meta.get("llm_trace"), list) else None
+
+        payload.append(
+            SupportDebugMessageItem(
+                sessionId=session.session_id,
+                sessionUser=session_user,
+                messageId=int(message.id),
+                role=str(message.role or ""),
+                message=message.content,
+                createdAt=message.created_at,
+                provider=message.provider,
+                model=message.model,
+                uiPath=str(ui.get("path") or "") or None,
+                uiName=str(ui.get("name") or "") or None,
+                previousUserMessageId=int(prev_user.id) if prev_user is not None else None,
+                previousUserMessage=prev_user.content if prev_user is not None else None,
+                previousUserMeta=prev_meta or None,
+                messageMeta=meta or None,
+                toolRouter=meta.get("tool_router") if isinstance(meta.get("tool_router"), dict) else None,
+                tooling=meta.get("tooling") if isinstance(meta.get("tooling"), dict) else None,
+                toolCalls=tool_calls,
+                llmTrace=llm_trace,
+                promptHeader=meta.get("prompt_header") if isinstance(meta.get("prompt_header"), dict) else None,
+            )
+        )
+
+    return payload
+
+
 @router.post("/feedback")
 def feedback(
     payload: FeedbackRequest,
@@ -2251,7 +2529,7 @@ def feedback(
     if payload.ui is not None:
         feedback_meta["ui"] = payload.ui.model_dump()
     if user is not None:
-        feedback_meta["user"] = {"id": user.id, "username": user.username, "role": str(user.role)}
+        feedback_meta["user"] = _support_user_summary(user)
     message.feedback_meta_json = (
         json.dumps(feedback_meta, ensure_ascii=False) if feedback_meta else None
     )

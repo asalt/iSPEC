@@ -300,6 +300,7 @@ def _ensure_auth_user_columns(engine: Engine) -> None:
     """Ensure legacy SQLite schemas include newer auth_user columns."""
 
     desired: list[tuple[str, str]] = [
+        ("assistant_brief", "TEXT"),
         ("must_change_password", "BOOLEAN NOT NULL DEFAULT 0"),
         ("last_login_at", "DATETIME"),
         ("password_changed_at", "DATETIME"),

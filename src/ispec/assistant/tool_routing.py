@@ -72,8 +72,26 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
     ),
     ToolGroup(
         name="devops",
-        description="Dev service controls (restart backend/supervisor/frontend/vLLM/Slack via tmux/make).",
-        tool_names=("assistant_enqueue_dev_restart_services",),
+        description="Dev/ops controls (restart services and hand off a message to the staff Slack channel).",
+        tool_names=("assistant_enqueue_dev_restart_services", "assistant_enqueue_staff_slack_message"),
+    ),
+    ToolGroup(
+        name="automation",
+        description="Internal-only schedule management for recurring assistant jobs.",
+        tool_names=(
+            "assistant_list_scheduled_jobs",
+            "assistant_upsert_scheduled_job",
+            "assistant_delete_scheduled_job",
+        ),
+    ),
+    ToolGroup(
+        name="tmux",
+        description="Use for questions about what is happening in tmux sessions, panes, windows, or Codex terminals; lists or reads only allowed panes.",
+        tool_names=(
+            "assistant_list_tmux_panes",
+            "assistant_capture_tmux_pane",
+            "assistant_compare_tmux_pane",
+        ),
     ),
     ToolGroup(
         name="assistant",
@@ -90,6 +108,7 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
             "assistant_get_digest",
             "assistant_search_digests",
             "assistant_list_users",
+            "assistant_set_user_brief",
             "assistant_search_internal_logs",
             "assistant_recent_agent_commands",
             "assistant_recent_agent_steps",

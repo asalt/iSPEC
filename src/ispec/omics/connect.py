@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from functools import lru_cache
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -20,6 +21,7 @@ logger = get_logger(__file__)
 DEFAULT_OMICS_LOGICAL_NAME = "analysis"
 LEGACY_OMICS_LOGICAL_NAME = "primary"
 PSM_OMICS_LOGICAL_NAME = "psm"
+_ALLOWED_SQLITE_JOURNAL_MODES = {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}
 
 
 class OmicsDatabaseUnavailableError(RuntimeError):
@@ -35,6 +37,32 @@ def _normalize_logical_name(logical_name: str) -> str:
     if normalized == LEGACY_OMICS_LOGICAL_NAME:
         return DEFAULT_OMICS_LOGICAL_NAME
     return normalized or DEFAULT_OMICS_LOGICAL_NAME
+
+
+def _omics_sqlite_journal_mode(*, logical_name: str) -> str | None:
+    normalized_name = _normalize_logical_name(logical_name)
+    env_keys: tuple[str, ...]
+    if normalized_name == PSM_OMICS_LOGICAL_NAME:
+        env_keys = ("ISPEC_PSM_SQLITE_JOURNAL_MODE",)
+    else:
+        env_keys = (
+            "ISPEC_ANALYSIS_SQLITE_JOURNAL_MODE",
+            "ISPEC_OMICS_SQLITE_JOURNAL_MODE",
+        )
+
+    for key in env_keys:
+        raw = (os.getenv(key) or "").strip().upper()
+        if not raw:
+            continue
+        if raw in _ALLOWED_SQLITE_JOURNAL_MODES:
+            return raw
+        logger.warning(
+            "Ignoring unsupported %s=%s for omics DB '%s'",
+            key,
+            raw,
+            normalized_name,
+        )
+    return None
 
 
 def get_omics_db_uri(
@@ -86,15 +114,23 @@ def _get_registry_row(
 
 
 @lru_cache(maxsize=None)
-def _get_engine(db_uri: str) -> Engine:
+def _get_engine(db_uri: str, *, logical_name: str = DEFAULT_OMICS_LOGICAL_NAME) -> Engine:
     engine = sqlite_engine(db_uri)
     OmicsBase.metadata.create_all(bind=engine)
+    journal_mode = _omics_sqlite_journal_mode(logical_name=logical_name)
+    if journal_mode is None:
+        return engine
     try:
         with engine.begin() as conn:
-            conn.exec_driver_sql("PRAGMA journal_mode=WAL")
-            conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
+            conn.exec_driver_sql(f"PRAGMA journal_mode={journal_mode}")
+            if journal_mode == "WAL":
+                conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
     except Exception:
-        logger.debug("Unable to set WAL pragmas for omics DB.")
+        logger.debug(
+            "Unable to set %s journal mode for omics DB '%s'.",
+            journal_mode,
+            _normalize_logical_name(logical_name),
+        )
     return engine
 
 
@@ -167,7 +203,7 @@ def get_omics_session(
     if sqlite_path is not None and not sqlite_path.exists():
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)
 
-    engine = _get_engine(db_uri)
+    engine = _get_engine(db_uri, logical_name=normalized_name)
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:

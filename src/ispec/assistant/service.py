@@ -214,6 +214,12 @@ def _system_prompt_planner(
             "- For collaborative project work, draft notes first; only write to project history if the user explicitly asks you to save."
         )
         tool_use_lines.append(
+            "- Requests like 'help me write a comment about project 1531' are drafting requests. Offer a draft and ask for confirmation or tweaks before saving anything."
+        )
+        tool_use_lines.append(
+            "- For drafting requests, write the draft text directly. Do not ask the user to emit TOOL_CALL syntax or name the create_project_comment tool."
+        )
+        tool_use_lines.append(
             "- If the user explicitly asks you to add/save/log a project note/comment (e.g. 'make a note for project 1478'), call create_project_comment immediately (confirm=true) and then confirm using the tool result (include comment_id)."
         )
         tool_use_lines.append(
@@ -232,6 +238,8 @@ def _system_prompt_planner(
             "- If the user explicitly asks you to use a tool, call the appropriate tool.",
             "- If the user requests a specific tool by name but it is not listed under Available tools, say you cannot call it (unavailable/permissions/config) and ask to enable it. Do not substitute a different tool silently.",
             "- Do not tell the user to run CLI commands or use the web app to run tools; you can call tools directly.",
+            "- Never show the literal TOOL_CALL protocol or ask the user to paste tool-call JSON.",
+            "- For any write action, do not claim it succeeded unless you already have an ok=true TOOL_RESULT from the write tool. If a write is needed, choose the tool instead of narrating a fake success.",
             "- When answering from a TOOL_RESULT, restate the scope (e.g. total vs current). Do not call a subset count 'total'.",
         ]
     )

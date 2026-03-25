@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import types
 
+import pytest
+
 from ispec.assistant.tools import openai_tools_for_user, run_tool
 from ispec.db.models import AuthUser, AuthUserProject, Person, Project, ProjectComment, UserRole
 
@@ -172,6 +174,62 @@ def test_create_project_comment_requires_confirm_and_explicit_user_request(db_se
         user_message="please commit the project note",
     )
     assert payload["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    [
+        "make a note for project 1",
+        "add a comment to project 1",
+        "log this in project history for project 1",
+        "please save this note on project 1",
+        "write this note into the project history for project 1",
+    ],
+)
+def test_create_project_comment_accepts_common_write_variations(db_session, user_message):
+    project = Project(id=1, prj_AddedBy="test", prj_ProjectTitle="Project 1")
+    user = _make_user("editor", role=UserRole.editor)
+    db_session.add_all([project, user])
+    db_session.commit()
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 1, "comment": "Variation note", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message=user_message,
+    )
+    assert payload["ok"] is True
+
+
+@pytest.mark.parametrize(
+    "user_message",
+    [
+        "help me write a comment about project 1",
+        "draft a comment for project 1",
+        "help me word a project note for project 1",
+        "rewrite this note for project 1 before we save it",
+    ],
+)
+def test_create_project_comment_rejects_draft_only_requests(db_session, user_message):
+    project = Project(id=1, prj_AddedBy="test", prj_ProjectTitle="Project 1")
+    user = _make_user("editor", role=UserRole.editor)
+    db_session.add_all([project, user])
+    db_session.commit()
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 1, "comment": "Draft note", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message=user_message,
+    )
+    assert payload["ok"] is False
+    assert "explicit" in (payload.get("error") or "").lower()
 
 
 def test_create_project_comment_creates_comment_and_assistant_person(db_session):

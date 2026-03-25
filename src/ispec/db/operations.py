@@ -257,6 +257,7 @@ def import_legacy_dump(
             return None
         if value.tzinfo is None:
             return value
+        # consider keeping in tzinfo in the future
         return value.astimezone(UTC).replace(tzinfo=None)
 
     data_root = Path(data_dir).expanduser().resolve()
