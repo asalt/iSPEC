@@ -4,7 +4,7 @@ import configparser
 import json
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +70,16 @@ _PROJECT_COMMENT_CREATED_TS_FIELD_CANDIDATES = (
     "prjcom_ModificationTS",
     "CreatedTS",
     "ModificationTS",
+)
+_PROJECT_COMMENT_MODIFIED_TS_FIELD_CANDIDATES = (
+    "prh_ModificationTS",
+    "prjc_ModificationTS",
+    "prjcom_ModificationTS",
+    "ModificationTS",
+    "prh_CreationTS",
+    "prjc_CreatedTS",
+    "prjcom_CreatedTS",
+    "CreatedTS",
 )
 _PROJECT_COMMENT_TYPE_FIELD_CANDIDATES = (
     "prh_CommentType",
@@ -398,6 +408,7 @@ class LegacyProjectCommentSource:
     note_field: str
     author_field: str | None
     created_ts_field: str | None
+    modified_ts_field: str | None
     comment_type_field: str | None
 
 
@@ -577,6 +588,15 @@ def _resolve_legacy_project_comment_source(base_url: str) -> LegacyProjectCommen
             )
             continue
 
+        created_ts_field = _resolve_first_available_field(
+            available_fields,
+            _PROJECT_COMMENT_CREATED_TS_FIELD_CANDIDATES,
+        )
+        modified_ts_field = _resolve_first_available_field(
+            available_fields,
+            _PROJECT_COMMENT_MODIFIED_TS_FIELD_CANDIDATES,
+        ) or created_ts_field
+
         return LegacyProjectCommentSource(
             table=str(payload.get("table") or table_candidate),
             project_field=project_field,
@@ -585,10 +605,8 @@ def _resolve_legacy_project_comment_source(base_url: str) -> LegacyProjectCommen
                 available_fields,
                 _PROJECT_COMMENT_AUTHOR_FIELD_CANDIDATES,
             ),
-            created_ts_field=_resolve_first_available_field(
-                available_fields,
-                _PROJECT_COMMENT_CREATED_TS_FIELD_CANDIDATES,
-            ),
+            created_ts_field=created_ts_field,
+            modified_ts_field=modified_ts_field,
             comment_type_field=_resolve_first_available_field(
                 available_fields,
                 _PROJECT_COMMENT_TYPE_FIELD_CANDIDATES,
@@ -673,6 +691,140 @@ def _fetch_legacy_project_comment_keys(
     return keys, len(items)
 
 
+def _positive_recent_days(value: int | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    return min(parsed, 3650)
+
+
+def _project_comment_since_datetime(
+    *,
+    since: str | None = None,
+    recent_days: int | None = None,
+) -> datetime | None:
+    if isinstance(since, str) and since.strip():
+        return _normalize_datetime(_coerce_datetime(since))
+    days = _positive_recent_days(recent_days)
+    if days is None:
+        return None
+    return _normalize_datetime(datetime.now(UTC) - timedelta(days=days))
+
+
+def scan_recent_legacy_project_comment_projects(
+    *,
+    legacy_url: str | None = None,
+    schema_path: str | Path | None = None,
+    recent_days: int | None = None,
+    since: str | None = None,
+    limit: int = 2000,
+    dump_json: str | Path | None = None,
+) -> dict[str, Any]:
+    """List legacy project ids with recent project-history activity.
+
+    This is a lightweight discovery pass used by periodic syncs to identify
+    projects worth re-checking for inbound comment updates without scanning the
+    full project table or syncing every project comment set every time.
+    """
+
+    since_dt = _project_comment_since_datetime(since=since, recent_days=recent_days)
+    if since_dt is None:
+        return {
+            "items": 0,
+            "projects": 0,
+            "project_ids": [],
+            "legacy_table": None,
+            "has_more": False,
+            "recent_days": _positive_recent_days(recent_days),
+            "recent_window_start": None,
+            "disabled": True,
+        }
+
+    resolved_schema = Path(schema_path).expanduser().resolve() if schema_path else default_schema_path()
+    base_url = _resolve_legacy_url(legacy_url=legacy_url, schema_path=resolved_schema)
+    source = _resolve_legacy_project_comment_source(base_url)
+    modified_field = source.modified_ts_field
+    if not isinstance(modified_field, str) or not modified_field.strip():
+        raise ValueError("Unable to infer legacy project-comment modified timestamp field")
+
+    limit_value = max(1, min(int(limit), 50000))
+    fields = [source.project_field, modified_field]
+    merge_key_fields = [source.project_field, modified_field]
+
+    url = f"{base_url}/api/v2/legacy/tables/{source.table}/rows"
+    params: dict[str, Any] = {
+        "modified_field": modified_field,
+        "limit": limit_value,
+        "since": _format_cursor_datetime(since_dt),
+        "order_by": f"-{modified_field}",
+    }
+
+    payload, fields_mode = _fetch_legacy_rows_best_effort(
+        url=url,
+        params=params,
+        modes=["repeat", "csv", "none"],
+        fields=list(fields),
+        expected_fields=set(fields),
+        required_fields=list(fields),
+        merge_key_fields=merge_key_fields,
+        threshold_missing=max(1, len(fields) // 2),
+        log_label="legacy recent project history",
+    )
+
+    dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
+    dump_path = _legacy_dump_path_for_request(
+        dump_file,
+        dump_dir,
+        table=source.table,
+        page=1,
+        mode=fields_mode,
+        id_value="recent",
+    )
+    if dump_path is not None:
+        if not _legacy_debug_requests_enabled():
+            request_url = _prepared_request_url(
+                url,
+                _legacy_params_with_fields(params, fields=list(fields), mode=str(fields_mode)),
+            )
+            logger.info("legacy recent project history request_url mode=%s %s", fields_mode, request_url)
+        _dump_legacy_payload(payload, path=dump_path)
+        logger.info("legacy recent project history dumped payload to %s", dump_path)
+
+    raw_items = payload.get("items") or payload.get("rows") or []
+    items: list[dict[str, Any]] = [item for item in raw_items if isinstance(item, dict)]
+
+    project_ids: list[int] = []
+    seen_projects: set[int] = set()
+    for item in items:
+        raw_project_id = item.get(source.project_field)
+        try:
+            project_id = int(raw_project_id)
+        except Exception:
+            continue
+        if project_id <= 0 or project_id in seen_projects:
+            continue
+        seen_projects.add(project_id)
+        project_ids.append(project_id)
+
+    has_more_raw = payload.get("has_more")
+    has_more = bool(has_more_raw) if has_more_raw is not None else len(items) >= limit_value
+
+    return {
+        "items": len(items),
+        "projects": len(project_ids),
+        "project_ids": project_ids,
+        "legacy_table": source.table,
+        "has_more": has_more,
+        "recent_days": _positive_recent_days(recent_days),
+        "recent_window_start": _format_cursor_datetime(since_dt),
+    }
+
+
 def sync_project_comments_to_legacy(
     *,
     legacy_url: str | None = None,
@@ -681,11 +833,16 @@ def sync_project_comments_to_legacy(
     project_id: int | None = None,
     limit: int = 5000,
     dry_run: bool = False,
+    recent_days: int | None = None,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """Push local non-System project comments to the legacy comment/history API."""
 
     if not db_file_path:
         db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
+
+    since_dt = _project_comment_since_datetime(since=since, recent_days=recent_days)
+    recent_days_value = _positive_recent_days(recent_days)
 
     selected_rows = 0
     skipped_blank = 0
@@ -702,6 +859,8 @@ def sync_project_comments_to_legacy(
         )
         if project_id is not None:
             query = query.filter(ProjectComment.project_id == int(project_id))
+        if since_dt is not None:
+            query = query.filter(ProjectComment.com_ModificationTS >= since_dt)
 
         rows = query.all()
         selected_rows = len(rows)
@@ -757,6 +916,8 @@ def sync_project_comments_to_legacy(
             "skipped_system": skipped_system,
             "duplicates_skipped": duplicates_skipped,
             "dry_run": bool(dry_run),
+            "recent_days": recent_days_value,
+            "recent_window_start": _format_cursor_datetime(since_dt) if since_dt is not None else None,
         }
 
     resolved_schema = Path(schema_path).expanduser().resolve() if schema_path else default_schema_path()
@@ -821,6 +982,8 @@ def sync_project_comments_to_legacy(
         "skipped_system": skipped_system,
         "duplicates_skipped": duplicates_skipped,
         "dry_run": bool(dry_run),
+        "recent_days": recent_days_value,
+        "recent_window_start": _format_cursor_datetime(since_dt) if since_dt is not None else None,
     }
 
 

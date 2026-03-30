@@ -252,3 +252,66 @@ def test_sync_legacy_project_comments_skips_conflicted_comment(tmp_path, monkeyp
         )
         assert comment.com_Comment == "Local edited"
 
+
+
+def test_scan_recent_legacy_project_comment_projects_discovers_unique_project_ids(monkeypatch):
+    payload_fields = {
+        "ok": True,
+        "table": "iSPEC_ProjectHistory",
+        "fields": [
+            "prh_PRJRecNo",
+            "prh_ModificationTS",
+            "prh_CreationTS",
+            "prh_Comment",
+        ],
+        "items": [],
+    }
+    payload_rows = {
+        "ok": True,
+        "table": "iSPEC_ProjectHistory",
+        "items": [
+            {"prh_PRJRecNo": 1498, "prh_ModificationTS": "2026-03-22 12:00:00"},
+            {"prh_PRJRecNo": 1498, "prh_ModificationTS": "2026-03-21 12:00:00"},
+            {"prh_PRJRecNo": 1501, "prh_ModificationTS": "2026-03-20 12:00:00"},
+        ],
+        "has_more": True,
+    }
+
+    class DummyResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    captured: dict[str, object] = {}
+
+    def fake_get(url, params=None, headers=None, auth=None, timeout=None):
+        if params == {"limit": 1}:
+            return DummyResponse(payload_fields)
+        captured["url"] = url
+        captured["params"] = dict(params or {})
+        return DummyResponse(payload_rows)
+
+    from ispec.db import legacy_sync
+
+    monkeypatch.setattr(legacy_sync.requests, "get", fake_get)
+
+    summary = legacy_sync.scan_recent_legacy_project_comment_projects(
+        legacy_url="http://legacy.example",
+        recent_days=30,
+        limit=200,
+    )
+
+    assert captured["url"] == "http://legacy.example/api/v2/legacy/tables/iSPEC_ProjectHistory/rows"
+    assert captured["params"]["modified_field"] == "prh_ModificationTS"
+    assert captured["params"]["limit"] == 200
+    assert "since" in captured["params"]
+    assert summary["legacy_table"] == "iSPEC_ProjectHistory"
+    assert summary["projects"] == 2
+    assert summary["project_ids"] == [1498, 1501]
+    assert summary["has_more"] is True
+    assert summary["recent_days"] == 30

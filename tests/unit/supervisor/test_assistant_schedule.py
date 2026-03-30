@@ -9,6 +9,13 @@ from ispec.agent.commands import COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT, COMMAND
 from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand, AgentRun
 from ispec.assistant.service import AssistantReply
+from ispec.assistant.turn_decision import (
+    TurnDecision,
+    TurnDecisionResponsePlan,
+    TurnDecisionResult,
+    TurnDecisionToolPlan,
+    TurnDecisionWritePlan,
+)
 from ispec.concurrency.thread_context import set_main_thread
 from ispec.supervisor.loop import _enqueue_command, _ensure_assistant_scheduled_commands, _process_one_command
 
@@ -245,3 +252,182 @@ def test_supervisor_processes_scheduled_assistant_prompt_and_queues_slack_post(t
         schedule_state = assistant_jobs.get("weekly_current_projects")
         assert isinstance(schedule_state, dict)
         assert schedule_state.get("last_completed_key") == "weekly_current_projects:2026-01-06T15:00:00+00:00"
+
+
+def test_supervisor_records_turn_decision_for_scheduled_assistant_prompt(tmp_path, monkeypatch):
+    agent_db_path = tmp_path / "agent.db"
+    core_db_path = tmp_path / "core.db"
+    assistant_db_path = tmp_path / "assistant.db"
+    schedule_db_path = tmp_path / "schedule.db"
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_DB_PATH", str(core_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_DB_PATH", str(assistant_db_path))
+    monkeypatch.setenv("ISPEC_SCHEDULE_DB_PATH", str(schedule_db_path))
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL", "C123STAFF")
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TURN_DECISION_MODE", "shadow")
+
+    fixed_now = datetime(2026, 1, 6, 15, 0, tzinfo=UTC)
+    import ispec.supervisor.loop as supervisor_loop
+
+    monkeypatch.setattr(supervisor_loop, "utcnow", lambda: fixed_now)
+    monkeypatch.setattr(
+        supervisor_loop,
+        "run_turn_decision_pipeline",
+        lambda **_: TurnDecisionResult(
+            ok=True,
+            mode="shadow",
+            source="scheduled_assistant",
+            applied=False,
+            decision=TurnDecision(
+                source="scheduled_assistant",
+                primary_goal="automation_task",
+                needs_clarification=False,
+                clarification_reason="none",
+                tool_plan=TurnDecisionToolPlan(
+                    use_tools=True,
+                    primary_group="devops",
+                    secondary_groups=(),
+                    preferred_first_tool="assistant_enqueue_staff_slack_message",
+                ),
+                write_plan=TurnDecisionWritePlan(mode="none"),
+                response_plan=TurnDecisionResponsePlan(mode="single", contract_cap="brief_explainer"),
+                confidence=0.77,
+                reason="The scheduled job should gather information and then enqueue a staff Slack post.",
+            ),
+        ),
+    )
+
+    with get_agent_session(agent_db_path) as agent_db:
+        agent_db.add(
+            AgentRun(
+                run_id="run-1",
+                agent_id="agent-1",
+                kind="supervisor",
+                status="running",
+                created_at=fixed_now,
+                updated_at=fixed_now,
+                config_json={},
+                state_json={"checks": {}},
+                summary_json={},
+            )
+        )
+        agent_db.commit()
+
+    real_run_tool = supervisor_loop.run_tool
+
+    def fake_run_tool(*, name, args, core_db, assistant_db, agent_db, schedule_db, omics_db, user, api_schema, user_message):  # type: ignore[no-untyped-def]
+        if name == "count_current_projects":
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {"count": 7, "scope": "current"},
+            }
+        return real_run_tool(
+            name=name,
+            args=args,
+            core_db=core_db,
+            assistant_db=assistant_db,
+            agent_db=agent_db,
+            schedule_db=schedule_db,
+            omics_db=omics_db,
+            user=user,
+            api_schema=api_schema,
+            user_message=user_message,
+        )
+
+    monkeypatch.setattr(supervisor_loop, "run_tool", fake_run_tool)
+
+    calls: list[dict[str, object]] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_):  # type: ignore[no-untyped-def]
+        calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        index = len(calls)
+        if index == 1:
+            return AssistantReply(
+                content="",
+                provider="test",
+                model="test-model",
+                meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "function": {"name": "count_current_projects", "arguments": "{}"},
+                    }
+                ],
+            )
+        if index == 2:
+            return AssistantReply(
+                content="FINAL:\nWe currently have 7 active projects.",
+                provider="test",
+                model="test-model",
+                meta=None,
+            )
+        if index == 3:
+            assert tool_choice == {
+                "type": "function",
+                "function": {"name": "assistant_enqueue_staff_slack_message"},
+            }
+            return AssistantReply(
+                content="",
+                provider="test",
+                model="test-model",
+                meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_2",
+                        "function": {
+                            "name": "assistant_enqueue_staff_slack_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "We currently have 7 active projects.",
+                                    "confirm": True,
+                                    "reason": "weekly current projects update",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            )
+        return AssistantReply(
+            content="FINAL:\nPosted the scheduled staff update.",
+            provider="test",
+            model="test-model",
+            meta=None,
+        )
+
+    monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
+
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT,
+        payload={
+            "job": {
+                "name": "weekly_current_projects",
+                "prompt": "Prepare the weekly current projects update and post it to staff Slack.",
+                "allowed_tools": ["count_current_projects", "assistant_enqueue_staff_slack_message"],
+                "required_tool": "assistant_enqueue_staff_slack_message",
+                "max_tool_calls": 4,
+            },
+            "schedule": {
+                "name": "weekly_current_projects",
+                "key": "weekly_current_projects:2026-01-06T15:00:00+00:00",
+                "occurrence_utc": "2026-01-06T15:00:00+00:00",
+                "timezone": "America/Chicago",
+                "weekday": 1,
+                "time": "09:00",
+            },
+        },
+    )
+    assert isinstance(cmd_id, int)
+
+    processed = _process_one_command(agent_id="agent-1", run_id="run-1")
+    assert processed is True
+
+    with get_agent_session(agent_db_path) as agent_db:
+        scheduled_cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
+        assert scheduled_cmd.status == "succeeded"
+        turn_decision = scheduled_cmd.result_json.get("turn_decision")
+        assert isinstance(turn_decision, dict)
+        assert turn_decision.get("mode") == "shadow"
+        assert turn_decision.get("decision", {}).get("primary_goal") == "automation_task"

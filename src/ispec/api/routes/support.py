@@ -28,6 +28,7 @@ from ispec.assistant.prompt_header import build_prompt_header, prompt_header_ena
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
 from ispec.assistant.response_contracts import (
     response_contracts_enabled,
+    response_contract_names,
     run_response_contract_pipeline,
 )
 from ispec.assistant.service import (
@@ -41,6 +42,11 @@ from ispec.assistant.tool_routing import (
     route_tool_groups_vllm,
     tool_groups_for_available_tools,
     tool_names_for_groups,
+)
+from ispec.assistant.turn_decision import (
+    parse_turn_decision_mode,
+    run_turn_decision_pipeline,
+    selected_tool_names_from_decision,
 )
 from ispec.assistant.tools import (
     TOOL_CALL_PREFIX,
@@ -83,6 +89,13 @@ _LIST_MY_PROJECTS_RE = re.compile(
     r"|\b(?:what|which|show|list)\s+(?:projects?|prjs?|projs?)\b",
     re.IGNORECASE,
 )
+_PROJECT_EXISTENCE_LOOKUP_RE = re.compile(
+    r"\b(?:do|does)\s+(?:we\s+)?have\s+(?:project|prj|proj)\s+#?\d+\b"
+    r"|\bdoes\s+(?:project|prj|proj)\s+#?\d+\s+exist\b"
+    r"|\bis\s+(?:project|prj|proj)\s+#?\d+\s+(?:available|present|there)\b"
+    r"|\b(?:project|prj|proj)\s+#?\d+\s+(?:exists?|available|present)\b",
+    re.IGNORECASE,
+)
 _FILE_ROUTER_HINT_RE = re.compile(
     r"\b("
     r"files?|results?|directory|directories|folder|folders|plots?|pca|biplot|"
@@ -119,8 +132,13 @@ _WRITE_SUCCESS_NOTE_RE = re.compile(
     r"\b(?:i|we)\s+(?:have|ve)\s+(?:made|added|saved|logged|recorded|created)\s+(?:a|an|the)?\s*(?:note|comment|entry|memo)\b",
     re.IGNORECASE,
 )
+_WRITE_SUCCESS_FIRST_PERSON_RE = re.compile(
+    r"\b(?:i|we)\s+(?:(?:have|ve)\s+)?(?:saved|added|logged|recorded|created|written|updated|committed)\b"
+    r".*\b(?:note|comment|history|memo|entry)\b",
+    re.IGNORECASE,
+)
 _WRITE_SUCCESS_PASSIVE_RE = re.compile(
-    r"\b(?:note|comment|entry|memo)\b.*\b(?:has|have)\s+been\b.*\b(saved|added|logged|recorded|created|written|updated|committed)\b"
+    r"\b(?:note|comment|history|entry|memo)\b.*\b(?:has|have|is|was)\s+(?:been\s+)?\b(saved|added|logged|recorded|created|written|updated|committed)\b"
     r"|\bsuccessfully\b.*\b(saved|added|logged|recorded|created|written|updated|committed)\b",
     re.IGNORECASE,
 )
@@ -176,6 +194,58 @@ def _parse_int_setting(raw: str, default: int, minimum: int) -> int:
         return default
 
 
+def _turn_decision_mode() -> str:
+    return parse_turn_decision_mode(
+        os.getenv("ISPEC_ASSISTANT_TURN_DECISION_MODE"),
+        auto_shadow=_state_dir_is_dev() and _assistant_provider() == "vllm",
+    )
+
+
+def _legacy_comment_intent_to_write_mode(decision: dict[str, Any] | None) -> str | None:
+    if not isinstance(decision, dict):
+        return None
+    intent = str(decision.get("intent") or "").strip()
+    if intent == "draft_only":
+        return "draft_only"
+    if intent == "save_now":
+        return "save_now"
+    if intent == "confirm_save":
+        return "confirm_save"
+    if intent == "other":
+        return "none"
+    return None
+
+
+def _merge_response_contract_request_meta(
+    *,
+    request_meta: dict[str, Any] | None,
+    contract_cap: str | None,
+) -> dict[str, Any] | None:
+    if not isinstance(request_meta, dict) and not contract_cap:
+        return request_meta
+
+    merged = dict(request_meta) if isinstance(request_meta, dict) else {}
+    if not contract_cap:
+        return merged
+
+    raw_policy = merged.get("response_contract")
+    policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
+    if not str(policy.get("force") or "").strip() and not str(policy.get("cap") or "").strip():
+        policy["cap"] = contract_cap
+    if policy:
+        merged["response_contract"] = policy
+    return merged
+
+
+def _response_contract_policy_meta(request_meta: dict[str, Any] | None) -> dict[str, str | None]:
+    raw_policy = request_meta.get("response_contract") if isinstance(request_meta, dict) else None
+    if not isinstance(raw_policy, dict):
+        return {"force": None, "cap": None}
+    force = str(raw_policy.get("force") or "").strip() or None
+    cap = str(raw_policy.get("cap") or "").strip() or None
+    return {"force": force, "cap": cap}
+
+
 def _policy_tool_for_message(message: str) -> str | None:
     if _COUNT_PROJECTS_RE.search(message or ""):
         return (
@@ -185,12 +255,19 @@ def _policy_tool_for_message(message: str) -> str | None:
         )
     if _LIST_MY_PROJECTS_RE.search(message or ""):
         return "my_projects"
+    project_ids = extract_project_ids(message or "")
+    if len(project_ids) == 1 and _PROJECT_EXISTENCE_LOOKUP_RE.search(message or ""):
+        return "get_project"
     if re.search(r"\btmux\b", message or "", re.IGNORECASE):
         return "assistant_list_tmux_panes"
     return None
 
 
 def _policy_tool_args_for_message(*, tool_name: str | None, message: str) -> dict[str, Any]:
+    if tool_name == "get_project":
+        project_ids = extract_project_ids(message or "")
+        if len(project_ids) == 1:
+            return {"id": int(project_ids[0])}
     if tool_name == "assistant_list_tmux_panes":
         match = _TMUX_SESSION_NAME_RE.search(message or "")
         if match:
@@ -198,6 +275,23 @@ def _policy_tool_args_for_message(*, tool_name: str | None, message: str) -> dic
             if session_name:
                 return {"session_name": session_name}
     return {}
+
+
+def _policy_messages_for_message(*, tool_name: str | None, message: str) -> list[dict[str, str]]:
+    text = message or ""
+    if tool_name == "get_project" and _PROJECT_EXISTENCE_LOOKUP_RE.search(text):
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "The user is asking for project existence/availability. "
+                    "After checking the project, answer directly whether it exists. "
+                    "Keep the answer concise. Do not draft a comment, do not claim anything was saved, "
+                    "and do not summarize project details or previous comments unless the user asks."
+                ),
+            }
+        ]
+    return []
 
 
 def _hinted_tool_groups_for_message(*, message: str, focused_project_id: int | None) -> set[str]:
@@ -716,12 +810,11 @@ def _assistant_claims_write_success(message: str | None) -> bool:
         return True
     if _WRITE_SUCCESS_NOTE_RE.search(text):
         return True
+    if _WRITE_SUCCESS_FIRST_PERSON_RE.search(text):
+        return True
     if _WRITE_SUCCESS_PASSIVE_RE.search(text):
         return True
-    return bool(
-        _WRITE_SUCCESS_VERB_RE.search(text)
-        and re.search(r"\b(note|comment|history|memo|entry)\b", text, re.IGNORECASE)
-    )
+    return False
 
 
 def _load_state(raw: str | None) -> dict[str, Any]:
@@ -1246,6 +1339,10 @@ def chat(
     tool_router: dict[str, Any] | None = None
     tool_schemas = openai_tools_for_user(user) if tool_protocol == "openai" and tools_enabled else None
     known_tool_names = openai_tool_names_all() if tool_protocol == "openai" and tools_enabled else set()
+    available_openai_tool_names_full = _openai_tool_names(tool_schemas)
+    available_write_tool_names_full = sorted(
+        name for name in available_openai_tool_names_full if tool_writes_data(name)
+    )
     requested_tool_names_known = (
         _requested_tool_names_from_text(payload.message, candidates=known_tool_names) if known_tool_names else []
     )
@@ -1254,6 +1351,50 @@ def chat(
     compare_mode_enabled = _compare_mode_enabled()
     self_review_enabled = _self_review_enabled()
     self_review_decider_enabled = _self_review_decider_enabled()
+    turn_decision_mode = _turn_decision_mode()
+    turn_decision_result = None
+    turn_decision_runtime_applied = False
+    turn_decision_groups = (
+        tool_groups_for_available_tools(available_openai_tool_names_full)
+        if tool_protocol == "openai" and tools_enabled and isinstance(tool_schemas, list) and tool_schemas
+        else []
+    )
+    last_assistant_turn_row = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session.id)
+        .filter(SupportMessage.role == "assistant")
+        .order_by(SupportMessage.id.desc())
+        .first()
+    )
+    last_assistant_text_for_turn_decision = (
+        str(getattr(last_assistant_turn_row, "content", "") or "").strip()
+        if last_assistant_turn_row is not None
+        else ""
+    )
+    if assistant_provider == "vllm" and turn_decision_mode != "off":
+        turn_decision_result = run_turn_decision_pipeline(
+            generate_reply_fn=generate_reply,
+            mode=turn_decision_mode,
+            source="support_chat",
+            user_message=payload.message,
+            last_assistant_message=last_assistant_text_for_turn_decision,
+            focused_project_id=focused_project_id,
+            referenced_project_ids=referenced_projects,
+            groups=turn_decision_groups,
+            response_modes=["single", "compare"] if compare_mode_enabled else ["single"],
+            contract_caps=list(response_contract_names()),
+            extra_context={
+                "confirmation_reply": confirmation_reply,
+                "tool_protocol": tool_protocol,
+                "tools_enabled": bool(tools_enabled),
+                "requested_tool_names": requested_tool_names_known,
+                "available_write_tools": available_write_tool_names_full,
+                "ui": ui_payload or {},
+            },
+        )
+        turn_decision_runtime_applied = bool(
+            turn_decision_result.ok and turn_decision_mode == "own" and turn_decision_result.decision is not None
+        )
 
     if (
         tool_protocol == "openai"
@@ -1267,42 +1408,20 @@ def chat(
         requested_tool_names_available = _requested_tool_names_from_text(
             payload.message, candidates=available_tool_names
         )
-        groups = tool_groups_for_available_tools(available_tool_names)
-        hinted_group_names = _hinted_tool_groups_for_message(
-            message=payload.message,
-            focused_project_id=focused_project_id,
-        )
-        decision, router_reply = route_tool_groups_vllm(
-            user_message=payload.message,
-            groups=groups,
-            generate_reply_fn=generate_reply,
-        )
-        tool_router = {
-            "ok": bool(router_reply.ok),
-            "provider": router_reply.provider,
-            "model": router_reply.model,
-            "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
-            "decision": decision,
-        }
-        if requested_tool_names_available:
-            tool_router["explicit_requested_tool_names"] = requested_tool_names_available
-        if router_reply.meta:
-            tool_router["provider_meta"] = router_reply.meta
-        if hinted_group_names:
-            tool_router["hinted_group_names"] = sorted(hinted_group_names)
-
-        grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
-        if decision:
-            selected_tool_names = tool_names_for_groups(
+        groups = turn_decision_groups or tool_groups_for_available_tools(available_tool_names)
+        if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
+            selected_tool_names = selected_tool_names_from_decision(
                 groups=groups,
-                primary=str(decision["primary"]),
-                secondary=list(decision["secondary"]),
+                decision=turn_decision_result.decision,
+                explicit_requested_tool_names=requested_tool_names_available,
+                always_include=["assistant_prompt_header", "assistant_list_tools"],
             )
-            for group_name in hinted_group_names:
-                selected_tool_names |= grouped_tool_names.get(group_name, set())
-            selected_tool_names |= {"assistant_prompt_header", "assistant_list_tools"}
-            if requested_tool_names_available:
-                selected_tool_names |= set(requested_tool_names_available)
+            tool_router = {
+                "ok": True,
+                "source": "turn_decision",
+                "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
+                "decision": turn_decision_result.decision.as_dict(),
+            }
             if selected_tool_names:
                 filtered: list[dict[str, Any]] = []
                 for spec in tool_schemas:
@@ -1313,19 +1432,67 @@ def chat(
                 if filtered:
                     tool_schemas = filtered
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
-        elif hinted_group_names:
-            selected_tool_names = {"assistant_prompt_header", "assistant_list_tools"}
-            for group_name in hinted_group_names:
-                selected_tool_names |= grouped_tool_names.get(group_name, set())
-            filtered = []
-            for spec in tool_schemas:
-                func_obj = spec.get("function") if isinstance(spec, dict) else None
-                name = func_obj.get("name") if isinstance(func_obj, dict) else None
-                if isinstance(name, str) and name.strip() in selected_tool_names:
-                    filtered.append(spec)
-            if filtered:
-                tool_schemas = filtered
-                tool_router["selected_tool_names"] = sorted(selected_tool_names)
+        else:
+            hinted_group_names = _hinted_tool_groups_for_message(
+                message=payload.message,
+                focused_project_id=focused_project_id,
+            )
+            decision, router_reply = route_tool_groups_vllm(
+                user_message=payload.message,
+                groups=groups,
+                generate_reply_fn=generate_reply,
+            )
+            tool_router = {
+                "ok": bool(router_reply.ok),
+                "provider": router_reply.provider,
+                "model": router_reply.model,
+                "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
+                "decision": decision,
+            }
+            if turn_decision_result and turn_decision_result.decision is not None:
+                tool_router["turn_decision"] = turn_decision_result.decision.as_dict()
+            if requested_tool_names_available:
+                tool_router["explicit_requested_tool_names"] = requested_tool_names_available
+            if router_reply.meta:
+                tool_router["provider_meta"] = router_reply.meta
+            if hinted_group_names:
+                tool_router["hinted_group_names"] = sorted(hinted_group_names)
+
+            grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
+            if decision:
+                selected_tool_names = tool_names_for_groups(
+                    groups=groups,
+                    primary=str(decision["primary"]),
+                    secondary=list(decision["secondary"]),
+                )
+                for group_name in hinted_group_names:
+                    selected_tool_names |= grouped_tool_names.get(group_name, set())
+                selected_tool_names |= {"assistant_prompt_header", "assistant_list_tools"}
+                if requested_tool_names_available:
+                    selected_tool_names |= set(requested_tool_names_available)
+                if selected_tool_names:
+                    filtered: list[dict[str, Any]] = []
+                    for spec in tool_schemas:
+                        func_obj = spec.get("function") if isinstance(spec, dict) else None
+                        name = func_obj.get("name") if isinstance(func_obj, dict) else None
+                        if isinstance(name, str) and name.strip() in selected_tool_names:
+                            filtered.append(spec)
+                    if filtered:
+                        tool_schemas = filtered
+                        tool_router["selected_tool_names"] = sorted(selected_tool_names)
+            elif hinted_group_names:
+                selected_tool_names = {"assistant_prompt_header", "assistant_list_tools"}
+                for group_name in hinted_group_names:
+                    selected_tool_names |= grouped_tool_names.get(group_name, set())
+                filtered = []
+                for spec in tool_schemas:
+                    func_obj = spec.get("function") if isinstance(spec, dict) else None
+                    name = func_obj.get("name") if isinstance(func_obj, dict) else None
+                    if isinstance(name, str) and name.strip() in selected_tool_names:
+                        filtered.append(spec)
+                if filtered:
+                    tool_schemas = filtered
+                    tool_router["selected_tool_names"] = sorted(selected_tool_names)
     elif (
         tool_protocol == "openai"
         and tools_enabled
@@ -1361,7 +1528,16 @@ def chat(
         if missing_requested_tool_names:
             tool_router["missing_requested_tool_names"] = missing_requested_tool_names
 
-    compare_mode_requested = compare_mode_enabled and _decide_if_dualchoice(payload=payload)
+    turn_decision_contract_cap = (
+        turn_decision_result.decision.response_plan.contract_cap
+        if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None
+        else None
+    )
+    compare_mode_requested = (
+        compare_mode_enabled and bool(turn_decision_result.decision.response_plan.mode == "compare")
+        if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None
+        else compare_mode_enabled and _decide_if_dualchoice(payload=payload)
+    )
     response_format = "compare" if compare_mode_requested else "single"
 
     tools_available = tool_schemas_count > 0 and tools_enabled
@@ -1483,7 +1659,52 @@ def chat(
     comment_intent_decision: dict[str, Any] | None = None
     comment_intent_reply = None
     comment_intent_messages: list[dict[str, Any]] = []
-    if (
+    if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
+        write_mode = turn_decision_result.decision.write_plan.mode
+        if write_mode == "draft_only":
+            comment_intent_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "NOTE: comment_intent=draft_only. "
+                        "Treat this as a hint: draft the comment, then ask for confirmation or tweaks before saving."
+                    ),
+                }
+            ]
+        elif write_mode == "save_now":
+            if turn_decision_result.decision.needs_clarification and (
+                turn_decision_result.decision.clarification_reason == "missing_comment_text"
+            ):
+                comment_intent_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "NOTE: The user appears to want a project comment saved, but the actual comment text is still missing. "
+                            "Do not save yet; ask for the comment text first."
+                        ),
+                    }
+                ]
+            else:
+                comment_intent_messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "NOTE: comment_intent=save_now. "
+                            "Treat this as a hint: the user appears to want the note saved now if you have enough content."
+                        ),
+                    }
+                ]
+        elif write_mode == "confirm_save":
+            comment_intent_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "NOTE: comment_intent=confirm_save. "
+                        "Treat this as a hint: the user appears to be confirming a previously drafted note should now be saved."
+                    ),
+                }
+            ]
+    elif (
         tool_protocol == "openai"
         and tools_enabled
         and assistant_provider == "vllm"
@@ -1514,7 +1735,7 @@ def chat(
             elif intent == "confirm_save":
                 hint = (
                     f"NOTE: comment_intent=confirm_save (confidence={confidence:.2f}). "
-                    "Treat this as a hint: the user appears to be confirming a previously drafted note should be saved now."
+                    "Treat this as a hint: the user appears to be confirming a previously drafted note should now be saved."
                 )
             else:
                 hint = (
@@ -1547,16 +1768,39 @@ def chat(
     ):
         if _assistant_requested_project_history_save(last_assistant_text):
             forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
-    policy_tool_name = _policy_tool_for_message(payload.message)
+    if (
+        tool_protocol == "openai"
+        and forced_tool_choice is None
+        and turn_decision_runtime_applied
+        and turn_decision_result
+        and turn_decision_result.decision is not None
+        and turn_decision_result.decision.tool_plan.preferred_first_tool in openai_tool_names
+    ):
+        forced_tool_choice = {
+            "type": "function",
+            "function": {"name": str(turn_decision_result.decision.tool_plan.preferred_first_tool)},
+        }
+    policy_tool_name = None if turn_decision_runtime_applied else _policy_tool_for_message(payload.message)
 
-    if policy_tool_name and policy_tool_name not in openai_no_arg_tool_names:
-        policy_tool_name = None
     policy_tool_args = _policy_tool_args_for_message(tool_name=policy_tool_name, message=payload.message) if policy_tool_name else {}
+    policy_messages = _policy_messages_for_message(tool_name=policy_tool_name, message=payload.message) if policy_tool_name else []
+    if policy_tool_name:
+        if policy_tool_name not in openai_tool_names:
+            policy_tool_name = None
+            policy_tool_args = {}
+            policy_messages = []
+        elif (
+            policy_tool_name not in openai_no_arg_tool_names
+            and not policy_tool_args
+        ):
+            policy_tool_name = None
+            policy_tool_args = {}
+            policy_messages = []
 
     if (
         tool_protocol == "openai"
         and forced_tool_choice is None
-        and policy_tool_name == "assistant_list_tmux_panes"
+        and policy_tool_name in {"assistant_list_tmux_panes", "get_project"}
         and policy_tool_name in openai_tool_names
     ):
         forced_tool_choice = {"type": "function", "function": {"name": policy_tool_name}}
@@ -1605,6 +1849,7 @@ def chat(
             *header_message,
             {"role": "system", "content": context_message},
             *tool_availability_messages,
+            *policy_messages,
             *comment_intent_messages,
             {"role": "user", "content": payload.message},
             *tool_messages,
@@ -1625,6 +1870,7 @@ def chat(
             *header_message,
             {"role": "system", "content": context_message},
             *tool_availability_messages,
+            *policy_messages,
             *comment_intent_messages,
             *trimmed_history,
             {"role": "user", "content": payload.message},
@@ -1996,6 +2242,10 @@ def chat(
     final_raw_reply_content = draft_raw_reply_content
 
     response_contract_enabled = response_contracts_enabled()
+    response_contract_request_meta = _merge_response_contract_request_meta(
+        request_meta=payload.meta if isinstance(payload.meta, dict) else None,
+        contract_cap=turn_decision_contract_cap if turn_decision_runtime_applied else None,
+    )
     response_contract_meta: dict[str, Any] = {
         "enabled": response_contract_enabled,
         "applied": False,
@@ -2016,7 +2266,7 @@ def chat(
                 user_message=payload.message,
                 tool_result_messages=tool_result_messages,
                 draft_answer=assistant_content,
-                request_meta=payload.meta if isinstance(payload.meta, dict) else None,
+                request_meta=response_contract_request_meta,
             )
             response_contract_meta = response_contract_result.as_meta()
             if response_contract_result.ok and response_contract_result.rendered_content:
@@ -2143,6 +2393,76 @@ def chat(
             "and I will handle the tool call myself."
         )
 
+    turn_decision_meta: dict[str, Any] | None = None
+    if turn_decision_result is not None:
+        turn_decision_meta = turn_decision_result.as_meta()
+        runtime_router_decision = tool_router.get("decision") if isinstance(tool_router, dict) else None
+        runtime_primary_group = None
+        runtime_secondary_groups: list[str] = []
+        if isinstance(runtime_router_decision, dict):
+            runtime_primary_group = str(runtime_router_decision.get("primary") or "").strip() or None
+            runtime_secondary_groups = [
+                str(item).strip()
+                for item in (runtime_router_decision.get("secondary") or [])
+                if isinstance(item, str) and str(item).strip()
+            ]
+        runtime_forced_tool_name = None
+        if isinstance(forced_tool_choice, dict):
+            func_obj = forced_tool_choice.get("function")
+            if isinstance(func_obj, dict):
+                runtime_forced_tool_name = str(func_obj.get("name") or "").strip() or None
+
+        runtime_snapshot = {
+            "tool_router_source": (
+                str(tool_router.get("source") or "").strip() if isinstance(tool_router, dict) else None
+            ),
+            "tool_router_primary_group": runtime_primary_group,
+            "tool_router_secondary_groups": runtime_secondary_groups,
+            "forced_tool_choice": runtime_forced_tool_name,
+            "compare_mode_requested": compare_mode_requested,
+            "response_contract_policy": _response_contract_policy_meta(response_contract_request_meta),
+            "comment_intent_write_mode": _legacy_comment_intent_to_write_mode(comment_intent_decision),
+        }
+        turn_decision_meta["runtime"] = runtime_snapshot
+
+        if turn_decision_result.mode == "shadow" and turn_decision_result.decision is not None:
+            divergence: dict[str, Any] = {}
+            if turn_decision_result.decision.tool_plan.primary_group != runtime_primary_group:
+                divergence["primary_group"] = {
+                    "turn_decision": turn_decision_result.decision.tool_plan.primary_group,
+                    "runtime": runtime_primary_group,
+                }
+            if list(turn_decision_result.decision.tool_plan.secondary_groups) != runtime_secondary_groups:
+                divergence["secondary_groups"] = {
+                    "turn_decision": list(turn_decision_result.decision.tool_plan.secondary_groups),
+                    "runtime": runtime_secondary_groups,
+                }
+            if turn_decision_result.decision.tool_plan.preferred_first_tool != runtime_forced_tool_name:
+                divergence["preferred_first_tool"] = {
+                    "turn_decision": turn_decision_result.decision.tool_plan.preferred_first_tool,
+                    "runtime": runtime_forced_tool_name,
+                }
+            runtime_response_mode = "compare" if compare_mode_requested else "single"
+            if turn_decision_result.decision.response_plan.mode != runtime_response_mode:
+                divergence["response_mode"] = {
+                    "turn_decision": turn_decision_result.decision.response_plan.mode,
+                    "runtime": runtime_response_mode,
+                }
+            runtime_contract_cap = _response_contract_policy_meta(response_contract_request_meta).get("cap")
+            if turn_decision_result.decision.response_plan.contract_cap != runtime_contract_cap:
+                divergence["response_contract_cap"] = {
+                    "turn_decision": turn_decision_result.decision.response_plan.contract_cap,
+                    "runtime": runtime_contract_cap,
+                }
+            runtime_write_mode = _legacy_comment_intent_to_write_mode(comment_intent_decision)
+            if turn_decision_result.decision.write_plan.mode != runtime_write_mode:
+                divergence["write_mode"] = {
+                    "turn_decision": turn_decision_result.decision.write_plan.mode,
+                    "runtime": runtime_write_mode,
+                }
+            if divergence:
+                turn_decision_meta["divergence"] = divergence
+
     meta: dict[str, Any] = {
         "provider": final_reply.provider,
         "model": final_reply.model,
@@ -2166,6 +2486,8 @@ def chat(
     meta["response_contract"] = response_contract_meta
     if tool_router:
         meta["tool_router"] = tool_router
+    if turn_decision_meta is not None:
+        meta["turn_decision"] = turn_decision_meta
     if comment_intent_decision is not None or comment_intent_reply is not None:
         meta["comment_intent"] = {
             "enabled": _project_comment_intent_hints_enabled(),

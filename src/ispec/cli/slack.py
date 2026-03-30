@@ -237,6 +237,73 @@ def _format_compare_choices(compare: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def _slack_response_field(response: Any, key: str) -> Any:
+    if isinstance(response, dict):
+        return response.get(key)
+    try:
+        getter = getattr(response, "get", None)
+        if callable(getter):
+            return getter(key)
+    except Exception:
+        pass
+    data = getattr(response, "data", None)
+    if isinstance(data, dict):
+        return data.get(key)
+    return None
+
+
+def _slack_api_error_code(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        return str(response.get("error") or "").strip()
+    try:
+        getter = getattr(response, "get", None)
+        if callable(getter):
+            return str(getter("error") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _safe_slack_post_message(*, client: Any, channel: str, thread_ts: str | None, text: str) -> str | None:
+    kwargs: dict[str, Any] = {"channel": channel, "text": text}
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+    try:
+        response = client.chat_postMessage(**kwargs)
+        ts = str(_slack_response_field(response, "ts") or "").strip()
+        return ts or None
+    except Exception as exc:
+        error = _slack_api_error_code(exc)
+        logger.exception("Slack chat_postMessage failed (%s) channel=%s thread_ts=%s", error, channel, thread_ts)
+        if error != "not_in_channel":
+            return None
+        try:
+            client.conversations_join(channel=channel)
+        except Exception:
+            logger.exception("Slack join failed channel=%s", channel)
+            return None
+        try:
+            response = client.chat_postMessage(**kwargs)
+            ts = str(_slack_response_field(response, "ts") or "").strip()
+            return ts or None
+        except Exception:
+            logger.exception("Slack chat_postMessage retry failed channel=%s thread_ts=%s", channel, thread_ts)
+            return None
+
+
+def _safe_slack_update_message(*, client: Any, channel: str, message_ts: str, text: str) -> bool:
+    if not message_ts:
+        return False
+    try:
+        client.chat_update(channel=channel, ts=message_ts, text=text)
+        return True
+    except Exception as exc:
+        error = _slack_api_error_code(exc)
+        logger.exception("Slack chat_update failed (%s) channel=%s ts=%s", error, channel, message_ts)
+        return False
+
+
 def _run_socket_mode(args) -> None:
     try:
         from slack_bolt import App
@@ -317,6 +384,16 @@ def _run_socket_mode(args) -> None:
                         say(text=text)
                 except Exception:
                     logger.exception("Slack say retry failed channel=%s thread_ts=%s", channel, thread_ts)
+
+    def _send_or_update(*, say, client, channel: str, thread_ts: str | None, text: str, pending_ts: str | None) -> None:
+        if pending_ts and _safe_slack_update_message(
+            client=client,
+            channel=channel,
+            message_ts=pending_ts,
+            text=text,
+        ):
+            return
+        _safe_say(say=say, client=client, channel=channel, thread_ts=thread_ts, text=text)
 
     @app.error
     def _on_slack_error(error, body, logger):  # type: ignore[no-untyped-def]
@@ -401,6 +478,7 @@ def _run_socket_mode(args) -> None:
             slack_user_id,
             message_for_ispec,
         )
+        pending_reply_ts: str | None = None
 
         match = _CHOOSE_RE.match(text)
         if match:
@@ -414,6 +492,12 @@ def _run_socket_mode(args) -> None:
                 session_id_pending = str(pending.get("session_id") or "")
                 user_message_id = int(pending.get("user_message_id") or 0)
                 if session_id_pending and user_message_id > 0 and choice_index in {0, 1}:
+                    pending_reply_ts = _safe_slack_post_message(
+                        client=client,
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text="Working on it...",
+                    )
                     try:
                         payload = _post_ispec_choose(
                             server=cfg.ispec_server,
@@ -429,27 +513,36 @@ def _run_socket_mode(args) -> None:
                             body = exc.response.text if exc.response is not None else ""
                         except Exception:
                             body = ""
-                        _safe_say(
+                        _send_or_update(
                             say=say,
                             client=client,
                             channel=channel,
                             thread_ts=thread_ts,
+                            pending_ts=pending_reply_ts,
                             text=f"iSPEC API error: {exc}\n{body}".strip(),
                         )
                         return
                     except Exception as exc:
-                        _safe_say(
+                        _send_or_update(
                             say=say,
                             client=client,
                             channel=channel,
                             thread_ts=thread_ts,
+                            pending_ts=pending_reply_ts,
                             text=f"iSPEC API call failed: {exc}",
                         )
                         return
                     pending_compare.pop(key, None)
                     message = str(payload.get("message") or "").strip()
                     if message:
-                        _safe_say(say=say, client=client, channel=channel, thread_ts=thread_ts, text=message)
+                        _send_or_update(
+                            say=say,
+                            client=client,
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            pending_ts=pending_reply_ts,
+                            text=message,
+                        )
                     return
             _safe_say(
                 say=say,
@@ -460,6 +553,12 @@ def _run_socket_mode(args) -> None:
             )
             return
 
+        pending_reply_ts = _safe_slack_post_message(
+            client=client,
+            channel=channel,
+            thread_ts=thread_ts,
+            text="Working on it...",
+        )
         try:
             payload = _post_ispec_chat(
                 server=cfg.ispec_server,
@@ -475,20 +574,22 @@ def _run_socket_mode(args) -> None:
                 body = exc.response.text if exc.response is not None else ""
             except Exception:
                 body = ""
-            _safe_say(
+            _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=thread_ts,
+                pending_ts=pending_reply_ts,
                 text=f"iSPEC API error: {exc}\n{body}".strip(),
             )
             return
         except Exception as exc:
-            _safe_say(
+            _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=thread_ts,
+                pending_ts=pending_reply_ts,
                 text=f"iSPEC API call failed: {exc}",
             )
             return
@@ -501,19 +602,34 @@ def _run_socket_mode(args) -> None:
                 "session_id": session_id,
                 "user_message_id": int(compare.get("userMessageId") or 0),
             }
-            _safe_say(
+            _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=thread_ts,
+                pending_ts=pending_reply_ts,
                 text=_format_compare_choices(compare),
             )
             return
 
         if not message:
-            _safe_say(say=say, client=client, channel=channel, thread_ts=thread_ts, text="(no response)")
+            _send_or_update(
+                say=say,
+                client=client,
+                channel=channel,
+                thread_ts=thread_ts,
+                pending_ts=pending_reply_ts,
+                text="(no response)",
+            )
             return
-        _safe_say(say=say, client=client, channel=channel, thread_ts=thread_ts, text=message)
+        _send_or_update(
+            say=say,
+            client=client,
+            channel=channel,
+            thread_ts=thread_ts,
+            pending_ts=pending_reply_ts,
+            text=message,
+        )
 
     @app.event("message")
     def _on_message(event, say, client, context, ack):  # type: ignore[no-untyped-def]
@@ -553,6 +669,12 @@ def _run_socket_mode(args) -> None:
                 session_id = str(pending.get("session_id") or "")
                 user_message_id = int(pending.get("user_message_id") or 0)
                 if session_id and user_message_id > 0:
+                    pending_reply_ts = _safe_slack_post_message(
+                        client=client,
+                        channel=channel,
+                        thread_ts=reply_thread,
+                        text="Working on it...",
+                    )
                     try:
                         payload = _post_ispec_choose(
                             server=cfg.ispec_server,
@@ -568,20 +690,22 @@ def _run_socket_mode(args) -> None:
                             body = exc.response.text if exc.response is not None else ""
                         except Exception:
                             body = ""
-                        _safe_say(
+                        _send_or_update(
                             say=say,
                             client=client,
                             channel=channel,
                             thread_ts=reply_thread,
+                            pending_ts=pending_reply_ts,
                             text=f"iSPEC API error: {exc}\n{body}".strip(),
                         )
                         return
                     except Exception as exc:
-                        _safe_say(
+                        _send_or_update(
                             say=say,
                             client=client,
                             channel=channel,
                             thread_ts=reply_thread,
+                            pending_ts=pending_reply_ts,
                             text=f"iSPEC API call failed: {exc}",
                         )
                         return
@@ -589,11 +713,12 @@ def _run_socket_mode(args) -> None:
                     pending_compare.pop(pending_key, None)
                     message = str(payload.get("message") or "").strip()
                     if message:
-                        _safe_say(
+                        _send_or_update(
                             say=say,
                             client=client,
                             channel=channel,
                             thread_ts=reply_thread,
+                            pending_ts=pending_reply_ts,
                             text=message,
                         )
             return
@@ -632,6 +757,12 @@ def _run_socket_mode(args) -> None:
                 "user_real_name": cached.get("user_real_name"),
             },
         }
+        pending_reply_ts = _safe_slack_post_message(
+            client=client,
+            channel=channel,
+            thread_ts=reply_thread,
+            text="Working on it...",
+        )
 
         try:
             payload = _post_ispec_chat(
@@ -648,20 +779,22 @@ def _run_socket_mode(args) -> None:
                 body = exc.response.text if exc.response is not None else ""
             except Exception:
                 body = ""
-            _safe_say(
+            _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=reply_thread,
+                pending_ts=pending_reply_ts,
                 text=f"iSPEC API error: {exc}\n{body}".strip(),
             )
             return
         except Exception as exc:
-            _safe_say(
+            _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=reply_thread,
+                pending_ts=pending_reply_ts,
                 text=f"iSPEC API call failed: {exc}",
             )
             return
@@ -673,19 +806,34 @@ def _run_socket_mode(args) -> None:
                 "session_id": session_id,
                 "user_message_id": int(compare.get("userMessageId") or 0),
             }
-            _safe_say(
+            _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=reply_thread,
+                pending_ts=pending_reply_ts,
                 text=_format_compare_choices(compare),
             )
             return
 
         if not message:
-            _safe_say(say=say, client=client, channel=channel, thread_ts=reply_thread, text="(no response)")
+            _send_or_update(
+                say=say,
+                client=client,
+                channel=channel,
+                thread_ts=reply_thread,
+                pending_ts=pending_reply_ts,
+                text="(no response)",
+            )
             return
-        _safe_say(say=say, client=client, channel=channel, thread_ts=reply_thread, text=message)
+        _send_or_update(
+            say=say,
+            client=client,
+            channel=channel,
+            thread_ts=reply_thread,
+            pending_ts=pending_reply_ts,
+            text=message,
+        )
 
     logger.info("Starting Slack bot (Socket Mode) -> %s", cfg.ispec_server)
     SocketModeHandler(app, cfg.app_token).start()

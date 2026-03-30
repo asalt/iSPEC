@@ -50,6 +50,7 @@ def test_supervisor_seeds_legacy_project_comment_writeback_command(tmp_path, mon
     monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_PROJECT_ID", "1351")
     monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_LIMIT", "77")
     monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_DRY_RUN", "1")
+    monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_RECENT_DAYS", "14")
 
     fixed_now = datetime(2026, 3, 23, 15, 0, tzinfo=UTC)
     import ispec.supervisor.loop as supervisor_loop
@@ -74,6 +75,7 @@ def test_supervisor_seeds_legacy_project_comment_writeback_command(tmp_path, mon
         assert cmd.payload_json["project_id"] == 1351
         assert cmd.payload_json["limit"] == 77
         assert cmd.payload_json["dry_run"] is True
+        assert cmd.payload_json["recent_days"] == 14
         assert cmd.payload_json["meta"]["run_id"] == "run-1"
 
 

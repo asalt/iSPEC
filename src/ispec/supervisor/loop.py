@@ -49,6 +49,7 @@ from ispec.assistant.models import (
     SupportSessionReview,
 )
 from ispec.assistant.prompting import estimate_tokens_for_messages
+from ispec.assistant.response_contracts import response_contract_names
 from ispec.assistant.schedules import (
     AssistantSchedule,
     load_assistant_schedules as _load_assistant_schedules,
@@ -57,6 +58,12 @@ from ispec.assistant.schedules import (
     parse_weekday as _parse_weekday,
 )
 from ispec.assistant.service import AssistantReply, _system_prompt_planner, generate_reply
+from ispec.assistant.tool_routing import tool_groups_for_available_tools
+from ispec.assistant.turn_decision import (
+    parse_turn_decision_mode,
+    run_turn_decision_pipeline,
+    selected_tool_names_from_decision,
+)
 from ispec.assistant.tools import (
     TOOL_CALL_PREFIX,
     extract_tool_call_line,
@@ -177,6 +184,14 @@ def _state_dir_is_dev() -> bool:
     except Exception:
         return False
     return path.name == ".pids"
+
+
+def _assistant_turn_decision_mode() -> str:
+    provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
+    return parse_turn_decision_mode(
+        os.getenv("ISPEC_ASSISTANT_TURN_DECISION_MODE"),
+        auto_shadow=_state_dir_is_dev() and provider == "vllm",
+    )
 
 
 def _inference_broker_enabled_status() -> tuple[bool, str | None]:
@@ -2762,6 +2777,48 @@ def _task_scheduled_assistant_prompt(
             error="scheduled_assistant_required_tool_unavailable",
         )
 
+    provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
+    turn_decision_mode = _assistant_turn_decision_mode()
+    turn_decision_groups = tool_groups_for_available_tools(provided_tool_names)
+    turn_decision_result = None
+    turn_decision_runtime_applied = False
+    if provider == "vllm" and turn_decision_mode != "off":
+        turn_decision_result = run_turn_decision_pipeline(
+            generate_reply_fn=generate_reply,
+            mode=turn_decision_mode,
+            source="scheduled_assistant",
+            user_message=prompt_text,
+            last_assistant_message=None,
+            focused_project_id=None,
+            referenced_project_ids=[],
+            groups=turn_decision_groups,
+            response_modes=["single"],
+            contract_caps=list(response_contract_names()),
+            extra_context={
+                "job_name": job_name or None,
+                "required_tool": required_tool,
+                "allowed_tools": sorted(provided_tool_names),
+            },
+        )
+        turn_decision_runtime_applied = bool(
+            turn_decision_result.ok and turn_decision_mode == "own" and turn_decision_result.decision is not None
+        )
+    if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
+        selected_tool_names = selected_tool_names_from_decision(
+            groups=turn_decision_groups,
+            decision=turn_decision_result.decision,
+            always_include=[required_tool] if required_tool else None,
+        )
+        tool_schemas = _filter_openai_tools_by_name(
+            tools=tool_schemas,
+            allowed_names=selected_tool_names,
+        )
+        provided_tool_names = {
+            name
+            for name in (_openai_tool_name_from_spec(tool) for tool in tool_schemas)
+            if isinstance(name, str) and name
+        }
+
     system_prompt = _scheduled_assistant_system_prompt(
         allowed_tool_names=provided_tool_names,
         required_tool=required_tool,
@@ -2792,6 +2849,7 @@ def _task_scheduled_assistant_prompt(
     final_text = ""
     forced_required_tool_round = False
     max_rounds = max(4, int(max_tool_calls) + 3)
+    turn_decision_meta = turn_decision_result.as_meta() if turn_decision_result is not None else None
 
     def execute_tool(tool_name: str, tool_args: dict[str, Any], *, protocol: str) -> dict[str, Any]:
         nonlocal used_tool_calls, required_tool_calls
@@ -2865,6 +2923,17 @@ def _task_scheduled_assistant_prompt(
                 if _openai_tool_name_from_spec(tool) == required_tool
             ]
             tool_choice = {"type": "function", "function": {"name": required_tool}}
+        elif (
+            llm_round == 1
+            and turn_decision_runtime_applied
+            and turn_decision_result
+            and turn_decision_result.decision is not None
+            and turn_decision_result.decision.tool_plan.preferred_first_tool in provided_tool_names
+        ):
+            tool_choice = {
+                "type": "function",
+                "function": {"name": str(turn_decision_result.decision.tool_plan.preferred_first_tool)},
+            }
 
         messages_for_llm: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -2977,6 +3046,7 @@ def _task_scheduled_assistant_prompt(
                         "final_text": final_text,
                         "tool_calls": tool_calls,
                         "required_tool": required_tool,
+                        "turn_decision": turn_decision_meta,
                     },
                     error="scheduled_assistant_required_tool_not_called",
                     prompt={
@@ -3015,6 +3085,7 @@ def _task_scheduled_assistant_prompt(
                 "queued_command_ids": queued_command_ids,
                 "used_tool_calls": int(used_tool_calls),
                 "tool_calls": tool_calls,
+                "turn_decision": turn_decision_meta,
                 "final_text": final_text,
                 "llm": {
                     "provider": reply.provider,
@@ -3042,6 +3113,7 @@ def _task_scheduled_assistant_prompt(
             "required_tool": required_tool,
             "required_tool_called": bool(required_tool_calls > 0) if required_tool else None,
             "tool_calls": tool_calls,
+            "turn_decision": turn_decision_meta,
             "final_text": final_text,
         },
         error="scheduled_assistant_max_rounds_exceeded",
@@ -3113,7 +3185,7 @@ def _scheduled_assistant_context_message(*, payload: dict[str, Any]) -> str:
 
 def _scheduled_assistant_system_prompt(*, allowed_tool_names: set[str], required_tool: str | None) -> str:
     base = _system_prompt_planner(
-        tools_available=True,
+        tools_available=bool(allowed_tool_names),
         response_format="single",
         tool_names=allowed_tool_names,
     ).strip()
@@ -5588,6 +5660,18 @@ def _legacy_sync_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[s
         max_pages = None
     max_project_comments = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_PROJECT_COMMENTS")) or 25
     max_experiment_runs = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_EXPERIMENT_RUNS")) or 25
+    recent_project_comment_days = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_RECENT_PROJECT_COMMENT_DAYS"))
+    if recent_project_comment_days is None:
+        recent_project_comment_days = 30
+    elif recent_project_comment_days <= 0:
+        recent_project_comment_days = None
+    recent_project_comment_scan_limit = _safe_int(
+        os.getenv("ISPEC_LEGACY_SYNC_RECENT_PROJECT_COMMENT_SCAN_LIMIT")
+    )
+    if recent_project_comment_scan_limit is None:
+        recent_project_comment_scan_limit = max(1000, int(limit))
+    elif recent_project_comment_scan_limit <= 0:
+        recent_project_comment_scan_limit = None
     backfill_missing_env = os.getenv("ISPEC_LEGACY_SYNC_BACKFILL_MISSING")
     backfill_missing = True if backfill_missing_env is None else _is_truthy(backfill_missing_env)
 
@@ -5597,6 +5681,16 @@ def _legacy_sync_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[s
         "backfill_missing": bool(backfill_missing),
         "max_project_comments": int(max_project_comments),
         "max_experiment_runs": int(max_experiment_runs),
+        "recent_project_comment_days": (
+            int(recent_project_comment_days)
+            if isinstance(recent_project_comment_days, int)
+            else None
+        ),
+        "recent_project_comment_scan_limit": (
+            int(recent_project_comment_scan_limit)
+            if isinstance(recent_project_comment_scan_limit, int)
+            else None
+        ),
         "meta": {"enqueued_by": "supervisor", "agent_id": agent_id, "run_id": run_id},
     }
     return payload, interval_seconds
@@ -5713,6 +5807,12 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
 
         max_project_comments = _safe_int(payload.get("max_project_comments")) or 25
         max_experiment_runs = _safe_int(payload.get("max_experiment_runs")) or 25
+        recent_project_comment_days = _safe_int(payload.get("recent_project_comment_days"))
+        if recent_project_comment_days is not None and recent_project_comment_days <= 0:
+            recent_project_comment_days = None
+        recent_project_comment_scan_limit = _safe_int(payload.get("recent_project_comment_scan_limit"))
+        if recent_project_comment_scan_limit is not None and recent_project_comment_scan_limit <= 0:
+            recent_project_comment_scan_limit = None
 
         summary = sync_legacy_all(
             db_file_path=payload.get("db_file_path"),
@@ -5726,6 +5826,8 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
             backfill_missing=bool(backfill_missing_bool),
             max_project_comments=int(max_project_comments),
             max_experiment_runs=int(max_experiment_runs),
+            recent_project_comment_days=recent_project_comment_days,
+            recent_project_comment_scan_limit=recent_project_comment_scan_limit,
             dump_json=payload.get("dump_json"),
         )
         return CommandExecution(ok=True, result=dict(summary))
@@ -5755,6 +5857,11 @@ def _legacy_push_project_comments_payload_from_env(*, agent_id: str, run_id: str
     project_id = _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_PROJECT_ID"))
     if project_id is not None and int(project_id) <= 0:
         project_id = None
+    recent_days = _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_RECENT_DAYS"))
+    if recent_days is None:
+        recent_days = 30
+    elif recent_days <= 0:
+        recent_days = None
 
     dry_run_env = os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_DRY_RUN")
     dry_run = _is_truthy(dry_run_env) if dry_run_env is not None else False
@@ -5763,6 +5870,7 @@ def _legacy_push_project_comments_payload_from_env(*, agent_id: str, run_id: str
         "project_id": int(project_id) if isinstance(project_id, int) else None,
         "limit": int(limit),
         "dry_run": bool(dry_run),
+        "recent_days": int(recent_days) if isinstance(recent_days, int) else None,
         "meta": {"enqueued_by": "supervisor", "agent_id": agent_id, "run_id": run_id},
     }
 
@@ -5861,6 +5969,7 @@ def _ensure_legacy_push_project_comments_scheduled_commands(*, agent_id: str, ru
         push_state["project_id"] = _safe_int(payload.get("project_id"))
         push_state["limit"] = int(_safe_int(payload.get("limit")) or 0)
         push_state["dry_run"] = bool(payload.get("dry_run"))
+        push_state["recent_days"] = _safe_int(payload.get("recent_days"))
 
         scheduler_state["legacy_push_project_comments"] = push_state
         _save_scheduler_state(run=run, state=scheduler_state)
@@ -5913,6 +6022,10 @@ def _run_legacy_push_project_comments(payload: dict[str, Any]) -> CommandExecuti
         else:
             dry_run = bool(dry_run_raw)
 
+        recent_days = _safe_int(payload.get("recent_days"))
+        if recent_days is not None and recent_days <= 0:
+            recent_days = None
+
         summary = sync_project_comments_to_legacy(
             legacy_url=payload.get("legacy_url"),
             schema_path=payload.get("schema_path"),
@@ -5920,6 +6033,7 @@ def _run_legacy_push_project_comments(payload: dict[str, Any]) -> CommandExecuti
             project_id=project_id,
             limit=int(_safe_int(payload.get("limit")) or 5000),
             dry_run=bool(dry_run),
+            recent_days=recent_days,
         )
         return CommandExecution(ok=True, result=dict(summary))
     except Exception as exc:

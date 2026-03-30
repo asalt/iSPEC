@@ -840,6 +840,13 @@ def register_subcommands(subparsers):
         action="store_true",
         help="Compare local comments against legacy and report what would be inserted without posting.",
     )
+    push_project_comments_parser.add_argument(
+        "--recent-days",
+        dest="recent_days",
+        type=int,
+        default=None,
+        help="Only consider local comments modified within the last N days before compare/push.",
+    )
 
     sync_experiments_parser = subparsers.add_parser(
         "sync-legacy-experiments",
@@ -1009,6 +1016,20 @@ def register_subcommands(subparsers):
         type=int,
         default=25,
         help="Max number of recently touched experiments to fetch runs for (default: 25).",
+    )
+    sync_all_parser.add_argument(
+        "--recent-project-comment-days",
+        dest="recent_project_comment_days",
+        type=int,
+        default=None,
+        help="Also discover projects with legacy comment activity in the last N days before pulling per-project history.",
+    )
+    sync_all_parser.add_argument(
+        "--recent-project-comment-scan-limit",
+        dest="recent_project_comment_scan_limit",
+        type=int,
+        default=None,
+        help="Max legacy project-history rows to scan when discovering recent comment-active projects.",
     )
     sync_all_parser.add_argument(
         "--dump-json",
@@ -1342,6 +1363,7 @@ def dispatch(args):
             project_id=getattr(args, "project_id", None),
             limit=int(getattr(args, "limit", 5000)),
             dry_run=bool(getattr(args, "dry_run", False)),
+            recent_days=getattr(args, "recent_days", None),
         )
         logger.info("local project comments push summary: %s", summary)
     elif args.subcommand == "sync-legacy-experiments":
@@ -1393,6 +1415,8 @@ def dispatch(args):
             backfill_missing=bool(getattr(args, "backfill_missing", True)),
             max_project_comments=int(getattr(args, "max_project_comments", 25)),
             max_experiment_runs=int(getattr(args, "max_experiment_runs", 25)),
+            recent_project_comment_days=getattr(args, "recent_project_comment_days", None),
+            recent_project_comment_scan_limit=getattr(args, "recent_project_comment_scan_limit", None),
             dump_json=getattr(args, "dump_json", None),
         )
         logger.info("legacy sync-all summary: %s", summary)

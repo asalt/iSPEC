@@ -255,3 +255,72 @@ def test_sync_project_comments_to_legacy_returns_early_when_no_candidates(tmp_pa
     assert summary["would_insert"] == 0
     assert summary["inserted"] == 0
     assert summary["skipped_system"] == 1
+
+
+def test_sync_project_comments_to_legacy_recent_days_filters_old_rows(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "push.db"
+    _seed_project_comment_db(db_path)
+
+    recent_dt = datetime(2026, 3, 20, 9, 0, 0)
+    old_dt = datetime(2026, 1, 10, 9, 0, 0)
+
+    with get_session(file_path=str(db_path)) as session:
+        session.add(
+            ProjectComment(
+                project_id=1498,
+                person_id=1,
+                com_CreationTS=old_dt,
+                com_ModificationTS=old_dt,
+                com_Comment="old local note",
+                com_CommentType="assistant_note",
+                com_AddedBy="api_key",
+            )
+        )
+        session.add(
+            ProjectComment(
+                project_id=1498,
+                person_id=1,
+                com_CreationTS=recent_dt,
+                com_ModificationTS=recent_dt,
+                com_Comment="recent local note",
+                com_CommentType="assistant_note",
+                com_AddedBy="api_key",
+            )
+        )
+
+    def fake_get(url, params=None, headers=None, auth=None, timeout=None):
+        if params == {"limit": 1}:
+            return DummyResponse(
+                {
+                    "ok": True,
+                    "table": "iSPEC_ProjectHistory",
+                    "fields": [
+                        "prh_PRJRecNo",
+                        "prh_Comment",
+                        "prh_AddedBy",
+                        "prh_CreationTS",
+                        "prh_CommentType",
+                    ],
+                    "items": [],
+                }
+            )
+        return DummyResponse({"ok": True, "table": "iSPEC_ProjectHistory", "items": [], "has_more": False})
+
+    monkeypatch.setattr(legacy_sync.requests, "get", fake_get)
+
+    summary = legacy_sync.sync_project_comments_to_legacy(
+        legacy_url="http://legacy.example",
+        db_file_path=str(db_path),
+        dry_run=True,
+        recent_days=14,
+        since="2026-03-10T00:00:00Z",
+    )
+
+    assert summary["selected"] == 1
+    assert summary["candidate_comments"] == 1
+    assert summary["would_insert"] == 1
+    assert summary["recent_days"] == 14
+    assert summary["recent_window_start"] == "2026-03-10T00:00:00Z"

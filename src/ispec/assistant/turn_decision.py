@@ -1,0 +1,645 @@
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Literal
+
+from ispec.assistant.response_contracts import ResponseContractName, response_contract_names
+from ispec.assistant.service import AssistantReply
+from ispec.assistant.tool_routing import ToolGroup, tool_names_for_groups
+
+
+TurnDecisionMode = Literal["off", "shadow", "own"]
+TurnDecisionSource = Literal["support_chat", "scheduled_assistant"]
+PrimaryGoal = Literal[
+    "answer_question",
+    "inspect_state",
+    "draft_project_comment",
+    "save_project_comment",
+    "confirm_save",
+    "automation_task",
+    "devops_task",
+]
+ClarificationReason = Literal[
+    "none",
+    "missing_identifier",
+    "missing_comment_text",
+    "ambiguous_target",
+    "missing_confirmation",
+]
+WritePlanMode = Literal["none", "draft_only", "save_now", "confirm_save"]
+ResponseMode = Literal["single", "compare"]
+
+_PRIMARY_GOALS: tuple[PrimaryGoal, ...] = (
+    "answer_question",
+    "inspect_state",
+    "draft_project_comment",
+    "save_project_comment",
+    "confirm_save",
+    "automation_task",
+    "devops_task",
+)
+_CLARIFICATION_REASONS: tuple[ClarificationReason, ...] = (
+    "none",
+    "missing_identifier",
+    "missing_comment_text",
+    "ambiguous_target",
+    "missing_confirmation",
+)
+_WRITE_PLAN_MODES: tuple[WritePlanMode, ...] = (
+    "none",
+    "draft_only",
+    "save_now",
+    "confirm_save",
+)
+_RESPONSE_MODES: tuple[ResponseMode, ...] = ("single", "compare")
+
+
+@dataclass(frozen=True)
+class TurnDecisionToolPlan:
+    use_tools: bool
+    primary_group: str | None
+    secondary_groups: tuple[str, ...]
+    preferred_first_tool: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "use_tools": self.use_tools,
+            "primary_group": self.primary_group,
+            "secondary_groups": list(self.secondary_groups),
+            "preferred_first_tool": self.preferred_first_tool,
+        }
+
+
+@dataclass(frozen=True)
+class TurnDecisionWritePlan:
+    mode: WritePlanMode
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"mode": self.mode}
+
+
+@dataclass(frozen=True)
+class TurnDecisionResponsePlan:
+    mode: ResponseMode
+    contract_cap: ResponseContractName | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "contract_cap": self.contract_cap,
+        }
+
+
+@dataclass(frozen=True)
+class TurnDecision:
+    source: TurnDecisionSource
+    primary_goal: PrimaryGoal
+    needs_clarification: bool
+    clarification_reason: ClarificationReason
+    tool_plan: TurnDecisionToolPlan
+    write_plan: TurnDecisionWritePlan
+    response_plan: TurnDecisionResponsePlan
+    confidence: float
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "primary_goal": self.primary_goal,
+            "needs_clarification": self.needs_clarification,
+            "clarification_reason": self.clarification_reason,
+            "tool_plan": self.tool_plan.as_dict(),
+            "write_plan": self.write_plan.as_dict(),
+            "response_plan": self.response_plan.as_dict(),
+            "confidence": self.confidence,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class TurnDecisionResult:
+    ok: bool
+    mode: TurnDecisionMode
+    source: TurnDecisionSource
+    applied: bool = False
+    decision: TurnDecision | None = None
+    raw_decision: dict[str, Any] | None = None
+    warnings: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    skipped_reason: str | None = None
+    reply_meta: dict[str, Any] | None = None
+
+    def as_meta(self) -> dict[str, Any]:
+        return {
+            "enabled": self.mode != "off",
+            "mode": self.mode,
+            "source": self.source,
+            "applied": self.applied,
+            "ok": self.ok,
+            "decision": self.decision.as_dict() if self.decision is not None else None,
+            "raw_decision": self.raw_decision,
+            "warnings": list(self.warnings),
+            "errors": list(self.errors),
+            "skipped_reason": self.skipped_reason,
+            "reply": self.reply_meta,
+        }
+
+
+def parse_turn_decision_mode(raw: str | None, *, auto_shadow: bool) -> TurnDecisionMode:
+    text = str(raw or "").strip().lower()
+    if not text or text == "auto":
+        return "shadow" if auto_shadow else "off"
+    if text in {"0", "false", "no", "off"}:
+        return "off"
+    if text in {"1", "true", "yes", "on", "shadow"}:
+        return "shadow"
+    if text == "own":
+        return "own"
+    return "off"
+
+
+def turn_decision_auto_shadow(*, assistant_provider: str, state_dir: str | None) -> bool:
+    if str(assistant_provider or "").strip().lower() != "vllm":
+        return False
+    raw = str(state_dir or "").strip()
+    if not raw:
+        return False
+    try:
+        path = Path(raw).expanduser().resolve()
+    except Exception:
+        return False
+    return path.name == ".pids"
+
+
+def turn_decision_schema(
+    *,
+    group_names: list[str],
+    tool_names: list[str],
+    response_modes: list[ResponseMode],
+    contract_caps: list[ResponseContractName],
+) -> dict[str, Any]:
+    primary_group_enum = [""] + [name for name in group_names if name]
+    tool_enum = [""] + [name for name in tool_names if name]
+    contract_enum = [""] + [name for name in contract_caps if name]
+    mode_enum = [mode for mode in response_modes if mode in _RESPONSE_MODES]
+    if not mode_enum:
+        mode_enum = ["single"]
+
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "source": {"type": "string", "enum": ["support_chat", "scheduled_assistant"]},
+            "primary_goal": {"type": "string", "enum": list(_PRIMARY_GOALS)},
+            "needs_clarification": {"type": "boolean"},
+            "clarification_reason": {"type": "string", "enum": list(_CLARIFICATION_REASONS)},
+            "tool_plan": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "use_tools": {"type": "boolean"},
+                    "primary_group": {"type": "string", "enum": primary_group_enum},
+                    "secondary_groups": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": group_names},
+                        "minItems": 0,
+                        "maxItems": 2,
+                    },
+                    "preferred_first_tool": {"type": "string", "enum": tool_enum},
+                },
+                "required": ["use_tools", "primary_group", "secondary_groups", "preferred_first_tool"],
+            },
+            "write_plan": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "mode": {"type": "string", "enum": list(_WRITE_PLAN_MODES)},
+                },
+                "required": ["mode"],
+            },
+            "response_plan": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "mode": {"type": "string", "enum": mode_enum},
+                    "contract_cap": {"type": "string", "enum": contract_enum},
+                },
+                "required": ["mode", "contract_cap"],
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "source",
+            "primary_goal",
+            "needs_clarification",
+            "clarification_reason",
+            "tool_plan",
+            "write_plan",
+            "response_plan",
+            "confidence",
+            "reason",
+        ],
+    }
+
+
+def _turn_decision_prompt(
+    *,
+    source: TurnDecisionSource,
+    groups: list[ToolGroup],
+    response_modes: list[ResponseMode],
+    contract_caps: list[ResponseContractName],
+) -> str:
+    lines = [
+        "Produce a structured turn decision for the iSPEC assistant.",
+        "Return only a JSON object that matches the schema exactly.",
+        "",
+        "Decision fields:",
+        "- primary_goal: the main job of this turn.",
+        "- needs_clarification / clarification_reason: only true when the assistant cannot safely continue without more input.",
+        "- tool_plan: whether tools should be used, the main tool group, up to two secondary groups, and one preferred first tool if obvious.",
+        "- write_plan.mode: none | draft_only | save_now | confirm_save.",
+        "- response_plan.mode: single or compare. Prefer single unless side-by-side alternatives would materially help.",
+        "- response_plan.contract_cap: choose the smallest response contract cap that should govern the final answer.",
+        "",
+        "Primary goals:",
+        "- answer_question: normal lookup/explanation/help answer.",
+        "- inspect_state: inspect tmux, repo, logs, or operational state.",
+        "- draft_project_comment: help draft/reword a project comment without saving yet.",
+        "- save_project_comment: user wants a project comment saved now.",
+        "- confirm_save: user is confirming that a previously drafted comment should now be saved.",
+        "- automation_task: internal scheduled assistant task.",
+        "- devops_task: task mainly about developer/devops operations or staff automation.",
+        "",
+        "Clarification reasons:",
+        "- none",
+        "- missing_identifier: needs a project/session/etc identifier.",
+        "- missing_comment_text: user wants to save a comment but has not provided the content yet.",
+        "- ambiguous_target: multiple plausible targets or unclear target.",
+        "- missing_confirmation: an explicit confirmation is still needed before a write.",
+        "",
+        "Write-plan rules:",
+        "- draft_project_comment must use draft_only.",
+        "- save_project_comment must use save_now.",
+        "- confirm_save must use confirm_save.",
+        "- all other primary goals should usually use none.",
+        "",
+        "Tool-plan rules:",
+        "- Prefer using tools when the answer should be grounded in current iSPEC state.",
+        "- preferred_first_tool should be empty unless one obvious first tool lookup stands out.",
+        "- Keep group selection tight; choose the smallest sufficient set.",
+        "",
+        "Response rules:",
+        "- Prefer the smallest response contract cap that fully answers the turn.",
+        "- Prefer single unless compare mode is genuinely helpful.",
+    ]
+    if source == "scheduled_assistant":
+        lines.extend(
+            [
+                "",
+                "Scheduled-assistant rules:",
+                "- This is not an end-user conversation.",
+                "- needs_clarification must be false.",
+                "- clarification_reason must be none.",
+                "- response_plan.mode must be single.",
+            ]
+        )
+
+    if groups:
+        lines.append("")
+        lines.append("Available tool groups:")
+        for group in groups:
+            lines.append(f"- {group.name}: {group.description}")
+    if response_modes:
+        lines.append("")
+        lines.append("Allowed response modes: " + ", ".join(response_modes))
+    if contract_caps:
+        lines.append("Allowed response contract caps: " + ", ".join(contract_caps))
+    return "\n".join(lines).strip()
+
+
+def _parse_json_object(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    raw = str(text).strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _clamp_confidence(raw: Any) -> float:
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.0
+    return max(0.0, min(1.0, value))
+
+
+def _normalize_write_mode(*, primary_goal: PrimaryGoal, raw_mode: Any, warnings: list[str]) -> WritePlanMode:
+    if primary_goal == "draft_project_comment":
+        if raw_mode != "draft_only":
+            warnings.append("write_plan_normalized_to_draft_only")
+        return "draft_only"
+    if primary_goal == "save_project_comment":
+        if raw_mode != "save_now":
+            warnings.append("write_plan_normalized_to_save_now")
+        return "save_now"
+    if primary_goal == "confirm_save":
+        if raw_mode != "confirm_save":
+            warnings.append("write_plan_normalized_to_confirm_save")
+        return "confirm_save"
+    if raw_mode not in _WRITE_PLAN_MODES:
+        if raw_mode not in (None, ""):
+            warnings.append("invalid_write_plan_mode")
+        return "none"
+    return raw_mode
+
+
+def _validate_turn_decision(
+    *,
+    raw_decision: dict[str, Any],
+    source: TurnDecisionSource,
+    groups: list[ToolGroup],
+    response_modes: list[ResponseMode],
+    contract_caps: list[ResponseContractName],
+) -> tuple[TurnDecision | None, list[str], list[str]]:
+    warnings: list[str] = []
+    errors: list[str] = []
+    group_names = [group.name for group in groups if group.name]
+    allowed_group_names = set(group_names)
+    group_by_tool: dict[str, str] = {}
+    for group in groups:
+        for tool_name in group.tool_names:
+            if tool_name and tool_name not in group_by_tool:
+                group_by_tool[tool_name] = group.name
+    allowed_tool_names = set(group_by_tool)
+
+    primary_goal_raw = raw_decision.get("primary_goal")
+    if primary_goal_raw not in _PRIMARY_GOALS:
+        errors.append("invalid_primary_goal")
+        return None, warnings, errors
+    primary_goal: PrimaryGoal = primary_goal_raw
+
+    needs_clarification = bool(raw_decision.get("needs_clarification"))
+    clarification_reason_raw = raw_decision.get("clarification_reason")
+    if clarification_reason_raw not in _CLARIFICATION_REASONS:
+        warnings.append("invalid_clarification_reason")
+        clarification_reason: ClarificationReason = "none"
+    else:
+        clarification_reason = clarification_reason_raw
+    if not needs_clarification:
+        clarification_reason = "none"
+
+    tool_plan_raw = raw_decision.get("tool_plan")
+    if not isinstance(tool_plan_raw, dict):
+        errors.append("missing_tool_plan")
+        return None, warnings, errors
+    use_tools = bool(tool_plan_raw.get("use_tools"))
+    primary_group_raw = str(tool_plan_raw.get("primary_group") or "").strip()
+    primary_group = primary_group_raw if primary_group_raw in allowed_group_names else None
+    if primary_group_raw and primary_group is None:
+        warnings.append("invalid_primary_group")
+
+    secondary_groups_raw = tool_plan_raw.get("secondary_groups")
+    secondary_groups: list[str] = []
+    if isinstance(secondary_groups_raw, list):
+        for item in secondary_groups_raw:
+            if isinstance(item, str) and item in allowed_group_names and item != primary_group and item not in secondary_groups:
+                secondary_groups.append(item)
+    elif secondary_groups_raw not in (None, []):
+        warnings.append("invalid_secondary_groups")
+    secondary_groups = secondary_groups[:2]
+
+    preferred_first_tool_raw = str(tool_plan_raw.get("preferred_first_tool") or "").strip()
+    preferred_first_tool = preferred_first_tool_raw if preferred_first_tool_raw in allowed_tool_names else None
+    if preferred_first_tool_raw and preferred_first_tool is None:
+        warnings.append("invalid_preferred_first_tool")
+
+    inferred_primary_group = group_by_tool.get(preferred_first_tool or "")
+    if primary_group is None and inferred_primary_group:
+        primary_group = inferred_primary_group
+        warnings.append("inferred_primary_group_from_preferred_tool")
+
+    if not use_tools and (primary_group or secondary_groups or preferred_first_tool):
+        warnings.append("tool_plan_normalized_to_use_tools")
+        use_tools = True
+    if use_tools and primary_group is None and not preferred_first_tool:
+        warnings.append("tool_plan_normalized_to_no_tools")
+        use_tools = False
+        secondary_groups = []
+    if not use_tools:
+        primary_group = None
+        secondary_groups = []
+        preferred_first_tool = None
+
+    write_plan_raw = raw_decision.get("write_plan")
+    if not isinstance(write_plan_raw, dict):
+        errors.append("missing_write_plan")
+        return None, warnings, errors
+    write_mode = _normalize_write_mode(
+        primary_goal=primary_goal,
+        raw_mode=write_plan_raw.get("mode"),
+        warnings=warnings,
+    )
+
+    response_plan_raw = raw_decision.get("response_plan")
+    if not isinstance(response_plan_raw, dict):
+        errors.append("missing_response_plan")
+        return None, warnings, errors
+    allowed_response_modes = [mode for mode in response_modes if mode in _RESPONSE_MODES] or ["single"]
+    response_mode_raw = response_plan_raw.get("mode")
+    response_mode: ResponseMode = (
+        response_mode_raw if response_mode_raw in allowed_response_modes else allowed_response_modes[0]
+    )
+    if response_mode_raw not in allowed_response_modes:
+        warnings.append("invalid_response_mode")
+
+    contract_cap_raw = str(response_plan_raw.get("contract_cap") or "").strip()
+    contract_cap: ResponseContractName | None = None
+    if contract_cap_raw:
+        if contract_cap_raw in contract_caps:
+            contract_cap = contract_cap_raw  # type: ignore[assignment]
+        else:
+            warnings.append("invalid_contract_cap")
+
+    if source == "scheduled_assistant":
+        if needs_clarification:
+            warnings.append("scheduled_assistant_forced_no_clarification")
+        needs_clarification = False
+        clarification_reason = "none"
+        if response_mode != "single":
+            warnings.append("scheduled_assistant_forced_single_mode")
+        response_mode = "single"
+
+    confidence = _clamp_confidence(raw_decision.get("confidence"))
+    reason = str(raw_decision.get("reason") or "").strip()
+    if not reason:
+        warnings.append("empty_reason")
+
+    return (
+        TurnDecision(
+            source=source,
+            primary_goal=primary_goal,
+            needs_clarification=needs_clarification,
+            clarification_reason=clarification_reason,
+            tool_plan=TurnDecisionToolPlan(
+                use_tools=use_tools,
+                primary_group=primary_group,
+                secondary_groups=tuple(secondary_groups),
+                preferred_first_tool=preferred_first_tool,
+            ),
+            write_plan=TurnDecisionWritePlan(mode=write_mode),
+            response_plan=TurnDecisionResponsePlan(
+                mode=response_mode,
+                contract_cap=contract_cap,
+            ),
+            confidence=confidence,
+            reason=reason,
+        ),
+        warnings,
+        errors,
+    )
+
+
+def run_turn_decision_pipeline(
+    *,
+    generate_reply_fn: Callable[..., AssistantReply],
+    mode: TurnDecisionMode,
+    source: TurnDecisionSource,
+    user_message: str,
+    last_assistant_message: str | None,
+    focused_project_id: int | None,
+    referenced_project_ids: list[int] | None,
+    groups: list[ToolGroup],
+    response_modes: list[ResponseMode],
+    contract_caps: list[ResponseContractName] | None = None,
+    extra_context: dict[str, Any] | None = None,
+) -> TurnDecisionResult:
+    if mode == "off":
+        return TurnDecisionResult(ok=False, mode=mode, source=source, skipped_reason="mode_off")
+
+    contract_cap_names = list(contract_caps or response_contract_names())
+    group_names = [group.name for group in groups if group.name]
+    tool_names = [
+        tool_name
+        for group in groups
+        for tool_name in group.tool_names
+        if isinstance(tool_name, str) and tool_name
+    ]
+    schema = turn_decision_schema(
+        group_names=group_names,
+        tool_names=tool_names,
+        response_modes=response_modes,
+        contract_caps=contract_cap_names,
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": _turn_decision_prompt(
+                source=source,
+                groups=groups,
+                response_modes=response_modes,
+                contract_caps=contract_cap_names,
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "source": source,
+                    "user_message": user_message,
+                    "last_assistant_message": last_assistant_message or "",
+                    "focused_project_id": focused_project_id,
+                    "referenced_project_ids": list(referenced_project_ids or []),
+                    "available_groups": group_names,
+                    "available_tools": tool_names,
+                    "response_modes": response_modes,
+                    "response_contract_caps": contract_cap_names,
+                    "context": extra_context or {},
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    reply = generate_reply_fn(
+        messages=messages,
+        tools=None,
+        vllm_extra_body={
+            "guided_json": schema,
+            "max_tokens": 300,
+            "temperature": 0,
+        },
+    )
+    result = TurnDecisionResult(
+        ok=False,
+        mode=mode,
+        source=source,
+        applied=mode == "own",
+        reply_meta={
+            "provider": reply.provider,
+            "model": reply.model,
+            "meta": reply.meta,
+        },
+    )
+    parsed = _parse_json_object(reply.content)
+    result.raw_decision = parsed
+    if not isinstance(parsed, dict):
+        result.errors.append("invalid_json")
+        return result
+
+    validated, warnings, errors = _validate_turn_decision(
+        raw_decision=parsed,
+        source=source,
+        groups=groups,
+        response_modes=response_modes,
+        contract_caps=contract_cap_names,
+    )
+    result.warnings.extend(warnings)
+    result.errors.extend(errors)
+    if validated is None:
+        return result
+
+    result.ok = True
+    result.decision = validated
+    return result
+
+
+def selected_tool_names_from_decision(
+    *,
+    groups: list[ToolGroup],
+    decision: TurnDecision,
+    explicit_requested_tool_names: list[str] | None = None,
+    always_include: list[str] | None = None,
+) -> set[str]:
+    selected: set[str] = set(always_include or [])
+    if decision.tool_plan.primary_group:
+        selected |= tool_names_for_groups(
+            groups=groups,
+            primary=decision.tool_plan.primary_group,
+            secondary=list(decision.tool_plan.secondary_groups),
+        )
+    if decision.tool_plan.preferred_first_tool:
+        selected.add(decision.tool_plan.preferred_first_tool)
+    if explicit_requested_tool_names:
+        selected |= {
+            str(name).strip()
+            for name in explicit_requested_tool_names
+            if isinstance(name, str) and str(name).strip()
+        }
+    return selected

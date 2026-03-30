@@ -6,6 +6,7 @@ from typing import Any
 from ispec.logging import get_logger
 
 from .legacy_sync import (
+    scan_recent_legacy_project_comment_projects,
     sync_legacy_experiment_runs,
     sync_legacy_experiments,
     sync_legacy_people,
@@ -54,6 +55,8 @@ def sync_legacy_all(
     backfill_missing: bool = True,
     max_project_comments: int = 25,
     max_experiment_runs: int = 25,
+    recent_project_comment_days: int | None = None,
+    recent_project_comment_scan_limit: int | None = None,
     dump_json: str | Path | None = None,
 ) -> dict[str, Any]:
     """Convenience wrapper to sync the core legacy metadata needed by iSPEC.
@@ -119,9 +122,33 @@ def sync_legacy_all(
     touched_projects = _coerce_int_list(projects.get("touched_ids"))
     touched_experiments = _coerce_int_list(experiments.get("touched_ids"))
 
+    recent_comment_scan_limit_value = recent_project_comment_scan_limit
+    if recent_comment_scan_limit_value is None:
+        recent_comment_scan_limit_value = max(1000, int(limit))
+
+    recent_comment_projects = scan_recent_legacy_project_comment_projects(
+        legacy_url=legacy_url,
+        schema_path=schema_path,
+        recent_days=recent_project_comment_days,
+        limit=max(1, int(recent_comment_scan_limit_value)),
+        dump_json=normalized_dump,
+    )
+    recent_comment_project_ids = _coerce_int_list(recent_comment_projects.get("project_ids"))
+
+    comment_project_ids: list[int] = []
+    seen_comment_projects: set[int] = set()
+    for candidate_project_id in [*touched_projects, *recent_comment_project_ids]:
+        project_int = int(candidate_project_id)
+        if project_int in seen_comment_projects:
+            continue
+        seen_comment_projects.add(project_int)
+        comment_project_ids.append(project_int)
+        if len(comment_project_ids) >= max(0, int(max_project_comments)):
+            break
+
     comments_totals = {"items": 0, "inserted": 0, "updated": 0, "conflicted": 0}
     comments_rows: list[dict[str, Any]] = []
-    for project_id in touched_projects[: max(0, int(max_project_comments))]:
+    for project_id in comment_project_ids:
         summary = sync_legacy_project_comments(
             legacy_url=legacy_url,
             schema_path=schema_path,
@@ -157,7 +184,21 @@ def sync_legacy_all(
         "people": people,
         "experiments": experiments,
         "project_comments": {
-            "requested": len(touched_projects[: max(0, int(max_project_comments))]),
+            "requested": len(comment_project_ids),
+            "candidate_projects": comment_project_ids[:10],
+            "source_counts": {
+                "project_sync_touched": len(touched_projects),
+                "recent_comment_scan": len(recent_comment_project_ids),
+            },
+            "recent_scan": {
+                "items": int(recent_comment_projects.get("items") or 0),
+                "projects": int(recent_comment_projects.get("projects") or 0),
+                "legacy_table": recent_comment_projects.get("legacy_table"),
+                "has_more": bool(recent_comment_projects.get("has_more")),
+                "recent_days": recent_comment_projects.get("recent_days"),
+                "recent_window_start": recent_comment_projects.get("recent_window_start"),
+                "disabled": bool(recent_comment_projects.get("disabled")),
+            },
             "totals": comments_totals,
             "summaries": comments_rows[:10],
         },
