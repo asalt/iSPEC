@@ -38,6 +38,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "These tests can hang in some sandboxed environments."
         ),
     )
+    parser.addoption(
+        "--run-behavioral",
+        action="store_true",
+        default=_is_truthy(os.getenv("ISPEC_RUN_BEHAVIORAL")),
+        help=(
+            "Run behavioral tests under tests/behavioral. "
+            "These scenario-style tests are opt-in and intended for experimental sandbox evaluation."
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -45,15 +54,25 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "testclient: requires FastAPI/Starlette TestClient (opt-in via --run-testclient)",
     )
+    config.addinivalue_line(
+        "markers",
+        "behavioral: scenario-style sandbox tests (opt-in via --run-behavioral)",
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    if config.getoption("--run-testclient"):
-        return
-
-    skip = pytest.mark.skip(
+    run_testclient = bool(config.getoption("--run-testclient"))
+    run_behavioral = bool(config.getoption("--run-behavioral"))
+    skip_testclient = pytest.mark.skip(
         reason="Requires FastAPI/Starlette TestClient (opt-in with --run-testclient or ISPEC_RUN_TESTCLIENT=1)."
     )
+    skip_behavioral = pytest.mark.skip(
+        reason="Behavioral tests are opt-in (use --run-behavioral or ISPEC_RUN_BEHAVIORAL=1)."
+    )
     for item in items:
-        if "testclient" in item.keywords:
-            item.add_marker(skip)
+        if not run_testclient and "testclient" in item.keywords:
+            item.add_marker(skip_testclient)
+        if not run_behavioral:
+            item_path = str(getattr(item, "fspath", "") or "")
+            if "behavioral" in item.keywords or "/tests/behavioral/" in item_path:
+                item.add_marker(skip_behavioral)

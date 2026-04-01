@@ -24,3 +24,4 @@ build/
 data/
 experiments_dump/
 src/repo.txt
+tests/behavioral/local/

@@ -17,6 +17,7 @@ from sqlalchemy import Text, cast, func, or_
 from sqlalchemy.orm import Session, defer
 
 from ispec.agent.archive import get_agent_archive_session_if_available
+from ispec.agent.connect import get_agent_session
 from ispec.assistant.context import person_summary, project_summary
 from ispec.assistant.models import (
     SupportMemory,
@@ -35,7 +36,12 @@ from ispec.assistant.schedules import (
     parse_weekday,
     write_assistant_schedule_rows,
 )
-from ispec.agent.commands import COMMAND_DEV_RESTART_SERVICES, COMMAND_ORCHESTRATOR_TICK, COMMAND_SLACK_POST_MESSAGE
+from ispec.agent.commands import (
+    COMMAND_DEV_RESTART_SERVICES,
+    COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
+    COMMAND_ORCHESTRATOR_TICK,
+    COMMAND_SLACK_POST_MESSAGE,
+)
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.db.models import (
     AuthUser,
@@ -1661,6 +1667,97 @@ def _clamp_int(value: int | None, *, default: int, min_value: int, max_value: in
     return max(min_value, min(max_value, value))
 
 
+def _enqueue_legacy_project_comment_push(
+    *,
+    project_id: int,
+    added_by: str | None,
+    comment_id: int,
+) -> dict[str, Any] | None:
+    if project_id <= 0:
+        return None
+    if not _is_truthy(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_ENABLED")):
+        return None
+
+    now = datetime.now(tz=UTC_TZ)
+    limit = _clamp_int(
+        _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_LIMIT")),
+        default=5000,
+        min_value=1,
+        max_value=50000,
+    )
+    max_attempts = _clamp_int(
+        _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_MAX_ATTEMPTS")),
+        default=1,
+        min_value=1,
+        max_value=10,
+    )
+    recent_days = _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_RECENT_DAYS"))
+    if recent_days is None:
+        recent_days = 30
+    elif recent_days <= 0:
+        recent_days = None
+
+    payload: dict[str, Any] = {
+        "source": "assistant_project_comment_write",
+        "trigger": "project_comment_created",
+        "project_id": int(project_id),
+        "limit": int(limit),
+        "dry_run": _is_truthy(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_DRY_RUN")),
+        "enqueued_at": now.isoformat(),
+        "comment_id": int(comment_id),
+    }
+    if recent_days is not None:
+        payload["recent_days"] = int(recent_days)
+    if isinstance(added_by, str) and added_by.strip():
+        payload["comment_added_by"] = added_by.strip()
+
+    try:
+        with get_agent_session() as agent_db:
+            existing = (
+                agent_db.query(AgentCommand)
+                .filter(AgentCommand.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS)
+                .filter(AgentCommand.status.in_(["queued", "running"]))
+                .order_by(AgentCommand.id.asc())
+                .first()
+            )
+            if existing is not None:
+                return {
+                    "ok": True,
+                    "enqueued": False,
+                    "reason": "already_enqueued",
+                    "command_id": int(existing.id),
+                    "project_id": int(project_id),
+                }
+
+            cmd = AgentCommand(
+                command_type=COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
+                status="queued",
+                priority=0,
+                available_at=now,
+                attempts=0,
+                max_attempts=int(max_attempts),
+                payload_json=payload,
+                result_json={},
+            )
+            agent_db.add(cmd)
+            agent_db.flush()
+            command_id = int(cmd.id)
+
+        return {
+            "ok": True,
+            "enqueued": True,
+            "command_id": command_id,
+            "project_id": int(project_id),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "enqueued": False,
+            "project_id": int(project_id),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _assistant_schedule_known_tool_names() -> set[str]:
     return {
         name
@@ -3157,12 +3254,17 @@ def run_tool(
             core_db.add(comment)
             core_db.flush()
             core_db.commit()
+            legacy_push_enqueue = _enqueue_legacy_project_comment_push(
+                project_id=int(project_id),
+                added_by=getattr(user, "username", None),
+                comment_id=int(comment.id),
+            )
 
             snippet = comment_text.strip().replace("\n", " ")
             if len(snippet) > 240:
                 snippet = snippet[:239] + "…"
 
-            return {
+            result = {
                 "ok": True,
                 "tool": name,
                 "result": {
@@ -3175,6 +3277,9 @@ def run_tool(
                     "links": {"project_ui": f"/project/{project_id}"},
                 },
             }
+            if legacy_push_enqueue is not None:
+                result["result"]["legacy_push_enqueue"] = legacy_push_enqueue
+            return result
 
         if name == "latest_activity":
             limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=200)

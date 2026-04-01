@@ -18,6 +18,7 @@ ResponseContractName = Literal[
     "structured_explainer",
     "deep_dive",
 ]
+ResponseContractMode = Literal["off", "shadow"]
 
 _CONTRACT_ORDER: tuple[ResponseContractName, ...] = (
     "direct",
@@ -95,6 +96,8 @@ class ResponseContractResult:
             payload["raw_slots"] = self.raw_slots
         if self.normalized_slots is not None:
             payload["slots"] = self.normalized_slots
+        if self.rendered_content is not None:
+            payload["candidate_content"] = self.rendered_content
         if self.selector_reply_meta is not None:
             payload["selector"] = self.selector_reply_meta
         if self.fill_reply_meta is not None:
@@ -166,9 +169,27 @@ _TEMPLATE_ENV = Environment(
 )
 
 
+def parse_response_contract_mode(
+    raw: str | None,
+    *,
+    auto_shadow: bool = False,
+) -> ResponseContractMode:
+    normalized = str(raw or "").strip().lower()
+    if not normalized or normalized == "auto":
+        return "shadow" if auto_shadow else "off"
+    if normalized in {"0", "off", "false", "no", "n"}:
+        return "off"
+    if normalized in {"1", "true", "yes", "y", "on", "shadow", "safe", "all"}:
+        return "shadow"
+    return "off"
+
+
+def response_contracts_mode() -> ResponseContractMode:
+    return parse_response_contract_mode(os.getenv("ISPEC_ASSISTANT_ENABLE_RESPONSE_CONTRACTS"))
+
+
 def response_contracts_enabled() -> bool:
-    raw = (os.getenv("ISPEC_ASSISTANT_ENABLE_RESPONSE_CONTRACTS") or "").strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
+    return response_contracts_mode() == "shadow"
 
 
 def response_contract_names() -> tuple[ResponseContractName, ...]:

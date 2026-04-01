@@ -4,6 +4,9 @@ import types
 
 import pytest
 
+from ispec.agent.commands import COMMAND_LEGACY_PUSH_PROJECT_COMMENTS
+from ispec.agent.connect import get_agent_session
+from ispec.agent.models import AgentCommand
 from ispec.assistant.tools import openai_tools_for_user, run_tool
 from ispec.db.models import AuthUser, AuthUserProject, Person, Project, ProjectComment, UserRole
 
@@ -267,3 +270,91 @@ def test_create_project_comment_creates_comment_and_assistant_person(db_session)
     assert person is not None
     assert person.ppl_Name_First == "iSPEC"
     assert person.ppl_Name_Last == "Assistant"
+
+
+def test_create_project_comment_enqueues_legacy_push_when_scheduler_enabled(db_session, tmp_path, monkeypatch):
+    project = Project(id=3, prj_AddedBy="test", prj_ProjectTitle="Project 3")
+    user = _make_user("editor", role=UserRole.editor)
+    db_session.add_all([project, user])
+    db_session.commit()
+
+    agent_db_path = tmp_path / "agent.db"
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_ENABLED", "1")
+    monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_RECENT_DAYS", "14")
+    monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_LIMIT", "77")
+    monkeypatch.delenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_DRY_RUN", raising=False)
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 3, "comment": "Please sync this note.", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="please save this note to the project history",
+    )
+    assert payload["ok"] is True
+    enqueue = payload["result"].get("legacy_push_enqueue")
+    assert isinstance(enqueue, dict)
+    assert enqueue["ok"] is True
+    assert enqueue["enqueued"] is True
+
+    with get_agent_session(agent_db_path) as agent_db:
+        cmd = (
+            agent_db.query(AgentCommand)
+            .filter(AgentCommand.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS)
+            .one()
+        )
+        assert cmd.status == "queued"
+        assert int(cmd.payload_json["project_id"]) == 3
+        assert int(cmd.payload_json["recent_days"]) == 14
+        assert int(cmd.payload_json["limit"]) == 77
+        assert cmd.payload_json["trigger"] == "project_comment_created"
+
+
+def test_create_project_comment_reuses_existing_legacy_push_command(db_session, tmp_path, monkeypatch):
+    project = Project(id=4, prj_AddedBy="test", prj_ProjectTitle="Project 4")
+    user = _make_user("editor", role=UserRole.editor)
+    db_session.add_all([project, user])
+    db_session.commit()
+
+    agent_db_path = tmp_path / "agent.db"
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_ENABLED", "1")
+
+    with get_agent_session(agent_db_path) as agent_db:
+        existing = AgentCommand(
+            command_type=COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
+            status="queued",
+            payload_json={"project_id": 999, "trigger": "test"},
+            result_json={},
+        )
+        agent_db.add(existing)
+        agent_db.flush()
+        existing_id = int(existing.id)
+
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 4, "comment": "Second note.", "confirm": True},
+        core_db=db_session,
+        schedule_db=None,
+        user=user,
+        api_schema=None,
+        user_message="please save this note to the project history",
+    )
+    assert payload["ok"] is True
+    enqueue = payload["result"].get("legacy_push_enqueue")
+    assert isinstance(enqueue, dict)
+    assert enqueue["ok"] is True
+    assert enqueue["enqueued"] is False
+    assert enqueue["reason"] == "already_enqueued"
+    assert int(enqueue["command_id"]) == existing_id
+
+    with get_agent_session(agent_db_path) as agent_db:
+        count = (
+            agent_db.query(AgentCommand)
+            .filter(AgentCommand.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS)
+            .count()
+        )
+        assert count == 1

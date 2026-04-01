@@ -39,6 +39,11 @@ def test_turn_decision_pipeline_normalizes_support_write_mode_and_primary_group(
                     },
                     "write_plan": {"mode": "none"},
                     "response_plan": {"mode": "compare", "contract_cap": "brief_explainer"},
+                    "reply_interpretation": {
+                        "kind": "none",
+                        "confidence": 0.0,
+                        "reason": "",
+                    },
                     "confidence": 0.83,
                     "reason": "A project lookup should happen before deciding whether the comment can be saved.",
                 }
@@ -99,6 +104,11 @@ def test_turn_decision_pipeline_forces_scheduled_assistant_single_mode_without_c
                     },
                     "write_plan": {"mode": "none"},
                     "response_plan": {"mode": "compare", "contract_cap": "direct"},
+                    "reply_interpretation": {
+                        "kind": "approve",
+                        "confidence": 0.9,
+                        "reason": "Scheduled tasks do not await a human confirmation reply.",
+                    },
                     "confidence": 0.64,
                     "reason": "This is an automated staff-facing task.",
                 }
@@ -127,5 +137,74 @@ def test_turn_decision_pipeline_forces_scheduled_assistant_single_mode_without_c
     assert result.decision.needs_clarification is False
     assert result.decision.clarification_reason == "none"
     assert result.decision.response_plan.mode == "single"
+    assert result.decision.reply_interpretation.kind == "none"
     assert "scheduled_assistant_forced_no_clarification" in result.warnings
     assert "invalid_response_mode" in result.warnings
+    assert "reply_interpretation_forced_none_for_scheduled_assistant" in result.warnings
+
+
+def test_turn_decision_pipeline_normalizes_missing_reply_interpretation_to_unclear_when_awaiting_state() -> None:
+    groups = [
+        ToolGroup(
+            name="projects",
+            description="Project lookups and comment writes.",
+            tool_names=("get_project", "create_project_comment"),
+        )
+    ]
+
+    def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_):  # type: ignore[no-untyped-def]
+        assert tools is None
+        assert isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body
+        return AssistantReply(
+            content=json.dumps(
+                {
+                    "source": "support_chat",
+                    "primary_goal": "confirm_save",
+                    "needs_clarification": False,
+                    "clarification_reason": "none",
+                    "tool_plan": {
+                        "use_tools": True,
+                        "primary_group": "projects",
+                        "secondary_groups": [],
+                        "preferred_first_tool": "",
+                    },
+                    "write_plan": {"mode": "confirm_save"},
+                    "response_plan": {"mode": "single", "contract_cap": "direct"},
+                    "reply_interpretation": {
+                        "kind": "none",
+                        "confidence": 0.12,
+                        "reason": "Missing classification.",
+                    },
+                    "confidence": 0.72,
+                    "reason": "This is a pending save confirmation turn.",
+                }
+            ),
+            provider="test",
+            model="test-model",
+            meta={"elapsed_ms": 5},
+        )
+
+    result = run_turn_decision_pipeline(
+        generate_reply_fn=fake_generate_reply,
+        mode="shadow",
+        source="support_chat",
+        user_message="sure, go ahead",
+        last_assistant_message="Would you like me to save this to project history?",
+        focused_project_id=1598,
+        referenced_project_ids=[1598],
+        groups=groups,
+        response_modes=["single"],
+        contract_caps=["direct", "brief_explainer"],
+        extra_context={
+            "awaiting_reply_state": {
+                "name": "project_comment_save_confirmation",
+                "project_id": 1598,
+                "pending_tool": "create_project_comment",
+            }
+        },
+    )
+
+    assert result.ok is True
+    assert result.decision is not None
+    assert result.decision.reply_interpretation.kind == "unclear"
+    assert "reply_interpretation_normalized_to_unclear" in result.warnings

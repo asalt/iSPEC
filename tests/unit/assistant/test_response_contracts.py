@@ -2,8 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from ispec.assistant.response_contracts import run_response_contract_pipeline
+from ispec.assistant.response_contracts import parse_response_contract_mode, run_response_contract_pipeline
 from ispec.assistant.service import AssistantReply
+
+
+def test_parse_response_contract_mode_normalizes_to_off_or_shadow():
+    assert parse_response_contract_mode(None) == "off"
+    assert parse_response_contract_mode("off") == "off"
+    assert parse_response_contract_mode("0") == "off"
+    assert parse_response_contract_mode("shadow") == "shadow"
+    assert parse_response_contract_mode("1") == "shadow"
+    assert parse_response_contract_mode("safe") == "shadow"
+    assert parse_response_contract_mode("all") == "shadow"
 
 
 def test_response_contract_pipeline_selects_and_renders_brief_explainer():
@@ -47,6 +57,7 @@ def test_response_contract_pipeline_selects_and_renders_brief_explainer():
     assert result.normalized_slots is not None
     assert result.normalized_slots["example"] == "A short question can still trigger a long explanation."
     assert result.normalized_slots["caveat"] is None
+    assert result.as_meta()["candidate_content"] == result.rendered_content
     assert any(item == "dropped_optional_over_budget:caveat" for item in result.warnings)
     assert result.rendered_content == (
         "The model over-answers because the reply shape is too open.\n\n"

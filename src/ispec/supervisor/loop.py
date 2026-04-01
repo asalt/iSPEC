@@ -24,6 +24,7 @@ from ispec.agent.commands import (
     COMMAND_ARCHIVE_AGENT_LOGS,
     COMMAND_COMPACT_SESSION_MEMORY,
     COMMAND_BUILD_SUPPORT_DIGEST,
+    COMMAND_POST_SEND_PREPARE,
     COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT,
     COMMAND_ASSESS_TACKLE_RESULTS,
     COMMAND_RUN_TACKLE_PROMPT,
@@ -40,6 +41,7 @@ from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.agent.policies.primitives.backoff import backoff_exponential_current
 from ispec.assistant.compaction import distill_conversation_memory
 from ispec.assistant.connect import get_assistant_db_uri, get_assistant_session
+from ispec.assistant.controller import enqueue_post_send_prepare_command, support_post_send_thread_key
 from ispec.assistant.formatting import split_plan_final
 from ispec.assistant.models import (
     SupportMemory,
@@ -2596,6 +2598,213 @@ def _coerce_session_review_output(
     if not isinstance(review, dict):
         return None
     return normalize_review_dict(review)
+
+
+def _controller_root_state(state: dict[str, Any]) -> dict[str, Any]:
+    raw = state.get("controller")
+    root = dict(raw) if isinstance(raw, dict) else {}
+    state["controller"] = root
+    return root
+
+
+def _controller_support_post_send_state(state: dict[str, Any]) -> dict[str, Any]:
+    root = _controller_root_state(state)
+    raw = root.get("support_post_send")
+    support_state = dict(raw) if isinstance(raw, dict) else {}
+    root["support_post_send"] = support_state
+    return support_state
+
+
+def _controller_set_support_prepared_followup_state(
+    state: dict[str, Any],
+    prepared: dict[str, Any] | None,
+) -> None:
+    root = _controller_root_state(state)
+    if isinstance(prepared, dict) and prepared:
+        root["prepared_followup"] = prepared
+    else:
+        root.pop("prepared_followup", None)
+
+
+def _controller_prepared_followup_from_review(
+    *,
+    review: dict[str, Any],
+    target_message_id: int,
+    prepared_at: datetime,
+) -> dict[str, Any]:
+    raw_issues = review.get("issues")
+    issues: list[str] = []
+    if isinstance(raw_issues, list):
+        for item in raw_issues[:3]:
+            if not isinstance(item, dict):
+                continue
+            description = item.get("description")
+            if isinstance(description, str) and description.strip():
+                issues.append(_truncate_text(description.strip(), limit=240))
+
+    raw_followups = review.get("followups")
+    followups: list[str] = []
+    if isinstance(raw_followups, str) and raw_followups.strip():
+        raw_followups = [raw_followups]
+    if isinstance(raw_followups, list):
+        for item in raw_followups[:3]:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if text:
+                followups.append(_truncate_text(text, limit=240))
+
+    summary = review.get("summary") if isinstance(review.get("summary"), str) else ""
+    return {
+        "schema_version": 1,
+        "for_message_id": int(target_message_id),
+        "prepared_at": prepared_at.isoformat(),
+        "summary": _truncate_text(summary, limit=600),
+        "issues": issues,
+        "followups": followups,
+    }
+
+
+def _run_support_post_send_prepare(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> CommandExecution:
+    review_execution = _run_support_session_review(
+        payload=payload,
+        agent_id=agent_id,
+        run_id=run_id,
+        command_id=command_id,
+    )
+    if not review_execution.ok:
+        return review_execution
+
+    review_result = dict(review_execution.result or {})
+    review = review_result.get("review") if isinstance(review_result.get("review"), dict) else {}
+    session_id = str(review_result.get("session_id") or payload.get("session_id") or "").strip()
+    session_pk = _safe_int(payload.get("session_pk"))
+    target_message_id = _safe_int(review_result.get("target_message_id")) or _safe_int(payload.get("target_message_id"))
+    if not session_id and session_pk is None:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing session for post-send prepare."},
+            error="missing_session",
+            prompt=review_execution.prompt,
+            response=review_execution.response,
+        )
+    if target_message_id is None or target_message_id <= 0:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing target_message_id for post-send prepare."},
+            error="missing_target_message_id",
+            prompt=review_execution.prompt,
+            response=review_execution.response,
+        )
+
+    prepared_at = utcnow()
+    prepared_followup = _controller_prepared_followup_from_review(
+        review=review,
+        target_message_id=int(target_message_id),
+        prepared_at=prepared_at,
+    )
+
+    next_enqueue_meta: dict[str, Any] | None = None
+    with get_assistant_session() as assistant_db:
+        session = None
+        if session_pk is not None:
+            session = assistant_db.query(SupportSession).filter(SupportSession.id == int(session_pk)).first()
+        if session is None and session_id:
+            session = assistant_db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+        if session is None:
+            return CommandExecution(
+                ok=False,
+                result={
+                    "ok": False,
+                    "error": "Support session not found for post-send prepare.",
+                    "session_id": session_id or None,
+                },
+                error="session_not_found",
+                prompt=review_execution.prompt,
+                response=review_execution.response,
+            )
+
+        state = _load_json_dict(getattr(session, "state_json", None))
+        support_state = _controller_support_post_send_state(state)
+        support_state["thread_key"] = str(payload.get("thread_key") or support_post_send_thread_key(session.session_id))
+        support_state["last_completed_target_message_id"] = int(target_message_id)
+        support_state["last_completed_at"] = prepared_at.isoformat()
+        support_state.pop("queued_command_id", None)
+        if _safe_int(support_state.get("queued_target_message_id")) == int(target_message_id):
+            support_state.pop("queued_target_message_id", None)
+        _controller_set_support_prepared_followup_state(state, prepared_followup)
+
+        pending_target_message_id = _safe_int(support_state.get("pending_target_message_id"))
+        if pending_target_message_id is not None and pending_target_message_id > int(target_message_id):
+            with get_agent_session() as agent_db:
+                enqueue_result = enqueue_post_send_prepare_command(
+                    agent_db=agent_db,
+                    source="support_chat",
+                    thread_key=str(support_state.get("thread_key") or ""),
+                    payload={
+                        "session_id": session.session_id,
+                        "session_pk": int(session.id),
+                        "target_message_id": int(pending_target_message_id),
+                        "requested_at": prepared_at.isoformat(),
+                    },
+                    priority=1,
+                    current_command_id=command_id,
+                )
+            next_enqueue_meta = enqueue_result.as_meta()
+            if enqueue_result.enqueued and enqueue_result.command_id is not None:
+                support_state["queued_target_message_id"] = int(pending_target_message_id)
+                support_state["queued_command_id"] = int(enqueue_result.command_id)
+                support_state["last_enqueued_at"] = prepared_at.isoformat()
+                support_state.pop("pending_target_message_id", None)
+                support_state.pop("pending_requested_at", None)
+
+        session.state_json = _dump_json(state)
+        session.updated_at = prepared_at
+        assistant_db.commit()
+
+    result_payload = dict(review_result)
+    result_payload["prepared_followup"] = prepared_followup
+    result_payload["thread_key"] = str(payload.get("thread_key") or support_post_send_thread_key(session_id))
+    if next_enqueue_meta is not None:
+        result_payload["next_enqueue"] = next_enqueue_meta
+    return CommandExecution(
+        ok=True,
+        result=result_payload,
+        prompt=review_execution.prompt,
+        response=review_execution.response,
+    )
+
+
+def _run_post_send_prepare(
+    *,
+    payload: dict[str, Any],
+    agent_id: str,
+    run_id: str,
+    command_id: int | None = None,
+) -> CommandExecution:
+    source = str(payload.get("source") or "").strip()
+    if source == "support_chat":
+        return _run_support_post_send_prepare(
+            payload=payload,
+            agent_id=agent_id,
+            run_id=run_id,
+            command_id=command_id,
+        )
+    return CommandExecution(
+        ok=True,
+        result={
+            "ok": True,
+            "noop": True,
+            "source": source or None,
+            "reason": "unsupported_source",
+        },
+    )
 
 
 def _run_support_chat_turn(
@@ -6569,6 +6778,13 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
                 run_id=run_id,
                 command_id=int(cmd.id),
             )
+        elif cmd.command_type == COMMAND_POST_SEND_PREPARE:
+            execution = _run_post_send_prepare(
+                payload=cmd.payload,
+                agent_id=agent_id,
+                run_id=run_id,
+                command_id=int(cmd.id),
+            )
         elif cmd.command_type == COMMAND_REVIEW_SUPPORT_SESSION:
             execution = _run_support_session_review(
                 payload=cmd.payload,
@@ -6813,6 +7029,13 @@ class _SupervisorCommandProcessor:
                         )
             elif cmd.command_type == COMMAND_SUPPORT_CHAT_TURN:
                 execution = _run_support_chat_turn(
+                    payload=cmd.payload,
+                    agent_id=self._agent_id,
+                    run_id=self._run_id,
+                    command_id=int(cmd.id),
+                )
+            elif cmd.command_type == COMMAND_POST_SEND_PREPARE:
+                execution = _run_post_send_prepare(
                     payload=cmd.payload,
                     agent_id=self._agent_id,
                     run_id=self._run_id,

@@ -12,6 +12,7 @@ COMMAND_REVIEW_SUPPORT_SESSION = "assistant_review_support_session_v1"
 COMMAND_REVIEW_REPO = "assistant_review_repo_v1"
 COMMAND_BUILD_SUPPORT_DIGEST = "assistant_build_support_digest_v1"
 COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT = "assistant_run_scheduled_prompt_v1"
+COMMAND_POST_SEND_PREPARE = "assistant_post_send_prepare_v1"
 
 # Analysis / telemetry helpers
 COMMAND_ASSESS_TACKLE_RESULTS = "assistant_assess_tackle_results_v1"

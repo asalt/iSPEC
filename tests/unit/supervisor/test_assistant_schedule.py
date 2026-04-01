@@ -11,6 +11,7 @@ from ispec.agent.models import AgentCommand, AgentRun
 from ispec.assistant.service import AssistantReply
 from ispec.assistant.turn_decision import (
     TurnDecision,
+    TurnDecisionReplyInterpretation,
     TurnDecisionResponsePlan,
     TurnDecisionResult,
     TurnDecisionToolPlan,
@@ -293,6 +294,11 @@ def test_supervisor_records_turn_decision_for_scheduled_assistant_prompt(tmp_pat
                 ),
                 write_plan=TurnDecisionWritePlan(mode="none"),
                 response_plan=TurnDecisionResponsePlan(mode="single", contract_cap="brief_explainer"),
+                reply_interpretation=TurnDecisionReplyInterpretation(
+                    kind="none",
+                    confidence=0.0,
+                    reason="",
+                ),
                 confidence=0.77,
                 reason="The scheduled job should gather information and then enqueue a staff Slack post.",
             ),

@@ -16,7 +16,7 @@ def test_support_chat_applies_response_contract_and_skips_self_review(tmp_path, 
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
-    monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_RESPONSE_CONTRACTS", "1")
+    monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_RESPONSE_CONTRACTS", "shadow")
     monkeypatch.setenv("ISPEC_ASSISTANT_SELF_REVIEW", "1")
 
     calls: list[dict[str, Any]] = []
@@ -81,9 +81,8 @@ def test_support_chat_applies_response_contract_and_skips_self_review(tmp_path, 
             )
 
         assert response.message == (
-            "The model over-answers because the reply shape is not constrained.\n\n"
-            "Why: When scope is loose, it keeps adding context and support to avoid missing something.\n\n"
-            "Example: A short question can still become a long reply."
+            "The model over-answers because it is trying to be maximally helpful. "
+            "Without a tighter structure, it keeps adding more support than the user wanted."
         )
         assert len(calls) == 3
 
@@ -96,9 +95,16 @@ def test_support_chat_applies_response_contract_and_skips_self_review(tmp_path, 
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert meta["response_contract"]["applied"] is True
+        assert meta["response_contract"]["configured_mode"] == "shadow"
+        assert meta["response_contract"]["applied"] is False
         assert meta["response_contract"]["selected_contract"] == "brief_explainer"
-        assert meta["self_review"]["mode"] == "skipped_response_contract"
+        assert meta["response_contract"]["shadow_candidate"] == (
+            "The model over-answers because the reply shape is not constrained.\n\n"
+            "Why: When scope is loose, it keeps adding context and support to avoid missing something.\n\n"
+            "Example: A short question can still become a long reply."
+        )
+        assert meta["response_contract"]["would_apply_if_live"] is True
+        assert meta["self_review"]["mode"] == "skipped_no_tool_calls"
         assert meta["raw_content"].startswith("PLAN:\n- Draft a concise answer")
 
 
@@ -107,7 +113,7 @@ def test_support_chat_response_contract_force_override_skips_selector(tmp_path, 
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
-    monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_RESPONSE_CONTRACTS", "1")
+    monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_RESPONSE_CONTRACTS", "shadow")
 
     calls: list[dict[str, Any]] = []
 
@@ -153,7 +159,7 @@ def test_support_chat_response_contract_force_override_skips_selector(tmp_path, 
                 user=None,
             )
 
-        assert response.message == "This is a longer draft that should be compressed.\n\nCaveat: It is still only a draft."
+        assert response.message == "This is a longer draft that should be compressed."
         assert len(calls) == 2
 
         assistant_row = (
@@ -165,6 +171,20 @@ def test_support_chat_response_contract_force_override_skips_selector(tmp_path, 
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert meta["response_contract"]["applied"] is True
+        assert meta["response_contract"]["applied"] is False
         assert meta["response_contract"]["selection"]["source"] == "forced"
         assert meta["response_contract"]["policy"]["force"] == "direct"
+        assert meta["response_contract"]["shadow_candidate"] == (
+            "This is a longer draft that should be compressed.\n\nCaveat: It is still only a draft."
+        )
+
+
+def test_support_chat_response_contract_live_eligibility_marks_project_comment_flow_as_protected():
+    enabled, reason = support_routes._response_contract_live_eligibility(
+        tool_calls=[{"name": "create_project_comment", "ok": True}],
+        comment_intent_decision=None,
+        turn_decision_result=None,
+    )
+
+    assert enabled is False
+    assert reason == "project_comment_tool_call"

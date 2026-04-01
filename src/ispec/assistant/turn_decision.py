@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from ispec.assistant.classifier_service import generate_classifier_reply
 from ispec.assistant.response_contracts import ResponseContractName, response_contract_names
 from ispec.assistant.service import AssistantReply
 from ispec.assistant.tool_routing import ToolGroup, tool_names_for_groups
@@ -30,6 +31,7 @@ ClarificationReason = Literal[
 ]
 WritePlanMode = Literal["none", "draft_only", "save_now", "confirm_save"]
 ResponseMode = Literal["single", "compare"]
+ReplyInterpretationKind = Literal["none", "approve", "deny", "defer", "modify", "unclear"]
 
 _PRIMARY_GOALS: tuple[PrimaryGoal, ...] = (
     "answer_question",
@@ -54,6 +56,14 @@ _WRITE_PLAN_MODES: tuple[WritePlanMode, ...] = (
     "confirm_save",
 )
 _RESPONSE_MODES: tuple[ResponseMode, ...] = ("single", "compare")
+_REPLY_INTERPRETATION_KINDS: tuple[ReplyInterpretationKind, ...] = (
+    "none",
+    "approve",
+    "deny",
+    "defer",
+    "modify",
+    "unclear",
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +103,20 @@ class TurnDecisionResponsePlan:
 
 
 @dataclass(frozen=True)
+class TurnDecisionReplyInterpretation:
+    kind: ReplyInterpretationKind
+    confidence: float
+    reason: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "confidence": self.confidence,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class TurnDecision:
     source: TurnDecisionSource
     primary_goal: PrimaryGoal
@@ -101,6 +125,7 @@ class TurnDecision:
     tool_plan: TurnDecisionToolPlan
     write_plan: TurnDecisionWritePlan
     response_plan: TurnDecisionResponsePlan
+    reply_interpretation: TurnDecisionReplyInterpretation
     confidence: float
     reason: str
 
@@ -113,6 +138,7 @@ class TurnDecision:
             "tool_plan": self.tool_plan.as_dict(),
             "write_plan": self.write_plan.as_dict(),
             "response_plan": self.response_plan.as_dict(),
+            "reply_interpretation": self.reply_interpretation.as_dict(),
             "confidence": self.confidence,
             "reason": self.reason,
         }
@@ -228,6 +254,16 @@ def turn_decision_schema(
                 },
                 "required": ["mode", "contract_cap"],
             },
+            "reply_interpretation": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "kind": {"type": "string", "enum": list(_REPLY_INTERPRETATION_KINDS)},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "reason": {"type": "string"},
+                },
+                "required": ["kind", "confidence", "reason"],
+            },
             "confidence": {"type": "number", "minimum": 0, "maximum": 1},
             "reason": {"type": "string"},
         },
@@ -239,6 +275,7 @@ def turn_decision_schema(
             "tool_plan",
             "write_plan",
             "response_plan",
+            "reply_interpretation",
             "confidence",
             "reason",
         ],
@@ -263,6 +300,7 @@ def _turn_decision_prompt(
         "- write_plan.mode: none | draft_only | save_now | confirm_save.",
         "- response_plan.mode: single or compare. Prefer single unless side-by-side alternatives would materially help.",
         "- response_plan.contract_cap: choose the smallest response contract cap that should govern the final answer.",
+        "- reply_interpretation: classify the latest user reply only when the turn is awaiting a bounded follow-up decision.",
         "",
         "Primary goals:",
         "- answer_question: normal lookup/explanation/help answer.",
@@ -294,6 +332,15 @@ def _turn_decision_prompt(
         "Response rules:",
         "- Prefer the smallest response contract cap that fully answers the turn.",
         "- Prefer single unless compare mode is genuinely helpful.",
+        "",
+        "Reply-interpretation rules:",
+        "- Use none when there is no awaiting_reply_state in context.",
+        "- If awaiting_reply_state is present, choose exactly one of: approve, deny, defer, modify, unclear.",
+        "- approve: clear confirmation or permission to proceed.",
+        "- deny: clear refusal, cancellation, or 'do not do it'.",
+        "- defer: not now / later / hold off, without cancelling permanently.",
+        "- modify: revise or tweak something before proceeding.",
+        "- unclear: ambiguous, unrelated, or not safely actionable.",
     ]
     if source == "scheduled_assistant":
         lines.extend(
@@ -371,6 +418,44 @@ def _normalize_write_mode(*, primary_goal: PrimaryGoal, raw_mode: Any, warnings:
     return raw_mode
 
 
+def _normalize_reply_interpretation(
+    *,
+    raw_reply_interpretation: Any,
+    awaiting_reply_state: dict[str, Any] | None,
+    source: TurnDecisionSource,
+    warnings: list[str],
+) -> TurnDecisionReplyInterpretation:
+    raw = raw_reply_interpretation if isinstance(raw_reply_interpretation, dict) else {}
+    raw_kind = str(raw.get("kind") or "").strip()
+    raw_reason = str(raw.get("reason") or "").strip()
+    confidence = _clamp_confidence(raw.get("confidence"))
+
+    if source == "scheduled_assistant":
+        if raw_kind not in {"", "none"}:
+            warnings.append("reply_interpretation_forced_none_for_scheduled_assistant")
+        return TurnDecisionReplyInterpretation(kind="none", confidence=0.0, reason=raw_reason)
+
+    if awaiting_reply_state is None:
+        if raw_kind not in {"", "none"}:
+            warnings.append("reply_interpretation_ignored_without_awaiting_state")
+        return TurnDecisionReplyInterpretation(kind="none", confidence=confidence, reason=raw_reason)
+
+    if raw_kind not in _REPLY_INTERPRETATION_KINDS:
+        if raw_kind:
+            warnings.append("invalid_reply_interpretation_kind")
+        return TurnDecisionReplyInterpretation(kind="unclear", confidence=confidence, reason=raw_reason)
+
+    if raw_kind == "none":
+        warnings.append("reply_interpretation_normalized_to_unclear")
+        return TurnDecisionReplyInterpretation(kind="unclear", confidence=confidence, reason=raw_reason)
+
+    return TurnDecisionReplyInterpretation(
+        kind=raw_kind,  # type: ignore[arg-type]
+        confidence=confidence,
+        reason=raw_reason,
+    )
+
+
 def _validate_turn_decision(
     *,
     raw_decision: dict[str, Any],
@@ -378,6 +463,7 @@ def _validate_turn_decision(
     groups: list[ToolGroup],
     response_modes: list[ResponseMode],
     contract_caps: list[ResponseContractName],
+    awaiting_reply_state: dict[str, Any] | None,
 ) -> tuple[TurnDecision | None, list[str], list[str]]:
     warnings: list[str] = []
     errors: list[str] = []
@@ -487,6 +573,13 @@ def _validate_turn_decision(
             warnings.append("scheduled_assistant_forced_single_mode")
         response_mode = "single"
 
+    reply_interpretation = _normalize_reply_interpretation(
+        raw_reply_interpretation=raw_decision.get("reply_interpretation"),
+        awaiting_reply_state=awaiting_reply_state,
+        source=source,
+        warnings=warnings,
+    )
+
     confidence = _clamp_confidence(raw_decision.get("confidence"))
     reason = str(raw_decision.get("reason") or "").strip()
     if not reason:
@@ -509,6 +602,7 @@ def _validate_turn_decision(
                 mode=response_mode,
                 contract_cap=contract_cap,
             ),
+            reply_interpretation=reply_interpretation,
             confidence=confidence,
             reason=reason,
         ),
@@ -577,9 +671,9 @@ def run_turn_decision_pipeline(
             ),
         },
     ]
-    reply = generate_reply_fn(
+    reply = generate_classifier_reply(
+        base_generate_reply_fn=generate_reply_fn,
         messages=messages,
-        tools=None,
         vllm_extra_body={
             "guided_json": schema,
             "max_tokens": 300,
@@ -609,6 +703,11 @@ def run_turn_decision_pipeline(
         groups=groups,
         response_modes=response_modes,
         contract_caps=contract_cap_names,
+        awaiting_reply_state=(
+            dict(extra_context.get("awaiting_reply_state"))
+            if isinstance(extra_context, dict) and isinstance(extra_context.get("awaiting_reply_state"), dict)
+            else None
+        ),
     )
     result.warnings.extend(warnings)
     result.errors.extend(errors)

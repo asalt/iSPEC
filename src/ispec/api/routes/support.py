@@ -21,22 +21,29 @@ from ispec.assistant.comment_intent import decide_project_comment_intent_vllm
 from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.assistant.compaction import normalize_conversation_memory
 from ispec.assistant.connect import get_assistant_session_dep
+from ispec.assistant.controller import (
+    enqueue_post_send_prepare_command,
+    run_message_pre_send_controller,
+    support_post_send_thread_key,
+)
 from ispec.assistant.formatting import split_compare_finals, split_plan_final
 from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
 from ispec.assistant.response_contracts import (
-    response_contracts_enabled,
+    response_contracts_mode,
     response_contract_names,
-    run_response_contract_pipeline,
 )
 from ispec.assistant.service import (
     _system_prompt_answer,
     _system_prompt_planner,
-    _system_prompt_review,
-    _system_prompt_review_decider,
     generate_reply,
+)
+from ispec.assistant.support_policies import (
+    comment_intent_messages_for_write_mode,
+    hinted_support_tool_groups,
+    select_support_tool_policy,
 )
 from ispec.assistant.tool_routing import (
     route_tool_groups_vllm,
@@ -72,54 +79,6 @@ _PROJECT_ROUTE_RE = re.compile(r"/project/(\d+)", re.IGNORECASE)
 _EXPERIMENT_ROUTE_RE = re.compile(r"/experiment/(\d+)", re.IGNORECASE)
 _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
 _CONTEXT_SCHEMA_VERSION = 1
-_COUNT_PROJECTS_RE = re.compile(
-    r"\bhow\s+many\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b"
-    r"|\bnumber\s+of\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b"
-    r"|\bcount\s+(?:(?:total|all|overall)\s+)?(?:projects?|prjs?|projs?)\b",
-    re.IGNORECASE,
-)
-_COUNT_CURRENT_PROJECTS_RE = re.compile(
-    r"\b(current|active|ongoing)\s+(?:projects?|prjs?|projs?)\b"
-    r"|\b(?:projects?|prjs?|projs?)\s+(current|active|ongoing)\b",
-    re.IGNORECASE,
-)
-_LIST_MY_PROJECTS_RE = re.compile(
-    r"\bmy\s+(?:projects?|prjs?|projs?)\b"
-    r"|\b(?:projects?|prjs?|projs?)\s+(?:can\s+i|do\s+i)\s+(?:view|see|access)\b"
-    r"|\b(?:what|which|show|list)\s+(?:projects?|prjs?|projs?)\b",
-    re.IGNORECASE,
-)
-_PROJECT_EXISTENCE_LOOKUP_RE = re.compile(
-    r"\b(?:do|does)\s+(?:we\s+)?have\s+(?:project|prj|proj)\s+#?\d+\b"
-    r"|\bdoes\s+(?:project|prj|proj)\s+#?\d+\s+exist\b"
-    r"|\bis\s+(?:project|prj|proj)\s+#?\d+\s+(?:available|present|there)\b"
-    r"|\b(?:project|prj|proj)\s+#?\d+\s+(?:exists?|available|present)\b",
-    re.IGNORECASE,
-)
-_FILE_ROUTER_HINT_RE = re.compile(
-    r"\b("
-    r"files?|results?|directory|directories|folder|folders|plots?|pca|biplot|"
-    r"cluster(?:plot)?s?|heatmap|volcano|pdfs?|images?|removed|filtered"
-    r")\b",
-    re.IGNORECASE,
-)
-_PROJECT_ROUTER_HINT_RE = re.compile(
-    r"\b("
-    r"meeting|prepare|prep|important|focus|understand|background|question|goal|summary|"
-    r"sample(?:s)?|geno(?:type)?s?|genders?|mmps?|proteins?|analysis|results?"
-    r")\b",
-    re.IGNORECASE,
-)
-_TMUX_ROUTER_HINT_RE = re.compile(
-    r"\b("
-    r"tmux|pane(?:s)?|window(?:s)?|session\s+group|codex"
-    r")\b",
-    re.IGNORECASE,
-)
-_TMUX_SESSION_NAME_RE = re.compile(
-    r"\b([A-Za-z][A-Za-z0-9_-]{0,63})\s+tmux\s+(?:session|session\s+group)\b",
-    re.IGNORECASE,
-)
 _PROJECT_COMMENT_INTENT_RE = re.compile(
     r"\b(comment|note|history|save|draft|rewrite|edit|word|wording|log|record|add|commit)\b",
     re.IGNORECASE,
@@ -145,6 +104,33 @@ _WRITE_SUCCESS_PASSIVE_RE = re.compile(
 _WRITE_RESULT_ID_RE = re.compile(r"\bcomment\s+id\b", re.IGNORECASE)
 _TRUTHY_ENV = {"1", "true", "yes", "y", "on"}
 _FALSY_ENV = {"0", "false", "no", "n", "off"}
+_REPLY_INTERPRETATION_ACTIONS: dict[str, dict[str, str]] = {
+    "project_comment_save_confirmation": {
+        "approve": "approve_save",
+        "deny": "deny_save",
+        "defer": "defer_save",
+        "modify": "modify_before_save",
+        "unclear": "clarify",
+    }
+}
+_REPLY_INTERPRETATION_POLICY_TEXT: dict[str, str] = {
+    "deny_save": (
+        "The user declined the pending save. Do not save anything. "
+        "Answer briefly that nothing was saved."
+    ),
+    "defer_save": (
+        "The user wants to wait before saving. Do not save anything. "
+        "Answer briefly that nothing was saved and they can come back later."
+    ),
+    "modify_before_save": (
+        "The user wants to change the pending draft before saving. Do not save anything. "
+        "Ask what should be revised or invite them to provide the updated wording."
+    ),
+    "clarify": (
+        "The turn is awaiting a bounded save confirmation, but the latest reply is not safely actionable. "
+        "Do not save anything. Ask a brief clarification question about whether to save, revise, or cancel."
+    ),
+}
 
 
 @cache
@@ -246,71 +232,57 @@ def _response_contract_policy_meta(request_meta: dict[str, Any] | None) -> dict[
     return {"force": force, "cap": cap}
 
 
+def _response_contract_live_eligibility(
+    *,
+    tool_calls: list[dict[str, Any]],
+    comment_intent_decision: dict[str, Any] | None,
+    turn_decision_result: Any,
+) -> tuple[bool, str | None]:
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        tool_name = str(call.get("name") or "").strip()
+        if tool_name == "create_project_comment":
+            return False, "project_comment_tool_call"
+
+    decision = getattr(turn_decision_result, "decision", None)
+    primary_goal = str(getattr(decision, "primary_goal", "") or "").strip()
+    if primary_goal in {"draft_project_comment", "save_project_comment"}:
+        return False, f"turn_decision_primary_goal:{primary_goal}"
+
+    write_plan = getattr(decision, "write_plan", None)
+    write_mode = str(getattr(write_plan, "mode", "") or "").strip()
+    if write_mode in {"draft_only", "save_now", "confirm_save"}:
+        return False, f"turn_decision_write_mode:{write_mode}"
+
+    comment_write_mode = _legacy_comment_intent_to_write_mode(comment_intent_decision)
+    if comment_write_mode in {"draft_only", "save_now", "confirm_save"}:
+        return False, f"comment_intent_write_mode:{comment_write_mode}"
+
+    return True, None
+
+
 def _policy_tool_for_message(message: str) -> str | None:
-    if _COUNT_PROJECTS_RE.search(message or ""):
-        return (
-            "count_current_projects"
-            if _COUNT_CURRENT_PROJECTS_RE.search(message or "")
-            else "count_all_projects"
-        )
-    if _LIST_MY_PROJECTS_RE.search(message or ""):
-        return "my_projects"
-    project_ids = extract_project_ids(message or "")
-    if len(project_ids) == 1 and _PROJECT_EXISTENCE_LOOKUP_RE.search(message or ""):
-        return "get_project"
-    if re.search(r"\btmux\b", message or "", re.IGNORECASE):
-        return "assistant_list_tmux_panes"
-    return None
+    selection = select_support_tool_policy(message=message)
+    return selection.tool_name if selection is not None else None
 
 
 def _policy_tool_args_for_message(*, tool_name: str | None, message: str) -> dict[str, Any]:
-    if tool_name == "get_project":
-        project_ids = extract_project_ids(message or "")
-        if len(project_ids) == 1:
-            return {"id": int(project_ids[0])}
-    if tool_name == "assistant_list_tmux_panes":
-        match = _TMUX_SESSION_NAME_RE.search(message or "")
-        if match:
-            session_name = str(match.group(1) or "").strip()
-            if session_name:
-                return {"session_name": session_name}
-    return {}
+    selection = select_support_tool_policy(message=message)
+    if selection is None or selection.tool_name != tool_name:
+        return {}
+    return dict(selection.args or {})
 
 
 def _policy_messages_for_message(*, tool_name: str | None, message: str) -> list[dict[str, str]]:
-    text = message or ""
-    if tool_name == "get_project" and _PROJECT_EXISTENCE_LOOKUP_RE.search(text):
-        return [
-            {
-                "role": "system",
-                "content": (
-                    "The user is asking for project existence/availability. "
-                    "After checking the project, answer directly whether it exists. "
-                    "Keep the answer concise. Do not draft a comment, do not claim anything was saved, "
-                    "and do not summarize project details or previous comments unless the user asks."
-                ),
-            }
-        ]
-    return []
+    selection = select_support_tool_policy(message=message)
+    if selection is None or selection.tool_name != tool_name:
+        return []
+    return list(selection.messages or [])
 
 
 def _hinted_tool_groups_for_message(*, message: str, focused_project_id: int | None) -> set[str]:
-    hinted: set[str] = set()
-    text = message or ""
-
-    if _TMUX_ROUTER_HINT_RE.search(text):
-        hinted.add("tmux")
-
-    if extract_project_ids(text):
-        hinted.add("projects")
-
-    if isinstance(focused_project_id, int) and focused_project_id > 0:
-        if _PROJECT_ROUTER_HINT_RE.search(text):
-            hinted.add("projects")
-        if _FILE_ROUTER_HINT_RE.search(text):
-            hinted.update({"projects", "files"})
-
-    return hinted
+    return hinted_support_tool_groups(message=message, focused_project_id=focused_project_id)
 
 
 def _truncate(value: str | None, limit: int = 400) -> str | None:
@@ -793,6 +765,83 @@ def _assistant_requested_project_history_save(message: str | None) -> bool:
     return "project" in text
 
 
+def _awaiting_reply_interpretation_state(
+    *,
+    tool_protocol: str,
+    available_tool_names: set[str],
+    focused_project_id: int | None,
+    last_assistant_message: str | None,
+) -> dict[str, Any] | None:
+    if str(tool_protocol or "").strip().lower() != "openai":
+        return None
+    if "create_project_comment" not in available_tool_names:
+        return None
+    if not isinstance(focused_project_id, int) or focused_project_id <= 0:
+        return None
+    if not _assistant_requested_project_history_save(last_assistant_message):
+        return None
+    return {
+        "name": "project_comment_save_confirmation",
+        "project_id": focused_project_id,
+        "pending_tool": "create_project_comment",
+    }
+
+
+def _legacy_reply_interpretation_kind(message: str | None) -> str:
+    if not _is_confirmation_reply(message):
+        return "unclear"
+    return "approve" if _is_affirmative_reply(message) else "deny"
+
+
+def _reply_interpretation_action(awaiting_state: dict[str, Any] | None, kind: str | None) -> str | None:
+    if not isinstance(awaiting_state, dict):
+        return None
+    state_name = str(awaiting_state.get("name") or "").strip()
+    if not state_name:
+        return None
+    mapping = _REPLY_INTERPRETATION_ACTIONS.get(state_name, {})
+    normalized_kind = str(kind or "").strip()
+    return mapping.get(normalized_kind)
+
+
+def _reply_interpretation_messages(
+    *,
+    action: str | None,
+    awaiting_state: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    if action == "approve_save" or not isinstance(awaiting_state, dict):
+        return []
+    text = _REPLY_INTERPRETATION_POLICY_TEXT.get(str(action or "").strip())
+    if not text:
+        return []
+    state_name = str(awaiting_state.get("name") or "").strip()
+    if state_name == "project_comment_save_confirmation":
+        project_id = awaiting_state.get("project_id")
+        if isinstance(project_id, int) and project_id > 0:
+            text += f" The pending draft is for project {project_id}."
+    return [{"role": "system", "content": text}]
+
+
+def _remove_write_tools_from_openai_schemas(
+    tools: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    if not isinstance(tools, list):
+        return tools, []
+    filtered: list[dict[str, Any]] = []
+    removed: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            filtered.append(tool)
+            continue
+        func_obj = tool.get("function")
+        name = func_obj.get("name") if isinstance(func_obj, dict) else None
+        if isinstance(name, str) and name.strip() and tool_writes_data(name.strip()):
+            removed.append(name.strip())
+            continue
+        filtered.append(tool)
+    return filtered, sorted(set(removed))
+
+
 def _assistant_leaks_tool_protocol(message: str | None) -> bool:
     text = (message or "").strip()
     if not text:
@@ -836,6 +885,127 @@ def _context_message(*, payload: dict[str, Any]) -> str:
     round_value = payload.get("agent", {}).get("round") if isinstance(payload.get("agent"), dict) else None
     suffix = f" - round {round_value}" if isinstance(round_value, int) and round_value > 0 else ""
     return f"CONTEXT v{version} (read-only JSON){suffix}:\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _controller_root_state(state: dict[str, Any]) -> dict[str, Any]:
+    raw = state.get("controller")
+    root = dict(raw) if isinstance(raw, dict) else {}
+    state["controller"] = root
+    return root
+
+
+def _support_post_send_state(state: dict[str, Any]) -> dict[str, Any]:
+    root = _controller_root_state(state)
+    raw = root.get("support_post_send")
+    support_state = dict(raw) if isinstance(raw, dict) else {}
+    root["support_post_send"] = support_state
+    return support_state
+
+
+def _support_prepared_followup_state(state: dict[str, Any]) -> dict[str, Any] | None:
+    root = _controller_root_state(state)
+    raw = root.get("prepared_followup")
+    return dict(raw) if isinstance(raw, dict) else None
+
+
+def _set_support_prepared_followup_state(state: dict[str, Any], prepared: dict[str, Any] | None) -> None:
+    root = _controller_root_state(state)
+    if isinstance(prepared, dict) and prepared:
+        root["prepared_followup"] = prepared
+    else:
+        root.pop("prepared_followup", None)
+
+
+def _support_prepared_followup_context_message(prepared: dict[str, Any]) -> str:
+    payload = {
+        "schema_version": 1,
+        "kind": "prepared_followup",
+        "for_message_id": _safe_int_from_state(prepared.get("for_message_id")),
+        "prepared_at": str(prepared.get("prepared_at") or "").strip() or None,
+        "summary": str(prepared.get("summary") or "").strip(),
+        "issues": list(prepared.get("issues") or [])[:3],
+        "followups": list(prepared.get("followups") or [])[:3],
+    }
+    return "PREPARED_FOLLOWUP_CONTEXT v1 (controller-generated; use as bounded follow-up context):\n" + json.dumps(
+        payload, ensure_ascii=False
+    )
+
+
+def _consume_support_prepared_followup_for_turn(
+    *,
+    state: dict[str, Any],
+    user_message_id: int,
+) -> tuple[dict[str, str] | None, bool]:
+    prepared = _support_prepared_followup_state(state)
+    if not isinstance(prepared, dict) or not prepared:
+        return None, False
+    if _safe_int_from_state(prepared.get("consumed_by_user_message_id")):
+        return None, False
+
+    prepared["consumed_by_user_message_id"] = int(user_message_id)
+    prepared["consumed_at"] = utcnow().isoformat()
+    _set_support_prepared_followup_state(state, prepared)
+    return {"role": "system", "content": _support_prepared_followup_context_message(prepared)}, True
+
+
+def _enqueue_support_post_send_prepare(
+    *,
+    assistant_db: Session,
+    agent_db: Session,
+    session: SupportSession,
+    state: dict[str, Any],
+    target_message_id: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if _assistant_provider() != "vllm":
+        return state, {
+            "action": "none",
+            "enqueued": False,
+            "thread_key": support_post_send_thread_key(session.session_id),
+            "reason": "provider_not_vllm",
+        }
+    if not hasattr(agent_db, "query"):
+        return state, {
+            "action": "none",
+            "enqueued": False,
+            "thread_key": support_post_send_thread_key(session.session_id),
+            "reason": "agent_db_unavailable",
+        }
+
+    now = utcnow()
+    thread_key = support_post_send_thread_key(session.session_id)
+    support_state = _support_post_send_state(state)
+    support_state["thread_key"] = thread_key
+    support_state["latest_target_message_id"] = int(target_message_id)
+    support_state["last_requested_at"] = now.isoformat()
+
+    enqueue_result = enqueue_post_send_prepare_command(
+        agent_db=agent_db,
+        source="support_chat",
+        thread_key=thread_key,
+        payload={
+            "session_id": session.session_id,
+            "session_pk": int(session.id),
+            "target_message_id": int(target_message_id),
+            "requested_at": now.isoformat(),
+        },
+        priority=1,
+    )
+
+    if enqueue_result.enqueued and enqueue_result.command_id is not None:
+        support_state["queued_target_message_id"] = int(target_message_id)
+        support_state["queued_command_id"] = int(enqueue_result.command_id)
+        support_state["last_enqueued_at"] = now.isoformat()
+        support_state.pop("pending_target_message_id", None)
+    elif enqueue_result.reason == "duplicate_inflight":
+        queued_target_id = _safe_int_from_state(support_state.get("queued_target_message_id")) or 0
+        pending_target_id = _safe_int_from_state(support_state.get("pending_target_message_id")) or 0
+        if int(target_message_id) > max(queued_target_id, pending_target_id):
+            support_state["pending_target_message_id"] = int(target_message_id)
+            support_state["pending_requested_at"] = now.isoformat()
+
+    session.state_json = _dump_state(state)
+    assistant_db.flush()
+    return state, enqueue_result.as_meta()
 
 
 def _normalize_assistant_brief(value: Any) -> str | None:
@@ -1327,6 +1497,15 @@ def chat(
     assistant_db.flush()
     assistant_db.commit()
 
+    prepared_followup_message = None
+    prepared_followup_consumed = False
+    prepared_followup_message, prepared_followup_consumed = _consume_support_prepared_followup_for_turn(
+        state=state,
+        user_message_id=int(user_message.id),
+    )
+    if prepared_followup_consumed:
+        state_changed = True
+
     history_limit = _history_limit()
     max_tokens = _max_prompt_tokens()
     assistant_provider = _assistant_provider()
@@ -1371,6 +1550,21 @@ def chat(
         if last_assistant_turn_row is not None
         else ""
     )
+    awaiting_reply_state = _awaiting_reply_interpretation_state(
+        tool_protocol=tool_protocol,
+        available_tool_names=available_openai_tool_names_full,
+        focused_project_id=focused_project_id,
+        last_assistant_message=last_assistant_text_for_turn_decision,
+    )
+    legacy_reply_interpretation_kind = (
+        _legacy_reply_interpretation_kind(payload.message)
+        if awaiting_reply_state is not None
+        else "none"
+    )
+    legacy_reply_interpretation_action = _reply_interpretation_action(
+        awaiting_reply_state,
+        legacy_reply_interpretation_kind,
+    )
     if assistant_provider == "vllm" and turn_decision_mode != "off":
         turn_decision_result = run_turn_decision_pipeline(
             generate_reply_fn=generate_reply,
@@ -1389,13 +1583,44 @@ def chat(
                 "tools_enabled": bool(tools_enabled),
                 "requested_tool_names": requested_tool_names_known,
                 "available_write_tools": available_write_tool_names_full,
+                "awaiting_reply_state": awaiting_reply_state,
                 "ui": ui_payload or {},
             },
         )
         turn_decision_runtime_applied = bool(
             turn_decision_result.ok and turn_decision_mode == "own" and turn_decision_result.decision is not None
         )
+    classifier_reply_interpretation_kind = (
+        turn_decision_result.decision.reply_interpretation.kind
+        if turn_decision_result is not None and turn_decision_result.decision is not None
+        else "none"
+    )
+    classifier_reply_interpretation_action = _reply_interpretation_action(
+        awaiting_reply_state,
+        classifier_reply_interpretation_kind,
+    )
+    reply_interpretation_runtime_applied = bool(
+        turn_decision_runtime_applied and awaiting_reply_state is not None
+    )
+    reply_interpretation_runtime_kind = (
+        classifier_reply_interpretation_kind
+        if reply_interpretation_runtime_applied
+        else legacy_reply_interpretation_kind
+    )
+    reply_interpretation_runtime_action = (
+        classifier_reply_interpretation_action
+        if reply_interpretation_runtime_applied
+        else legacy_reply_interpretation_action
+    )
+    reply_interpretation_policy_messages = _reply_interpretation_messages(
+        action=reply_interpretation_runtime_action if reply_interpretation_runtime_applied else None,
+        awaiting_state=awaiting_reply_state,
+    )
+    skip_tool_router_for_reply_interpretation = bool(reply_interpretation_runtime_applied)
 
+    selected_policy_rule_name: str | None = None
+    tool_selector_source: str | None = None
+    support_policy_selection = None
     if (
         tool_protocol == "openai"
         and tools_enabled
@@ -1403,6 +1628,7 @@ def chat(
         and tool_schemas
         and assistant_provider == "vllm"
         and not confirmation_reply
+        and not skip_tool_router_for_reply_interpretation
     ):
         available_tool_names = _openai_tool_names(tool_schemas)
         requested_tool_names_available = _requested_tool_names_from_text(
@@ -1410,6 +1636,7 @@ def chat(
         )
         groups = turn_decision_groups or tool_groups_for_available_tools(available_tool_names)
         if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
+            tool_selector_source = "turn_decision"
             selected_tool_names = selected_tool_names_from_decision(
                 groups=groups,
                 decision=turn_decision_result.decision,
@@ -1433,7 +1660,11 @@ def chat(
                     tool_schemas = filtered
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
         else:
-            hinted_group_names = _hinted_tool_groups_for_message(
+            support_policy_selection = select_support_tool_policy(
+                message=payload.message,
+                focused_project_id=focused_project_id,
+            )
+            hinted_group_names = hinted_support_tool_groups(
                 message=payload.message,
                 focused_project_id=focused_project_id,
             )
@@ -1457,9 +1688,12 @@ def chat(
                 tool_router["provider_meta"] = router_reply.meta
             if hinted_group_names:
                 tool_router["hinted_group_names"] = sorted(hinted_group_names)
+            if support_policy_selection is not None:
+                tool_router["policy_rule"] = support_policy_selection.rule_name
 
             grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
             if decision:
+                tool_selector_source = "generic_router"
                 selected_tool_names = tool_names_for_groups(
                     groups=groups,
                     primary=str(decision["primary"]),
@@ -1477,10 +1711,11 @@ def chat(
                         name = func_obj.get("name") if isinstance(func_obj, dict) else None
                         if isinstance(name, str) and name.strip() in selected_tool_names:
                             filtered.append(spec)
-                    if filtered:
-                        tool_schemas = filtered
-                        tool_router["selected_tool_names"] = sorted(selected_tool_names)
+                if filtered:
+                    tool_schemas = filtered
+                    tool_router["selected_tool_names"] = sorted(selected_tool_names)
             elif hinted_group_names:
+                tool_selector_source = "hinted_groups"
                 selected_tool_names = {"assistant_prompt_header", "assistant_list_tools"}
                 for group_name in hinted_group_names:
                     selected_tool_names |= grouped_tool_names.get(group_name, set())
@@ -1499,9 +1734,23 @@ def chat(
         and isinstance(tool_schemas, list)
         and tool_schemas
         and assistant_provider == "vllm"
-        and confirmation_reply
+        and (confirmation_reply or skip_tool_router_for_reply_interpretation)
     ):
-        tool_router = {"ok": True, "skipped": True, "reason": "confirmation_reply"}
+        tool_router = {
+            "ok": True,
+            "skipped": True,
+            "reason": "reply_interpretation" if skip_tool_router_for_reply_interpretation else "confirmation_reply",
+        }
+
+    reply_interpretation_removed_write_tools: list[str] = []
+    if (
+        tool_protocol == "openai"
+        and reply_interpretation_runtime_applied
+        and reply_interpretation_runtime_action != "approve_save"
+    ):
+        tool_schemas, reply_interpretation_removed_write_tools = _remove_write_tools_from_openai_schemas(tool_schemas)
+        if isinstance(tool_router, dict) and reply_interpretation_removed_write_tools:
+            tool_router["reply_interpretation_removed_write_tools"] = reply_interpretation_removed_write_tools
 
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
     openai_tool_names = _openai_tool_names(tool_schemas)
@@ -1547,7 +1796,6 @@ def chat(
         tool_names=openai_tool_names if tool_protocol == "openai" else None,
     )
     answer_prompt = _system_prompt_answer(response_format=response_format)
-    review_prompt = _system_prompt_review()
     prompt_for_budget = planner_prompt if tools_enabled else answer_prompt
 
     selected_history: list[SupportMessage] = []
@@ -1580,6 +1828,7 @@ def chat(
 
         ispec_context = build_ispec_context(core_db, message=payload.message, state=state, user=user)
         state_for_context = dict(state)
+        state_for_context.pop("controller", None)
         for key in ("ui_route", "ui_project_id", "ui_experiment_id", "ui_experiment_run_id"):
             state_for_context.pop(key, None)
         for key in (
@@ -1609,7 +1858,9 @@ def chat(
         base_messages = [
             {"role": "system", "content": prompt_for_budget},
             {"role": "system", "content": context_message},
+            *([prepared_followup_message] if prepared_followup_message else []),
             *tool_availability_messages,
+            *reply_interpretation_policy_messages,
             {"role": "user", "content": payload.message},
         ]
         tokens = estimate_tokens_for_messages(base_messages)
@@ -1661,49 +1912,15 @@ def chat(
     comment_intent_messages: list[dict[str, Any]] = []
     if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
         write_mode = turn_decision_result.decision.write_plan.mode
-        if write_mode == "draft_only":
-            comment_intent_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "NOTE: comment_intent=draft_only. "
-                        "Treat this as a hint: draft the comment, then ask for confirmation or tweaks before saving."
-                    ),
-                }
-            ]
-        elif write_mode == "save_now":
-            if turn_decision_result.decision.needs_clarification and (
-                turn_decision_result.decision.clarification_reason == "missing_comment_text"
-            ):
-                comment_intent_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "NOTE: The user appears to want a project comment saved, but the actual comment text is still missing. "
-                            "Do not save yet; ask for the comment text first."
-                        ),
-                    }
-                ]
-            else:
-                comment_intent_messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "NOTE: comment_intent=save_now. "
-                            "Treat this as a hint: the user appears to want the note saved now if you have enough content."
-                        ),
-                    }
-                ]
-        elif write_mode == "confirm_save":
-            comment_intent_messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "NOTE: comment_intent=confirm_save. "
-                        "Treat this as a hint: the user appears to be confirming a previously drafted note should now be saved."
-                    ),
-                }
-            ]
+        if not (reply_interpretation_runtime_applied and reply_interpretation_runtime_action != "approve_save"):
+            comment_intent_messages = comment_intent_messages_for_write_mode(
+                write_mode=write_mode,
+                missing_comment_text=(
+                    write_mode == "save_now"
+                    and turn_decision_result.decision.needs_clarification
+                    and turn_decision_result.decision.clarification_reason == "missing_comment_text"
+                ),
+            )
     elif (
         tool_protocol == "openai"
         and tools_enabled
@@ -1722,29 +1939,11 @@ def chat(
             intent = str(comment_intent_decision.get("intent") or "").strip()
             confidence = float(comment_intent_decision.get("confidence") or 0.0)
             reason = _truncate(str(comment_intent_decision.get("reason") or ""), 240)
-            if intent == "draft_only":
-                hint = (
-                    f"NOTE: comment_intent=draft_only (confidence={confidence:.2f}). "
-                    "Treat this as a hint: draft the comment, then ask for confirmation or tweaks before saving."
-                )
-            elif intent == "save_now":
-                hint = (
-                    f"NOTE: comment_intent=save_now (confidence={confidence:.2f}). "
-                    "Treat this as a hint: the user appears to want the note saved now if you have enough content."
-                )
-            elif intent == "confirm_save":
-                hint = (
-                    f"NOTE: comment_intent=confirm_save (confidence={confidence:.2f}). "
-                    "Treat this as a hint: the user appears to be confirming a previously drafted note should now be saved."
-                )
-            else:
-                hint = (
-                    f"NOTE: comment_intent=other (confidence={confidence:.2f}). "
-                    "Treat this as a hint only; do not infer that a project comment write is needed."
-                )
-            if reason:
-                hint += f" Reason: {reason}"
-            comment_intent_messages = [{"role": "system", "content": hint}]
+            comment_intent_messages = comment_intent_messages_for_write_mode(
+                write_mode=_legacy_comment_intent_to_write_mode(comment_intent_decision),
+                confidence=confidence,
+                reason=reason,
+            )
 
     tool_calls: list[dict[str, Any]] = []
     tool_messages: list[dict[str, Any]] = []
@@ -1757,6 +1956,15 @@ def chat(
     tool_protocol_retry_used = False
     tool_protocol_guard_triggered = False
     forced_tool_choice: str | dict[str, Any] | None = None
+    if (
+        tool_protocol == "openai"
+        and reply_interpretation_runtime_applied
+        and reply_interpretation_runtime_action == "approve_save"
+        and isinstance(focused_project_id, int)
+        and focused_project_id > 0
+        and "create_project_comment" in openai_tool_names
+    ):
+        forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
     if (
         tool_protocol == "openai"
         and confirmation_reply
@@ -1776,26 +1984,24 @@ def chat(
         and turn_decision_result.decision is not None
         and turn_decision_result.decision.tool_plan.preferred_first_tool in openai_tool_names
     ):
+        tool_selector_source = tool_selector_source or "turn_decision"
         forced_tool_choice = {
             "type": "function",
             "function": {"name": str(turn_decision_result.decision.tool_plan.preferred_first_tool)},
         }
-    policy_tool_name = None if turn_decision_runtime_applied else _policy_tool_for_message(payload.message)
-
-    policy_tool_args = _policy_tool_args_for_message(tool_name=policy_tool_name, message=payload.message) if policy_tool_name else {}
-    policy_messages = _policy_messages_for_message(tool_name=policy_tool_name, message=payload.message) if policy_tool_name else []
-    if policy_tool_name:
-        if policy_tool_name not in openai_tool_names:
-            policy_tool_name = None
-            policy_tool_args = {}
-            policy_messages = []
-        elif (
-            policy_tool_name not in openai_no_arg_tool_names
-            and not policy_tool_args
-        ):
-            policy_tool_name = None
-            policy_tool_args = {}
-            policy_messages = []
+    policy_tool_name = None if turn_decision_runtime_applied else (
+        support_policy_selection.tool_name if support_policy_selection is not None else None
+    )
+    policy_tool_args = dict(support_policy_selection.args or {}) if support_policy_selection is not None else {}
+    policy_messages = list(support_policy_selection.messages or []) if support_policy_selection is not None else []
+    if policy_tool_name and (
+        policy_tool_name not in openai_tool_names
+        or (policy_tool_name not in openai_no_arg_tool_names and not policy_tool_args)
+    ):
+        policy_tool_name = None
+        policy_tool_args = {}
+        policy_messages = []
+        support_policy_selection = None
 
     if (
         tool_protocol == "openai"
@@ -1803,6 +2009,10 @@ def chat(
         and policy_tool_name in {"assistant_list_tmux_panes", "get_project"}
         and policy_tool_name in openai_tool_names
     ):
+        tool_selector_source = tool_selector_source or "support_policy_rule"
+        selected_policy_rule_name = (
+            support_policy_selection.rule_name if support_policy_selection is not None else selected_policy_rule_name
+        )
         forced_tool_choice = {"type": "function", "function": {"name": policy_tool_name}}
 
     prompt_header = None
@@ -1848,8 +2058,10 @@ def chat(
             {"role": "system", "content": system_prompt},
             *header_message,
             {"role": "system", "content": context_message},
+            *([prepared_followup_message] if prepared_followup_message else []),
             *tool_availability_messages,
             *policy_messages,
+            *reply_interpretation_policy_messages,
             *comment_intent_messages,
             {"role": "user", "content": payload.message},
             *tool_messages,
@@ -1869,8 +2081,10 @@ def chat(
             {"role": "system", "content": system_prompt},
             *header_message,
             {"role": "system", "content": context_message},
+            *([prepared_followup_message] if prepared_followup_message else []),
             *tool_availability_messages,
             *policy_messages,
+            *reply_interpretation_policy_messages,
             *comment_intent_messages,
             *trimmed_history,
             {"role": "user", "content": payload.message},
@@ -2213,6 +2427,7 @@ def chat(
                 {"role": "system", "content": answer_prompt},
                 {"role": "system", "content": context_message},
                 *tool_availability_messages,
+                *reply_interpretation_policy_messages,
                 *history_payload,
                 {"role": "user", "content": payload.message},
                 *tool_messages,
@@ -2241,134 +2456,47 @@ def chat(
     final_reply = reply
     final_raw_reply_content = draft_raw_reply_content
 
-    response_contract_enabled = response_contracts_enabled()
+    response_contract_mode = response_contracts_mode()
+    response_contract_would_apply_if_live, response_contract_protection_reason = _response_contract_live_eligibility(
+        tool_calls=tool_calls,
+        comment_intent_decision=comment_intent_decision,
+        turn_decision_result=turn_decision_result,
+    )
     response_contract_request_meta = _merge_response_contract_request_meta(
         request_meta=payload.meta if isinstance(payload.meta, dict) else None,
         contract_cap=turn_decision_contract_cap if turn_decision_runtime_applied else None,
     )
-    response_contract_meta: dict[str, Any] = {
-        "enabled": response_contract_enabled,
-        "applied": False,
-    }
-    response_contract_applied = False
-    if response_contract_enabled:
-        if compare_choices is not None:
-            response_contract_meta["skipped_reason"] = "compare_mode"
-        elif not final_reply.ok:
-            response_contract_meta["skipped_reason"] = "draft_reply_error"
-        elif not assistant_content.strip():
-            response_contract_meta["skipped_reason"] = "empty_draft"
-        else:
-            response_contract_result = run_response_contract_pipeline(
-                generate_reply_fn=generate_reply,
-                context_message=context_message,
-                history_messages=history_for_llm,
-                user_message=payload.message,
-                tool_result_messages=tool_result_messages,
-                draft_answer=assistant_content,
-                request_meta=response_contract_request_meta,
-            )
-            response_contract_meta = response_contract_result.as_meta()
-            if response_contract_result.ok and response_contract_result.rendered_content:
-                assistant_content = response_contract_result.rendered_content
-                response_contract_applied = True
-
-    self_review_changed = False
-    self_review_error: str | None = None
-    self_review_mode: str | None = None
-    self_review_decision: str | None = None
-    should_self_review = (
-        self_review_enabled
-        and compare_choices is None
-        and final_reply.ok
-        and assistant_content.strip()
-        and not response_contract_applied
+    controller_pre_send = run_message_pre_send_controller(
+        generate_reply_fn=generate_reply,
+        source="support_chat",
+        context_message=context_message,
+        history_messages=history_for_llm,
+        user_message=payload.message,
+        tool_messages=tool_messages,
+        tool_result_messages=tool_result_messages,
+        draft_answer=assistant_content,
+        draft_reply=final_reply,
+        compare_mode=compare_choices is not None,
+        request_meta=response_contract_request_meta,
+        response_contract_mode=response_contract_mode,
+        response_contract_would_apply_if_live=response_contract_would_apply_if_live,
+        response_contract_protection_reason=response_contract_protection_reason,
+        self_review_enabled=self_review_enabled,
+        self_review_decider_enabled=assistant_provider == "vllm" and self_review_decider_enabled,
+        used_tool_calls=used_tool_calls,
     )
-    if self_review_enabled and response_contract_applied:
-        self_review_mode = "skipped_response_contract"
-    elif should_self_review and used_tool_calls <= 0:
-        self_review_mode = "skipped_no_tool_calls"
-    elif should_self_review:
-        self_review_mode = "rewrite"
-
-        if assistant_provider == "vllm" and self_review_decider_enabled:
-            self_review_mode = "guided_choice"
-            decider_instruction = (
-                "Decide if the draft answer needs changes. "
-                "Output only KEEP (no changes) or REWRITE (needs changes)."
-            )
-            decider_reply = generate_reply(
-                messages=[
-                    {"role": "system", "content": _system_prompt_review_decider()},
-                    {"role": "system", "content": context_message},
-                    *history_for_llm,
-                    {"role": "user", "content": payload.message},
-                    *tool_messages,
-                    {"role": "assistant", "content": assistant_content},
-                    {"role": "user", "content": decider_instruction},
-                ],
-                tools=None,
-                vllm_extra_body={
-                    "guided_choice": ["KEEP", "REWRITE"],
-                    "max_tokens": 3,
-                    "stop": ["\n"],
-                    "temperature": 0,
-                },
-            )
-            if not decider_reply.ok:
-                self_review_error = "review_decider_error"
-                self_review_decision = "keep"
-            else:
-                decider_text = (decider_reply.content or "").strip().upper()
-                if decider_text.startswith("KEEP"):
-                    self_review_decision = "keep"
-                elif decider_text.startswith("REWRITE"):
-                    self_review_decision = "rewrite"
-                else:
-                    self_review_error = "review_decider_invalid_output"
-
-        if self_review_decision != "keep":
-            review_instruction = (
-                "Review the assistant answer above for correctness (grounded in CONTEXT/TOOL_RESULT), "
-                "clarity, and iSPEC tone. If it's already good, repeat it verbatim. "
-                "If it needs changes, rewrite it. Do not call tools.\n"
-                "Output only:\nFINAL:\n<answer>"
-            )
-            review_reply = generate_reply(
-                messages=[
-                    {"role": "system", "content": review_prompt},
-                    {"role": "system", "content": context_message},
-                    *history_for_llm,
-                    {"role": "user", "content": payload.message},
-                    *tool_messages,
-                    {"role": "assistant", "content": assistant_content},
-                    {"role": "user", "content": review_instruction},
-                ],
-                tools=None,
-            )
-
-            if not review_reply.ok:
-                self_review_error = "review_error"
-            else:
-                review_tool_call = parse_tool_call(review_reply.content)
-                if review_tool_call is not None or review_reply.tool_calls:
-                    self_review_error = "review_requested_tool_call"
-                else:
-                    review_raw = (review_reply.content or "").strip()
-                    review_plan_text, review_final_content = split_plan_final(review_raw)
-                    reviewed_content = (review_final_content or review_raw).strip()
-                    if reviewed_content:
-                        final_reply = reply
-                        final_raw_reply_content = draft_raw_reply_content
-                        assistant_content = draft_assistant_content
-
-                        if reviewed_content != assistant_content.strip():
-                            self_review_changed = True
-                            assistant_content = reviewed_content
-                            final_reply = review_reply
-                            final_raw_reply_content = review_raw
-                    else:
-                        self_review_error = "empty_review_output"
+    assistant_content = controller_pre_send.final_content
+    final_reply = controller_pre_send.final_reply
+    final_raw_reply_content = controller_pre_send.final_raw_content
+    response_contract_meta = controller_pre_send.response_contract_meta
+    response_contract_meta["configured_mode"] = response_contract_mode
+    response_contract_meta["would_apply_if_live"] = response_contract_would_apply_if_live
+    response_contract_meta["protection_reason"] = response_contract_protection_reason
+    response_contract_applied = controller_pre_send.response_contract_applied
+    self_review_changed = controller_pre_send.self_review_changed
+    self_review_error = controller_pre_send.self_review_error
+    self_review_mode = controller_pre_send.self_review_mode
+    self_review_decision = controller_pre_send.self_review_decision
 
     successful_write_tools_final = {
         str(call.get("name") or "").strip()
@@ -2422,6 +2550,14 @@ def chat(
             "compare_mode_requested": compare_mode_requested,
             "response_contract_policy": _response_contract_policy_meta(response_contract_request_meta),
             "comment_intent_write_mode": _legacy_comment_intent_to_write_mode(comment_intent_decision),
+            "awaiting_reply_state": (
+                str(awaiting_reply_state.get("name") or "").strip()
+                if isinstance(awaiting_reply_state, dict)
+                else None
+            ),
+            "reply_interpretation_kind": reply_interpretation_runtime_kind,
+            "reply_interpretation_action": reply_interpretation_runtime_action,
+            "reply_interpretation_applied": reply_interpretation_runtime_applied,
         }
         turn_decision_meta["runtime"] = runtime_snapshot
 
@@ -2460,6 +2596,16 @@ def chat(
                     "turn_decision": turn_decision_result.decision.write_plan.mode,
                     "runtime": runtime_write_mode,
                 }
+            if classifier_reply_interpretation_kind != reply_interpretation_runtime_kind:
+                divergence["reply_interpretation_kind"] = {
+                    "turn_decision": classifier_reply_interpretation_kind,
+                    "runtime": reply_interpretation_runtime_kind,
+                }
+            if classifier_reply_interpretation_action != reply_interpretation_runtime_action:
+                divergence["reply_interpretation_action"] = {
+                    "turn_decision": classifier_reply_interpretation_action,
+                    "runtime": reply_interpretation_runtime_action,
+                }
             if divergence:
                 turn_decision_meta["divergence"] = divergence
 
@@ -2471,6 +2617,21 @@ def chat(
             if referenced_projects
             else ([focused_project_id] if focused_project_id is not None else []),
         },
+    }
+    controller_thread_key = support_post_send_thread_key(session.session_id)
+    meta["controller"] = {
+        "schema_version": 1,
+        "source": "support_chat",
+        "thread_key": controller_thread_key,
+        "pre_send": {
+            "action": controller_pre_send.action,
+            "stages": [stage.as_meta() for stage in controller_pre_send.stages],
+            "response_contract_applied": response_contract_applied,
+            "self_review_changed": self_review_changed,
+        },
+        "tool_selector": tool_selector_source,
+        "selected_rule_name": selected_policy_rule_name,
+        "prepared_followup_injected": bool(prepared_followup_consumed),
     }
     meta["tooling"] = {
         "enabled": bool(tools_enabled_initial),
@@ -2488,6 +2649,32 @@ def chat(
         meta["tool_router"] = tool_router
     if turn_decision_meta is not None:
         meta["turn_decision"] = turn_decision_meta
+    if isinstance(awaiting_reply_state, dict) or classifier_reply_interpretation_kind != "none":
+        meta["reply_interpretation"] = {
+            "awaiting_state": (
+                str(awaiting_reply_state.get("name") or "").strip()
+                if isinstance(awaiting_reply_state, dict)
+                else None
+            ),
+            "legacy_kind": legacy_reply_interpretation_kind,
+            "legacy_action": legacy_reply_interpretation_action,
+            "classifier_kind": classifier_reply_interpretation_kind,
+            "classifier_action": classifier_reply_interpretation_action,
+            "classifier_confidence": (
+                turn_decision_result.decision.reply_interpretation.confidence
+                if turn_decision_result is not None and turn_decision_result.decision is not None
+                else 0.0
+            ),
+            "classifier_reason": (
+                turn_decision_result.decision.reply_interpretation.reason
+                if turn_decision_result is not None and turn_decision_result.decision is not None
+                else ""
+            ),
+            "runtime_kind": reply_interpretation_runtime_kind,
+            "runtime_action": reply_interpretation_runtime_action,
+            "applied": reply_interpretation_runtime_applied,
+            "removed_write_tools": reply_interpretation_removed_write_tools,
+        }
     if comment_intent_decision is not None or comment_intent_reply is not None:
         meta["comment_intent"] = {
             "enabled": _project_comment_intent_hints_enabled(),
@@ -2524,7 +2711,7 @@ def chat(
             "decision": self_review_decision,
         }
         if self_review_changed:
-            draft_raw = draft_raw_reply_content.strip()
+            draft_raw = str(controller_pre_send.draft_raw_content or "").strip()
             if draft_raw and draft_raw != raw_final:
                 meta["draft_raw_content"] = draft_raw
     if write_claim_guard_triggered:
@@ -2543,6 +2730,7 @@ def chat(
         }
 
     if compare_choices is not None and final_reply.ok and assistant_content.strip():
+        meta["controller"]["post_send"] = {"action": "none", "reason": "compare_pending_choice"}
         answer_a, answer_b = compare_choices
         meta_a = {**meta, "compare_choice": {"index": 0}}
         meta_b = {**meta, "compare_choice": {"index": 1}}
@@ -2610,10 +2798,21 @@ def chat(
         content=assistant_content,
         provider=final_reply.provider,
         model=final_reply.model,
-        meta_json=json.dumps(meta, ensure_ascii=False),
+        meta_json=None,
     )
     assistant_db.add(assistant_message)
     session.updated_at = utcnow()
+    assistant_db.flush()
+
+    state, post_send_meta = _enqueue_support_post_send_prepare(
+        assistant_db=assistant_db,
+        agent_db=agent_db,
+        session=session,
+        state=state,
+        target_message_id=int(assistant_message.id),
+    )
+    meta["controller"]["post_send"] = post_send_meta
+    assistant_message.meta_json = json.dumps(meta, ensure_ascii=False)
     assistant_db.flush()
 
     state, enqueued = _maybe_enqueue_session_compaction(
@@ -2627,18 +2826,6 @@ def chat(
     if enqueued:
         session.state_json = _dump_state(state)
         assistant_db.flush()
-
-    try:
-        # Inline chat: assistant message commits after the handler returns (FastAPI dependency),
-        # so add a tiny delay to avoid racing the supervisor snapshot.
-        _poke_orchestrator_tick_now(
-            agent_db=agent_db,
-            source="support_chat_inline",
-            session_id=session.session_id,
-            delay_seconds=1,
-        )
-    except Exception:
-        pass
 
     return ChatResponse(
         sessionId=session.session_id,
@@ -2724,6 +2911,16 @@ def choose(
     if user is not None:
         compare_selection["user"] = _support_user_summary(user)
     assistant_meta = {**assistant_meta, "compare_selection": compare_selection}
+    controller_meta = assistant_meta.get("controller") if isinstance(assistant_meta.get("controller"), dict) else {}
+    if not isinstance(controller_meta, dict):
+        controller_meta = {}
+    controller_meta = {
+        "schema_version": 1,
+        "source": "support_chat",
+        "thread_key": support_post_send_thread_key(session.session_id),
+        **controller_meta,
+    }
+    assistant_meta["controller"] = controller_meta
 
     assistant_message = SupportMessage(
         session_pk=session.id,
@@ -2737,13 +2934,27 @@ def choose(
     session.updated_at = utcnow()
     assistant_db.flush()
 
+    state = _load_state(getattr(session, "state_json", None))
+    state, post_send_meta = _enqueue_support_post_send_prepare(
+        assistant_db=assistant_db,
+        agent_db=agent_db,
+        session=session,
+        state=state,
+        target_message_id=int(assistant_message.id),
+    )
+    assistant_meta["controller"] = {
+        **controller_meta,
+        "post_send": post_send_meta,
+    }
+    assistant_message.meta_json = json.dumps(assistant_meta, ensure_ascii=False) if assistant_meta else None
+    assistant_db.flush()
+
     compare_meta["selected_index"] = int(payload.choiceIndex)
     compare_meta["selected_message_id"] = int(assistant_message.id)
     compare_meta["selected_at"] = utcnow().isoformat()
     user_message.meta_json = json.dumps({**_load_state(meta_raw), "compare": compare_meta}, ensure_ascii=False)
     assistant_db.flush()
 
-    state = _load_state(getattr(session, "state_json", None))
     state, enqueued = _maybe_enqueue_session_compaction(
         assistant_db=assistant_db,
         agent_db=agent_db,
@@ -2755,16 +2966,6 @@ def choose(
     if enqueued:
         session.state_json = _dump_state(state)
         assistant_db.flush()
-
-    try:
-        _poke_orchestrator_tick_now(
-            agent_db=agent_db,
-            source="support_chat_choose",
-            session_id=session.session_id,
-            delay_seconds=1,
-        )
-    except Exception:
-        pass
 
     return ChooseResponse(
         sessionId=session.session_id,
