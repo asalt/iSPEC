@@ -727,6 +727,23 @@ def _tmux_capture_text(*, target: str, history_lines: int | None = None) -> str:
     return str(proc.stdout or "")
 
 
+def _tmux_activity_summary(*, pane: dict[str, Any], last_nonempty_line: str | None) -> str:
+    alias = str(pane.get("preferred_alias") or pane.get("target") or pane.get("pane_id") or "pane").strip() or "pane"
+    current_command = str(pane.get("current_command") or "").strip()
+    pane_title = str(pane.get("pane_title") or "").strip()
+    state_bits = [f"{alias} is {'active' if bool(pane.get('pane_active')) else 'available'}"]
+    if bool(pane.get("pane_dead")):
+        state_bits[0] = f"{alias} is marked dead"
+    if current_command:
+        state_bits.append(f"running {current_command}")
+    if pane_title:
+        state_bits.append(f"title={pane_title!r}")
+    summary = ", ".join(state_bits) + "."
+    if last_nonempty_line:
+        summary += f" Last visible non-empty line: {last_nonempty_line!r}."
+    return summary
+
+
 def _tmux_capture_snapshot(
     *,
     pane: dict[str, Any],
@@ -779,6 +796,7 @@ def _tmux_capture_snapshot(
         "captured_total_lines": len(all_lines),
         "visible_line_count": len(visible_lines),
         "last_nonempty_line": last_nonempty_line,
+        "activity_summary": _tmux_activity_summary(pane=pane, last_nonempty_line=last_nonempty_line),
         "content": "\n".join(visible_lines),
     }
 
@@ -1533,7 +1551,7 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     )
     add(
         "assistant_capture_tmux_pane",
-        "- assistant_capture_tmux_pane(target: str, lines: int = 120, include_history: bool = false, history_lines: int | None = None)  # internal-only; capture text from one readable tmux pane",
+        "- assistant_capture_tmux_pane(target: str, lines: int = 120, include_history: bool = false, history_lines: int | None = None)  # internal-only; capture text plus summary metadata from one readable tmux pane; summarize by default unless raw output is requested",
     )
     add(
         "assistant_compare_tmux_pane",
@@ -6156,8 +6174,8 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "function": {
             "name": "assistant_capture_tmux_pane",
             "description": (
-                "Internal-only: capture visible text from one readable tmux pane. "
-                "Use assistant_list_tmux_panes first to pick a target."
+                "Internal-only: capture visible text plus summary metadata from one readable tmux pane. "
+                "Use assistant_list_tmux_panes first to pick a target, and summarize by default unless the user asks for raw output."
             ),
             "parameters": {
                 "type": "object",

@@ -153,7 +153,7 @@ def test_support_chat_self_review_decider_can_keep_draft_without_rewrite(tmp_pat
 
         assert "Output only KEEP" in last_user_content
         assert vllm_extra_body == {
-            "guided_choice": ["KEEP", "REWRITE"],
+            "structured_outputs": {"choice": ["KEEP", "REWRITE"]},
             "max_tokens": 3,
             "stop": ["\n"],
             "temperature": 0,
@@ -202,7 +202,7 @@ def test_support_chat_self_review_decider_can_keep_draft_without_rewrite(tmp_pat
         assert assistant_row.content == "Draft answer."
 
         meta = json.loads(assistant_row.meta_json)
-        assert meta["self_review"]["mode"] == "guided_choice"
+        assert meta["self_review"]["mode"] == "structured_choice"
         assert meta["self_review"]["decision"] == "keep"
         assert meta["self_review"]["changed"] is False
 

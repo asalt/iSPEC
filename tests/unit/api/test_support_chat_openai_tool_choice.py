@@ -1085,7 +1085,7 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
         if len(calls) == 1:
             assert tools is None
             assert isinstance(vllm_extra_body, dict)
-            assert "guided_json" in vllm_extra_body
+            assert isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
             return AssistantReply(
                 content=json.dumps(
                     {
@@ -1195,21 +1195,41 @@ def test_support_chat_forces_openai_tmux_list_tool_choice_for_live_tmux_request(
         ]
 
     monkeypatch.setattr(support_routes, "openai_tools_for_user", fake_openai_tools_for_user)
+    monkeypatch.setattr(
+        "ispec.assistant.support_policies._tmux_policy_panes",
+        lambda: [
+            {
+                "session": "ispec-0",
+                "session_group": "ispec",
+                "session_names": ["ispec-0", "ispec-1"],
+                "target": "ispec-0:node.1",
+                "preferred_alias": "ispec:node.1",
+                "capture_target": "%0",
+                "pane_id": "%0",
+                "pane_number": 0,
+                "target_aliases": ["ispec:node.1", "ispec-0:node.1", "ispec-1:node.1"],
+                "window_aliases": ["ispec:node", "ispec-0:node", "ispec-1:node"],
+                "window_name": "node",
+                "pane_title": "codex resume --all /home/alex/tools/ispec-full",
+                "current_command": "node",
+            }
+        ],
+    )
 
     tool_runs: list[dict[str, Any]] = []
 
     def fake_run_tool(*, name=None, args=None, **_):
         tool_runs.append({"name": name, "args": args})
-        assert name == "assistant_list_tmux_panes"
+        assert name == "assistant_capture_tmux_pane"
+        assert args == {"target": "%0", "lines": 40}
         return {
             "ok": True,
-            "items": [
-                {
-                    "target": "ispec-0:node.1",
-                    "session_name": "ispec",
-                    "pane_title": "codex resume --all /home/alex/tools/ispec-full",
-                }
-            ],
+            "result": {
+                "target": "%0",
+                "capture_target": "%0",
+                "content": "thinking\nCodex ready",
+                "last_nonempty_line": "Codex ready",
+            },
         }
 
     monkeypatch.setattr(support_routes, "run_tool", fake_run_tool)
@@ -1226,7 +1246,7 @@ def test_support_chat_forces_openai_tmux_list_tool_choice_for_live_tmux_request(
             }
         )
 
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             return AssistantReply(
                 content=json.dumps(
                     {
@@ -1242,7 +1262,7 @@ def test_support_chat_forces_openai_tmux_list_tool_choice_for_live_tmux_request(
             )
 
         if len(tool_runs) == 0:
-            assert tool_choice == {"type": "function", "function": {"name": "assistant_list_tmux_panes"}}
+            assert tool_choice == {"type": "function", "function": {"name": "assistant_capture_tmux_pane"}}
             return AssistantReply(
                 content="",
                 provider="test",
@@ -1253,8 +1273,8 @@ def test_support_chat_forces_openai_tmux_list_tool_choice_for_live_tmux_request(
                         "id": "call_1",
                         "type": "function",
                         "function": {
-                            "name": "assistant_list_tmux_panes",
-                            "arguments": json.dumps({"session_name": "ispec"}),
+                            "name": "assistant_capture_tmux_pane",
+                            "arguments": json.dumps({"target": "default"}),
                         },
                     }
                 ],
@@ -1264,8 +1284,8 @@ def test_support_chat_forces_openai_tmux_list_tool_choice_for_live_tmux_request(
         assert any(
             isinstance(item, dict)
             and (
-                "assistant_list_tmux_panes" in str(item.get("content") or "")
-                or "ispec-0:node.1" in str(item.get("content") or "")
+                "assistant_capture_tmux_pane" in str(item.get("content") or "")
+                or "Codex ready" in str(item.get("content") or "")
             )
             for item in (messages or [])
         )
@@ -1315,10 +1335,11 @@ def test_support_chat_forces_openai_tmux_list_tool_choice_for_live_tmux_request(
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert meta["tool_calls"][0]["name"] == "assistant_list_tmux_panes"
+        assert meta["tool_calls"][0]["name"] == "assistant_capture_tmux_pane"
+        assert meta["tool_calls"][0]["arguments"] == {"target": "%0", "lines": 40}
         assert meta["tooling"]["forced_tool_choice"] == {
             "type": "function",
-            "function": {"name": "assistant_list_tmux_panes"},
+            "function": {"name": "assistant_capture_tmux_pane"},
         }
 
 
@@ -1386,7 +1407,7 @@ def test_support_chat_forces_get_project_tool_choice_for_project_existence_reque
             }
         )
 
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             return AssistantReply(
                 content=json.dumps(
                     {
@@ -1711,7 +1732,7 @@ def test_support_chat_project_existence_reply_does_not_trigger_write_claim_guard
             }
         )
 
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             return AssistantReply(
                 content=json.dumps(
                     {

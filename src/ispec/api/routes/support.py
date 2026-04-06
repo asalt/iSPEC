@@ -504,7 +504,7 @@ def _rating_value(rating: str) -> int:
 
 def _history_limit() -> int:
     raw = (os.getenv("ISPEC_ASSISTANT_HISTORY_LIMIT") or "").strip()
-    return _parse_int_setting(raw, 20, 0)
+    return _parse_int_setting(raw, 10, 0)
 
 
 def _max_prompt_tokens() -> int:
@@ -885,6 +885,75 @@ def _context_message(*, payload: dict[str, Any]) -> str:
     round_value = payload.get("agent", {}).get("round") if isinstance(payload.get("agent"), dict) else None
     suffix = f" - round {round_value}" if isinstance(round_value, int) and round_value > 0 else ""
     return f"CONTEXT v{version} (read-only JSON){suffix}:\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _isoformat_utc(value: datetime | None) -> str | None:
+    dt = _as_utc_datetime(value)
+    return dt.isoformat() if isinstance(dt, datetime) else None
+
+
+def _prompt_state_from_session_state(state: dict[str, Any]) -> dict[str, Any]:
+    prompt_state: dict[str, Any] = {}
+
+    current_project_id = _safe_int_from_state(state.get("current_project_id"))
+    if current_project_id is not None and current_project_id > 0:
+        prompt_state["current_project_id"] = int(current_project_id)
+
+    ui_route = state.get("ui_route") if isinstance(state.get("ui_route"), dict) else {}
+    ui_payload: dict[str, Any] = {}
+    route_name = str(ui_route.get("name") or "").strip()
+    route_path = str(ui_route.get("path") or "").strip()
+    if route_name:
+        ui_payload["route_name"] = route_name
+    if route_path:
+        ui_payload["route_path"] = route_path
+
+    for state_key, output_key in (
+        ("ui_project_id", "project_id"),
+        ("ui_experiment_id", "experiment_id"),
+        ("ui_experiment_run_id", "experiment_run_id"),
+    ):
+        value = _safe_int_from_state(state.get(state_key))
+        if value is not None and value > 0:
+            ui_payload[output_key] = int(value)
+    if ui_payload:
+        prompt_state["ui"] = ui_payload
+
+    memory = state.get("conversation_memory") if isinstance(state.get("conversation_memory"), dict) else None
+    memory = normalize_conversation_memory(memory) if memory is not None else {}
+    summary = str(state.get("conversation_summary") or "").strip()
+    memory_up_to_id = _safe_int_from_state(state.get("conversation_memory_up_to_id")) or 0
+    summary_up_to_id = _safe_int_from_state(state.get("conversation_summary_up_to_id")) or 0
+
+    if memory:
+        prompt_state["conversation_memory"] = memory
+        if memory_up_to_id > 0:
+            prompt_state["conversation_memory_up_to_id"] = int(memory_up_to_id)
+
+    include_summary = bool(summary)
+    if memory and memory_up_to_id > 0 and summary_up_to_id > 0 and memory_up_to_id >= summary_up_to_id:
+        include_summary = False
+    if include_summary:
+        prompt_state["conversation_summary"] = summary
+        if summary_up_to_id > 0:
+            prompt_state["conversation_summary_up_to_id"] = int(summary_up_to_id)
+
+    return prompt_state
+
+
+def _context_time_payload(
+    *,
+    session: SupportSession,
+    previous_message: SupportMessage | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"now_utc": utcnow().isoformat()}
+    previous_message_at = _isoformat_utc(getattr(previous_message, "created_at", None))
+    if previous_message_at:
+        payload["previous_message_at_utc"] = previous_message_at
+    session_created_at = _isoformat_utc(getattr(session, "created_at", None))
+    if session_created_at:
+        payload["session_created_at_utc"] = session_created_at
+    return payload
 
 
 def _controller_root_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -1495,6 +1564,13 @@ def chat(
     assistant_db.add(user_message)
     session.updated_at = utcnow()
     assistant_db.flush()
+    previous_session_message = (
+        assistant_db.query(SupportMessage)
+        .filter(SupportMessage.session_pk == session.id)
+        .filter(SupportMessage.id < int(user_message.id))
+        .order_by(SupportMessage.id.desc())
+        .first()
+    )
     assistant_db.commit()
 
     prepared_followup_message = None
@@ -1635,7 +1711,46 @@ def chat(
             payload.message, candidates=available_tool_names
         )
         groups = turn_decision_groups or tool_groups_for_available_tools(available_tool_names)
-        if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
+        support_policy_selection = select_support_tool_policy(
+            message=payload.message,
+            focused_project_id=focused_project_id,
+            generate_reply_fn=generate_reply,
+        )
+        hinted_group_names = hinted_support_tool_groups(
+            message=payload.message,
+            focused_project_id=focused_project_id,
+        )
+        if support_policy_selection is not None and support_policy_selection.force_tool_choice:
+            tool_selector_source = "support_policy_rule"
+            selected_policy_rule_name = support_policy_selection.rule_name
+            grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
+            selected_tool_names = {
+                "assistant_prompt_header",
+                "assistant_list_tools",
+                support_policy_selection.tool_name,
+            }
+            selected_tool_names |= grouped_tool_names.get("tmux", set())
+            if requested_tool_names_available:
+                selected_tool_names |= set(requested_tool_names_available)
+            tool_router = {
+                "ok": True,
+                "source": "support_policy_rule",
+                "groups": [{"name": group.name, "tools": list(group.tool_names)} for group in groups],
+                "policy_rule": support_policy_selection.rule_name,
+                "hinted_group_names": sorted(hinted_group_names) if hinted_group_names else [],
+                "selected_tool_names": sorted(selected_tool_names),
+            }
+            if support_policy_selection.meta:
+                tool_router["tmux_resolution"] = dict(support_policy_selection.meta)
+            filtered: list[dict[str, Any]] = []
+            for spec in tool_schemas:
+                func_obj = spec.get("function") if isinstance(spec, dict) else None
+                name = func_obj.get("name") if isinstance(func_obj, dict) else None
+                if isinstance(name, str) and name.strip() in selected_tool_names:
+                    filtered.append(spec)
+            if filtered:
+                tool_schemas = filtered
+        elif turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
             tool_selector_source = "turn_decision"
             selected_tool_names = selected_tool_names_from_decision(
                 groups=groups,
@@ -1660,14 +1775,6 @@ def chat(
                     tool_schemas = filtered
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
         else:
-            support_policy_selection = select_support_tool_policy(
-                message=payload.message,
-                focused_project_id=focused_project_id,
-            )
-            hinted_group_names = hinted_support_tool_groups(
-                message=payload.message,
-                focused_project_id=focused_project_id,
-            )
             decision, router_reply = route_tool_groups_vllm(
                 user_message=payload.message,
                 groups=groups,
@@ -1827,32 +1934,15 @@ def chat(
         ]
 
         ispec_context = build_ispec_context(core_db, message=payload.message, state=state, user=user)
-        state_for_context = dict(state)
-        state_for_context.pop("controller", None)
-        for key in ("ui_route", "ui_project_id", "ui_experiment_id", "ui_experiment_run_id"):
-            state_for_context.pop(key, None)
-        for key in (
-            "conversation_memory_requested_up_to_id",
-            "conversation_memory_requested_at",
-            "conversation_memory_requested_reason",
-            "conversation_memory_last_error",
-        ):
-            state_for_context.pop(key, None)
-        if isinstance(state_for_context.get("conversation_memory"), dict) and state_for_context.get(
-            "conversation_memory"
-        ):
-            memory_up_to_id = _safe_int_from_state(state_for_context.get("conversation_memory_up_to_id")) or 0
-            summary_up_to_id = _safe_int_from_state(state_for_context.get("conversation_summary_up_to_id")) or 0
-            if summary_up_to_id > 0 and memory_up_to_id >= summary_up_to_id:
-                state_for_context.pop("conversation_summary", None)
+        state_for_context = _prompt_state_from_session_state(state)
         context_payload: dict[str, Any] = {
             "schema_version": _CONTEXT_SCHEMA_VERSION,
             "agent": {"multi_round": True, "round": 0},
-            "session": {"id": session.session_id, "state": state},
+            "session": {"id": session.session_id, "state": state_for_context},
+            "time": _context_time_payload(session=session, previous_message=previous_session_message),
             "user": _support_user_summary(user),
             "ispec": ispec_context,
         }
-        context_payload["session"]["state"] = state_for_context
         context_message = _context_message(payload=context_payload)
 
         base_messages = [
@@ -1989,11 +2079,11 @@ def chat(
             "type": "function",
             "function": {"name": str(turn_decision_result.decision.tool_plan.preferred_first_tool)},
         }
-    policy_tool_name = None if turn_decision_runtime_applied else (
-        support_policy_selection.tool_name if support_policy_selection is not None else None
-    )
+    policy_tool_name = support_policy_selection.tool_name if support_policy_selection is not None else None
     policy_tool_args = dict(support_policy_selection.args or {}) if support_policy_selection is not None else {}
     policy_messages = list(support_policy_selection.messages or []) if support_policy_selection is not None else []
+    policy_force_tool_choice = bool(support_policy_selection.force_tool_choice) if support_policy_selection is not None else False
+    policy_override_tool_args = bool(support_policy_selection.override_tool_args) if support_policy_selection is not None else False
     if policy_tool_name and (
         policy_tool_name not in openai_tool_names
         or (policy_tool_name not in openai_no_arg_tool_names and not policy_tool_args)
@@ -2005,8 +2095,8 @@ def chat(
 
     if (
         tool_protocol == "openai"
-        and forced_tool_choice is None
-        and policy_tool_name in {"assistant_list_tmux_panes", "get_project"}
+        and (forced_tool_choice is None or policy_force_tool_choice)
+        and policy_tool_name in {"assistant_list_tmux_panes", "assistant_capture_tmux_pane", "get_project"}
         and policy_tool_name in openai_tool_names
     ):
         tool_selector_source = tool_selector_source or "support_policy_rule"
@@ -2036,6 +2126,12 @@ def chat(
             )
         except Exception as exc:
             prompt_header_error = f"{type(exc).__name__}: {exc}"
+
+    llm_observability_context = {
+        "surface": "support_chat",
+        "session_id": session.session_id,
+        "message_id": int(user_message.id),
+    }
 
     llm_round = 0
 
@@ -2114,6 +2210,10 @@ def chat(
             messages=messages_for_llm,
             tools=tools_for_call,
             tool_choice=tool_choice,
+            observability_context={
+                **llm_observability_context,
+                "stage": "planner" if tools_enabled else "answer",
+            },
         )
         trace_step["provider"] = reply.provider
         trace_step["model"] = reply.model
@@ -2169,6 +2269,14 @@ def chat(
                         parsed_args = {}
                 except Exception:
                     parsed_args = {}
+
+                if (
+                    policy_override_tool_args
+                    and not tool_calls
+                    and tool_name == policy_tool_name
+                    and isinstance(parsed_args, dict)
+                ):
+                    parsed_args = dict(policy_tool_args)
 
                 if used_tool_calls >= max_tool_calls:
                     tool_payload = {
@@ -2434,6 +2542,7 @@ def chat(
                 {"role": "system", "content": f"{TOOL_CALL_PREFIX} limit exceeded; answer without tools."},
             ],
             tools=None,
+            observability_context={**llm_observability_context, "stage": "answer"},
         )
 
     compare_choices: tuple[str, str] | None = None
@@ -2643,6 +2752,13 @@ def chat(
         "forced_tool_choice": forced_tool_choice,
         "requested_tool_names": requested_tool_names_known,
         "missing_requested_tool_names": missing_requested_tool_names,
+    }
+    meta["context"] = {
+        "history_messages_used": len(history_payload),
+        "used_conversation_memory": bool(state_for_context.get("conversation_memory")),
+        "used_conversation_summary": bool(state_for_context.get("conversation_summary")),
+        "context_state_keys": sorted(state_for_context.keys()),
+        "time": context_payload.get("time"),
     }
     meta["response_contract"] = response_contract_meta
     if tool_router:

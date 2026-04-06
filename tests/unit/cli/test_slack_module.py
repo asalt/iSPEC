@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from ispec.cli import slack
 
 
@@ -121,3 +123,19 @@ def test_safe_slack_update_message_uses_existing_placeholder() -> None:
     assert client.update_calls == [
         {"channel": "C123", "ts": "171234.5678", "text": "Finished."}
     ]
+
+
+def test_session_id_for_dm_rotates_by_utc_day_bucket() -> None:
+    session_id = slack._session_id_for_dm(
+        team_id="T123",
+        channel="D456",
+        now=datetime(2026, 4, 2, 23, 59, tzinfo=UTC),
+    )
+
+    assert session_id == "slack:T123:D456:dm24:20260402"
+
+
+def test_thread_session_id_stays_thread_scoped() -> None:
+    session_id = slack._session_id(team_id="T123", channel="C456", thread_ts="171000.0001")
+
+    assert session_id == "slack:T123:C456:171000.0001"

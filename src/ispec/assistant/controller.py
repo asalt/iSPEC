@@ -310,7 +310,7 @@ def _self_review_decider(ctx: ControllerContext, *, assistant_content: str) -> t
         ],
         tools=None,
         vllm_extra_body={
-            "guided_choice": ["KEEP", "REWRITE"],
+            "structured_outputs": {"choice": ["KEEP", "REWRITE"]},
             "max_tokens": 3,
             "stop": ["\n"],
             "temperature": 0,
@@ -334,7 +334,7 @@ def _self_review_stage(ctx: ControllerContext, state: ControllerState) -> Contro
 
     state.self_review_mode = "rewrite"
     if ctx.self_review_decider_enabled:
-        state.self_review_mode = "guided_choice"
+        state.self_review_mode = "structured_choice"
         decision, error = _self_review_decider(ctx, assistant_content=state.content)
         state.self_review_decision = decision
         if error:

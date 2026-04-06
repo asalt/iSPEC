@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import hashlib
+from datetime import UTC, datetime
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,9 +89,18 @@ def _session_id(*, team_id: str | None, channel: str, thread_ts: str) -> str:
     return f"slack:{safe_team}:{channel}:{thread_ts}"
 
 
-def _session_id_for_dm(*, team_id: str | None, channel: str) -> str:
+def _dm_day_bucket(now: datetime | None = None) -> str:
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    else:
+        current = current.astimezone(UTC)
+    return current.strftime("%Y%m%d")
+
+
+def _session_id_for_dm(*, team_id: str | None, channel: str, now: datetime | None = None) -> str:
     safe_team = team_id or "unknown"
-    return f"slack:{safe_team}:{channel}"
+    return f"slack:{safe_team}:{channel}:dm24:{_dm_day_bucket(now)}"
 
 
 def _pending_key(*, channel: str, thread_ts: str | None) -> str:

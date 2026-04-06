@@ -8,6 +8,7 @@ from ispec.api.routes.support import ChatRequest, chat
 from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportSession
 from ispec.assistant.service import AssistantReply
+from ispec.assistant.support_policies import SupportToolPolicySelection
 from ispec.schedule.connect import get_schedule_session
 
 
@@ -25,7 +26,7 @@ def test_support_chat_tool_router_filters_openai_tools_by_group(tmp_path, db_ses
     def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_) -> AssistantReply:
         calls.append({"messages": messages, "tools": tools, "vllm_extra_body": vllm_extra_body})
 
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             assert tools is None
             return AssistantReply(
                 content=json.dumps(
@@ -139,7 +140,7 @@ def test_support_chat_tool_router_includes_explicitly_requested_tool_name(tmp_pa
     def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_) -> AssistantReply:
         calls.append({"messages": messages, "tools": tools, "vllm_extra_body": vllm_extra_body})
 
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             return AssistantReply(
                 content=json.dumps(
                     {
@@ -252,7 +253,7 @@ def test_support_chat_disables_required_tool_choice_when_requested_tool_missing(
             }
         )
 
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             return AssistantReply(
                 content=json.dumps(
                     {
@@ -347,7 +348,7 @@ def test_support_chat_tool_router_keeps_project_tools_for_explicit_project_reque
     monkeypatch.setattr(support_routes, "openai_tools_for_user", fake_openai_tools_for_user)
 
     def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, vllm_extra_body=None, **_) -> AssistantReply:
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             return AssistantReply(
                 content=json.dumps(
                     {
@@ -447,7 +448,7 @@ def test_support_chat_tool_router_keeps_file_tools_for_focused_project_results_f
     monkeypatch.setattr(support_routes, "openai_tools_for_user", fake_openai_tools_for_user)
 
     def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_) -> AssistantReply:
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+        if isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]:
             return AssistantReply(
                 content=json.dumps(
                     {
@@ -526,7 +527,7 @@ def test_support_chat_tool_router_keeps_file_tools_for_focused_project_results_f
         assert "project_files_for_project" in meta["tool_router"]["selected_tool_names"]
         assert "get_project" in meta["tool_router"]["selected_tool_names"]
 
-def test_support_chat_tool_router_hints_tmux_group_for_tmux_request(tmp_path, db_session, monkeypatch):
+def test_support_chat_tmux_policy_overrides_invented_openai_tool_args(tmp_path, db_session, monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
     monkeypatch.setenv("ISPEC_ASSISTANT_COMPACTION_ENABLED", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
@@ -535,6 +536,20 @@ def test_support_chat_tool_router_hints_tmux_group_for_tmux_request(tmp_path, db
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
     monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
 
+    monkeypatch.setattr(
+        support_routes,
+        "select_support_tool_policy",
+        lambda **_: SupportToolPolicySelection(
+            rule_name="tmux_capture_unique_pane",
+            tool_name="assistant_capture_tmux_pane",
+            args={"target": "%0", "lines": 40},
+            messages=[{"role": "system", "content": "Use the real resolved pane."}],
+            force_tool_choice=True,
+            override_tool_args=True,
+            meta={"resolver": "tmux_inventory", "strategy": "unique_candidate", "selected_target": "%0"},
+        ),
+    )
+
     def fake_openai_tools_for_user(_user):
         return [
             {"type": "function", "function": {"name": "assistant_prompt_header", "parameters": {"type": "object"}}},
@@ -542,61 +557,51 @@ def test_support_chat_tool_router_hints_tmux_group_for_tmux_request(tmp_path, db
             {"type": "function", "function": {"name": "assistant_list_tmux_panes", "parameters": {"type": "object"}}},
             {"type": "function", "function": {"name": "assistant_capture_tmux_pane", "parameters": {"type": "object", "required": ["target"]}}},
             {"type": "function", "function": {"name": "assistant_compare_tmux_pane", "parameters": {"type": "object", "required": ["target"]}}},
-            {"type": "function", "function": {"name": "search_people", "parameters": {"type": "object"}}},
         ]
 
     monkeypatch.setattr(support_routes, "openai_tools_for_user", fake_openai_tools_for_user)
 
-    calls: list[dict[str, Any]] = []
+    llm_calls: list[dict[str, Any]] = []
 
-    def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_):
-        calls.append({"messages": messages, "tools": tools, "vllm_extra_body": vllm_extra_body})
-
-        if isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body:
+    def fake_generate_reply(*, tools=None, tool_choice=None, **_):
+        llm_calls.append({"tools": tools, "tool_choice": tool_choice})
+        if len(llm_calls) == 1:
             return AssistantReply(
-                content=json.dumps(
-                    {
-                        "primary": "people",
-                        "secondary": [],
-                        "confidence": 0.55,
-                        "clarify": False,
-                    }
-                ),
+                content="",
                 provider="test",
                 model="test-model",
                 meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "assistant_capture_tmux_pane",
+                            "arguments": json.dumps({"target": "default", "lines": 80}),
+                        },
+                    }
+                ],
             )
-
-        if isinstance(tools, list):
-            tool_names: set[str] = set()
-            for tool in tools:
-                if not isinstance(tool, dict):
-                    continue
-                func_obj = tool.get("function")
-                if not isinstance(func_obj, dict):
-                    continue
-                name = func_obj.get("name")
-                if isinstance(name, str) and name:
-                    tool_names.add(name)
-
-            assert tool_names == {
-                "assistant_prompt_header",
-                "assistant_list_tools",
-                "assistant_list_tmux_panes",
-                "assistant_capture_tmux_pane",
-                "assistant_compare_tmux_pane",
-                "search_people",
-            }
-        else:
-            assert any(
-                isinstance(item, dict)
-                and "assistant_list_tmux_panes" in str(item.get("content") or "")
-                for item in (messages or [])
-            )
-
-        return AssistantReply(content="FINAL:\nOk.", provider="test", model="test-model", meta=None)
+        return AssistantReply(content="FINAL:\nThe codex pane is busy.", provider="test", model="test-model", meta=None)
 
     monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
+
+    run_tool_calls: list[dict[str, Any]] = []
+
+    def fake_run_tool(*, name=None, args=None, **_):
+        run_tool_calls.append({"name": name, "args": dict(args or {})})
+        return {
+            "ok": True,
+            "tool": name,
+            "result": {
+                "target": "%0",
+                "capture_target": "%0",
+                "content": "thinking\nCodex ready",
+                "last_nonempty_line": "Codex ready",
+            },
+        }
+
+    monkeypatch.setattr(support_routes, "run_tool", fake_run_tool)
 
     db_path = tmp_path / "assistant.db"
     with get_assistant_session(db_path) as assistant_db:
@@ -607,7 +612,7 @@ def test_support_chat_tool_router_hints_tmux_group_for_tmux_request(tmp_path, db
         payload = ChatRequest.model_validate(
             {
                 "sessionId": "session-tmux-1",
-                "message": "hello what is going on in the codex pane for the ispec session group?",
+                "message": "hello what is going on on the ispec tmux pane?",
                 "history": [],
                 "ui": None,
             }
@@ -623,8 +628,9 @@ def test_support_chat_tool_router_hints_tmux_group_for_tmux_request(tmp_path, db
                 user=None,
             )
 
-        assert response.message == "Ok."
-        assert len(calls) >= 2
+        assert response.message == "The codex pane is busy."
+        assert llm_calls[0]["tool_choice"] == {"type": "function", "function": {"name": "assistant_capture_tmux_pane"}}
+        assert run_tool_calls == [{"name": "assistant_capture_tmux_pane", "args": {"target": "%0", "lines": 40}}]
 
         assistant_row = (
             assistant_db.query(support_routes.SupportMessage)
@@ -635,15 +641,44 @@ def test_support_chat_tool_router_hints_tmux_group_for_tmux_request(tmp_path, db
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert "tmux" in meta["tool_router"]["hinted_group_names"]
-        assert "assistant_list_tmux_panes" in meta["tool_router"]["selected_tool_names"]
+        assert meta["tool_router"]["source"] == "support_policy_rule"
+        assert meta["tool_router"]["policy_rule"] == "tmux_capture_unique_pane"
+        assert meta["tool_router"]["tmux_resolution"]["selected_target"] == "%0"
+        assert meta["tool_calls"][0]["arguments"] == {"target": "%0", "lines": 40}
 
 
-def test_policy_tool_for_tmux_message_prefers_tmux_list():
-    assert support_routes._policy_tool_for_message("hello what is going on on the ispec tmux session?") == "assistant_list_tmux_panes"
+def test_policy_tool_for_tmux_message_uses_support_policy_selection(monkeypatch):
+    monkeypatch.setattr(
+        support_routes,
+        "select_support_tool_policy",
+        lambda **_: SupportToolPolicySelection(
+            rule_name="tmux_capture_unique_pane",
+            tool_name="assistant_capture_tmux_pane",
+            args={"target": "%0", "lines": 40},
+            messages=[],
+            force_tool_choice=True,
+            override_tool_args=True,
+        ),
+    )
 
-def test_policy_tool_args_for_tmux_message_extracts_session_name():
+    assert support_routes._policy_tool_for_message("hello what is going on on the ispec tmux session?") == "assistant_capture_tmux_pane"
+
+
+def test_policy_tool_args_for_tmux_message_uses_resolved_target(monkeypatch):
+    monkeypatch.setattr(
+        support_routes,
+        "select_support_tool_policy",
+        lambda **_: SupportToolPolicySelection(
+            rule_name="tmux_capture_unique_pane",
+            tool_name="assistant_capture_tmux_pane",
+            args={"target": "%0", "lines": 40},
+            messages=[],
+            force_tool_choice=True,
+            override_tool_args=True,
+        ),
+    )
+
     assert support_routes._policy_tool_args_for_message(
-        tool_name="assistant_list_tmux_panes",
+        tool_name="assistant_capture_tmux_pane",
         message="hello what is going on on the ispec tmux session?",
-    ) == {"session_name": "ispec"}
+    ) == {"target": "%0", "lines": 40}
