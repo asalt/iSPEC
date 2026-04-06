@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ispec.assistant.service import AssistantReply
+from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
 
 
 MEMORY_SCHEMA_VERSION = 1
@@ -76,20 +77,9 @@ def conversation_memory_schema() -> dict[str, Any]:
     }
 
 
+@prompt_binding("assistant.compaction.distiller")
 def _distiller_system_prompt() -> str:
-    return (
-        "You are a conversation memory distiller for the iSPEC support assistant.\n"
-        "Update a structured 'conversation_memory' JSON object given:\n"
-        "- previous_memory: existing memory JSON (may be empty)\n"
-        "- new_messages: a list of new chat messages to incorporate\n"
-        "\n"
-        "Rules:\n"
-        "- Output ONLY a JSON object matching the provided schema.\n"
-        "- Be concise; keep lists short.\n"
-        "- Do not store secrets or credentials. Omit API keys, passwords, env vars, file paths, or tokens.\n"
-        "- Only include entity IDs if explicitly mentioned in the messages.\n"
-        "- Prefer stable facts and ongoing tasks over transient phrasing.\n"
-    )
+    return load_bound_prompt(_distiller_system_prompt).text
 
 
 def _parse_json_object(text: str | None) -> dict[str, Any] | None:
@@ -247,15 +237,20 @@ def distill_conversation_memory(
     schema = conversation_memory_schema()
     previous = _normalize_memory(previous_memory)
     payload = {"previous_memory": previous, "new_messages": list(new_messages or [])}
+    prompt = load_bound_prompt(_distiller_system_prompt)
     messages = [
-        {"role": "system", "content": _distiller_system_prompt()},
+        {"role": "system", "content": prompt.text},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
     reply = generate_reply_fn(
         messages=messages,
         tools=None,
-        vllm_extra_body={"guided_json": schema, "temperature": 0, "max_tokens": int(max_tokens)},
+        vllm_extra_body={"structured_outputs": {"json": schema}, "temperature": 0, "max_tokens": int(max_tokens)},
+        observability_context=prompt_observability_context(
+            prompt,
+            extra={"surface": "support_chat", "stage": "conversation_memory_distill"},
+        ),
     )
     parsed = _parse_json_object(reply.content)
     if not isinstance(parsed, dict):

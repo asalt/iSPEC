@@ -21,6 +21,7 @@ class InferenceRequest:
     tool_choice: str | dict[str, Any] | None = None
     stage: str = "answer"
     vllm_extra_body: dict[str, Any] | None = None
+    observability_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,12 @@ class InferenceBroker:
                     tool_choice=req.tool_choice,
                     stage=req.stage,  # type: ignore[arg-type]
                     vllm_extra_body=req.vllm_extra_body,
+                    observability_context={
+                        "surface": "supervisor_task",
+                        "command_id": int(job.command_id),
+                        "stage": req.stage,
+                        **(req.observability_context or {}),
+                    },
                 )
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"

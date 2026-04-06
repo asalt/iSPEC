@@ -9,6 +9,7 @@ from ispec.assistant.classifier_service import generate_classifier_reply
 from ispec.assistant.response_contracts import ResponseContractName, response_contract_names
 from ispec.assistant.service import AssistantReply
 from ispec.assistant.tool_routing import ToolGroup, tool_names_for_groups
+from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
 
 
 TurnDecisionMode = Literal["off", "shadow", "own"]
@@ -282,6 +283,7 @@ def turn_decision_schema(
     }
 
 
+@prompt_binding("assistant.turn_decision.classifier")
 def _turn_decision_prompt(
     *,
     source: TurnDecisionSource,
@@ -289,83 +291,39 @@ def _turn_decision_prompt(
     response_modes: list[ResponseMode],
     contract_caps: list[ResponseContractName],
 ) -> str:
-    lines = [
-        "Produce a structured turn decision for the iSPEC assistant.",
-        "Return only a JSON object that matches the schema exactly.",
-        "",
-        "Decision fields:",
-        "- primary_goal: the main job of this turn.",
-        "- needs_clarification / clarification_reason: only true when the assistant cannot safely continue without more input.",
-        "- tool_plan: whether tools should be used, the main tool group, up to two secondary groups, and one preferred first tool if obvious.",
-        "- write_plan.mode: none | draft_only | save_now | confirm_save.",
-        "- response_plan.mode: single or compare. Prefer single unless side-by-side alternatives would materially help.",
-        "- response_plan.contract_cap: choose the smallest response contract cap that should govern the final answer.",
-        "- reply_interpretation: classify the latest user reply only when the turn is awaiting a bounded follow-up decision.",
-        "",
-        "Primary goals:",
-        "- answer_question: normal lookup/explanation/help answer.",
-        "- inspect_state: inspect tmux, repo, logs, or operational state.",
-        "- draft_project_comment: help draft/reword a project comment without saving yet.",
-        "- save_project_comment: user wants a project comment saved now.",
-        "- confirm_save: user is confirming that a previously drafted comment should now be saved.",
-        "- automation_task: internal scheduled assistant task.",
-        "- devops_task: task mainly about developer/devops operations or staff automation.",
-        "",
-        "Clarification reasons:",
-        "- none",
-        "- missing_identifier: needs a project/session/etc identifier.",
-        "- missing_comment_text: user wants to save a comment but has not provided the content yet.",
-        "- ambiguous_target: multiple plausible targets or unclear target.",
-        "- missing_confirmation: an explicit confirmation is still needed before a write.",
-        "",
-        "Write-plan rules:",
-        "- draft_project_comment must use draft_only.",
-        "- save_project_comment must use save_now.",
-        "- confirm_save must use confirm_save.",
-        "- all other primary goals should usually use none.",
-        "",
-        "Tool-plan rules:",
-        "- Prefer using tools when the answer should be grounded in current iSPEC state.",
-        "- preferred_first_tool should be empty unless one obvious first tool lookup stands out.",
-        "- Keep group selection tight; choose the smallest sufficient set.",
-        "",
-        "Response rules:",
-        "- Prefer the smallest response contract cap that fully answers the turn.",
-        "- Prefer single unless compare mode is genuinely helpful.",
-        "",
-        "Reply-interpretation rules:",
-        "- Use none when there is no awaiting_reply_state in context.",
-        "- If awaiting_reply_state is present, choose exactly one of: approve, deny, defer, modify, unclear.",
-        "- approve: clear confirmation or permission to proceed.",
-        "- deny: clear refusal, cancellation, or 'do not do it'.",
-        "- defer: not now / later / hold off, without cancelling permanently.",
-        "- modify: revise or tweak something before proceeding.",
-        "- unclear: ambiguous, unrelated, or not safely actionable.",
-    ]
+    scheduled_rules_block = ""
     if source == "scheduled_assistant":
-        lines.extend(
-            [
-                "",
-                "Scheduled-assistant rules:",
-                "- This is not an end-user conversation.",
-                "- needs_clarification must be false.",
-                "- clarification_reason must be none.",
-                "- response_plan.mode must be single.",
-            ]
+        scheduled_rules_block = (
+            "\n\nScheduled-assistant rules:\n"
+            "- This is not an end-user conversation.\n"
+            "- needs_clarification must be false.\n"
+            "- clarification_reason must be none.\n"
+            "- response_plan.mode must be single."
         )
 
+    groups_block = ""
     if groups:
-        lines.append("")
-        lines.append("Available tool groups:")
-        for group in groups:
-            lines.append(f"- {group.name}: {group.description}")
-    if response_modes:
-        lines.append("")
-        lines.append("Allowed response modes: " + ", ".join(response_modes))
-    if contract_caps:
-        lines.append("Allowed response contract caps: " + ", ".join(contract_caps))
-    return "\n".join(lines).strip()
+        groups_block = "\n\nAvailable tool groups:\n" + "\n".join(
+            f"- {group.name}: {group.description}" for group in groups
+        )
 
+    response_modes_block = ""
+    if response_modes:
+        response_modes_block = "\n\nAllowed response modes: " + ", ".join(response_modes)
+
+    contract_caps_block = ""
+    if contract_caps:
+        contract_caps_block = "\nAllowed response contract caps: " + ", ".join(contract_caps)
+
+    return load_bound_prompt(
+        _turn_decision_prompt,
+        values={
+            "scheduled_rules_block": scheduled_rules_block,
+            "groups_block": groups_block,
+            "response_modes_block": response_modes_block,
+            "contract_caps_block": contract_caps_block,
+        },
+    ).text
 
 def _parse_json_object(text: str | None) -> dict[str, Any] | None:
     if not text:
@@ -642,16 +600,29 @@ def run_turn_decision_pipeline(
         response_modes=response_modes,
         contract_caps=contract_cap_names,
     )
-    messages = [
-        {
-            "role": "system",
-            "content": _turn_decision_prompt(
-                source=source,
-                groups=groups,
-                response_modes=response_modes,
-                contract_caps=contract_cap_names,
+    prompt = load_bound_prompt(
+        _turn_decision_prompt,
+        values={
+            "scheduled_rules_block": (
+                "\n\nScheduled-assistant rules:\n"
+                "- This is not an end-user conversation.\n"
+                "- needs_clarification must be false.\n"
+                "- clarification_reason must be none.\n"
+                "- response_plan.mode must be single."
+                if source == "scheduled_assistant"
+                else ""
             ),
+            "groups_block": (
+                "\n\nAvailable tool groups:\n" + "\n".join(f"- {group.name}: {group.description}" for group in groups)
+                if groups
+                else ""
+            ),
+            "response_modes_block": ("\n\nAllowed response modes: " + ", ".join(response_modes)) if response_modes else "",
+            "contract_caps_block": ("\nAllowed response contract caps: " + ", ".join(contract_cap_names)) if contract_cap_names else "",
         },
+    )
+    messages = [
+        {"role": "system", "content": prompt.text},
         {
             "role": "user",
             "content": json.dumps(
@@ -675,10 +646,22 @@ def run_turn_decision_pipeline(
         base_generate_reply_fn=generate_reply_fn,
         messages=messages,
         vllm_extra_body={
-            "guided_json": schema,
+            "structured_outputs": {"json": schema},
             "max_tokens": 300,
             "temperature": 0,
         },
+        observability_context=prompt_observability_context(
+            prompt,
+            extra={
+                "surface": "turn_decision",
+                "task": source,
+                "stage": (
+                    "reply_interpretation"
+                    if isinstance(extra_context, dict) and isinstance(extra_context.get("awaiting_reply_state"), dict)
+                    else "turn_decision"
+                ),
+            },
+        ),
     )
     result = TurnDecisionResult(
         ok=False,

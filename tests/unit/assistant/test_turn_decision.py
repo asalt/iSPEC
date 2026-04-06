@@ -23,7 +23,7 @@ def test_turn_decision_pipeline_normalizes_support_write_mode_and_primary_group(
 
     def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_):  # type: ignore[no-untyped-def]
         assert tools is None
-        assert isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body
+        assert isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
         return AssistantReply(
             content=json.dumps(
                 {
@@ -88,7 +88,7 @@ def test_turn_decision_pipeline_forces_scheduled_assistant_single_mode_without_c
 
     def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_):  # type: ignore[no-untyped-def]
         assert tools is None
-        assert isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body
+        assert isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
         return AssistantReply(
             content=json.dumps(
                 {
@@ -154,7 +154,7 @@ def test_turn_decision_pipeline_normalizes_missing_reply_interpretation_to_uncle
 
     def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_):  # type: ignore[no-untyped-def]
         assert tools is None
-        assert isinstance(vllm_extra_body, dict) and "guided_json" in vllm_extra_body
+        assert isinstance(vllm_extra_body, dict) and isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
         return AssistantReply(
             content=json.dumps(
                 {

@@ -10,6 +10,7 @@ from typing import Any, Callable, Literal
 from jinja2 import Environment, FileSystemLoader
 
 from ispec.assistant.service import AssistantReply
+from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
 
 
 ResponseContractName = Literal[
@@ -268,8 +269,16 @@ def run_response_contract_pipeline(
             "source": "forced",
         }
     else:
+        selection_prompt = load_bound_prompt(
+            _selection_prompt,
+            values={
+                "contracts_block": "\n".join(
+                    f"- {name}: {CONTRACTS[name].intent}" for name in policy.allowed_contracts
+                ),
+            },
+        )
         selector_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _selection_prompt(policy.allowed_contracts)},
+            {"role": "system", "content": selection_prompt.text},
             {"role": "system", "content": context_message},
             *history_messages,
             {"role": "user", "content": user_message},
@@ -279,9 +288,13 @@ def run_response_contract_pipeline(
             messages=selector_messages,
             tools=None,
             vllm_extra_body={
-                "guided_json": _selection_schema(policy.allowed_contracts),
+                "structured_outputs": {"json": _selection_schema(policy.allowed_contracts)},
                 "temperature": 0,
             },
+            observability_context=prompt_observability_context(
+                selection_prompt,
+                extra={"surface": "support_chat", "stage": "response_contract_selection"},
+            ),
         )
         result.selector_reply_meta = _reply_meta_payload(selector_reply)
         if not selector_reply.ok:
@@ -311,8 +324,24 @@ def run_response_contract_pipeline(
     spec = CONTRACTS[selected_contract]
     result.selected_contract = selected_contract
 
+    fill_prompt = load_bound_prompt(
+        _fill_prompt,
+        values={
+            "contract_name": spec.name,
+            "contract_intent": spec.intent,
+            "required_slots": ", ".join(spec.required_slots),
+            "optional_slots": ", ".join(spec.optional_slots) if spec.optional_slots else "none.",
+            "max_optional": spec.max_optional,
+            "points_rule": (
+                f"points must be a JSON array of {spec.min_points}-{spec.max_points} short strings, not paragraphs."
+                if "points" in spec.required_slots + spec.optional_slots
+                else ""
+            ),
+            "allowed_slots": ", ".join(spec.required_slots + spec.optional_slots),
+        },
+    )
     fill_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": _fill_prompt(spec)},
+        {"role": "system", "content": fill_prompt.text},
         {"role": "system", "content": context_message},
         *history_messages,
         {"role": "user", "content": user_message},
@@ -326,9 +355,13 @@ def run_response_contract_pipeline(
         messages=fill_messages,
         tools=None,
         vllm_extra_body={
-            "guided_json": _slots_schema(spec),
+            "structured_outputs": {"json": _slots_schema(spec)},
             "temperature": 0,
         },
+        observability_context=prompt_observability_context(
+            fill_prompt,
+            extra={"surface": "support_chat", "stage": "response_contract_fill"},
+        ),
     )
     result.fill_reply_meta = _reply_meta_payload(fill_reply)
     if not fill_reply.ok:
@@ -349,8 +382,15 @@ def run_response_contract_pipeline(
     result.hard_violations = list(hard_violations)
 
     if hard_violations:
+        repair_prompt = load_bound_prompt(
+            _repair_prompt,
+            values={
+                "contract_name": spec.name,
+                "violations_block": "\n".join(f"- {item}" for item in hard_violations),
+            },
+        )
         repair_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _repair_prompt(spec, hard_violations)},
+            {"role": "system", "content": repair_prompt.text},
             {"role": "system", "content": context_message},
             *history_messages,
             {"role": "user", "content": user_message},
@@ -368,9 +408,13 @@ def run_response_contract_pipeline(
             messages=repair_messages,
             tools=None,
             vllm_extra_body={
-                "guided_json": _slots_schema(spec),
+                "structured_outputs": {"json": _slots_schema(spec)},
                 "temperature": 0,
             },
+            observability_context=prompt_observability_context(
+                repair_prompt,
+                extra={"surface": "support_chat", "stage": "response_contract_repair"},
+            ),
         )
         result.repair_applied = True
         result.repair_reply_meta = _reply_meta_payload(repair_reply)
@@ -414,71 +458,46 @@ def render_response_contract(contract_name: ResponseContractName, slots: dict[st
     return rendered
 
 
+@prompt_binding("assistant.response_contract.selection")
 def _selection_prompt(allowed_contracts: tuple[ResponseContractName, ...]) -> str:
-    lines = [
-        "Choose exactly one response contract.",
-        "Pick the smallest contract that fully answers the user.",
-        "If uncertain, choose the smaller contract.",
-        "Do not choose a larger contract just because you could say more.",
-        "",
-        "Available contracts:",
-    ]
-    for name in allowed_contracts:
-        spec = CONTRACTS[name]
-        lines.append(f"- {name}: {spec.intent}")
-    lines.extend(
-        [
-            "",
-            "Return JSON only with:",
-            '{"contract":"<name>","confidence":0.0,"reason":"<one short sentence>"}',
-        ]
-    )
-    return "\n".join(lines)
+    contracts_block = "\n".join(f"- {name}: {CONTRACTS[name].intent}" for name in allowed_contracts)
+    return load_bound_prompt(
+        _selection_prompt,
+        values={"contracts_block": contracts_block},
+    ).text
 
 
+@prompt_binding("assistant.response_contract.fill")
 def _fill_prompt(spec: ResponseContractSpec) -> str:
     allowed_slots = list(spec.required_slots + spec.optional_slots)
-    lines = [
-        f"Fill slots for the response contract: {spec.name}.",
-        f"Intent: {spec.intent}",
-        f"Required slots: {', '.join(spec.required_slots)}.",
-        (
-            "Optional slots: " + ", ".join(spec.optional_slots) + "."
-            if spec.optional_slots
-            else "Optional slots: none."
-        ),
-        f"Use at most {spec.max_optional} optional slot(s).",
-        "Use the provided draft answer as source material, but make each slot compact.",
-        "Keep slots independent. Do not let one slot contain the whole essay.",
-        "If detail does not fit, omit it instead of spilling into extra prose.",
-    ]
-    if "points" in allowed_slots:
-        lines.append(
-            f"points must be a JSON array of {spec.min_points}-{spec.max_points} short strings, not paragraphs."
-        )
-    lines.extend(
-        [
-            "Return JSON only.",
-            "Omit optional slots that are unused.",
-            "Allowed slots: " + ", ".join(allowed_slots) + ".",
-        ]
-    )
-    return "\n".join(lines)
+    return load_bound_prompt(
+        _fill_prompt,
+        values={
+            "contract_name": spec.name,
+            "contract_intent": spec.intent,
+            "required_slots": ", ".join(spec.required_slots),
+            "optional_slots": ", ".join(spec.optional_slots) if spec.optional_slots else "none.",
+            "max_optional": spec.max_optional,
+            "points_rule": (
+                f"points must be a JSON array of {spec.min_points}-{spec.max_points} short strings, not paragraphs."
+                if "points" in allowed_slots
+                else ""
+            ),
+            "allowed_slots": ", ".join(allowed_slots),
+        },
+    ).text
 
 
+@prompt_binding("assistant.response_contract.repair")
 def _repair_prompt(spec: ResponseContractSpec, violations: list[str]) -> str:
-    return "\n".join(
-        [
-            f"Repair this slot payload for contract {spec.name}.",
-            "Keep the same contract.",
-            "Preserve meaning from the draft answer.",
-            "Shorten or remove low-priority optional content before changing required content.",
-            "Return JSON only with the corrected allowed slots.",
-            "Problems:",
-            *[f"- {item}" for item in violations],
-        ]
-    )
-
+    violations_block = "\n".join(f"- {item}" for item in violations)
+    return load_bound_prompt(
+        _repair_prompt,
+        values={
+            "contract_name": spec.name,
+            "violations_block": violations_block,
+        },
+    ).text
 
 def _selection_schema(allowed_contracts: tuple[ResponseContractName, ...]) -> dict[str, Any]:
     return {

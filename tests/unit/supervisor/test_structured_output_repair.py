@@ -64,7 +64,7 @@ def test_supervisor_repairs_session_review_json(tmp_path, monkeypatch):
         assert tools is None
         assert isinstance(messages, list)
         assert isinstance(vllm_extra_body, dict)
-        assert "guided_json" in vllm_extra_body
+        assert isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
         calls["n"] += 1
         if calls["n"] == 1:
             # Malformed JSON that cannot be repaired by simply appending braces.
@@ -162,7 +162,7 @@ def test_supervisor_repairs_support_digest_json(tmp_path, monkeypatch):
         assert tools is None
         assert isinstance(messages, list)
         assert isinstance(vllm_extra_body, dict)
-        assert "guided_json" in vllm_extra_body
+        assert isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
         calls["n"] += 1
         if calls["n"] == 1:
             return AssistantReply(

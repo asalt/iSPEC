@@ -282,8 +282,44 @@ def test_generate_reply_vllm_can_accept_extra_body(monkeypatch):
 
     payload = captured["json"]
     assert isinstance(payload, dict)
-    assert payload["guided_choice"] == ["KEEP", "REWRITE"]
+    assert payload["structured_outputs"] == {"choice": ["KEEP", "REWRITE"]}
+    assert "guided_choice" not in payload
     assert payload["max_tokens"] == 1
+
+
+def test_generate_reply_vllm_normalizes_guided_json_to_structured_outputs(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ISPEC_VLLM_MODEL", "test-model")
+
+    captured: dict[str, object] = {}
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _DummyResponse:
+        captured["json"] = json
+        return _DummyResponse({"choices": [{"message": {"role": "assistant", "content": "OK"}}]})
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+
+    reply = service.generate_reply(
+        message="Ping",
+        history=None,
+        context=None,
+        vllm_extra_body={"guided_json": schema, "temperature": 0},
+    )
+    assert reply.provider == "vllm"
+    assert reply.content == "OK"
+
+    payload = captured["json"]
+    assert isinstance(payload, dict)
+    assert payload["structured_outputs"] == {"json": schema}
+    assert "guided_json" not in payload
 
 
 def test_generate_reply_vllm_normalizes_base_url_suffix(monkeypatch):

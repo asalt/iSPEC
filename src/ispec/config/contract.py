@@ -166,6 +166,16 @@ def default_contract() -> tuple[VarSpec, ...]:
             },
         ),
         VarSpec(
+            key="ISPEC_PROMPTS_DB_PATH",
+            kind="path",
+            group="Database",
+            description="Prompt registry/history SQLite DB path or sqlite:/// URI (defaults next to ISPEC_DB_PATH).",
+            default_by_profile={
+                "dev": "~/.ispec/db/ispec-prompts.db",
+                "prod": "/var/lib/ispec/ispec-prompts.db",
+            },
+        ),
+        VarSpec(
             key="ISPEC_AGENT_DB_PATH",
             kind="path",
             group="Database",

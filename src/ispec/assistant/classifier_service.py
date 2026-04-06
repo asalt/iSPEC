@@ -6,7 +6,12 @@ from typing import Any, Callable, Literal
 
 import requests
 
-from ispec.assistant.service import AssistantReply, _normalize_openai_base_url
+from ispec.assistant.service import (
+    AssistantReply,
+    _normalize_openai_base_url,
+    _sanitize_vllm_extra_body,
+)
+from ispec.assistant.usage_logging import record_inference_usage_event
 
 
 ClassifierProvider = Literal["inherit", "vllm"]
@@ -74,6 +79,7 @@ def _generate_classifier_vllm_reply(
     *,
     messages: list[dict[str, Any]],
     vllm_extra_body: dict[str, Any],
+    observability_context: dict[str, Any] | None = None,
 ) -> AssistantReply:
     base_url = _classifier_vllm_url()
     url = f"{base_url}/v1/chat/completions"
@@ -84,7 +90,7 @@ def _generate_classifier_vllm_reply(
         "model": model,
         "messages": messages,
         "stream": False,
-        **dict(vllm_extra_body or {}),
+        **_sanitize_vllm_extra_body(dict(vllm_extra_body or {})),
     }
     started = time.monotonic()
     try:
@@ -93,11 +99,20 @@ def _generate_classifier_vllm_reply(
         data = response.json()
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
+        meta = {"url": url, "error": repr(exc)}
+        record_inference_usage_event(
+            provider="classifier_vllm",
+            model=model,
+            meta=meta,
+            ok=False,
+            error=error,
+            observability_context=observability_context,
+        )
         return AssistantReply(
             content=f"Assistant error: {error}",
             provider="classifier_vllm",
             model=model,
-            meta={"url": url, "error": repr(exc)},
+            meta=meta,
             ok=False,
             error=error,
         )
@@ -118,11 +133,19 @@ def _generate_classifier_vllm_reply(
         content = ""
     if not content:
         content = str(data)[:4000]
+    meta = {"url": url, "elapsed_ms": elapsed_ms, "usage": usage}
+    record_inference_usage_event(
+        provider="classifier_vllm",
+        model=model,
+        meta=meta,
+        ok=True,
+        observability_context=observability_context,
+    )
     return AssistantReply(
         content=content,
         provider="classifier_vllm",
         model=model,
-        meta={"url": url, "elapsed_ms": elapsed_ms, "usage": usage},
+        meta=meta,
     )
 
 
@@ -131,8 +154,9 @@ def generate_classifier_reply(
     base_generate_reply_fn: Callable[..., AssistantReply],
     messages: list[dict[str, Any]],
     vllm_extra_body: dict[str, Any],
+    observability_context: dict[str, Any] | None = None,
 ) -> AssistantReply:
     provider = _classifier_provider()
     if provider == "vllm":
-        return _generate_classifier_vllm_reply(messages=messages, vllm_extra_body=vllm_extra_body)
-    return base_generate_reply_fn(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+        return _generate_classifier_vllm_reply(messages=messages, vllm_extra_body=vllm_extra_body, observability_context=observability_context)
+    return base_generate_reply_fn(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=observability_context)

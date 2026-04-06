@@ -12,6 +12,7 @@ def main():
         load_env_files(env_files, override=True)
 
     from ispec.cli import (
+        prompt,
         agent,
         api,
         auth,
@@ -47,6 +48,10 @@ def main():
     dev_parser = subparsers.add_parser("dev", help="Dev helpers (tmux)")
     dev_subparsers = dev_parser.add_subparsers(dest="subcommand", required=True)
     dev.register_subcommands(dev_subparsers)
+
+    prompt_parser = subparsers.add_parser("prompt", help="Prompt registry helpers")
+    prompt_subparsers = prompt_parser.add_subparsers(dest="subcommand", required=True)
+    prompt.register_subcommands(prompt_subparsers)
 
     auth_parser = subparsers.add_parser("auth", help="Authentication/user helpers")
     auth_subparsers = auth_parser.add_subparsers(dest="subcommand", required=True)
@@ -89,6 +94,8 @@ def main():
         api.dispatch(args)
     elif args.command == "dev":
         dev.dispatch(args)
+    elif args.command == "prompt":
+        prompt.dispatch(args)
     elif args.command == "auth":
         auth.dispatch(args)
     elif args.command == "logging":
@@ -103,3 +110,7 @@ def main():
         config_cli.dispatch(args)
     elif args.command == "supervisor":
         supervisor.dispatch(args)
+
+
+if __name__ == "__main__":
+    main()

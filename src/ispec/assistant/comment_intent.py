@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ispec.assistant.service import AssistantReply
+from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
 
 
 def project_comment_intent_schema() -> dict[str, Any]:
@@ -23,20 +24,9 @@ def project_comment_intent_schema() -> dict[str, Any]:
     }
 
 
+@prompt_binding("assistant.comment_intent.classifier")
 def _project_comment_intent_prompt() -> str:
-    return (
-        "Classify the user's intent for iSPEC project-comment handling.\n"
-        "Return only a JSON object matching the schema.\n"
-        "\n"
-        "intent meanings:\n"
-        "- draft_only: the user wants help drafting/rewording a comment or note, but not saving it yet.\n"
-        "- save_now: the user explicitly wants a project note/comment/history entry saved now.\n"
-        "- confirm_save: the user is confirming that a previously drafted note should now be saved.\n"
-        "- other: not really a project-comment drafting/saving request.\n"
-        "\n"
-        "Prefer draft_only when the request is about wording, drafting, rewriting, or improving a comment.\n"
-        "Prefer confirm_save only when the user is clearly confirming an earlier draft/save question."
-    )
+    return load_bound_prompt(_project_comment_intent_prompt).text
 
 
 def _parse_json_object(text: str | None) -> dict[str, Any] | None:
@@ -88,8 +78,9 @@ def decide_project_comment_intent_vllm(
     focused_project_id: int | None,
     generate_reply_fn: Callable[..., AssistantReply],
 ) -> tuple[dict[str, Any] | None, AssistantReply]:
+    prompt = load_bound_prompt(_project_comment_intent_prompt)
     messages = [
-        {"role": "system", "content": _project_comment_intent_prompt()},
+        {"role": "system", "content": prompt.text},
         {
             "role": "user",
             "content": json.dumps(
@@ -106,10 +97,14 @@ def decide_project_comment_intent_vllm(
         messages=messages,
         tools=None,
         vllm_extra_body={
-            "guided_json": project_comment_intent_schema(),
+            "structured_outputs": {"json": project_comment_intent_schema()},
             "max_tokens": 200,
             "temperature": 0,
         },
+        observability_context=prompt_observability_context(
+            prompt,
+            extra={"surface": "support_chat", "stage": "project_comment_intent"},
+        ),
     )
     parsed = _parse_json_object(reply.content)
     validated = _validate_intent_decision(parsed) if isinstance(parsed, dict) else None

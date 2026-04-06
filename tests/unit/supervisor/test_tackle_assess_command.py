@@ -42,7 +42,7 @@ def test_supervisor_processes_tackle_assess_command(tmp_path, monkeypatch) -> No
         assert tools is None
         assert isinstance(messages, list)
         assert isinstance(vllm_extra_body, dict)
-        assert "guided_json" in vllm_extra_body
+        assert isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
 
         return AssistantReply(
             content=json.dumps(

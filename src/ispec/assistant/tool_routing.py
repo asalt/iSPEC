@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ispec.assistant.service import AssistantReply
+from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
 
 
 @dataclass(frozen=True)
@@ -172,17 +173,13 @@ def tool_router_schema(group_names: list[str]) -> dict[str, Any]:
     }
 
 
+@prompt_binding("assistant.tool_router.classifier")
 def _tool_router_system_prompt(groups: list[ToolGroup]) -> str:
-    lines = [
-        "Select the best tool group(s) for the user request.",
-        "Return only a JSON object that matches the provided schema.",
-        'If you cannot follow the schema exactly, return: {"groups":["<primary>","<optional-secondary>",...]}',
-        "",
-        "Groups:",
-    ]
-    for group in groups:
-        lines.append(f"- {group.name}: {group.description}")
-    return "\n".join(lines).strip()
+    groups_block = "\n".join(f"- {group.name}: {group.description}" for group in groups)
+    return load_bound_prompt(
+        _tool_router_system_prompt,
+        values={"groups_block": groups_block},
+    ).text
 
 
 def _parse_json_object(text: str | None) -> dict[str, Any] | None:
@@ -270,18 +267,26 @@ def route_tool_groups_vllm(
 
     group_names = [group.name for group in groups]
     schema = tool_router_schema(group_names)
+    prompt = load_bound_prompt(
+        _tool_router_system_prompt,
+        values={"groups_block": "\n".join(f"- {group.name}: {group.description}" for group in groups)},
+    )
     router_messages = [
-        {"role": "system", "content": _tool_router_system_prompt(groups)},
+        {"role": "system", "content": prompt.text},
         {"role": "user", "content": f'User request: "{user_message}"'},
     ]
     reply = generate_reply_fn(
         messages=router_messages,
         tools=None,
         vllm_extra_body={
-            "guided_json": schema,
+            "structured_outputs": {"json": schema},
             "max_tokens": 200,
             "temperature": 0,
         },
+        observability_context=prompt_observability_context(
+            prompt,
+            extra={"surface": "support_chat", "stage": "tool_router"},
+        ),
     )
     parsed = _parse_json_object(reply.content)
     validated = (

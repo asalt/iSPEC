@@ -81,7 +81,7 @@ def test_supervisor_processes_support_digest_and_writes_memory(tmp_path, monkeyp
         assert tools is None
         assert isinstance(messages, list)
         assert isinstance(vllm_extra_body, dict)
-        assert "guided_json" in vllm_extra_body
+        assert isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
         digest = {
             "schema_version": 1,
             "from_review_id": 0,

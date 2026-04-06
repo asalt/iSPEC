@@ -10,6 +10,7 @@ from typing import Any, Literal
 import requests
 
 from ispec.assistant.tools import TOOL_CALL_PREFIX, TOOL_RESULT_PREFIX, tool_prompt
+from ispec.assistant.usage_logging import record_inference_usage_event
 from ispec.logging import get_logger
 
 
@@ -436,6 +437,7 @@ def generate_reply(
     tool_choice: str | dict[str, Any] | None = None,
     stage: Literal["planner", "answer", "review"] = "answer",
     vllm_extra_body: dict[str, Any] | None = None,
+    observability_context: dict[str, Any] | None = None,
 ) -> AssistantReply:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub").strip().lower()
     if messages is None:
@@ -449,13 +451,14 @@ def generate_reply(
             tools_available=bool(tools),
         )
     if provider == "ollama":
-        return _generate_ollama_reply(messages=messages, tools=tools)
+        return _generate_ollama_reply(messages=messages, tools=tools, observability_context=observability_context)
     if provider == "vllm":
         return _generate_vllm_reply(
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
             extra_body=vllm_extra_body,
+            observability_context=observability_context,
         )
     return AssistantReply(
         content=(
@@ -526,7 +529,7 @@ def _build_messages(
     return messages
 
 
-def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> AssistantReply:
+def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, observability_context: dict[str, Any] | None = None) -> AssistantReply:
     url = f"{_ollama_url()}/api/chat"
     model = _ollama_model()
     timeout = _ollama_timeout_seconds()
@@ -553,11 +556,20 @@ def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[s
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         logger.warning("Ollama request failed (%s): %s", url, error)
+        meta = {"url": url, "error": repr(exc)}
+        record_inference_usage_event(
+            provider="ollama",
+            model=model,
+            meta=meta,
+            ok=False,
+            error=error,
+            observability_context=observability_context,
+        )
         return AssistantReply(
             content=f"Assistant error: {error}",
             provider="ollama",
             model=model,
-            meta={"url": url, "error": repr(exc)},
+            meta=meta,
             ok=False,
             error=error,
         )
@@ -572,13 +584,46 @@ def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[s
     if not content and not tool_calls:
         content = json.dumps(data)[:4000]
 
+    meta = {"url": url, "elapsed_ms": elapsed_ms}
+    record_inference_usage_event(
+        provider="ollama",
+        model=model,
+        meta=meta,
+        ok=True,
+        observability_context=observability_context,
+    )
     return AssistantReply(
         content=content,
         provider="ollama",
         model=model,
-        meta={"url": url, "elapsed_ms": elapsed_ms},
+        meta=meta,
         tool_calls=None,
     )
+
+
+def _normalize_vllm_structured_outputs(extra_body: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(extra_body)
+    structured_outputs_raw = cleaned.get("structured_outputs")
+    structured_outputs: dict[str, Any] = (
+        dict(structured_outputs_raw) if isinstance(structured_outputs_raw, dict) else {}
+    )
+
+    if "guided_json" in cleaned and "json" not in structured_outputs and "response_format" not in cleaned:
+        structured_outputs["json"] = cleaned.pop("guided_json")
+    else:
+        cleaned.pop("guided_json", None)
+
+    if "guided_choice" in cleaned and "choice" not in structured_outputs:
+        structured_outputs["choice"] = cleaned.pop("guided_choice")
+    else:
+        cleaned.pop("guided_choice", None)
+
+    if structured_outputs:
+        cleaned["structured_outputs"] = structured_outputs
+    elif "structured_outputs" in cleaned and not isinstance(cleaned.get("structured_outputs"), dict):
+        cleaned.pop("structured_outputs", None)
+
+    return cleaned
 
 
 def _sanitize_vllm_extra_body(extra_body: dict[str, Any]) -> dict[str, Any]:
@@ -590,7 +635,7 @@ def _sanitize_vllm_extra_body(extra_body: dict[str, Any]) -> dict[str, Any]:
         if key in forbidden:
             continue
         cleaned[key] = value
-    return cleaned
+    return _normalize_vllm_structured_outputs(cleaned)
 
 
 def _generate_vllm_reply(
@@ -599,6 +644,7 @@ def _generate_vllm_reply(
     tools: list[dict[str, Any]] | None,
     tool_choice: str | dict[str, Any] | None = None,
     extra_body: dict[str, Any] | None = None,
+    observability_context: dict[str, Any] | None = None,
 ) -> AssistantReply:
     base_url = _vllm_url()
     url = f"{base_url}/v1/chat/completions"
@@ -611,11 +657,20 @@ def _generate_vllm_reply(
         model = _vllm_model()
         error = f"{type(exc).__name__}: {exc}"
         logger.warning("vLLM model resolution failed (%s): %s", base_url, error)
+        meta = {"url": base_url, "error": repr(exc)}
+        record_inference_usage_event(
+            provider="vllm",
+            model=model,
+            meta=meta,
+            ok=False,
+            error=error,
+            observability_context=observability_context,
+        )
         return AssistantReply(
             content=f"Assistant error: {error}",
             provider="vllm",
             model=model,
-            meta={"url": base_url, "error": repr(exc)},
+            meta=meta,
             tool_calls=None,
             ok=False,
             error=error,
@@ -713,6 +768,14 @@ def _generate_vllm_reply(
             meta.get("status_code"),
             meta.get("response_text") or error,
         )
+        record_inference_usage_event(
+            provider="vllm",
+            model=model,
+            meta=meta,
+            ok=False,
+            error=error,
+            observability_context=observability_context,
+        )
         return AssistantReply(
             content=f"Assistant error: {error}",
             provider="vllm",
@@ -725,11 +788,20 @@ def _generate_vllm_reply(
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         logger.warning("vLLM request failed (%s): %s", url, error)
+        meta = {"url": url, "error": repr(exc)}
+        record_inference_usage_event(
+            provider="vllm",
+            model=model,
+            meta=meta,
+            ok=False,
+            error=error,
+            observability_context=observability_context,
+        )
         return AssistantReply(
             content=f"Assistant error: {error}",
             provider="vllm",
             model=model,
-            meta={"url": url, "error": repr(exc)},
+            meta=meta,
             tool_calls=None,
             ok=False,
             error=error,
@@ -768,6 +840,13 @@ def _generate_vllm_reply(
             meta["fallback"]["rejected"] = rejections[-3:]
         logger.info("vLLM request succeeded with fallback %s", meta["fallback"])
 
+    record_inference_usage_event(
+        provider="vllm",
+        model=model,
+        meta=meta,
+        ok=True,
+        observability_context=observability_context,
+    )
     return AssistantReply(
         content=content,
         provider="vllm",

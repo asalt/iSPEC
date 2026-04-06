@@ -66,6 +66,7 @@ from ispec.assistant.turn_decision import (
     run_turn_decision_pipeline,
     selected_tool_names_from_decision,
 )
+from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
 from ispec.assistant.tools import (
     TOOL_CALL_PREFIX,
     extract_tool_call_line,
@@ -1020,6 +1021,11 @@ def _run_llm_task_sync(task: LLMTask) -> CommandExecution:
             tool_choice=request.tool_choice,
             stage=request.stage,  # type: ignore[arg-type]
             vllm_extra_body=request.vllm_extra_body,
+            observability_context={
+                "surface": "supervisor_task",
+                "stage": request.stage,
+                **(request.observability_context or {}),
+            },
         )
 
 
@@ -1852,33 +1858,9 @@ def _orchestrator_decision_schema(*, max_commands: int) -> dict[str, Any]:
     }
 
 
+@prompt_binding("supervisor.orchestrator.system")
 def _orchestrator_system_prompt(*, max_commands: int) -> str:
-    lines = [
-        "You are the iSPEC internal orchestrator.",
-        "You run periodically to decide what self-work to do next.",
-        "",
-        "Goals:",
-        "- Review new/updated user support sessions to spot issues and follow-ups.",
-        "- Periodically build a short digest across new session reviews for longer-term retrieval.",
-        "- Optionally review the codebase (backend + frontend) based on what users are running into.",
-        "- Keep internal notes concise and actionable.",
-        "",
-        "Rules:",
-        "- Enqueue at most one command per tick unless there is a strong reason for two.",
-        "- If any sessions are marked as needing review, enqueue a support-session review command for the most recently updated session.",
-        "- Keep thoughts aligned with actions: only mention tasks that are actually present in commands this tick.",
-        "- Example (no commands): thoughts='No sessions need review right now, so I will wait for the next tick.'",
-        "- Example (one review command): thoughts='Reviewing the newest pending support session now.'",
-        "- If unsure, enqueue nothing and schedule the next tick later.",
-        "- Always include a short 'thoughts' string explaining your choice.",
-        "- Do NOT copy or repeat the input context JSON.",
-        "- Return ONLY a JSON object with keys: schema_version, thoughts, next_tick_seconds, commands.",
-        "- The response must be small (no transcripts, no context echo).",
-        "",
-        f"Max commands this tick: {max_commands}.",
-    ]
-    return "\n".join(lines).strip()
-
+    return load_bound_prompt(_orchestrator_system_prompt, values={"max_commands": max_commands}).text
 
 def _validate_orchestrator_decision(
     decision: dict[str, Any] | None,
@@ -2130,14 +2112,16 @@ def _task_orchestrator_tick(
     }
 
     schema = _orchestrator_decision_schema(max_commands=max_commands)
+    prompt = load_bound_prompt(_orchestrator_system_prompt, values={"max_commands": max_commands})
     messages = [
-        {"role": "system", "content": _orchestrator_system_prompt(max_commands=max_commands)},
+        {"role": "system", "content": prompt.text},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
     reply = yield InferenceRequest(
         messages=messages,
         tools=None,
-        vllm_extra_body={"guided_json": schema, "temperature": 0, "max_tokens": 800},
+        vllm_extra_body={"structured_outputs": {"json": schema}, "temperature": 0, "max_tokens": 800},
+        observability_context=prompt_observability_context(prompt, extra={"task": "orchestrator_tick"}),
     )
 
     parsed = _parse_json_object(reply.content)
@@ -2352,7 +2336,7 @@ def _task_orchestrator_tick(
                     "invalid_output_recovered": bool(llm_invalid),
                 },
             },
-            prompt={"messages": messages, "guided_json": schema},
+            prompt={"messages": messages, "structured_outputs": {"json": schema}},
             response={"raw": reply.content, "parsed": parsed, "validated": validated, "llm_invalid": llm_invalid},
         )
 
@@ -2412,34 +2396,13 @@ def _session_review_schema() -> dict[str, Any]:
     }
 
 
+@prompt_binding("supervisor.session_review.system")
 def _session_review_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are the iSPEC internal QA reviewer.",
-            "You review a single support session transcript and write internal notes.",
-            "Focus on: missed tool opportunities, incorrect claims, confusing UX guidance, bugs, and follow-ups.",
-            "Do NOT call tools. Do NOT write anything user-facing.",
-            "Return ONLY a JSON object that matches the schema.",
-            "Required top-level keys: schema_version, session_id, target_message_id, summary, issues, repo_search_queries, followups.",
-            "- schema_version must be 1.",
-            "- Do not wrap output in review/review_notes/notes; return the object directly.",
-            "- Do not use markdown fences or quote the JSON.",
-        ]
-    ).strip()
+    return load_bound_prompt(_session_review_system_prompt).text
 
-
+@prompt_binding("supervisor.session_review.repair")
 def _session_review_repair_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are repairing a previous invalid JSON response for an iSPEC session review.",
-            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
-            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
-            "Required top-level keys: schema_version, session_id, target_message_id, summary, issues, repo_search_queries, followups.",
-            "The object MUST look like:",
-            '{"schema_version":1,"session_id":"...","target_message_id":123,"summary":"...","issues":[],"repo_search_queries":[],"followups":[]}',
-        ]
-    ).strip()
-
+    return load_bound_prompt(_session_review_repair_system_prompt).text
 
 def _coerce_session_review_output(
     parsed: dict[str, Any] | None,
@@ -3566,16 +3529,17 @@ def _task_support_session_review(
         }
 
         schema = _session_review_schema()
+        prompt = load_bound_prompt(_session_review_system_prompt)
         messages = [
-            {"role": "system", "content": _session_review_system_prompt()},
+            {"role": "system", "content": prompt.text},
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
         ]
         temperature = _structured_llm_temperature("SESSION_REVIEW", default=0.0)
         repair_temperature = _structured_llm_repair_temperature("SESSION_REVIEW", default=0.25)
         max_repairs = _structured_llm_max_repairs("SESSION_REVIEW", default=1)
 
-        vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
-        reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+        vllm_extra_body = {"structured_outputs": {"json": schema}, "temperature": temperature, "max_tokens": 1200}
+        reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=prompt_observability_context(prompt, extra={"task": "session_review"}))
 
         attempts: list[dict[str, Any]] = []
         parsed = _parse_json_object(reply.content)
@@ -3599,12 +3563,13 @@ def _task_support_session_review(
         if (not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _SESSION_REVIEW_VERSION) and (
             max_repairs > 0
         ):
+            repair_prompt = load_bound_prompt(_session_review_repair_system_prompt)
             repair_messages = [
-                {"role": "system", "content": _session_review_repair_system_prompt()},
+                {"role": "system", "content": repair_prompt.text},
                 {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
             ]
-            repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
-            repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+            repair_body = {"structured_outputs": {"json": schema}, "temperature": repair_temperature, "max_tokens": 1200}
+            repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body, observability_context=prompt_observability_context(repair_prompt, extra={"task": "session_review_repair"}))
             parsed2 = _parse_json_object(repair_reply.content)
             coerced2 = _coerce_session_review_output(
                 parsed2 if isinstance(parsed2, dict) else None,
@@ -3638,7 +3603,7 @@ def _task_support_session_review(
                     "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
                 },
                 error="invalid_review_output",
-                prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+                prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
                 response={"attempts": attempts},
             )
 
@@ -3678,7 +3643,7 @@ def _task_support_session_review(
                     "attempts": len(attempts),
                 },
             },
-            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
             response={"attempts": attempts},
         )
 
@@ -3869,37 +3834,13 @@ def _support_digest_schema(*, max_sessions: int) -> dict[str, Any]:
     }
 
 
+@prompt_binding("supervisor.support_digest.system")
 def _support_digest_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are the iSPEC internal summarizer.",
-            "You write short internal digests from structured support-session reviews.",
-            "",
-            "Guidelines:",
-            "- Summarize what changed since the last digest.",
-            "- Focus on user goals, notable issues, and actionable follow-ups.",
-            "- Do not add new facts; only summarize the provided review items.",
-            "- Do not call tools.",
-            "- Return ONLY a JSON object that matches the schema.",
-            "- Required top-level keys: schema_version, from_review_id, to_review_id, summary, highlights, followups, sessions.",
-            "- schema_version must be 1.",
-            "- Do not use markdown fences or quote the JSON.",
-        ]
-    ).strip()
+    return load_bound_prompt(_support_digest_system_prompt).text
 
-
+@prompt_binding("supervisor.support_digest.repair")
 def _support_digest_repair_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are repairing a previous invalid JSON response for an iSPEC support digest.",
-            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
-            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
-            "Required top-level keys: schema_version, from_review_id, to_review_id, summary, highlights, followups, sessions.",
-            "The object MUST look like:",
-            '{"schema_version":1,"from_review_id":0,"to_review_id":0,"summary":"...","highlights":[],"followups":[],"sessions":[]}',
-        ]
-    ).strip()
-
+    return load_bound_prompt(_support_digest_repair_system_prompt).text
 
 def _coerce_support_digest_output(
     parsed: dict[str, Any] | None,
@@ -4110,16 +4051,17 @@ def _task_support_digest(
     }
 
     schema = _support_digest_schema(max_sessions=len(review_items))
+    prompt = load_bound_prompt(_support_digest_system_prompt)
     messages = [
-        {"role": "system", "content": _support_digest_system_prompt()},
+        {"role": "system", "content": prompt.text},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
     temperature = _structured_llm_temperature("SUPPORT_DIGEST", default=0.0)
     repair_temperature = _structured_llm_repair_temperature("SUPPORT_DIGEST", default=0.25)
     max_repairs = _structured_llm_max_repairs("SUPPORT_DIGEST", default=1)
 
-    vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
-    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+    vllm_extra_body = {"structured_outputs": {"json": schema}, "temperature": temperature, "max_tokens": 1200}
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=prompt_observability_context(prompt, extra={"task": "support_digest"}))
 
     attempts: list[dict[str, Any]] = []
     parsed = _parse_json_object(reply.content)
@@ -4141,12 +4083,13 @@ def _task_support_digest(
 
     recovered = False
     if not isinstance(coerced, dict) and max_repairs > 0:
+        repair_prompt = load_bound_prompt(_support_digest_repair_system_prompt)
         repair_messages = [
-            {"role": "system", "content": _support_digest_repair_system_prompt()},
+            {"role": "system", "content": repair_prompt.text},
             {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
         ]
-        repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
-        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        repair_body = {"structured_outputs": {"json": schema}, "temperature": repair_temperature, "max_tokens": 1200}
+        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body, observability_context=prompt_observability_context(repair_prompt, extra={"task": "support_digest_repair"}))
         parsed2 = _parse_json_object(repair_reply.content)
         coerced2 = _coerce_support_digest_output(
             parsed2 if isinstance(parsed2, dict) else None,
@@ -4183,7 +4126,7 @@ def _task_support_digest(
                 "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
             },
             error="invalid_digest_output",
-            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
             response={"attempts": attempts},
         )
 
@@ -4243,7 +4186,7 @@ def _task_support_digest(
                 "attempts": len(attempts),
             },
         },
-        prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+        prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
         response={"attempts": attempts},
     )
 
@@ -4314,33 +4257,13 @@ def _repo_review_schema() -> dict[str, Any]:
     }
 
 
+@prompt_binding("supervisor.repo_review.system")
 def _repo_review_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are the iSPEC internal code reviewer.",
-            "You are given a small set of code snippets and grep matches from the repo.",
-            "Produce an internal review report with actionable recommendations.",
-            "Do NOT invent files or line numbers; reference only what is provided.",
-            "Return ONLY a JSON object that matches the schema.",
-            "Required top-level keys: schema_version, summary, findings, next_steps.",
-            "- schema_version must be 1.",
-            "- Do not use markdown fences or quote the JSON.",
-        ]
-    ).strip()
+    return load_bound_prompt(_repo_review_system_prompt).text
 
-
+@prompt_binding("supervisor.repo_review.repair")
 def _repo_review_repair_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are repairing a previous invalid JSON response for an iSPEC repo review.",
-            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
-            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
-            "Required top-level keys: schema_version, summary, findings, next_steps.",
-            "The object MUST look like:",
-            '{"schema_version":1,"summary":"...","findings":[],"next_steps":[]}',
-        ]
-    ).strip()
-
+    return load_bound_prompt(_repo_review_repair_system_prompt).text
 
 def _coerce_repo_review_output(parsed: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
@@ -4600,16 +4523,17 @@ def _task_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) ->
     }
 
     schema = _repo_review_schema()
+    prompt = load_bound_prompt(_repo_review_system_prompt)
     messages = [
-        {"role": "system", "content": _repo_review_system_prompt()},
+        {"role": "system", "content": prompt.text},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
     temperature = _structured_llm_temperature("REPO_REVIEW", default=0.0)
     repair_temperature = _structured_llm_repair_temperature("REPO_REVIEW", default=0.25)
     max_repairs = _structured_llm_max_repairs("REPO_REVIEW", default=1)
 
-    vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
-    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+    vllm_extra_body = {"structured_outputs": {"json": schema}, "temperature": temperature, "max_tokens": 1200}
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=prompt_observability_context(prompt, extra={"task": "repo_review"}))
 
     attempts: list[dict[str, Any]] = []
     parsed = _parse_json_object(reply.content)
@@ -4629,12 +4553,13 @@ def _task_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) ->
     if (not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _REPO_REVIEW_VERSION) and (
         max_repairs > 0
     ):
+        repair_prompt = load_bound_prompt(_repo_review_repair_system_prompt)
         repair_messages = [
-            {"role": "system", "content": _repo_review_repair_system_prompt()},
+            {"role": "system", "content": repair_prompt.text},
             {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
         ]
-        repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
-        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        repair_body = {"structured_outputs": {"json": schema}, "temperature": repair_temperature, "max_tokens": 1200}
+        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body, observability_context=prompt_observability_context(repair_prompt, extra={"task": "repo_review_repair"}))
         parsed2 = _parse_json_object(repair_reply.content)
         coerced2 = _coerce_repo_review_output(parsed2 if isinstance(parsed2, dict) else None)
         attempts.append(
@@ -4668,7 +4593,7 @@ def _task_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) ->
                 "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
             },
             error="invalid_repo_review_output",
-            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
             response={"attempts": attempts},
         )
 
@@ -4689,7 +4614,7 @@ def _task_repo_review(*, payload: dict[str, Any], agent_id: str, run_id: str) ->
                 "attempts": len(attempts),
             },
         },
-        prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+        prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
         response={"attempts": attempts},
     )
 
@@ -4788,40 +4713,13 @@ def _tackle_assess_schema() -> dict[str, Any]:
     }
 
 
+@prompt_binding("supervisor.tackle_assess.system")
 def _tackle_assess_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are the iSPEC internal analysis assistant.",
-            "You are given structured telemetry and statistical results from a tackle run (e.g. PCA + limma).",
-            "",
-            "Goals:",
-            "- Provide concise, actionable interpretation and QC notes.",
-            "- Highlight suspicious patterns (batch effects, outliers, tiny N, confounding, label leakage).",
-            "- Suggest follow-up plots/tests or metadata checks.",
-            "",
-            "Rules:",
-            "- Do NOT call tools.",
-            "- Do NOT invent values that are not present in the input payload.",
-            "- Return ONLY a JSON object that matches the schema.",
-            "- Required top-level keys: schema_version, project_id, summary, findings, next_steps, questions.",
-            "- schema_version must be 1.",
-            "- Do not use markdown fences or quote the JSON.",
-        ]
-    ).strip()
+    return load_bound_prompt(_tackle_assess_system_prompt).text
 
-
+@prompt_binding("supervisor.tackle_assess.repair")
 def _tackle_assess_repair_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are repairing a previous invalid JSON response for an iSPEC tackle results assessment.",
-            "Return ONLY a valid JSON object that matches the schema. No markdown, no code fences, no quoted JSON.",
-            "If the previous output is truncated or malformed, ignore it and regenerate the full object from the provided context.",
-            "Required top-level keys: schema_version, project_id, summary, findings, next_steps, questions.",
-            "The object MUST look like:",
-            '{"schema_version":1,"project_id":null,"summary":"...","findings":[],"next_steps":[],"questions":[]}',
-        ]
-    ).strip()
-
+    return load_bound_prompt(_tackle_assess_repair_system_prompt).text
 
 def _coerce_tackle_assess_output(parsed: dict[str, Any] | None, *, project_id: int | None) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
@@ -4938,16 +4836,17 @@ def _task_tackle_results_assess(
     }
 
     schema = _tackle_assess_schema()
+    prompt = load_bound_prompt(_tackle_assess_system_prompt)
     messages = [
-        {"role": "system", "content": _tackle_assess_system_prompt()},
+        {"role": "system", "content": prompt.text},
         {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
     ]
     temperature = _structured_llm_temperature("TACKLE_ASSESS", default=0.0)
     repair_temperature = _structured_llm_repair_temperature("TACKLE_ASSESS", default=0.25)
     max_repairs = _structured_llm_max_repairs("TACKLE_ASSESS", default=1)
 
-    vllm_extra_body = {"guided_json": schema, "temperature": temperature, "max_tokens": 1200}
-    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+    vllm_extra_body = {"structured_outputs": {"json": schema}, "temperature": temperature, "max_tokens": 1200}
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=prompt_observability_context(prompt, extra={"task": "tackle_assess"}))
 
     attempts: list[dict[str, Any]] = []
     parsed = _parse_json_object(reply.content)
@@ -4967,12 +4866,13 @@ def _task_tackle_results_assess(
     if (not isinstance(coerced, dict) or int(coerced.get("schema_version") or 0) != _TACKLE_ASSESS_VERSION) and (
         max_repairs > 0
     ):
+        repair_prompt = load_bound_prompt(_tackle_assess_repair_system_prompt)
         repair_messages = [
-            {"role": "system", "content": _tackle_assess_repair_system_prompt()},
+            {"role": "system", "content": repair_prompt.text},
             {"role": "user", "content": json.dumps({"context": context, "previous_output": reply.content}, ensure_ascii=False)},
         ]
-        repair_body = {"guided_json": schema, "temperature": repair_temperature, "max_tokens": 1200}
-        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body)
+        repair_body = {"structured_outputs": {"json": schema}, "temperature": repair_temperature, "max_tokens": 1200}
+        repair_reply = yield InferenceRequest(messages=repair_messages, tools=None, vllm_extra_body=repair_body, observability_context=prompt_observability_context(repair_prompt, extra={"task": "tackle_assess_repair"}))
         parsed2 = _parse_json_object(repair_reply.content)
         coerced2 = _coerce_tackle_assess_output(parsed2 if isinstance(parsed2, dict) else None, project_id=project_id)
         attempts.append(
@@ -5003,7 +4903,7 @@ def _task_tackle_results_assess(
                 "llm": {"provider": reply.provider, "model": reply.model, "meta": reply.meta},
             },
             error="invalid_tackle_assess_output",
-            prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+            prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
             response={"attempts": attempts},
         )
 
@@ -5021,7 +4921,7 @@ def _task_tackle_results_assess(
                 "attempts": len(attempts),
             },
         },
-        prompt={"messages": messages, "guided_json": schema, "vllm_extra_body": vllm_extra_body},
+        prompt={"messages": messages, "structured_outputs": {"json": schema}, "vllm_extra_body": vllm_extra_body},
         response={"attempts": attempts},
     )
 
@@ -5038,25 +4938,9 @@ def _run_tackle_results_assess(
     )
 
 
+@prompt_binding("supervisor.tackle_prompt.system")
 def _tackle_prompt_system_prompt() -> str:
-    return "\n".join(
-        [
-            "You are the iSPEC local analysis assistant.",
-            "You are given a freeform prompt from a pipeline (tackle) containing telemetry and statistical results.",
-            "",
-            "Goals:",
-            "- Provide concise, practical commentary on what the prompt shows.",
-            "- Flag likely issues (outliers, batch effects, confounding, tiny N, mislabeled samples).",
-            "- Suggest next checks and follow-ups.",
-            "",
-            "Rules:",
-            "- Do NOT call tools.",
-            "- Do NOT invent values not present in the prompt/context.",
-            "- Do NOT reveal secrets, API keys, or internal paths.",
-            "- Respond in plain text (no JSON required).",
-        ]
-    ).strip()
-
+    return load_bound_prompt(_tackle_prompt_system_prompt).text
 
 def _task_tackle_prompt_freeform(
     *,
@@ -5096,8 +4980,9 @@ def _task_tackle_prompt_freeform(
     user_parts.append(prompt)
     user_content = "\n\n".join(user_parts).strip()
 
+    prompt = load_bound_prompt(_tackle_prompt_system_prompt)
     messages = [
-        {"role": "system", "content": _tackle_prompt_system_prompt()},
+        {"role": "system", "content": prompt.text},
         {"role": "user", "content": user_content},
     ]
 
@@ -5108,7 +4993,7 @@ def _task_tackle_prompt_freeform(
     max_tokens = _clamp_int(int(max_tokens), min_value=64, max_value=2400)
 
     vllm_extra_body = {"max_tokens": int(max_tokens)}
-    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body)
+    reply = yield InferenceRequest(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=prompt_observability_context(prompt, extra={"task": "tackle_prompt_freeform"}))
     if not reply.ok:
         return CommandExecution(
             ok=False,
