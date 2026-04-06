@@ -78,6 +78,47 @@ def test_assistant_recent_sessions_lists_state_fields(tmp_path, db_session):
         assert item["reviewed_up_to_id"] == 0
 
 
+def test_assistant_stats_reports_backup_health(tmp_path, db_session, monkeypatch):
+    assistant_db_path = tmp_path / "assistant.db"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setenv("ISPEC_STATE_DIR", str(state_dir))
+    (state_dir / "backup-status.json").write_text(
+        '{\"ok\": true, \"status\": \"ok\", \"last_attempted_at\": \"2026-04-02T10:00:00+00:00\", \"last_succeeded_at\": \"2026-04-02T10:01:00+00:00\", \"target_root\": \"/media/alex/202603/ispec-backups\", \"latest_snapshot_path\": \"/media/alex/202603/ispec-backups/2026/04/02/20260402T100100Z\"}\n',
+        encoding="utf-8",
+    )
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        session = SupportSession(session_id="s1", user_id=None)
+        assistant_db.add(session)
+        assistant_db.flush()
+        assistant_db.add_all(
+            [
+                SupportMessage(session_pk=session.id, role="user", content="Hi"),
+                SupportMessage(session_pk=session.id, role="assistant", content="Hello"),
+            ]
+        )
+        assistant_db.commit()
+
+    with get_assistant_session(assistant_db_path) as assistant_db, get_agent_session(tmp_path / "agent.db") as agent_db:
+        payload = run_tool(
+            name="assistant_stats",
+            args={},
+            core_db=db_session,
+            assistant_db=assistant_db,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+        )
+        assert payload["ok"] is True
+        backup = payload["result"]["supervisor_health"]["backup"]
+        assert backup["ok"] is True
+        assert backup["status"] == "ok"
+        assert backup["latest_snapshot_path"].endswith("20260402T100100Z")
+
+
 def test_assistant_stats_reports_supervisor_health_snapshot(tmp_path, db_session):
     assistant_db_path = tmp_path / "assistant.db"
     agent_db_path = tmp_path / "agent.db"

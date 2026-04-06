@@ -16,6 +16,7 @@ def main():
         agent,
         api,
         auth,
+        backup,
         dev,
         config as config_cli,
         db,
@@ -48,6 +49,10 @@ def main():
     dev_parser = subparsers.add_parser("dev", help="Dev helpers (tmux)")
     dev_subparsers = dev_parser.add_subparsers(dest="subcommand", required=True)
     dev.register_subcommands(dev_subparsers)
+
+    backup_parser = subparsers.add_parser("backup", help="Operational backup helpers")
+    backup_subparsers = backup_parser.add_subparsers(dest="subcommand", required=True)
+    backup.register_subcommands(backup_subparsers)
 
     prompt_parser = subparsers.add_parser("prompt", help="Prompt registry helpers")
     prompt_subparsers = prompt_parser.add_subparsers(dest="subcommand", required=True)
@@ -94,6 +99,8 @@ def main():
         api.dispatch(args)
     elif args.command == "dev":
         dev.dispatch(args)
+    elif args.command == "backup":
+        backup.dispatch(args)
     elif args.command == "prompt":
         prompt.dispatch(args)
     elif args.command == "auth":

@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, defer
 
 from ispec.agent.archive import get_agent_archive_session_if_available
 from ispec.agent.connect import get_agent_session
+from ispec.backup import load_backup_status
 from ispec.assistant.context import person_summary, project_summary
 from ispec.assistant.models import (
     SupportMemory,
@@ -850,6 +851,21 @@ def _isoformat_or_none(value: datetime | None) -> str | None:
     return normalized.isoformat() if normalized is not None else None
 
 
+def _assistant_backup_health_snapshot() -> dict[str, Any] | None:
+    payload = load_backup_status()
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "ok": bool(payload.get("ok")),
+        "status": payload.get("status"),
+        "last_attempted_at": payload.get("last_attempted_at"),
+        "last_succeeded_at": payload.get("last_succeeded_at"),
+        "last_error": payload.get("last_error"),
+        "target_root": payload.get("target_root"),
+        "latest_snapshot_path": payload.get("latest_snapshot_path"),
+    }
+
+
 def _assistant_supervisor_health_snapshot(
     *,
     agent_db: Session,
@@ -1041,6 +1057,7 @@ def _assistant_supervisor_health_snapshot(
             "is_overdue": bool(is_overdue),
             "overdue_seconds": int(overdue_seconds),
         },
+        "backup": _assistant_backup_health_snapshot(),
     }
 
 

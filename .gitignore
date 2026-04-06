@@ -23,5 +23,6 @@ data/testdata/raw/
 build/
 data/
 experiments_dump/
+logs/
 src/repo.txt
 tests/behavioral/local/
