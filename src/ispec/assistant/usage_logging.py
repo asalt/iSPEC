@@ -85,6 +85,9 @@ def record_inference_usage_event(
             for key, value in fallback.items()
             if isinstance(key, str) and key
         }
+    for key in ("tool_call_dialect", "tool_parser_fallback_used", "tool_parser_fallback_shape"):
+        if key in meta_dict:
+            event[key] = _clean_scalar(meta_dict.get(key))
 
     context = observability_context if isinstance(observability_context, dict) else {}
     for key in (

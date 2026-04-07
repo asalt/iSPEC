@@ -5,6 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from ispec.prompt.audit import audit_inline_prompt_literals
 from ispec.prompt.connect import connect_prompts_db, get_prompts_db_path
 from ispec.prompt.loader import load_prompt_source, resolve_prompt_root
 from ispec.prompt.sync import sync_prompts
@@ -25,6 +26,12 @@ def register_subcommands(subparsers) -> None:
 
     search_parser = subparsers.add_parser('search', help='Search prompt families and notes')
     search_parser.add_argument('query', help='Substring query')
+
+    audit_parser = subparsers.add_parser('audit-inline', help='Audit obvious large inline model-prompt literals in Python code')
+    audit_parser.add_argument('--source-root', default='', help='Optional Python source root to scan (default: src/ispec)')
+    audit_parser.add_argument('--min-chars', type=int, default=160, help='Minimum stripped character count to flag')
+    audit_parser.add_argument('--min-newlines', type=int, default=4, help='Minimum newline count to flag')
+    audit_parser.add_argument('--check', action='store_true', help='Exit nonzero when any findings are present')
 
 
 def _db_exists() -> bool:
@@ -109,6 +116,23 @@ def dispatch(args) -> None:
             title = f" :: {row['title']}" if row['title'] else ''
             notes = f" [{row['notes']}]" if row['notes'] else ''
             print(f"{row['family']}{version}{title}{notes}")
+        return
+
+    if args.subcommand == 'audit-inline':
+        source_root = Path(args.source_root).expanduser().resolve() if str(args.source_root or '').strip() else Path(__file__).resolve().parents[1]
+        findings = audit_inline_prompt_literals(
+            source_root=source_root,
+            min_chars=int(args.min_chars),
+            min_newlines=int(args.min_newlines),
+        )
+        payload = {
+            'source_root': str(source_root),
+            'count': len(findings),
+            'findings': [item.as_dict() for item in findings],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        if args.check and findings:
+            raise SystemExit(1)
         return
 
     if args.subcommand == 'show':

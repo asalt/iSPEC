@@ -2991,10 +2991,11 @@ def _task_scheduled_assistant_prompt(
             if isinstance(name, str) and name
         }
 
-    system_prompt = _scheduled_assistant_system_prompt(
+    system_prompt_rendered = _render_scheduled_assistant_system_prompt(
         allowed_tool_names=provided_tool_names,
         required_tool=required_tool,
     )
+    system_prompt = system_prompt_rendered.text
     context_payload: dict[str, Any] = {
         "schema_version": 1,
         "job": {
@@ -3119,6 +3120,10 @@ def _task_scheduled_assistant_prompt(
             tools=tools_for_call,
             tool_choice=tool_choice,
             stage="planner",
+            observability_context=prompt_observability_context(
+                system_prompt_rendered,
+                extra={"task": "scheduled_assistant", "job_name": job_name or None},
+            ),
         )
 
         raw_reply = reply.content or ""
@@ -3355,28 +3360,39 @@ def _scheduled_assistant_context_message(*, payload: dict[str, Any]) -> str:
     return "SCHEDULED_ASSISTANT_CONTEXT v1:\n" + json.dumps(payload, ensure_ascii=False)
 
 
+@prompt_binding("supervisor.scheduled_assistant.system")
 def _scheduled_assistant_system_prompt(*, allowed_tool_names: set[str], required_tool: str | None) -> str:
-    base = _system_prompt_planner(
-        tools_available=bool(allowed_tool_names),
-        response_format="single",
-        tool_names=allowed_tool_names,
-    ).strip()
-    rules = [
-        "Scheduled job rules:",
-        "- This is an internal scheduled assistant task, not an end-user conversation.",
-        "- Gather live information using the provided tools when needed.",
-        "- Do not ask clarifying questions; make a reasonable best effort from available data.",
-        "- Keep the staff-facing message concise and readable.",
-    ]
+    return _render_scheduled_assistant_system_prompt(
+        allowed_tool_names=allowed_tool_names,
+        required_tool=required_tool,
+    ).text
+
+
+def _render_scheduled_assistant_system_prompt(
+    *,
+    allowed_tool_names: set[str],
+    required_tool: str | None,
+):
+    required_tool_block = ""
     if required_tool:
-        rules.extend(
+        required_tool_block = "\n".join(
             [
                 f"- After gathering the needed information, call {required_tool} exactly once.",
                 "- Do not stop after drafting the message; complete the required final tool call.",
                 "- If the required tool succeeds, finish with a short FINAL confirming the action.",
             ]
         )
-    return base + "\n\n" + "\n".join(rules)
+    return load_bound_prompt(
+        _scheduled_assistant_system_prompt,
+        values={
+            "planner_prompt": _system_prompt_planner(
+                tools_available=bool(allowed_tool_names),
+                response_format="single",
+                tool_names=allowed_tool_names,
+            ).strip(),
+            "required_tool_block": required_tool_block,
+        },
+    )
 
 
 def _task_support_session_review(
@@ -7553,7 +7569,11 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
             stale_recovery.get("running_total"),
             stale_recovery.get("stale_seconds"),
         )
-    seeded_id = _seed_orchestrator_tick(delay_seconds=5, agent_id=config.agent_id, run_id=run_id)
+    seeded_id = _seed_orchestrator_tick(
+        delay_seconds=_orchestrator_tick_min_seconds(),
+        agent_id=config.agent_id,
+        run_id=run_id,
+    )
     if seeded_id is not None:
         logger.info("Seeded orchestrator tick (command_id=%s)", seeded_id)
 

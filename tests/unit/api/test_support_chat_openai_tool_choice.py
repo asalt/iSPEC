@@ -342,6 +342,12 @@ def test_support_chat_draft_request_returns_draft_without_writing(
 
     def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
         calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        tool_names = {
+            str(spec.get("function", {}).get("name") or "")
+            for spec in (tools or [])
+            if isinstance(spec, dict)
+        }
+        assert "create_project_comment" not in tool_names
         assert tool_choice is None
         if len(calls) == 1:
             return AssistantReply(
@@ -1082,29 +1088,19 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
                 "vllm_extra_body": vllm_extra_body,
             }
         )
-        if len(calls) == 1:
-            assert tools is None
-            assert isinstance(vllm_extra_body, dict)
-            assert isinstance(vllm_extra_body.get("structured_outputs"), dict) and "json" in vllm_extra_body["structured_outputs"]
-            return AssistantReply(
-                content=json.dumps(
-                    {
-                        "intent": "draft_only",
-                        "confidence": 0.96,
-                        "reason": "The user asked for help writing a comment, not saving it yet.",
-                    }
-                ),
-                provider="intent",
-                model="intent-model",
-                meta=None,
-            )
-
+        tool_names = {
+            str(spec.get("function", {}).get("name") or "")
+            for spec in (tools or [])
+            if isinstance(spec, dict)
+        }
+        assert "create_project_comment" not in tool_names
         assert any(
             isinstance(item, dict)
             and item.get("role") == "system"
-            and "comment_intent=draft_only" in str(item.get("content") or "")
+            and "Do not save or log to project history in this turn unless the user explicitly asks you to save" in str(item.get("content") or "")
             for item in (messages or [])
         )
+        assert vllm_extra_body is None
         return AssistantReply(
             content=(
                 "FINAL:\n"
@@ -1153,7 +1149,7 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
             )
 
         assert "Draft comment for project 1531" in (response.message or "")
-        assert len(calls) == 2
+        assert len(calls) == 1
         assert (
             db_session.query(ProjectComment)
             .filter(ProjectComment.project_id == 1531)
@@ -1169,8 +1165,8 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
         )
         assert assistant_row is not None
         meta = json.loads(assistant_row.meta_json)
-        assert meta["comment_intent"]["decision"]["intent"] == "draft_only"
-        assert meta["comment_intent"]["provider"] == "intent"
+        assert meta["tooling"]["project_comment_write_tool_exposed"] is False
+        assert meta["tooling"]["project_comment_write_tool_reason"] == "no_explicit_save_request"
 
 
 def test_support_chat_forces_openai_tmux_list_tool_choice_for_live_tmux_request(
@@ -1826,3 +1822,138 @@ def test_support_chat_project_existence_reply_does_not_trigger_write_claim_guard
         assert write_claim_guard.get("triggered", False) is False
         assert write_claim_guard.get("retried", False) is False
         assert write_claim_guard.get("blocked_final_claim", False) is False
+
+
+def test_support_chat_blocks_write_tool_after_policy_denial(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
+
+    db_session.add(Project(id=1531, prj_AddedBy="test", prj_ProjectTitle="Project 1531"))
+    db_session.commit()
+
+    llm_calls: list[dict[str, Any]] = []
+    run_calls: list[dict[str, Any]] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
+        llm_calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        tool_names = {
+            str(spec.get("function", {}).get("name") or "")
+            for spec in (tools or [])
+            if isinstance(spec, dict)
+        }
+        if len(llm_calls) == 1:
+            assert "create_project_comment" in tool_names
+            return AssistantReply(
+                content="",
+                provider="test",
+                model="test-model",
+                meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "create_project_comment",
+                            "arguments": json.dumps(
+                                {
+                                    "project_id": 1531,
+                                    "comment": "Project 1531 is ready for review.",
+                                    "comment_type": "note",
+                                    "confirm": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+            )
+
+        assert "create_project_comment" not in tool_names
+        assert any(
+            isinstance(item, dict)
+            and item.get("role") == "system"
+            and "Do not call write/save tools again in this turn" in str(item.get("content") or "")
+            for item in (messages or [])
+        )
+        return AssistantReply(
+            content="FINAL:\nI drafted the note, but I have not saved it yet.",
+            provider="test",
+            model="test-model",
+            meta=None,
+        )
+
+    def fake_run_tool(*, name=None, args=None, **_):
+        run_calls.append({"name": name, "args": dict(args or {})})
+        if name == "create_project_comment":
+            return {
+                "ok": False,
+                "tool": name,
+                "error": "User did not explicitly request saving to project history.",
+            }
+        return {"ok": False, "tool": name, "error": "unexpected tool"}
+
+    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
+    monkeypatch.setattr(support_routes, "run_tool", fake_run_tool)
+
+    db_path = tmp_path / "assistant.db"
+    with get_assistant_session(db_path) as assistant_db:
+        support_session = SupportSession(session_id="session-write-denial", user_id=None)
+        assistant_db.add(support_session)
+        assistant_db.flush()
+
+        payload = ChatRequest.model_validate(
+            {
+                "sessionId": "session-write-denial",
+                "message": "Add a note to project 1531 that it is ready for review.",
+                "history": [],
+                "ui": None,
+            }
+        )
+
+        service_user = types.SimpleNamespace(
+            id=1,
+            username="api_key",
+            role=UserRole.viewer,
+            can_write_project_comments=True,
+        )
+
+        schedule_path = tmp_path / "schedule.db"
+        with get_schedule_session(schedule_path) as schedule_db:
+            response = chat(
+                payload,
+                assistant_db=assistant_db,
+                core_db=db_session,
+                schedule_db=schedule_db,
+                user=service_user,
+            )
+
+        assert response.message == "I drafted the note, but I have not saved it yet."
+        assert run_calls == [
+            {
+                "name": "create_project_comment",
+                "args": {
+                    "project_id": 1531,
+                    "comment": "Project 1531 is ready for review.",
+                    "comment_type": "note",
+                    "confirm": True,
+                },
+            }
+        ]
+        assert len(llm_calls) == 2
+
+        assistant_row = (
+            assistant_db.query(support_routes.SupportMessage)
+            .filter(support_routes.SupportMessage.session_pk == support_session.id)
+            .filter(support_routes.SupportMessage.role == "assistant")
+            .order_by(support_routes.SupportMessage.id.desc())
+            .first()
+        )
+        assert assistant_row is not None
+        meta = json.loads(assistant_row.meta_json)
+        assert meta["tool_calls"][0]["name"] == "create_project_comment"
+        assert meta["tool_calls"][0]["ok"] is False
+        assert "create_project_comment" in meta["tooling"]["blocked_write_tools"]
+        assert meta["tooling"]["write_block_reason"] == "explicit_save_required"
+        assert meta["tooling"]["project_comment_write_tool_exposed"] is False

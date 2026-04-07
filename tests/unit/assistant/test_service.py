@@ -476,3 +476,137 @@ def test_build_messages_review_stage_drops_history(monkeypatch):
     )
     roles = [msg.get("role") for msg in messages]
     assert roles == ["system", "system", "user"]
+
+
+def test_generate_reply_vllm_enriches_stage_prompt_observability(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ISPEC_VLLM_MODEL", "test-model")
+
+    captured: dict[str, object] = {}
+
+    def fake_post(
+        url: str,
+        *,
+        json: dict[str, Any],
+        headers: dict[str, str],
+        timeout: float,
+    ) -> _DummyResponse:
+        return _DummyResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "OK"}}], "usage": {"total_tokens": 1}}
+        )
+
+    def fake_record_inference_usage_event(*, provider, model, meta, ok, error=None, observability_context=None):  # type: ignore[no-untyped-def]
+        captured["provider"] = provider
+        captured["model"] = model
+        captured["meta"] = meta
+        captured["ok"] = ok
+        captured["observability_context"] = observability_context
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+    monkeypatch.setattr(service, "record_inference_usage_event", fake_record_inference_usage_event)
+
+    reply = service.generate_reply(message="Plan this", history=None, context=None, stage="planner")
+
+    assert reply.content == "OK"
+    observability = captured["observability_context"]
+    assert isinstance(observability, dict)
+    assert observability["prompt_family"] == "assistant.planner.system"
+    assert observability["prompt_binding"].endswith(":_system_prompt_planner")
+
+
+def test_planner_tool_protocol_block_uses_parser_native_json_for_vllm():
+    text = service._planner_tool_protocol_block(tools_available=True, provider="vllm")
+    assert 'OpenAI-style tool_calls' not in text
+    assert '{"name":"<tool>","arguments":{...}}' in text
+    assert 'parser-native JSON tool calls' in text
+
+
+def test_generate_reply_vllm_salvages_name_arguments_tool_call_from_content(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ISPEC_VLLM_MODEL", "test-model")
+
+    def fake_post(url: str, *, json: dict[str, Any], headers: dict[str, str], timeout: float) -> _DummyResponse:
+        return _DummyResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"name":"count_all_projects","arguments":{}}',
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 1},
+            }
+        )
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "count_all_projects",
+                "description": "Count projects.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    reply = service.generate_reply(message="Ping", history=None, context=None, tools=tools)
+    assert reply.content == ""
+    assert reply.tool_calls and reply.tool_calls[0]["function"]["name"] == "count_all_projects"
+    assert reply.meta["tool_call_dialect"] == "parser_native_name_arguments"
+    assert reply.meta["tool_parser_fallback_used"] is True
+    assert reply.meta["tool_parser_fallback_shape"] == "name_arguments"
+
+
+def test_generate_reply_vllm_salvages_wrapped_function_tool_call_from_content(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ISPEC_VLLM_MODEL", "test-model")
+
+    def fake_post(url: str, *, json: dict[str, Any], headers: dict[str, str], timeout: float) -> _DummyResponse:
+        return _DummyResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json_module.dumps(
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "count_all_projects",
+                                        "arguments": {"scope": "all"},
+                                    },
+                                }
+                            ),
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 1},
+            }
+        )
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "count_all_projects",
+                "description": "Count projects.",
+                "parameters": {"type": "object", "properties": {"scope": {"type": "string"}}},
+            },
+        }
+    ]
+
+    import json as json_module
+
+    reply = service.generate_reply(message="Ping", history=None, context=None, tools=tools)
+    assert reply.tool_calls and reply.tool_calls[0]["function"]["name"] == "count_all_projects"
+    assert reply.meta["tool_parser_fallback_used"] is True
+    assert reply.meta["tool_parser_fallback_shape"] == "function_wrapper"

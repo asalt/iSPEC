@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -12,6 +13,7 @@ import requests
 from ispec.assistant.tools import TOOL_CALL_PREFIX, TOOL_RESULT_PREFIX, tool_prompt
 from ispec.assistant.usage_logging import record_inference_usage_event
 from ispec.logging import get_logger
+from ispec.prompt import PromptSource, PromptVersionInfo, RenderedPrompt, load_bound_prompt, prompt_binding, prompt_observability_context
 
 
 logger = get_logger(__name__)
@@ -25,6 +27,8 @@ class AssistantReply:
     model: str | None = None
     meta: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    tool_parser_fallback_used = False
+    tool_parser_fallback_shape: str | None = None
     ok: bool = True
     error: str | None = None
 
@@ -101,35 +105,55 @@ def _prompt_extras() -> str | None:
     return combined.strip() or None
 
 
-def _default_prompt_base() -> str:
-    identity = (os.getenv("ISPEC_ASSISTANT_NAME") or "iSPEC").strip() or "iSPEC"
-    return (
-        f"You are {identity}, the built-in support assistant for the iSPEC web app.\n"
-        "Your job is to help users (staff and project-scoped clients) use iSPEC to track projects, files, experiments, and runs.\n"
-        "\n"
-        "Behavior:\n"
-        "- Be concise, practical, and action-oriented.\n"
-        "- Ask a single clarifying question when needed.\n"
-        "- Never invent database values, IDs, or outcomes.\n"
-        "- Never claim you saved/updated/wrote data unless a tool call succeeded (ok=true).\n"
-        "- If you reference a record, include its id and title when available.\n"
-        "- Respect access boundaries (e.g., client users only see their projects).\n"
-        "- CONTEXT is a partial snapshot; do not assume lists are exhaustive or infer global counts from them.\n"
-        "- When tool calling is available, use tools for database lookups; do not claim you can't access iSPEC data.\n"
-        "- When discussing new features or implementation, prefer using existing iSPEC data/endpoints; if unsure what exists, ask.\n"
-        "- iSPEC already tracks project timestamps (created/modified, milestone dates, and timestamped comments); do not suggest adding timestamps unless confirmed missing.\n"
-        "- If asked about end-user setup/UX, describe the UI flow (where to click, what appears), not backend schema changes.\n"
-        "- If users share product feedback or feature requests, thank them and ask for specifics (page/route, what they expected).\n"
-        "- Do not reveal secrets (API keys, env vars, credentials) or internal paths.\n"
-        "\n"
-        "You may be provided an additional system message called CONTEXT that contains\n"
-        "read-only JSON from the iSPEC database and your chat session state. Treat that\n"
-        "context as authoritative.\n"
-        "If CONTEXT.session.state.conversation_memory is present, it is distilled memory\n"
-        "of older turns that may be omitted from the message history.\n"
-        "If CONTEXT.session.state.conversation_summary is present, it is a raw rolling\n"
-        "summary of older turns; prefer conversation_memory when both are present.\n"
+def _assistant_identity() -> str:
+    return (os.getenv("ISPEC_ASSISTANT_NAME") or "iSPEC").strip() or "iSPEC"
+
+
+def _prompt_text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _overlay_rendered_prompt(
+    prompt: RenderedPrompt,
+    *,
+    text: str,
+    source_path: str | None = None,
+) -> RenderedPrompt:
+    normalized = (text or "").strip()
+    source = PromptSource(
+        family=prompt.source.family,
+        source_path=source_path or prompt.source.source_path,
+        title=prompt.source.title,
+        notes=prompt.source.notes,
+        body=normalized,
+        body_sha256=_prompt_text_sha256(normalized),
     )
+    return RenderedPrompt(text=normalized, source=source, binding=prompt.binding, version=PromptVersionInfo())
+
+
+def _apply_prompt_extras(prompt: RenderedPrompt) -> RenderedPrompt:
+    extras = _prompt_extras()
+    if not extras:
+        return prompt
+    return _overlay_rendered_prompt(prompt, text=prompt.text.rstrip() + "\n\n" + extras)
+
+
+def _legacy_answer_prompt_override() -> tuple[str | None, str | None]:
+    prompt_text: str | None = None
+    source_path: str | None = None
+
+    file_override = _read_prompt_from_env("ISPEC_ASSISTANT_SYSTEM_PROMPT_PATH")
+    if file_override:
+        prompt_text = file_override.strip()
+        source_path = "env:ISPEC_ASSISTANT_SYSTEM_PROMPT_PATH"
+
+    override = (os.getenv("ISPEC_ASSISTANT_SYSTEM_PROMPT") or "").strip()
+    if override:
+        prompt_text = override.strip()
+        source_path = "env:ISPEC_ASSISTANT_SYSTEM_PROMPT"
+
+    return prompt_text, source_path
+
 
 def _final_template(*, response_format: ResponseFormat) -> str:
     if response_format == "compare":
@@ -142,42 +166,16 @@ def _final_template(*, response_format: ResponseFormat) -> str:
     return "  FINAL:\n  <your user-facing answer>\n"
 
 
-def _system_prompt_answer(*, response_format: ResponseFormat = "single") -> str:
-    prompt = (
-        _default_prompt_base().rstrip()
-        + "\n\n"
-        + "Response format:\n"
-        + "- Output only:\n"
-        + _final_template(response_format=response_format)
-        + "- Do not include PLAN.\n"
-        + "\n"
-        + "UI routes (common): /projects, /project/<id>, /people, /experiments,\n"
-        + "/experiment/<id>, /experiment-runs, /experiment-run/<id>.\n"
-        + "Project status values: inquiry, consultation, waiting, processing, analysis,\n"
-        + "summary, closed, hibernate.\n"
-    )
-
-    file_override = _read_prompt_from_env("ISPEC_ASSISTANT_SYSTEM_PROMPT_PATH")
-    if file_override:
-        prompt = file_override.strip()
-
-    override = (os.getenv("ISPEC_ASSISTANT_SYSTEM_PROMPT") or "").strip()
-    if override:
-        prompt = override.strip()
-
-    extras = _prompt_extras()
-    if extras:
-        prompt = prompt.rstrip() + "\n\n" + extras
-
-    return prompt.strip()
+@prompt_binding("assistant.base.system")
+def _base_system_prompt() -> str:
+    return _render_base_system_prompt().text
 
 
-def _system_prompt_planner(
-    *,
-    tools_available: bool,
-    response_format: ResponseFormat = "single",
-    tool_names: set[str] | None = None,
-) -> str:
+def _render_base_system_prompt() -> RenderedPrompt:
+    return load_bound_prompt(_base_system_prompt, values={"identity": _assistant_identity()})
+
+
+def _planner_tool_use_block(*, tool_names: set[str] | None = None) -> str:
     def has(name: str) -> bool:
         return tool_names is None or name in tool_names
 
@@ -244,83 +242,129 @@ def _system_prompt_planner(
             "- When answering from a TOOL_RESULT, restate the scope (e.g. total vs current). Do not call a subset count 'total'.",
         ]
     )
+    return "\n".join(tool_use_lines)
 
-    prompt = _default_prompt_base().rstrip() + "\n\n" + "\n".join(tool_use_lines) + "\n"
 
+def _planner_tool_protocol_block(*, tools_available: bool, provider: str | None = None) -> str:
+    normalized_provider = str(provider or _assistant_provider()).strip().lower()
     if tools_available:
-        prompt += (
-            "\n"
+        if normalized_provider == "vllm":
+            return (
+                "Tool calling protocol:\n"
+                "- The active local parser expects parser-native JSON tool calls.\n"
+                "- When calling a single tool, output only a JSON object like:\n"
+                '  {"name":"<tool>","arguments":{...}}\n'
+                "- When calling multiple tools, output only a JSON array of those objects.\n"
+                '- Use top-level "name" and "arguments" keys. Do not wrap calls inside '
+                '"tool_calls", "type":"function", or another envelope.\n'
+                "- When calling tools, do not include PLAN/FINAL or any extra prose.\n"
+                f"- If raw JSON tool calls are not supported, fallback to one line starting with {TOOL_CALL_PREFIX}:\n"
+                f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
+                f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative."
+            )
+        return (
             "Tool calling protocol:\n"
             "- Use OpenAI-style tool_calls (tools/tool_choice are provided).\n"
             "- When calling tools, do not include PLAN/FINAL in the content.\n"
             f"- If structured tool_calls are not supported, fallback to one line starting with {TOOL_CALL_PREFIX}:\n"
             f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
-            f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative.\n"
+            f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative."
         )
-    else:
-        prompt += (
-            "\n"
-            "Tool calling protocol:\n"
-            f"- Request a tool by outputting exactly one line starting with {TOOL_CALL_PREFIX}:\n"
-            f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
-            f"- Tool results arrive as a {TOOL_RESULT_PREFIX} system message; treat them as authoritative.\n"
-        )
+    return (
+        "Tool calling protocol:\n"
+        f"- Request a tool by outputting exactly one line starting with {TOOL_CALL_PREFIX}:\n"
+        f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
+        f"- Tool results arrive as a {TOOL_RESULT_PREFIX} system message; treat them as authoritative."
+    )
 
-    prompt += "\n" + tool_prompt(tool_names=tool_names)
-
-    prompt += (
-        "\n"
+def _planner_response_format_block(*, response_format: ResponseFormat) -> str:
+    return (
         "Response format:\n"
         "- If you call a tool: output only the tool call (or tool_calls), with no extra text.\n"
         "- Otherwise, output only:\n"
-        + _final_template(response_format=response_format)
+        + _final_template(response_format=response_format).rstrip()
     )
 
-    extras = _prompt_extras()
-    if extras:
-        prompt = prompt.rstrip() + "\n\n" + extras
 
-    return prompt.strip()
+@prompt_binding("assistant.answer.system")
+def _system_prompt_answer(*, response_format: ResponseFormat = "single") -> str:
+    return _render_system_prompt_answer(response_format=response_format).text
 
 
+def _render_system_prompt_answer(*, response_format: ResponseFormat = "single") -> RenderedPrompt:
+    prompt = load_bound_prompt(
+        _system_prompt_answer,
+        values={
+            "base_prompt": _render_base_system_prompt().text,
+            "response_format_block": _final_template(response_format=response_format).rstrip(),
+        },
+    )
+    override, override_source = _legacy_answer_prompt_override()
+    if override:
+        prompt = _overlay_rendered_prompt(prompt, text=override, source_path=override_source)
+    return _apply_prompt_extras(prompt)
+
+
+@prompt_binding("assistant.planner.system")
+def _system_prompt_planner(
+    *,
+    tools_available: bool,
+    response_format: ResponseFormat = "single",
+    tool_names: set[str] | None = None,
+) -> str:
+    return _render_system_prompt_planner(
+        tools_available=tools_available,
+        response_format=response_format,
+        tool_names=tool_names,
+    ).text
+
+
+def _render_system_prompt_planner(
+    *,
+    tools_available: bool,
+    response_format: ResponseFormat = "single",
+    tool_names: set[str] | None = None,
+) -> RenderedPrompt:
+    prompt = load_bound_prompt(
+        _system_prompt_planner,
+        values={
+            "base_prompt": _render_base_system_prompt().text,
+            "tool_use_block": _planner_tool_use_block(tool_names=tool_names),
+            "tool_protocol_block": _planner_tool_protocol_block(
+                tools_available=tools_available,
+                provider=(os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub"),
+            ),
+            "tool_catalog_block": tool_prompt(tool_names=tool_names).strip() + "\n",
+            "response_format_block": _planner_response_format_block(response_format=response_format),
+        },
+    )
+    return _apply_prompt_extras(prompt)
+
+
+@prompt_binding("assistant.review.system")
 def _system_prompt_review() -> str:
-    prompt = (
-        _default_prompt_base().rstrip()
-        + "\n\n"
-        + "You are in review mode.\n"
-        + "- Review the draft answer for correctness (grounded in CONTEXT / tool results), clarity, and iSPEC tone.\n"
-        + "- Do not call tools.\n"
-        + "- If the draft is already good, repeat it verbatim.\n"
-        + "- Otherwise, rewrite it.\n"
-        + "\n"
-        + "Response format:\n"
-        + "- Output only:\n"
-        + "  FINAL:\n"
-        + "  <answer>\n"
+    return _render_system_prompt_review().text
+
+
+def _render_system_prompt_review() -> RenderedPrompt:
+    prompt = load_bound_prompt(
+        _system_prompt_review,
+        values={"base_prompt": _render_base_system_prompt().text},
     )
-
-    extras = _prompt_extras()
-    if extras:
-        prompt = prompt.rstrip() + "\n\n" + extras
-
-    return prompt.strip()
+    return _apply_prompt_extras(prompt)
 
 
+@prompt_binding("assistant.review_decider.system")
 def _system_prompt_review_decider() -> str:
-    prompt = (
-        _default_prompt_base().rstrip()
-        + "\n\n"
-        + "You are in review decision mode.\n"
-        + "- Decide if the draft answer needs changes.\n"
-        + "- Do not call tools.\n"
-        + "- Output exactly one token: KEEP or REWRITE.\n"
+    return _render_system_prompt_review_decider().text
+
+
+def _render_system_prompt_review_decider() -> RenderedPrompt:
+    prompt = load_bound_prompt(
+        _system_prompt_review_decider,
+        values={"base_prompt": _render_base_system_prompt().text},
     )
-
-    extras = _prompt_extras()
-    if extras:
-        prompt = prompt.rstrip() + "\n\n" + extras
-
-    return prompt.strip()
+    return _apply_prompt_extras(prompt)
 
 
 def _system_prompt() -> str:
@@ -443,13 +487,15 @@ def generate_reply(
     if messages is None:
         if message is None:
             raise ValueError("message is required when messages is not provided")
+        stage_prompt = _render_stage_prompt(stage=stage, tools_available=bool(tools))
         messages = _build_messages(
             message=message,
             history=history,
             context=context,
             stage=stage,
-            tools_available=bool(tools),
+            system_prompt=stage_prompt.text,
         )
+        observability_context = prompt_observability_context(stage_prompt, extra=observability_context)
     if provider == "ollama":
         return _generate_ollama_reply(messages=messages, tools=tools, observability_context=observability_context)
     if provider == "vllm":
@@ -472,6 +518,18 @@ def generate_reply(
     )
 
 
+def _render_stage_prompt(
+    *,
+    stage: Literal["planner", "answer", "review"],
+    tools_available: bool,
+) -> RenderedPrompt:
+    if stage == "planner":
+        return _render_system_prompt_planner(tools_available=tools_available)
+    if stage == "review":
+        return _render_system_prompt_review()
+    return _render_system_prompt_answer()
+
+
 def _build_messages(
     *,
     message: str,
@@ -479,14 +537,10 @@ def _build_messages(
     context: str | None,
     stage: Literal["planner", "answer", "review"] = "answer",
     tools_available: bool = False,
+    system_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
-    if stage == "planner":
-        system_prompt = _system_prompt_planner(tools_available=tools_available)
-    elif stage == "review":
-        system_prompt = _system_prompt_review()
-    else:
-        system_prompt = _system_prompt_answer()
-
+    if system_prompt is None:
+        system_prompt = _render_stage_prompt(stage=stage, tools_available=tools_available).text
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     if context:
         messages.append({"role": "system", "content": context})
@@ -636,6 +690,114 @@ def _sanitize_vllm_extra_body(extra_body: dict[str, Any]) -> dict[str, Any]:
             continue
         cleaned[key] = value
     return _normalize_vllm_structured_outputs(cleaned)
+
+
+def _coerce_salvaged_tool_arguments(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_salvaged_tool_call_object(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(raw, dict):
+        return None, None
+
+    if "tool_calls" in raw and isinstance(raw.get("tool_calls"), list):
+        tool_calls: list[dict[str, Any]] = []
+        child_shape: str | None = None
+        for item in raw.get("tool_calls") or []:
+            normalized, normalized_shape = _normalize_salvaged_tool_call_object(item)
+            if normalized is None:
+                return None, None
+            tool_calls.append(normalized)
+            child_shape = child_shape or normalized_shape
+        if tool_calls:
+            return {"tool_calls": tool_calls}, f"tool_calls_wrapper:{child_shape or 'unknown'}"
+        return None, None
+
+    if raw.get("type") == "function" and isinstance(raw.get("function"), dict):
+        func_obj = raw.get("function") or {}
+        name = str(func_obj.get("name") or "").strip()
+        arguments = _coerce_salvaged_tool_arguments(func_obj.get("arguments"))
+        if name and arguments is not None:
+            return (
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+                    },
+                },
+                "function_wrapper",
+            )
+        return None, None
+
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        return None, None
+    if "arguments" in raw:
+        arguments = _coerce_salvaged_tool_arguments(raw.get("arguments"))
+        shape = "name_arguments"
+    elif "parameters" in raw:
+        arguments = _coerce_salvaged_tool_arguments(raw.get("parameters"))
+        shape = "name_parameters"
+    else:
+        return None, None
+    if arguments is None:
+        return None, None
+    return (
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+            },
+        },
+        shape,
+    )
+
+
+def _salvage_vllm_tool_calls_from_content(content: str | None) -> tuple[list[dict[str, Any]] | None, str | None]:
+    raw = str(content or "").strip()
+    if not raw or raw[0] not in {"{", "["}:
+        return None, None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None, None
+
+    if isinstance(parsed, list):
+        tool_calls: list[dict[str, Any]] = []
+        child_shape: str | None = None
+        for item in parsed:
+            normalized, normalized_shape = _normalize_salvaged_tool_call_object(item)
+            if normalized is None or "tool_calls" in normalized:
+                return None, None
+            tool_calls.append(normalized)
+            child_shape = child_shape or normalized_shape
+        if tool_calls:
+            return tool_calls, f"list:{child_shape or 'unknown'}"
+        return None, None
+
+    normalized, shape = _normalize_salvaged_tool_call_object(parsed)
+    if normalized is None:
+        return None, None
+    if "tool_calls" in normalized:
+        wrapped = normalized.get("tool_calls")
+        if isinstance(wrapped, list) and wrapped:
+            return wrapped, shape
+        return None, None
+    return [normalized], shape
 
 
 def _generate_vllm_reply(
@@ -811,6 +973,8 @@ def _generate_vllm_reply(
     content = ""
     usage: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    tool_parser_fallback_used = False
+    tool_parser_fallback_shape: str | None = None
     if isinstance(data, dict):
         usage_obj = data.get("usage")
         if isinstance(usage_obj, dict):
@@ -828,12 +992,24 @@ def _generate_vllm_reply(
                         tool_calls = [tc for tc in tool_calls_obj if isinstance(tc, dict)]
                 if not content and "text" in choice0:
                     content = str(choice0.get("text") or "")
-    if not content:
+    if tools is not None and not tool_calls:
+        salvaged_tool_calls, salvage_shape = _salvage_vllm_tool_calls_from_content(content)
+        if salvaged_tool_calls:
+            tool_calls = salvaged_tool_calls
+            tool_parser_fallback_used = True
+            tool_parser_fallback_shape = salvage_shape
+            content = ""
+    if not content and not tool_calls:
         content = json.dumps(data)[:4000]
 
     meta: dict[str, Any] = {"url": url, "elapsed_ms": elapsed_ms}
     if usage is not None:
         meta["usage"] = usage
+    if tools is not None:
+        meta["tool_call_dialect"] = "parser_native_name_arguments"
+    if tool_parser_fallback_used:
+        meta["tool_parser_fallback_used"] = True
+        meta["tool_parser_fallback_shape"] = tool_parser_fallback_shape
     if fallback:
         meta["fallback"] = dict(fallback)
         if rejections:

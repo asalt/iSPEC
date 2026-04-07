@@ -205,6 +205,10 @@ def _project_comment_save_requested(user_message: str | None) -> bool:
     return False
 
 
+def project_comment_save_requested(user_message: str | None) -> bool:
+    return _project_comment_save_requested(user_message)
+
+
 _REPO_TOOLS_ENV = "ISPEC_ASSISTANT_ENABLE_REPO_TOOLS"
 _REPO_ROOT_ENV = "ISPEC_ASSISTANT_REPO_ROOT"
 _DEV_RESTART_ENABLED_ENV = "ISPEC_DEV_RESTART_ENABLED"

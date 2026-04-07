@@ -77,8 +77,8 @@ def register_subcommands(subparsers) -> None:
     run_parser.add_argument(
         "--interval-seconds",
         type=int,
-        default=10,
-        help="Seconds between steps (default: 10)",
+        default=30,
+        help="Seconds between steps (default: 30)",
     )
     run_parser.add_argument(
         "--timeout-seconds",

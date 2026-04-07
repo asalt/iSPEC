@@ -36,8 +36,8 @@ from ispec.assistant.response_contracts import (
     response_contract_names,
 )
 from ispec.assistant.service import (
-    _system_prompt_answer,
-    _system_prompt_planner,
+    _render_system_prompt_answer,
+    _render_system_prompt_planner,
     generate_reply,
 )
 from ispec.assistant.support_policies import (
@@ -62,12 +62,14 @@ from ispec.assistant.tools import (
     openai_tools_for_user,
     openai_tool_names_all,
     parse_tool_call,
+    project_comment_save_requested,
     run_tool,
     tool_writes_data,
 )
 from ispec.db.connect import get_session_dep
 from ispec.db.models import AuthUser, UserRole
 from ispec.omics.connect import get_omics_session_dep
+from ispec.prompt import prompt_observability_context
 from ispec.schedule.connect import get_schedule_session_dep
 
 
@@ -822,10 +824,15 @@ def _reply_interpretation_messages(
     return [{"role": "system", "content": text}]
 
 
-def _remove_write_tools_from_openai_schemas(
+def _remove_tool_names_from_openai_schemas(
     tools: list[dict[str, Any]] | None,
+    *,
+    names: set[str],
 ) -> tuple[list[dict[str, Any]] | None, list[str]]:
     if not isinstance(tools, list):
+        return tools, []
+    normalized_names = {str(name).strip() for name in names if str(name).strip()}
+    if not normalized_names:
         return tools, []
     filtered: list[dict[str, Any]] = []
     removed: list[str] = []
@@ -835,11 +842,79 @@ def _remove_write_tools_from_openai_schemas(
             continue
         func_obj = tool.get("function")
         name = func_obj.get("name") if isinstance(func_obj, dict) else None
-        if isinstance(name, str) and name.strip() and tool_writes_data(name.strip()):
+        if isinstance(name, str) and name.strip() in normalized_names:
             removed.append(name.strip())
             continue
         filtered.append(tool)
     return filtered, sorted(set(removed))
+
+
+def _remove_write_tools_from_openai_schemas(
+    tools: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]] | None, list[str]]:
+    names = {name for name in _openai_tool_names(tools) if tool_writes_data(name)}
+    return _remove_tool_names_from_openai_schemas(tools, names=names)
+
+
+def _project_comment_write_tool_allowed(
+    *,
+    explicit_save_requested: bool,
+    confirmation_reply: bool,
+    awaiting_state: dict[str, Any] | None,
+    reply_interpretation_action: str | None,
+) -> tuple[bool, str]:
+    action = str(reply_interpretation_action or "").strip()
+    if action == "approve_save":
+        return True, "reply_interpretation_approve"
+    if action:
+        return False, f"reply_interpretation:{action}"
+    if explicit_save_requested and (not confirmation_reply or isinstance(awaiting_state, dict)):
+        return True, "explicit_save_request"
+    if confirmation_reply and not isinstance(awaiting_state, dict):
+        return False, "confirmation_without_pending_save"
+    return False, "no_explicit_save_request"
+
+
+def _project_comment_write_policy_message(*, project_id: int | None) -> dict[str, str]:
+    text = (
+        "Do not save or log to project history in this turn unless the user explicitly asks you to save. "
+        "You may still help draft or revise the note in normal language."
+    )
+    if isinstance(project_id, int) and project_id > 0:
+        text += f" The current draft context is project {project_id}."
+    return {"role": "system", "content": text}
+
+
+def _write_block_reason_for_tool_payload(tool_name: str | None, tool_payload: dict[str, Any] | None) -> str | None:
+    if not tool_writes_data(tool_name):
+        return None
+    error_text = str((tool_payload or {}).get("error") or "").strip()
+    if not error_text:
+        return None
+    if "confirm=true is required" in error_text:
+        return "confirm_required"
+    if "explicitly request saving" in error_text:
+        return "explicit_save_required"
+    if "requested not to save yet" in error_text:
+        return "user_declined_save"
+    return None
+
+
+def _write_block_policy_message(*, reason: str | None) -> dict[str, str]:
+    detail = "The prior write attempt was denied by policy."
+    if reason == "confirm_required":
+        detail = "The prior write attempt was denied because confirm=true was required."
+    elif reason == "explicit_save_required":
+        detail = "The prior write attempt was denied because the user did not explicitly ask to save."
+    elif reason == "user_declined_save":
+        detail = "The prior write attempt was denied because the user indicated it should not be saved yet."
+    return {
+        "role": "system",
+        "content": (
+            f"{detail} Do not call write/save tools again in this turn. "
+            "Either present a draft or ask for explicit confirmation before saving."
+        ),
+    }
 
 
 def _assistant_leaks_tool_protocol(message: str | None) -> bool:
@@ -1693,6 +1768,38 @@ def chat(
         awaiting_state=awaiting_reply_state,
     )
     skip_tool_router_for_reply_interpretation = bool(reply_interpretation_runtime_applied)
+    explicit_project_comment_save_request = project_comment_save_requested(payload.message)
+    project_comment_write_policy_messages: list[dict[str, str]] = []
+    project_comment_write_tool_exposed = "create_project_comment" in available_openai_tool_names_full
+    project_comment_write_tool_reason = "not_available"
+    reply_interpretation_removed_write_tools: list[str] = []
+    if (
+        tool_protocol == "openai"
+        and tools_enabled
+        and isinstance(tool_schemas, list)
+        and project_comment_write_tool_exposed
+    ):
+        project_comment_write_allowed, project_comment_write_tool_reason = _project_comment_write_tool_allowed(
+            explicit_save_requested=explicit_project_comment_save_request,
+            confirmation_reply=confirmation_reply,
+            awaiting_state=awaiting_reply_state,
+            reply_interpretation_action=reply_interpretation_runtime_action,
+        )
+        if not project_comment_write_allowed:
+            tool_schemas, removed_project_comment_tools = _remove_tool_names_from_openai_schemas(
+                tool_schemas,
+                names={"create_project_comment"},
+            )
+            if removed_project_comment_tools:
+                project_comment_write_tool_exposed = False
+                if project_comment_write_tool_reason.startswith("reply_interpretation:"):
+                    reply_interpretation_removed_write_tools = removed_project_comment_tools
+                else:
+                    project_comment_write_policy_messages = [
+                        _project_comment_write_policy_message(project_id=focused_project_id)
+                    ]
+    elif project_comment_write_tool_exposed:
+        project_comment_write_tool_reason = "available"
 
     selected_policy_rule_name: str | None = None
     tool_selector_source: str | None = None
@@ -1849,13 +1956,16 @@ def chat(
             "reason": "reply_interpretation" if skip_tool_router_for_reply_interpretation else "confirmation_reply",
         }
 
-    reply_interpretation_removed_write_tools: list[str] = []
     if (
         tool_protocol == "openai"
         and reply_interpretation_runtime_applied
         and reply_interpretation_runtime_action != "approve_save"
     ):
-        tool_schemas, reply_interpretation_removed_write_tools = _remove_write_tools_from_openai_schemas(tool_schemas)
+        tool_schemas, additional_removed_write_tools = _remove_write_tools_from_openai_schemas(tool_schemas)
+        if additional_removed_write_tools:
+            reply_interpretation_removed_write_tools = sorted(
+                set(reply_interpretation_removed_write_tools) | set(additional_removed_write_tools)
+            )
         if isinstance(tool_router, dict) and reply_interpretation_removed_write_tools:
             tool_router["reply_interpretation_removed_write_tools"] = reply_interpretation_removed_write_tools
 
@@ -1897,13 +2007,13 @@ def chat(
     response_format = "compare" if compare_mode_requested else "single"
 
     tools_available = tool_schemas_count > 0 and tools_enabled
-    planner_prompt = _system_prompt_planner(
+    planner_prompt = _render_system_prompt_planner(
         tools_available=tools_available,
         response_format=response_format,
         tool_names=openai_tool_names if tool_protocol == "openai" else None,
     )
-    answer_prompt = _system_prompt_answer(response_format=response_format)
-    prompt_for_budget = planner_prompt if tools_enabled else answer_prompt
+    answer_prompt = _render_system_prompt_answer(response_format=response_format)
+    prompt_for_budget = planner_prompt.text if tools_enabled else answer_prompt.text
 
     selected_history: list[SupportMessage] = []
     context_message = ""
@@ -1950,6 +2060,7 @@ def chat(
             {"role": "system", "content": context_message},
             *([prepared_followup_message] if prepared_followup_message else []),
             *tool_availability_messages,
+            *project_comment_write_policy_messages,
             *reply_interpretation_policy_messages,
             {"role": "user", "content": payload.message},
         ]
@@ -2041,6 +2152,8 @@ def chat(
     llm_trace: list[dict[str, Any]] = []
     reply = None
     history_for_llm: list[dict[str, Any]] = []
+    final_prompt_observability: dict[str, Any] = {}
+    final_prompt_stage: str | None = None
     write_claim_retry_used = False
     write_claim_guard_triggered = False
     tool_protocol_retry_used = False
@@ -2105,6 +2218,75 @@ def chat(
         )
         forced_tool_choice = {"type": "function", "function": {"name": policy_tool_name}}
 
+    blocked_write_tool_names: set[str] = set()
+    write_block_reason: str | None = None
+
+    def _refresh_tool_schema_state() -> None:
+        nonlocal tool_schemas_count, openai_tool_names, openai_no_arg_tool_names, available_write_tool_names
+        nonlocal tools_enabled, forced_tool_choice, policy_tool_name, policy_tool_args, policy_messages
+
+        tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
+        openai_tool_names = _openai_tool_names(tool_schemas)
+        openai_no_arg_tool_names = _openai_no_arg_tool_names(tool_schemas)
+        available_write_tool_names = sorted(name for name in openai_tool_names if tool_writes_data(name))
+        if tool_schemas_count <= 0:
+            tools_enabled = False
+        if isinstance(forced_tool_choice, dict):
+            forced_function = forced_tool_choice.get("function")
+            forced_name = forced_function.get("name") if isinstance(forced_function, dict) else None
+            if isinstance(forced_name, str) and forced_name.strip() and forced_name.strip() not in openai_tool_names:
+                forced_tool_choice = None
+        if policy_tool_name and (
+            policy_tool_name not in openai_tool_names
+            or (policy_tool_name not in openai_no_arg_tool_names and not policy_tool_args)
+        ):
+            policy_tool_name = None
+            policy_tool_args = {}
+            policy_messages = []
+
+    def _blocked_or_unavailable_tool_payload(tool_name: str | None) -> dict[str, Any] | None:
+        normalized_name = str(tool_name or "").strip()
+        if not normalized_name:
+            return {"ok": False, "tool": None, "error": "Tool name missing."}
+        if normalized_name in blocked_write_tool_names:
+            return {
+                "ok": False,
+                "tool": normalized_name,
+                "error": "Write/save tools were already blocked earlier in this turn; do not retry them.",
+            }
+        if tool_protocol == "openai" and openai_tool_names and normalized_name not in openai_tool_names:
+            if normalized_name == "create_project_comment" and not project_comment_write_tool_exposed:
+                return {
+                    "ok": False,
+                    "tool": normalized_name,
+                    "error": (
+                        "Project history writing is not allowed in this turn because the user did not explicitly ask to save. "
+                        "Draft or revise the note instead."
+                    ),
+                }
+            return {
+                "ok": False,
+                "tool": normalized_name,
+                "error": "Tool unavailable for this turn; do not retry it.",
+            }
+        return None
+
+    def _maybe_block_write_tools_for_turn(tool_name: str | None, tool_payload: dict[str, Any] | None) -> None:
+        nonlocal tool_schemas, write_block_reason, project_comment_write_tool_exposed, project_comment_write_tool_reason
+        reason = _write_block_reason_for_tool_payload(tool_name, tool_payload)
+        if not reason:
+            return
+        write_block_reason = reason
+        tool_schemas, removed_write_tools = _remove_write_tools_from_openai_schemas(tool_schemas)
+        if not removed_write_tools:
+            return
+        blocked_write_tool_names.update(removed_write_tools)
+        if "create_project_comment" in removed_write_tools:
+            project_comment_write_tool_exposed = False
+            project_comment_write_tool_reason = f"blocked:{reason}"
+        _refresh_tool_schema_state()
+        tool_messages.append(_write_block_policy_message(reason=reason))
+
     prompt_header = None
     prompt_header_included_round1 = False
     prompt_header_error: str | None = None
@@ -2142,7 +2324,9 @@ def chat(
             agent_state["round"] = llm_round
         context_message = _context_message(payload=context_payload)
 
-        system_prompt = planner_prompt if tools_enabled else answer_prompt
+        system_prompt_rendered = planner_prompt if tools_enabled else answer_prompt
+        system_prompt = system_prompt_rendered.text
+        system_prompt_observability = system_prompt_rendered.observability_fields()
         header_message = (
             [{"role": "system", "content": prompt_header.line}]
             if prompt_header is not None and llm_round == 1
@@ -2156,6 +2340,7 @@ def chat(
             {"role": "system", "content": context_message},
             *([prepared_followup_message] if prepared_followup_message else []),
             *tool_availability_messages,
+            *project_comment_write_policy_messages,
             *policy_messages,
             *reply_interpretation_policy_messages,
             *comment_intent_messages,
@@ -2179,6 +2364,7 @@ def chat(
             {"role": "system", "content": context_message},
             *([prepared_followup_message] if prepared_followup_message else []),
             *tool_availability_messages,
+            *project_comment_write_policy_messages,
             *policy_messages,
             *reply_interpretation_policy_messages,
             *comment_intent_messages,
@@ -2205,15 +2391,23 @@ def chat(
             "tool_choice": effective_tool_choice,
             "history_messages": len(trimmed_history),
             "tool_messages": len(tool_messages),
+            "prompt_family": system_prompt_observability.get("prompt_family"),
+            "prompt_version_num": system_prompt_observability.get("prompt_version_num"),
+            "prompt_binding": system_prompt_observability.get("prompt_binding"),
         }
+        final_prompt_observability = dict(system_prompt_observability)
+        final_prompt_stage = "planner" if tools_enabled else "answer"
         reply = generate_reply(
             messages=messages_for_llm,
             tools=tools_for_call,
             tool_choice=tool_choice,
-            observability_context={
-                **llm_observability_context,
-                "stage": "planner" if tools_enabled else "answer",
-            },
+            observability_context=prompt_observability_context(
+                system_prompt_rendered,
+                extra={
+                    **llm_observability_context,
+                    "stage": final_prompt_stage,
+                },
+            ),
         )
         trace_step["provider"] = reply.provider
         trace_step["model"] = reply.model
@@ -2222,6 +2416,9 @@ def chat(
                 "elapsed_ms": reply.meta.get("elapsed_ms"),
                 "usage": reply.meta.get("usage"),
                 "fallback": reply.meta.get("fallback"),
+                "tool_call_dialect": reply.meta.get("tool_call_dialect"),
+                "tool_parser_fallback_used": reply.meta.get("tool_parser_fallback_used"),
+                "tool_parser_fallback_shape": reply.meta.get("tool_parser_fallback_shape"),
             }
         trace_step["reply_preview"] = _truncate(reply.content, 320)
         if reply.tool_calls:
@@ -2278,6 +2475,7 @@ def chat(
                 ):
                     parsed_args = dict(policy_tool_args)
 
+                unavailable_tool_payload = _blocked_or_unavailable_tool_payload(tool_name)
                 if used_tool_calls >= max_tool_calls:
                     tool_payload = {
                         "ok": False,
@@ -2285,6 +2483,8 @@ def chat(
                         "error": "Tool call limit exceeded; no further tools executed.",
                     }
                     tools_enabled = False
+                elif unavailable_tool_payload is not None:
+                    tool_payload = unavailable_tool_payload
                 else:
                     used_tool_calls += 1
                     tool_payload = run_tool(
@@ -2299,6 +2499,7 @@ def chat(
                         api_schema=api_schema,
                         user_message=payload.message,
                     )
+                    _maybe_block_write_tools_for_turn(tool_name, tool_payload)
                     if used_tool_calls >= max_tool_calls:
                         tools_enabled = False
 
@@ -2491,20 +2692,25 @@ def chat(
             reply = None
             break
 
-        used_tool_calls += 1
         tool_name, tool_args = tool_call
-        tool_payload = run_tool(
-            name=tool_name,
-            args=tool_args,
-            core_db=core_db,
-            assistant_db=assistant_db,
-            agent_db=agent_db,
-            schedule_db=schedule_db,
-            omics_db=omics_db,
-            user=user,
-            api_schema=api_schema,
-            user_message=payload.message,
-        )
+        unavailable_tool_payload = _blocked_or_unavailable_tool_payload(tool_name)
+        used_tool_calls += 1
+        if unavailable_tool_payload is not None:
+            tool_payload = unavailable_tool_payload
+        else:
+            tool_payload = run_tool(
+                name=tool_name,
+                args=tool_args,
+                core_db=core_db,
+                assistant_db=assistant_db,
+                agent_db=agent_db,
+                schedule_db=schedule_db,
+                omics_db=omics_db,
+                user=user,
+                api_schema=api_schema,
+                user_message=payload.message,
+            )
+            _maybe_block_write_tools_for_turn(tool_name, tool_payload)
         tool_calls.append(
             {
                 "name": tool_name,
@@ -2532,9 +2738,10 @@ def chat(
         history_for_llm = history_payload
         reply = generate_reply(
             messages=[
-                {"role": "system", "content": answer_prompt},
+                {"role": "system", "content": answer_prompt.text},
                 {"role": "system", "content": context_message},
                 *tool_availability_messages,
+                *project_comment_write_policy_messages,
                 *reply_interpretation_policy_messages,
                 *history_payload,
                 {"role": "user", "content": payload.message},
@@ -2542,8 +2749,13 @@ def chat(
                 {"role": "system", "content": f"{TOOL_CALL_PREFIX} limit exceeded; answer without tools."},
             ],
             tools=None,
-            observability_context={**llm_observability_context, "stage": "answer"},
+            observability_context=prompt_observability_context(
+                answer_prompt,
+                extra={**llm_observability_context, "stage": "answer"},
+            ),
         )
+        final_prompt_observability = dict(answer_prompt.observability_fields())
+        final_prompt_stage = "answer"
 
     compare_choices: tuple[str, str] | None = None
 
@@ -2752,6 +2964,10 @@ def chat(
         "forced_tool_choice": forced_tool_choice,
         "requested_tool_names": requested_tool_names_known,
         "missing_requested_tool_names": missing_requested_tool_names,
+        "project_comment_write_tool_exposed": project_comment_write_tool_exposed,
+        "project_comment_write_tool_reason": project_comment_write_tool_reason,
+        "blocked_write_tools": sorted(blocked_write_tool_names),
+        "write_block_reason": write_block_reason,
     }
     meta["context"] = {
         "history_messages_used": len(history_payload),
@@ -2800,6 +3016,10 @@ def chat(
         }
     if final_reply.meta:
         meta["provider_meta"] = final_reply.meta
+    if final_prompt_observability:
+        meta.update(final_prompt_observability)
+    if final_prompt_stage:
+        meta["prompt_stage"] = final_prompt_stage
     meta["tool_calls"] = tool_calls
     prompt_header_configured = prompt_header_enabled()
     if prompt_header_configured or prompt_header_error:
