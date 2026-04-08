@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
 
+from ispec.assistant.json_utils import parse_json_object
 from ispec.assistant.service import AssistantReply
 from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
 
@@ -182,29 +183,6 @@ def _tool_router_system_prompt(groups: list[ToolGroup]) -> str:
     ).text
 
 
-def _parse_json_object(text: str | None) -> dict[str, Any] | None:
-    if not text:
-        return None
-    raw = str(text).strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        pass
-
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        parsed = json.loads(raw[start : end + 1])
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
-
-
 def _validate_router_decision(decision: dict[str, Any], *, group_names: set[str]) -> dict[str, Any] | None:
     primary = decision.get("primary")
     secondary: Any = decision.get("secondary")
@@ -288,7 +266,7 @@ def route_tool_groups_vllm(
             extra={"surface": "support_chat", "stage": "tool_router"},
         ),
     )
-    parsed = _parse_json_object(reply.content)
+    parsed = parse_json_object(reply.content)
     validated = (
         _validate_router_decision(parsed, group_names=set(group_names)) if isinstance(parsed, dict) else None
     )
