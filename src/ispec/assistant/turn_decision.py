@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from ispec.assistant.classifier_service import generate_classifier_reply
+from ispec.assistant.json_utils import parse_json_object
 from ispec.assistant.response_contracts import ResponseContractName, response_contract_names
 from ispec.assistant.service import AssistantReply
 from ispec.assistant.tool_routing import ToolGroup, tool_names_for_groups
@@ -291,61 +292,43 @@ def _turn_decision_prompt(
     response_modes: list[ResponseMode],
     contract_caps: list[ResponseContractName],
 ) -> str:
-    scheduled_rules_block = ""
-    if source == "scheduled_assistant":
-        scheduled_rules_block = (
+    values = _turn_decision_prompt_values(
+        source=source,
+        groups=groups,
+        response_modes=response_modes,
+        contract_caps=contract_caps,
+    )
+    return load_bound_prompt(
+        _turn_decision_prompt,
+        values=values,
+    ).text
+
+
+def _turn_decision_prompt_values(
+    *,
+    source: TurnDecisionSource,
+    groups: list[ToolGroup],
+    response_modes: list[ResponseMode],
+    contract_caps: list[ResponseContractName],
+) -> dict[str, str]:
+    return {
+        "scheduled_rules_block": (
             "\n\nScheduled-assistant rules:\n"
             "- This is not an end-user conversation.\n"
             "- needs_clarification must be false.\n"
             "- clarification_reason must be none.\n"
             "- response_plan.mode must be single."
-        )
-
-    groups_block = ""
-    if groups:
-        groups_block = "\n\nAvailable tool groups:\n" + "\n".join(
-            f"- {group.name}: {group.description}" for group in groups
-        )
-
-    response_modes_block = ""
-    if response_modes:
-        response_modes_block = "\n\nAllowed response modes: " + ", ".join(response_modes)
-
-    contract_caps_block = ""
-    if contract_caps:
-        contract_caps_block = "\nAllowed response contract caps: " + ", ".join(contract_caps)
-
-    return load_bound_prompt(
-        _turn_decision_prompt,
-        values={
-            "scheduled_rules_block": scheduled_rules_block,
-            "groups_block": groups_block,
-            "response_modes_block": response_modes_block,
-            "contract_caps_block": contract_caps_block,
-        },
-    ).text
-
-def _parse_json_object(text: str | None) -> dict[str, Any] | None:
-    if not text:
-        return None
-    raw = str(text).strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        pass
-
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        parsed = json.loads(raw[start : end + 1])
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
+            if source == "scheduled_assistant"
+            else ""
+        ),
+        "groups_block": (
+            "\n\nAvailable tool groups:\n" + "\n".join(f"- {group.name}: {group.description}" for group in groups)
+            if groups
+            else ""
+        ),
+        "response_modes_block": ("\n\nAllowed response modes: " + ", ".join(response_modes)) if response_modes else "",
+        "contract_caps_block": ("\nAllowed response contract caps: " + ", ".join(contract_caps)) if contract_caps else "",
+    }
 
 
 def _clamp_confidence(raw: Any) -> float:
@@ -602,24 +585,12 @@ def run_turn_decision_pipeline(
     )
     prompt = load_bound_prompt(
         _turn_decision_prompt,
-        values={
-            "scheduled_rules_block": (
-                "\n\nScheduled-assistant rules:\n"
-                "- This is not an end-user conversation.\n"
-                "- needs_clarification must be false.\n"
-                "- clarification_reason must be none.\n"
-                "- response_plan.mode must be single."
-                if source == "scheduled_assistant"
-                else ""
-            ),
-            "groups_block": (
-                "\n\nAvailable tool groups:\n" + "\n".join(f"- {group.name}: {group.description}" for group in groups)
-                if groups
-                else ""
-            ),
-            "response_modes_block": ("\n\nAllowed response modes: " + ", ".join(response_modes)) if response_modes else "",
-            "contract_caps_block": ("\nAllowed response contract caps: " + ", ".join(contract_cap_names)) if contract_cap_names else "",
-        },
+        values=_turn_decision_prompt_values(
+            source=source,
+            groups=groups,
+            response_modes=response_modes,
+            contract_caps=contract_cap_names,
+        ),
     )
     messages = [
         {"role": "system", "content": prompt.text},
@@ -674,7 +645,7 @@ def run_turn_decision_pipeline(
             "meta": reply.meta,
         },
     )
-    parsed = _parse_json_object(reply.content)
+    parsed = parse_json_object(reply.content)
     result.raw_decision = parsed
     if not isinstance(parsed, dict):
         result.errors.append("invalid_json")
