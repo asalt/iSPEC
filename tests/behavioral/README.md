@@ -59,3 +59,26 @@ python scripts/extract_behavioral_scenarios.py --session-pk 244 --tag project-no
 
 The checked-in behavioral smoke set should stay small and sanitized. Promote a
 local extracted scenario only after manually curating it into a stable fixture.
+
+## Benchmark runner
+
+Use the benchmark runner when we want timing, tool-loop counts, and scenario
+comparison against the live local support stack without turning pytest into a
+performance harness.
+
+Run it from the repo root with:
+
+```bash
+make benchmark-support-vllm
+```
+
+Or pass through extra selectors/flags such as:
+
+```bash
+make benchmark-support-vllm BENCHMARK_SUPPORT_ARGS='--scenario-label tmux-unique-pane-summary --allow-supervisor-running'
+```
+
+This runner is intentionally separate from `tests/behavioral`: behavioral tests
+prove correctness and regression safety, while the benchmark runner measures
+full-turn latency, model-call counts, tool-loop rounds, and related support-chat
+performance signals.

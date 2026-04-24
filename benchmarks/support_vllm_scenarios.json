@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "label": "lookup-project-exists",
+      "family": "lookup",
+      "tags": [
+        "lookup",
+        "read_only"
+      ],
+      "turns": [
+        {
+          "message": "does project ${lookup_project_id} exist?",
+          "expect": {
+            "tool_call_names_include": [
+              "get_project"
+            ],
+            "final_assistant_contains": [
+              "${lookup_project_id}"
+            ],
+            "final_assistant_not_contains": [
+              "Assistant error",
+              "TOOL_CALL"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "lookup-project-followup-status",
+      "family": "followup",
+      "tags": [
+        "lookup",
+        "followup"
+      ],
+      "turns": [
+        {
+          "message": "does project ${lookup_project_id} exist?",
+          "expect": {
+            "tool_call_names_include": [
+              "get_project"
+            ],
+            "final_assistant_not_contains": [
+              "Assistant error"
+            ]
+          }
+        },
+        {
+          "message": "what status is it in?",
+          "expect": {
+            "final_assistant_not_contains": [
+              "Assistant error",
+              "TOOL_CALL"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "tmux-unique-pane-summary",
+      "family": "tmux",
+      "tags": [
+        "tmux",
+        "capture"
+      ],
+      "turns": [
+        {
+          "message": "what is going on on the ${tmux_alias} tmux pane?",
+          "expect": {
+            "tool_call_names_include": [
+              "assistant_capture_tmux_pane"
+            ],
+            "final_assistant_not_contains": [
+              "Assistant error",
+              "TOOL_CALL"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "tmux-list-session",
+      "family": "tmux",
+      "tags": [
+        "tmux",
+        "list"
+      ],
+      "turns": [
+        {
+          "message": "show me the panes in the ${tmux_alias} tmux session",
+          "expect": {
+            "tool_call_names_include": [
+              "assistant_list_tmux_panes"
+            ],
+            "final_assistant_not_contains": [
+              "Assistant error",
+              "TOOL_CALL"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "project-note-draft",
+      "family": "draft_save",
+      "tags": [
+        "project-note",
+        "draft"
+      ],
+      "turns": [
+        {
+          "message": "add a note to project ${write_project_id} that it is ready for review.",
+          "expect": {
+            "final_assistant_not_contains": [
+              "Comment ID",
+              "successfully saved",
+              "Saved the note."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "project-note-deny-save",
+      "family": "draft_save",
+      "tags": [
+        "project-note",
+        "deny"
+      ],
+      "turns": [
+        {
+          "message": "add a note to project ${write_project_id} that it is ready for review.",
+          "expect": {
+            "final_assistant_not_contains": [
+              "Comment ID",
+              "successfully saved",
+              "Saved the note."
+            ]
+          }
+        },
+        {
+          "message": "no don't save it",
+          "expect": {
+            "reply_interpretation_runtime_action": "deny_save",
+            "final_assistant_not_contains": [
+              "Comment ID",
+              "successfully saved",
+              "Saved the note."
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
