@@ -241,24 +241,24 @@ def _tmux_list_session_name(panes: list[dict[str, Any]], *, message: str) -> str
     return None
 
 
+@prompt_binding("assistant.tmux.capture_guidance")
+def _tmux_capture_guidance_prompt() -> str:
+    return load_bound_prompt(_tmux_capture_guidance_prompt).text
+
+
+@prompt_binding("assistant.tmux.list_guidance")
+def _tmux_list_guidance_prompt() -> str:
+    return load_bound_prompt(_tmux_list_guidance_prompt).text
+
+
 def _tmux_selection_messages(*, mode: str, scope_label: str | None = None) -> list[dict[str, str]]:
     if mode == "capture":
-        content = (
-            "The tmux resolver already selected the best real allowlisted pane for this request. "
-            "Use the capture result directly. By default, summarize the pane's current state in 1-3 concise sentences "
-            "or a few short bullets. Prefer structured fields like activity_summary, last_nonempty_line, current_command, "
-            "pane_title, and preferred_alias over dumping raw pane content. Quote or paste raw pane text only when the user "
-            "explicitly asks for exact output, raw text, logs, traceback, or a transcript. Do not rename the session, do not invent "
-            "another pane handle, and do not claim you inspected a different pane."
-        )
+        content = load_bound_prompt(_tmux_capture_guidance_prompt).text
         return [{"role": "system", "content": content}]
-    content = (
-        "The tmux resolver did not find one unique pane to inspect. "
-        "Use the returned tmux pane list and ask the user to choose from the real handles in that list, "
-        "preferably preferred_alias, capture_target, or pane_id. Do not invent session names or pane handles."
-    )
-    if scope_label:
-        content += f" The list is narrowed to {scope_label}."
+    content = load_bound_prompt(
+        _tmux_list_guidance_prompt,
+        values={"scope_suffix": f" The list is narrowed to {scope_label}." if scope_label else ""},
+    ).text
     return [{"role": "system", "content": content}]
 
 

@@ -120,6 +120,7 @@ def test_select_support_tool_policy_for_tmux_request_does_not_invent_session_nam
     assert selection.meta is not None
     assert selection.meta["selected_target"] is None
     assert selection.meta["strategy"] == "list_session"
+    assert "narrowed to session 'ispecfull'" in selection.messages[0]["content"]
 
 
 def test_select_support_tool_policy_for_tmux_request_can_use_classifier(monkeypatch) -> None:
