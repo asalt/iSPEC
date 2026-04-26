@@ -34,6 +34,11 @@ _PROJECT_EXISTENCE_LOOKUP_RE = re.compile(
     r"|\b(?:project|prj|proj)\s+#?\d+\s+(?:exists?|available|present)\b",
     re.IGNORECASE,
 )
+_EXPLICIT_GET_PROJECT_RE = re.compile(
+    r"\bget_project\b"
+    r"|\buse\s+(?:the\s+)?(?:project\s+)?tool\b.*\b(?:project|prj|proj)\s+#?\d+\b",
+    re.IGNORECASE,
+)
 _FILE_ROUTER_HINT_RE = re.compile(
     r"\b("
     r"files?|results?|directory|directories|folder|folders|plots?|pca|biplot|"
@@ -607,6 +612,13 @@ _TOOL_POLICY_RULES: tuple[SupportToolPolicyRule, ...] = (
         tool_name=lambda _ctx: "my_projects",
         build_args=lambda _ctx: {},
         build_messages=lambda _ctx: [],
+    ),
+    SupportToolPolicyRule(
+        name="explicit_get_project",
+        matches=lambda ctx: len(_project_ids(ctx)) == 1 and bool(_EXPLICIT_GET_PROJECT_RE.search(ctx.message or "")),
+        tool_name=lambda _ctx: "get_project",
+        build_args=lambda ctx: {"id": int(_project_ids(ctx)[0])} if len(_project_ids(ctx)) == 1 else {},
+        build_messages=_project_existence_messages,
     ),
     SupportToolPolicyRule(
         name="project_existence_lookup",

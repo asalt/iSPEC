@@ -37,6 +37,16 @@ def test_select_support_tool_policy_for_project_existence_lookup() -> None:
     assert "answer directly whether it exists" in selection.messages[0]["content"]
 
 
+def test_select_support_tool_policy_for_explicit_get_project_request() -> None:
+    selection = select_support_tool_policy(message="use the get_project tool to fetch project 1598")
+
+    assert selection is not None
+    assert selection.rule_name == "explicit_get_project"
+    assert selection.tool_name == "get_project"
+    assert selection.args == {"id": 1598}
+    assert selection.messages
+
+
 def test_select_support_tool_policy_for_tmux_request_resolves_unique_pane(monkeypatch) -> None:
     monkeypatch.setattr(
         "ispec.assistant.support_policies._tmux_policy_panes",

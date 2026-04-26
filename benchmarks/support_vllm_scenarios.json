@@ -38,6 +38,30 @@
         {
           "message": "fetch project ${lookup_project_id} info and briefly summarize its title and status.",
           "expect": {
+            "final_assistant_contains": [
+              "${lookup_project_id}"
+            ],
+            "final_assistant_not_contains": [
+              "Assistant error",
+              "TOOL_CALL"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "fetch-project-info-explicit-tool",
+      "family": "lookup",
+      "tags": [
+        "lookup",
+        "read_only",
+        "project-info",
+        "tool-call"
+      ],
+      "turns": [
+        {
+          "message": "use the get_project tool to fetch project ${lookup_project_id}, then briefly summarize its title and status.",
+          "expect": {
             "tool_call_names_include": [
               "get_project"
             ],
