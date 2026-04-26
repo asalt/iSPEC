@@ -27,8 +27,10 @@ from ispec.assistant.support_benchmark import (
     load_local_benchmark_scenarios,
     load_synthetic_benchmark_scenarios,
     load_workspace_env,
+    normalize_timing_thresholds,
     summarize_benchmark_results,
     support_chat_url,
+    timing_status_for_turn,
     wait_for_latest_assistant_message,
     workspace_root,
     _json_post,
@@ -50,6 +52,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     parser.add_argument("--assistant-wait-seconds", type=float, default=15.0)
+    parser.add_argument("--slow-threshold-seconds", type=float, default=90.0)
+    parser.add_argument("--problematic-threshold-seconds", type=float, default=180.0)
     parser.add_argument("--allow-supervisor-running", action="store_true")
     parser.add_argument("--allow-non-vllm-provider", action="store_true")
     parser.add_argument("--skip-vllm-health-check", action="store_true")
@@ -90,7 +94,7 @@ def _scenario_case(messages: list[Any]) -> dict[str, Any]:
     return {"messages": case_messages}
 
 
-def _run_turn(*, session_id: str, message: str, expect: dict[str, Any] | None, url: str, api_key_value: str | None, timeout_seconds: float, assistant_wait_seconds: float) -> dict[str, Any]:
+def _run_turn(*, session_id: str, message: str, expect: dict[str, Any] | None, url: str, api_key_value: str | None, timeout_seconds: float, assistant_wait_seconds: float, timing_thresholds: dict[str, int]) -> dict[str, Any]:
     messages_before, _ = assistant_session_rows(session_id)
     last_assistant_id = max([int(row.id) for row in messages_before if str(row.role or "") == "assistant"], default=0)
     started = time.monotonic()
@@ -107,12 +111,17 @@ def _run_turn(*, session_id: str, message: str, expect: dict[str, Any] | None, u
         ok = False
         expectation_error = str(exc) or exc.__class__.__name__
     metrics = collect_turn_metrics(session_id=session_id, assistant_row=assistant_row, wall_clock_ms=wall_clock_ms)
+    timing_status = timing_status_for_turn(
+        wall_clock_ms=int(metrics.get("wall_clock_ms") or wall_clock_ms),
+        thresholds=timing_thresholds,
+    )
     return {
         "message": message,
         "response_message": str(response.get("message") or ""),
         "http_response": response,
         "ok": ok,
         "expectation_error": expectation_error,
+        "timing_status": timing_status,
         **metrics,
     }
 
@@ -132,6 +141,10 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
         "write_project_id": int(args.write_project_id),
         "tmux_alias": str(args.tmux_alias),
     }
+    timing_thresholds = normalize_timing_thresholds(
+        slow_seconds=float(args.slow_threshold_seconds),
+        problematic_seconds=float(args.problematic_threshold_seconds),
+    )
     labels = {str(item).strip() for item in args.scenario_label if str(item).strip()}
     families = {str(item).strip() for item in args.family if str(item).strip()}
     scenarios = load_synthetic_benchmark_scenarios(path=args.scenario_file, variables=render_vars, labels=labels or None, families=families or None)
@@ -158,6 +171,7 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
                     api_key_value=api_key_value,
                     timeout_seconds=float(args.timeout_seconds),
                     assistant_wait_seconds=float(args.assistant_wait_seconds),
+                    timing_thresholds=timing_thresholds,
                 ))
             scenario_case_messages, _ = assistant_session_rows(session_id)
             scenario_case = _scenario_case(scenario_case_messages)
@@ -182,7 +196,7 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
                 "turns": turn_results,
             })
 
-    summary = summarize_benchmark_results(results)
+    summary = summarize_benchmark_results(results, timing_thresholds=timing_thresholds)
     report = {
         "schema_version": 1,
         "run_id": run_id,
@@ -192,6 +206,7 @@ def run(argv: list[str] | None = None) -> dict[str, Any]:
         "scenario_file": str(Path(args.scenario_file).expanduser().resolve()),
         "local_case_selectors": list(args.local_case or []),
         "render_vars": render_vars,
+        "timing_thresholds": timing_thresholds,
         "summary": summary,
         "results": results,
     }

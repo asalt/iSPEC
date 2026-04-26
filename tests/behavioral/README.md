@@ -82,3 +82,9 @@ This runner is intentionally separate from `tests/behavioral`: behavioral tests
 prove correctness and regression safety, while the benchmark runner measures
 full-turn latency, model-call counts, tool-loop rounds, and related support-chat
 performance signals.
+
+The default benchmark path forces inline chat and expects the background
+orchestrator to be disabled unless explicitly enabled. Timing buckets default to
+90 seconds for `slow` turns and 180 seconds for `problematic` turns; override
+them with `--slow-threshold-seconds` and `--problematic-threshold-seconds` when
+calibrating a particular local machine.

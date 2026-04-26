@@ -43,6 +43,9 @@ _VLLM_BASELINE_ENV_KEYS = (
     "VLLM_EXTRA_ARGS",
 )
 
+DEFAULT_SLOW_WALL_CLOCK_MS = 90_000
+DEFAULT_PROBLEMATIC_WALL_CLOCK_MS = 180_000
+
 
 def workspace_root() -> Path:
     return Path(__file__).resolve().parents[4]
@@ -246,6 +249,35 @@ def _percentile(values: list[float], pct: float) -> float | None:
     ordered = sorted(values)
     rank = max(0, min(len(ordered) - 1, math.ceil((pct / 100.0) * len(ordered)) - 1))
     return ordered[rank]
+
+
+def normalize_timing_thresholds(
+    *,
+    slow_seconds: float | int | None = None,
+    problematic_seconds: float | int | None = None,
+) -> dict[str, int]:
+    slow = DEFAULT_SLOW_WALL_CLOCK_MS if slow_seconds is None else int(float(slow_seconds) * 1000)
+    problematic = (
+        DEFAULT_PROBLEMATIC_WALL_CLOCK_MS
+        if problematic_seconds is None
+        else int(float(problematic_seconds) * 1000)
+    )
+    slow = max(1, int(slow))
+    problematic = max(int(slow), int(problematic))
+    return {
+        "slow_wall_clock_ms": slow,
+        "problematic_wall_clock_ms": problematic,
+    }
+
+
+def timing_status_for_turn(*, wall_clock_ms: int | float, thresholds: dict[str, int] | None = None) -> str:
+    resolved = dict(thresholds or normalize_timing_thresholds())
+    elapsed = float(wall_clock_ms)
+    if elapsed >= float(resolved["problematic_wall_clock_ms"]):
+        return "problematic"
+    if elapsed >= float(resolved["slow_wall_clock_ms"]):
+        return "slow"
+    return "ok"
 
 
 def _service_state(path: Path) -> dict[str, Any]:
@@ -546,16 +578,25 @@ def collect_turn_metrics(*, session_id: str, assistant_row: SupportMessage, wall
     }
 
 
-def summarize_benchmark_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_benchmark_results(
+    results: list[dict[str, Any]],
+    *,
+    timing_thresholds: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    thresholds = dict(timing_thresholds or normalize_timing_thresholds())
     families: dict[str, dict[str, Any]] = {}
     total_turns = 0
     successful_turns = 0
+    slow_turns = 0
+    problematic_turns = 0
     for scenario in results:
         family = str(scenario.get("family") or "unknown")
         bucket = families.setdefault(family, {
             "scenario_count": 0,
             "turn_count": 0,
             "successful_turns": 0,
+            "slow_turns": 0,
+            "problematic_turns": 0,
             "wall_clock_ms": [],
             "model_elapsed_ms_total": [],
             "model_call_count": [],
@@ -572,7 +613,18 @@ def summarize_benchmark_results(results: list[dict[str, Any]]) -> dict[str, Any]
                 successful_turns += 1
                 bucket["successful_turns"] += 1
             if isinstance(turn.get("wall_clock_ms"), (int, float)):
-                bucket["wall_clock_ms"].append(float(turn["wall_clock_ms"]))
+                wall_clock_ms = float(turn["wall_clock_ms"])
+                bucket["wall_clock_ms"].append(wall_clock_ms)
+                timing_status = timing_status_for_turn(
+                    wall_clock_ms=wall_clock_ms,
+                    thresholds=thresholds,
+                )
+                if timing_status == "slow":
+                    slow_turns += 1
+                    bucket["slow_turns"] += 1
+                elif timing_status == "problematic":
+                    problematic_turns += 1
+                    bucket["problematic_turns"] += 1
             if isinstance(turn.get("model_elapsed_ms_total"), (int, float)):
                 bucket["model_elapsed_ms_total"].append(float(turn["model_elapsed_ms_total"]))
             if isinstance(turn.get("model_call_count"), (int, float)):
@@ -598,6 +650,9 @@ def summarize_benchmark_results(results: list[dict[str, Any]]) -> dict[str, Any]
         "scenario_count": len(results),
         "turn_count": total_turns,
         "successful_turns": successful_turns,
+        "slow_turns": slow_turns,
+        "problematic_turns": problematic_turns,
+        "timing_thresholds": thresholds,
         "family_summary": family_summary,
     }
 
@@ -613,8 +668,10 @@ def format_benchmark_summary(summary: dict[str, Any]) -> str:
         f"Scenarios: {int(summary.get('scenario_count') or 0)}",
         f"Turns: {int(summary.get('turn_count') or 0)}",
         f"Successful turns: {int(summary.get('successful_turns') or 0)}",
+        f"Slow turns: {int(summary.get('slow_turns') or 0)}",
+        f"Problematic turns: {int(summary.get('problematic_turns') or 0)}",
         "",
-        "Family	Scenarios	Turns	Success	Wall p50	Wall p95	Model avg	Calls avg	Tools avg",
+        "Family	Scenarios	Turns	Success	Slow	Problem	Wall p50	Wall p95	Model avg	Calls avg	Tools avg",
     ]
     family_summary = summary.get("family_summary") if isinstance(summary.get("family_summary"), dict) else {}
     for family, item in sorted(family_summary.items()):
@@ -623,6 +680,8 @@ def format_benchmark_summary(summary: dict[str, Any]) -> str:
             str(int(item.get("scenario_count") or 0)),
             str(int(item.get("turn_count") or 0)),
             str(int(item.get("successful_turns") or 0)),
+            str(int(item.get("slow_turns") or 0)),
+            str(int(item.get("problematic_turns") or 0)),
             _format_float(item.get("wall_clock_ms_p50")),
             _format_float(item.get("wall_clock_ms_p95")),
             _format_float(item.get("model_elapsed_ms_total_avg")),

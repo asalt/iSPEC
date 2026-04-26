@@ -8,7 +8,9 @@ from ispec.assistant.support_benchmark import (
     format_benchmark_summary,
     load_local_benchmark_scenarios,
     load_synthetic_benchmark_scenarios,
+    normalize_timing_thresholds,
     summarize_benchmark_results,
+    timing_status_for_turn,
 )
 
 
@@ -108,6 +110,7 @@ def test_assert_case_expectations_uses_final_assistant_meta() -> None:
 
 
 def test_summarize_benchmark_results_groups_by_family() -> None:
+    thresholds = normalize_timing_thresholds(slow_seconds=1.0, problematic_seconds=2.0)
     summary = summarize_benchmark_results(
         [
             {
@@ -125,12 +128,26 @@ def test_summarize_benchmark_results_groups_by_family() -> None:
                     {"ok": True, "wall_clock_ms": 1500, "model_elapsed_ms_total": 900, "model_call_count": 2, "tool_call_count": 1},
                 ],
             },
-        ]
+        ],
+        timing_thresholds=thresholds,
     )
 
     assert summary["scenario_count"] == 2
     assert summary["turn_count"] == 3
     assert summary["successful_turns"] == 2
+    assert summary["slow_turns"] == 2
+    assert summary["problematic_turns"] == 0
+    assert summary["timing_thresholds"] == thresholds
     assert summary["family_summary"]["lookup"]["turn_count"] == 2
     assert summary["family_summary"]["lookup"]["wall_clock_ms_p50"] == 800
+    assert summary["family_summary"]["lookup"]["slow_turns"] == 1
     assert "Family	Scenarios" in format_benchmark_summary(summary)
+    assert "Slow turns: 2" in format_benchmark_summary(summary)
+
+
+def test_timing_status_for_turn_uses_normalized_thresholds() -> None:
+    thresholds = normalize_timing_thresholds(slow_seconds=2.0, problematic_seconds=1.0)
+
+    assert thresholds == {"slow_wall_clock_ms": 2000, "problematic_wall_clock_ms": 2000}
+    assert timing_status_for_turn(wall_clock_ms=1999, thresholds=thresholds) == "ok"
+    assert timing_status_for_turn(wall_clock_ms=2000, thresholds=thresholds) == "problematic"

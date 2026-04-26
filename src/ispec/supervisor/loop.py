@@ -1558,13 +1558,8 @@ def _orchestrator_enabled() -> bool:
     )
     if err:
         logger.warning("%s", err)
-        parsed = None
-    if parsed is True:
-        return True
-    if parsed is False:
         return False
-    provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "").strip().lower()
-    return provider == "vllm"
+    return parsed is True
 
 
 def _orchestrator_tick_min_seconds() -> int:

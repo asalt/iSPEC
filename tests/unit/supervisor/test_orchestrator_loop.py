@@ -17,6 +17,7 @@ from ispec.assistant.service import AssistantReply
 from ispec.concurrency.thread_context import set_main_thread
 from ispec.supervisor.loop import (
     _enqueue_command,
+    _orchestrator_enabled,
     _process_one_command,
     _recover_stale_running_commands,
     _seed_orchestrator_tick,
@@ -25,8 +26,22 @@ from ispec.supervisor.loop import (
 
 
 @pytest.fixture(autouse=True)
-def _supervisor_main_thread() -> None:
+def _supervisor_main_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     set_main_thread(owner="pytest")
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_ENABLED", "1")
+
+
+def test_orchestrator_requires_explicit_enable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+
+    monkeypatch.delenv("ISPEC_ORCHESTRATOR_ENABLED", raising=False)
+    assert _orchestrator_enabled() is False
+
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_ENABLED", "auto")
+    assert _orchestrator_enabled() is False
+
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_ENABLED", "1")
+    assert _orchestrator_enabled() is True
 
 
 def test_supervisor_processes_orchestrator_tick_and_schedules_followups(tmp_path, monkeypatch):
