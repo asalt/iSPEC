@@ -92,7 +92,11 @@ def test_supervisor_processes_orchestrator_tick_and_schedules_followups(tmp_path
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test"},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
 
     processed = _process_one_command(agent_id="agent-1", run_id="run-1")
@@ -170,7 +174,11 @@ def test_orchestrator_tick_forces_session_review_when_model_schedules_none(tmp_p
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test"},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
 
     processed = _process_one_command(agent_id="agent-1", run_id="run-1")
@@ -318,33 +326,36 @@ def test_orchestrator_tick_applies_idle_backoff(tmp_path, monkeypatch):
         )
         agent_db.commit()
 
-    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
-        assert tools is None
-        decision = {
-            "schema_version": 1,
-            "thoughts": "No work right now.",
-            "next_tick_seconds": 30,
-            "commands": [],
-        }
-        return AssistantReply(content=json.dumps(decision), provider="test", model="test-model", meta=None)
+    def fake_generate_reply(*_, **__) -> AssistantReply:
+        raise AssertionError("idle orchestrator ticks should not invoke the model")
 
     import ispec.supervisor.loop as supervisor_loop
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test"},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
     assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
 
     with get_agent_session(agent_db_path) as agent_db:
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
+        llm = cmd.result_json.get("llm") if isinstance(cmd.result_json, dict) else None
+        assert isinstance(llm, dict)
+        assert llm.get("skipped") is True
+        assert llm.get("reason") == "idle_no_work"
+
         run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
         orchestrator = run.summary_json.get("orchestrator") if isinstance(run.summary_json, dict) else None
         assert isinstance(orchestrator, dict)
         assert orchestrator["idle_streak"] == 1
-        assert orchestrator["next_tick_reason"] == "idle_backoff"
+        assert orchestrator["next_tick_reason"] == "idle_no_work"
         assert orchestrator["next_tick_seconds"] == 60
         assert isinstance(orchestrator.get("last_action_summary"), str)
-        assert "No commands scheduled" in str(orchestrator.get("last_action_summary"))
+        assert "skipped orchestrator model call" in str(orchestrator.get("last_action_summary"))
         action_obj = orchestrator.get("last_action")
         assert isinstance(action_obj, dict)
         totals = action_obj.get("totals")
@@ -369,7 +380,7 @@ def test_orchestrator_tick_applies_idle_backoff(tmp_path, monkeypatch):
         orchestrator = run.summary_json.get("orchestrator") if isinstance(run.summary_json, dict) else None
         assert isinstance(orchestrator, dict)
         assert orchestrator["idle_streak"] == 2
-        assert orchestrator["next_tick_reason"] == "idle_backoff"
+        assert orchestrator["next_tick_reason"] == "idle_no_work"
         assert orchestrator["next_tick_seconds"] == 120
 
 
@@ -427,7 +438,11 @@ def test_orchestrator_tick_schedules_fast_when_review_backlog(tmp_path, monkeypa
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test"},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
     assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
 
@@ -478,7 +493,11 @@ def test_orchestrator_tick_invalid_output_uses_error_backoff(tmp_path, monkeypat
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test", "force_llm": True},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
     assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
 
@@ -707,7 +726,11 @@ def test_orchestrator_tick_skips_duplicate_inflight_review_command(tmp_path, mon
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test", "force_llm": True},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
     assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
 
@@ -792,7 +815,11 @@ def test_orchestrator_tick_cools_down_after_recent_invalid_review_output(tmp_pat
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test", "force_llm": True},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
     assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
 
@@ -872,7 +899,11 @@ def test_orchestrator_tick_skips_duplicate_inflight_digest_command(tmp_path, mon
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test", "force_llm": True},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
     assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
 
@@ -958,7 +989,11 @@ def test_orchestrator_tick_cools_down_after_recent_invalid_digest_output(tmp_pat
 
     monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
 
-    cmd_id = _enqueue_command(command_type=COMMAND_ORCHESTRATOR_TICK, payload={"source": "test"}, priority=0)
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test", "force_llm": True},
+        priority=0,
+    )
     assert isinstance(cmd_id, int)
     assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
 

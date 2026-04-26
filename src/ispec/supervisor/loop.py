@@ -1589,6 +1589,38 @@ def _orchestrator_tick_max_seconds() -> int:
         return 3600
 
 
+def _orchestrator_initial_delay_seconds(*, min_tick_seconds: int, max_tick_seconds: int) -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_INITIAL_DELAY_SECONDS") or "").strip()
+    if raw:
+        try:
+            return _clamp_int(int(raw), min_value=int(min_tick_seconds), max_value=int(max_tick_seconds))
+        except ValueError:
+            pass
+    return _orchestrator_base_tick_seconds(min_tick_seconds=min_tick_seconds, max_tick_seconds=max_tick_seconds)
+
+
+def _orchestrator_skip_idle_llm() -> bool:
+    parsed, err = _parse_env_tristate_bool(
+        os.getenv("ISPEC_ORCHESTRATOR_SKIP_IDLE_LLM"),
+        key="ISPEC_ORCHESTRATOR_SKIP_IDLE_LLM",
+    )
+    if err:
+        logger.warning("%s", err)
+        parsed = None
+    if parsed is False:
+        return False
+    return True
+
+
+def _orchestrator_payload_force_llm(payload: dict[str, Any]) -> bool:
+    value = payload.get("force_llm") if isinstance(payload, dict) else None
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _TRUTHY
+
+
 def _orchestrator_max_commands_per_tick() -> int:
     raw = (os.getenv("ISPEC_ORCHESTRATOR_MAX_COMMANDS_PER_TICK") or "").strip()
     if not raw:
@@ -2103,6 +2135,19 @@ def _task_orchestrator_tick(
     if isinstance(prompt_snapshot.get("sessions_needing_review"), list):
         prompt_snapshot["sessions_needing_review"] = prompt_snapshot["sessions_needing_review"][:3]
 
+    sessions_needing_review = (
+        assistant_snapshot.get("sessions_needing_review") if isinstance(assistant_snapshot, dict) else None
+    )
+    if not isinstance(sessions_needing_review, list):
+        sessions_needing_review = []
+    sessions_needing_review_count = len(sessions_needing_review)
+    latest_review_id = (
+        _safe_int(assistant_snapshot.get("latest_review_id")) if isinstance(assistant_snapshot, dict) else None
+    )
+    latest_review_id = int(latest_review_id or 0)
+    digest_last_review_id = _safe_int(state_for_prompt.get("digest_last_review_id"))
+    digest_last_review_id = int(digest_last_review_id or 0)
+
     context = {
         "schema_version": 1,
         "agent": {"agent_id": agent_id, "run_id": run_id, "command_id": int(command_id)},
@@ -2110,6 +2155,71 @@ def _task_orchestrator_tick(
         "assistant": prompt_snapshot,
         "requested": dict(payload or {}),
     }
+
+    if (
+        _orchestrator_skip_idle_llm()
+        and not _orchestrator_payload_force_llm(dict(payload or {}))
+        and sessions_needing_review_count == 0
+        and latest_review_id <= digest_last_review_id
+    ):
+        new_idle_streak = int(prev_idle_streak) + 1
+        tick_seconds = _clamp_int(
+            _orchestrator_idle_backoff_seconds(base_seconds=base_tick, idle_streak=new_idle_streak),
+            min_value=min_tick,
+            max_value=max_tick,
+        )
+        scheduled_tick_id = _schedule_orchestrator_tick(delay_seconds=tick_seconds, current_command_id=command_id)
+        action_summary = {
+            "requested": {},
+            "scheduled": {},
+            "skipped": {},
+            "totals": {"requested": 0, "scheduled": 0, "skipped": 0},
+            "summary": "No review or digest work due; skipped orchestrator model call.",
+        }
+        idle_decision = {
+            "schema_version": _ORCHESTRATOR_DECISION_VERSION,
+            "thoughts": "",
+            "next_tick_seconds": int(tick_seconds),
+            "commands": [],
+        }
+
+        with get_agent_session() as agent_db:
+            run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+            state = _load_orchestrator_state(run)
+            state["last_model_thought"] = ""
+            state["last_thought"] = str(action_summary["summary"])
+            state["recent_thoughts"] = (
+                [*([str(x) for x in state.get("recent_thoughts") if isinstance(x, str)]), state["last_thought"]]
+            )[-10:]
+            state["last_action_summary"] = action_summary["summary"]
+            state["last_action"] = action_summary
+            state["last_action_at"] = utcnow().isoformat()
+            state["idle_streak"] = int(new_idle_streak)
+            state["error_streak"] = 0
+            state["next_tick_seconds"] = int(tick_seconds)
+            state["next_tick_command_id"] = scheduled_tick_id
+            state["next_tick_reason"] = "idle_no_work"
+            state["base_tick_seconds"] = int(base_tick)
+            state["requested_tick_seconds"] = None
+            _save_orchestrator_state(run=run, state=state)
+            agent_db.commit()
+
+        return CommandExecution(
+            ok=True,
+            result={
+                "ok": True,
+                "decision": idle_decision,
+                "scheduled": [],
+                "skipped": [],
+                "action_summary": action_summary,
+                "scheduled_tick_command_id": scheduled_tick_id,
+                "assistant_snapshot": assistant_snapshot,
+                "severity": "info",
+                "llm": {"skipped": True, "reason": "idle_no_work"},
+            },
+            prompt={"skipped_idle_llm": True, "context": context},
+            response={"validated": idle_decision, "llm_skipped": True},
+        )
 
     schema = _orchestrator_decision_schema(max_commands=max_commands)
     prompt = load_bound_prompt(_orchestrator_system_prompt, values={"max_commands": max_commands})
@@ -7264,13 +7374,13 @@ def _supervisor_command_poll_seconds(*, base_interval_seconds: int) -> float:
     """Polling interval for checking queued commands during long sleeps."""
 
     raw = (os.getenv("ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS") or "").strip()
-    default_value = 0.5
+    default_value = 5.0
     if not raw:
         return _clamp_float(float(default_value), min_value=0.1, max_value=max(0.1, float(base_interval_seconds)))
     try:
         return _clamp_float(float(raw), min_value=0.1, max_value=60.0)
     except ValueError:
-        return float(default_value)
+        return _clamp_float(float(default_value), min_value=0.1, max_value=60.0)
 
 
 def _supervisor_heartbeat_seconds() -> float:
@@ -7396,7 +7506,7 @@ def _supervisor_dynamic_idle_sleep_seconds(
             idle_streak = _safe_int(orchestrator.get("idle_streak")) or 0
             next_tick_seconds = _safe_int(orchestrator.get("next_tick_seconds")) or 0
 
-            if reason == "idle_backoff" and idle_streak > 0:
+            if reason in {"idle_backoff", "idle_no_work"} and idle_streak > 0:
                 sleep_seconds = int(
                     backoff_exponential_current(
                         int(idle_streak),
@@ -7569,8 +7679,13 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
             stale_recovery.get("running_total"),
             stale_recovery.get("stale_seconds"),
         )
+    orchestrator_min_tick = _orchestrator_tick_min_seconds()
+    orchestrator_max_tick = _orchestrator_tick_max_seconds()
     seeded_id = _seed_orchestrator_tick(
-        delay_seconds=_orchestrator_tick_min_seconds(),
+        delay_seconds=_orchestrator_initial_delay_seconds(
+            min_tick_seconds=orchestrator_min_tick,
+            max_tick_seconds=orchestrator_max_tick,
+        ),
         agent_id=config.agent_id,
         run_id=run_id,
     )
