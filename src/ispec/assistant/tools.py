@@ -768,7 +768,11 @@ def _tmux_capture_snapshot(
     capture_target = str(pane.get("capture_target") or pane.get("pane_id") or pane.get("target") or "")
     text = _tmux_capture_text(target=capture_target, history_lines=history_limit)
     all_lines = text.splitlines()
-    visible_lines = all_lines[-lines_int:]
+    content_end = len(all_lines)
+    while content_end > 0 and not all_lines[content_end - 1].strip():
+        content_end -= 1
+    content_lines = all_lines[:content_end] or all_lines
+    visible_lines = content_lines[-lines_int:]
     last_nonempty_line = None
     for line in reversed(visible_lines):
         stripped = line.strip()
@@ -799,6 +803,7 @@ def _tmux_capture_snapshot(
         "include_history": bool(include_history),
         "history_lines": int(history_limit) if history_limit is not None else None,
         "captured_total_lines": len(all_lines),
+        "trailing_blank_line_count": max(len(all_lines) - content_end, 0),
         "visible_line_count": len(visible_lines),
         "last_nonempty_line": last_nonempty_line,
         "activity_summary": _tmux_activity_summary(pane=pane, last_nonempty_line=last_nonempty_line),
