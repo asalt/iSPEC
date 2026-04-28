@@ -8,6 +8,7 @@ egg-info/
 .env.*
 !.env.example
 !.env.*.example
+.codex-session
 *.log
 *.egg-info/
 *.swp

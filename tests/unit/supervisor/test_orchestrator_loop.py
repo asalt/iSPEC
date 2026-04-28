@@ -16,19 +16,96 @@ from ispec.assistant.models import SupportMessage, SupportSession, SupportSessio
 from ispec.assistant.service import AssistantReply
 from ispec.concurrency.thread_context import set_main_thread
 from ispec.supervisor.loop import (
+    _ORCHESTRATOR_STATE_VERSION,
     _enqueue_command,
     _orchestrator_enabled,
+    _orchestrator_sentinel_enabled,
     _process_one_command,
     _recover_stale_running_commands,
     _seed_orchestrator_tick,
     utcnow,
 )
+from ispec.supervisor.sentinel import build_observation, build_sentinel_report, next_state_from_report
 
 
 @pytest.fixture(autouse=True)
 def _supervisor_main_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     set_main_thread(owner="pytest")
     monkeypatch.setenv("ISPEC_ORCHESTRATOR_ENABLED", "1")
+
+
+def _seed_idle_orchestrator_databases(tmp_path, monkeypatch, *, orchestrator_state=None):
+    agent_db_path = tmp_path / "agent.db"
+    assistant_db_path = tmp_path / "assistant.db"
+
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_DB_PATH", str(assistant_db_path))
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_BASE_SECONDS", "60")
+
+    with get_assistant_session(assistant_db_path):
+        pass
+
+    from ispec.agent.connect import get_agent_session
+
+    with get_agent_session(agent_db_path) as agent_db:
+        agent_db.add(
+            AgentRun(
+                run_id="run-1",
+                agent_id="agent-1",
+                kind="supervisor",
+                status="running",
+                created_at=utcnow(),
+                updated_at=utcnow(),
+                config_json={},
+                state_json={"checks": {}},
+                summary_json={
+                    "orchestrator": dict(
+                        orchestrator_state
+                        or {
+                            "schema_version": _ORCHESTRATOR_STATE_VERSION,
+                        }
+                    )
+                },
+            )
+        )
+        agent_db.commit()
+    return agent_db_path, assistant_db_path
+
+
+def _sentinel_observation(text: str, *, target: str = "ispec:worker.1"):
+    return build_observation(
+        pane={
+            "target": target,
+            "pane_id": "%1",
+            "session": "ispec",
+            "window_name": "worker",
+            "current_command": "bash",
+        },
+        snapshot={
+            "target": target,
+            "pane_id": "%1",
+            "content": text,
+            "last_nonempty_line": None,
+        },
+        captured_at="2026-04-27T12:00:00+00:00",
+    )
+
+
+def _sentinel_report_triplet(text: str, *, previous_state=None, target: str = "ispec:worker.1"):
+    observation = _sentinel_observation(text, target=target)
+    report = build_sentinel_report(
+        observations=[observation],
+        previous_state=previous_state,
+        now=utcnow(),
+    )
+    next_state = next_state_from_report(
+        report=report,
+        observations=[observation],
+        previous_state=previous_state,
+        now=utcnow(),
+    )
+    return report, next_state, [observation]
 
 
 def test_orchestrator_requires_explicit_enable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,6 +119,17 @@ def test_orchestrator_requires_explicit_enable(monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setenv("ISPEC_ORCHESTRATOR_ENABLED", "1")
     assert _orchestrator_enabled() is True
+
+
+def test_orchestrator_sentinel_requires_explicit_enable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ISPEC_ORCHESTRATOR_SENTINEL_ENABLED", raising=False)
+    assert _orchestrator_sentinel_enabled() is False
+
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_SENTINEL_ENABLED", "auto")
+    assert _orchestrator_sentinel_enabled() is False
+
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_SENTINEL_ENABLED", "1")
+    assert _orchestrator_sentinel_enabled() is True
 
 
 def test_supervisor_processes_orchestrator_tick_and_schedules_followups(tmp_path, monkeypatch):
@@ -397,6 +485,165 @@ def test_orchestrator_tick_applies_idle_backoff(tmp_path, monkeypatch):
         assert orchestrator["idle_streak"] == 2
         assert orchestrator["next_tick_reason"] == "idle_no_work"
         assert orchestrator["next_tick_seconds"] == 120
+
+
+def test_orchestrator_sentinel_changed_pane_skips_command_llm_and_stores_state(tmp_path, monkeypatch):
+    agent_db_path, _assistant_db_path = _seed_idle_orchestrator_databases(tmp_path, monkeypatch)
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_SENTINEL_ENABLED", "1")
+
+    import ispec.supervisor.loop as supervisor_loop
+
+    def fake_generate_reply(*_, **__) -> AssistantReply:
+        raise AssertionError("sentinel-only idle ticks should not invoke the command scheduler LLM")
+
+    def fake_sentinel_report(*, previous_state=None, resources=None):
+        assert resources is None
+        return _sentinel_report_triplet("Need approval before continuing", previous_state=previous_state)
+
+    monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
+    monkeypatch.setattr(supervisor_loop, "_orchestrator_sentinel_report", fake_sentinel_report)
+
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test"},
+        priority=0,
+    )
+    assert isinstance(cmd_id, int)
+    assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
+
+    from ispec.agent.connect import get_agent_session
+
+    with get_agent_session(agent_db_path) as agent_db:
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
+        assert cmd.status == "succeeded"
+        assert cmd.result_json["llm"] == {
+            "skipped": True,
+            "reason": "sentinel_change",
+            "sentinel_model_summary": False,
+        }
+        report = cmd.result_json["sentinel"]
+        assert report["read_only"] is True
+        assert report["changed_panes"] == ["ispec:worker.1"]
+        assert report["notifications"]["slack"] == "simulated"
+        assert "message_preview" in report["notifications"]
+
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
+        orchestrator = run.summary_json.get("orchestrator")
+        assert isinstance(orchestrator, dict)
+        assert orchestrator["idle_streak"] == 0
+        assert orchestrator["next_tick_reason"] == "sentinel_change"
+        assert orchestrator["sentinel"]["panes"]["ispec:worker.1"]["state"] == "waiting_for_human"
+        assert orchestrator["sentinel"]["last_report"]["changed_panes"] == ["ispec:worker.1"]
+
+
+def test_orchestrator_sentinel_unchanged_pane_uses_idle_path_without_attention(tmp_path, monkeypatch):
+    observation = _sentinel_observation("ordinary progress 10%")
+    previous_state = next_state_from_report(
+        report=build_sentinel_report(observations=[observation], previous_state=None, now=utcnow()),
+        observations=[observation],
+        previous_state=None,
+        now=utcnow(),
+    )
+    agent_db_path, _assistant_db_path = _seed_idle_orchestrator_databases(
+        tmp_path,
+        monkeypatch,
+        orchestrator_state={
+            "schema_version": _ORCHESTRATOR_STATE_VERSION,
+            "sentinel": previous_state,
+        },
+    )
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_SENTINEL_ENABLED", "1")
+
+    import ispec.supervisor.loop as supervisor_loop
+
+    def fake_generate_reply(*_, **__) -> AssistantReply:
+        raise AssertionError("unchanged sentinel idle ticks should not invoke the model")
+
+    def fake_sentinel_report(*, previous_state=None, resources=None):
+        assert previous_state is not None
+        return _sentinel_report_triplet("ordinary progress 10%", previous_state=previous_state)
+
+    monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
+    monkeypatch.setattr(supervisor_loop, "_orchestrator_sentinel_report", fake_sentinel_report)
+
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test"},
+        priority=0,
+    )
+    assert isinstance(cmd_id, int)
+    assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
+
+    from ispec.agent.connect import get_agent_session
+
+    with get_agent_session(agent_db_path) as agent_db:
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
+        assert cmd.status == "succeeded"
+        assert cmd.result_json["llm"]["reason"] == "idle_no_work"
+        assert cmd.result_json["sentinel"]["changed_panes"] == []
+        assert cmd.result_json["sentinel"]["notifications"]["candidates"] == []
+
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
+        orchestrator = run.summary_json.get("orchestrator")
+        assert isinstance(orchestrator, dict)
+        assert orchestrator["idle_streak"] == 1
+        assert orchestrator["next_tick_reason"] == "idle_no_work"
+        assert orchestrator["sentinel"]["last_report"]["changed_panes"] == []
+
+
+def test_orchestrator_sentinel_model_summary_is_separate_from_command_scheduler(tmp_path, monkeypatch):
+    agent_db_path, _assistant_db_path = _seed_idle_orchestrator_databases(tmp_path, monkeypatch)
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_SENTINEL_ENABLED", "1")
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_SENTINEL_MODEL_SUMMARY", "1")
+
+    import ispec.supervisor.loop as supervisor_loop
+
+    calls: list[dict[str, object]] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, **_) -> AssistantReply:
+        calls.append({"messages": messages, "tools": tools})
+        assert tools is None
+        assert isinstance(messages, list)
+        context = json.loads(messages[-1]["content"])
+        assert context["read_only"] is True
+        assert context["changed_observations"][0]["target"] == "ispec:worker.1"
+        return AssistantReply(
+            content="Pane appears to be waiting for human approval.",
+            provider="test",
+            model="test-model",
+            meta={"purpose": "sentinel-summary"},
+        )
+
+    def fake_sentinel_report(*, previous_state=None, resources=None):
+        return _sentinel_report_triplet("Need approval before continuing", previous_state=previous_state)
+
+    monkeypatch.setattr(supervisor_loop, "generate_reply", fake_generate_reply)
+    monkeypatch.setattr(supervisor_loop, "_orchestrator_sentinel_report", fake_sentinel_report)
+
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_ORCHESTRATOR_TICK,
+        payload={"source": "test"},
+        priority=0,
+    )
+    assert isinstance(cmd_id, int)
+    assert _process_one_command(agent_id="agent-1", run_id="run-1") is True
+    assert len(calls) == 1
+
+    from ispec.agent.connect import get_agent_session
+
+    with get_agent_session(agent_db_path) as agent_db:
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
+        assert cmd.status == "succeeded"
+        assert cmd.result_json["llm"]["skipped"] is True
+        assert cmd.result_json["llm"]["sentinel_model_summary"] is True
+        assert cmd.result_json["sentinel"]["model_summary"] == "Pane appears to be waiting for human approval."
+
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == "run-1").one()
+        orchestrator = run.summary_json.get("orchestrator")
+        assert isinstance(orchestrator, dict)
+        assert orchestrator["sentinel"]["last_report"]["model_summary"] == (
+            "Pane appears to be waiting for human approval."
+        )
 
 
 def test_orchestrator_tick_schedules_fast_when_review_backlog(tmp_path, monkeypatch):

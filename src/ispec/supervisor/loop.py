@@ -88,6 +88,11 @@ from ispec.logging import get_logger
 from ispec.omics.connect import get_omics_session
 from ispec.schedule.connect import get_schedule_db_uri, get_schedule_session
 from ispec.supervisor.inference_broker import InferenceBroker, InferenceRequest
+from ispec.supervisor.sentinel import (
+    build_sentinel_report,
+    next_state_from_report,
+    observe_tmux_panes,
+)
 
 logger = get_logger(__file__)
 
@@ -1607,6 +1612,48 @@ def _orchestrator_skip_idle_llm() -> bool:
     return True
 
 
+def _orchestrator_sentinel_enabled() -> bool:
+    parsed, err = _parse_env_tristate_bool(
+        os.getenv("ISPEC_ORCHESTRATOR_SENTINEL_ENABLED"),
+        key="ISPEC_ORCHESTRATOR_SENTINEL_ENABLED",
+    )
+    if err:
+        logger.warning("%s", err)
+        return False
+    return parsed is True
+
+
+def _orchestrator_sentinel_model_summary_enabled() -> bool:
+    parsed, err = _parse_env_tristate_bool(
+        os.getenv("ISPEC_ORCHESTRATOR_SENTINEL_MODEL_SUMMARY"),
+        key="ISPEC_ORCHESTRATOR_SENTINEL_MODEL_SUMMARY",
+    )
+    if err:
+        logger.warning("%s", err)
+        return False
+    return parsed is True
+
+
+def _orchestrator_sentinel_lines() -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_SENTINEL_LINES") or "").strip()
+    if not raw:
+        return 80
+    try:
+        return _clamp_int(int(raw), min_value=10, max_value=400)
+    except ValueError:
+        return 80
+
+
+def _orchestrator_sentinel_min_notify_seconds() -> int:
+    raw = (os.getenv("ISPEC_ORCHESTRATOR_SENTINEL_MIN_NOTIFY_SECONDS") or "").strip()
+    if not raw:
+        return 900
+    try:
+        return _clamp_int(int(raw), min_value=0, max_value=86400)
+    except ValueError:
+        return 900
+
+
 def _orchestrator_payload_force_llm(payload: dict[str, Any]) -> bool:
     value = payload.get("force_llm") if isinstance(payload, dict) else None
     if isinstance(value, bool):
@@ -1889,6 +1936,12 @@ def _orchestrator_decision_schema(*, max_commands: int) -> dict[str, Any]:
 def _orchestrator_system_prompt(*, max_commands: int) -> str:
     return load_bound_prompt(_orchestrator_system_prompt, values={"max_commands": max_commands}).text
 
+
+@prompt_binding("supervisor.orchestrator_sentinel.summary")
+def _orchestrator_sentinel_summary_prompt() -> str:
+    return load_bound_prompt(_orchestrator_sentinel_summary_prompt).text
+
+
 def _validate_orchestrator_decision(
     decision: dict[str, Any] | None,
     *,
@@ -2020,6 +2073,103 @@ def _orchestrator_action_summary(
     }
 
 
+def _orchestrator_sentinel_report(
+    *,
+    previous_state: dict[str, Any] | None,
+    resources: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], list[Any]]:
+    """Collect a read-only tmux sentinel report.
+
+    The sentinel receives only fixed observer callables. It does not accept
+    model-generated commands or expose the tmux send-key helper.
+    """
+
+    lines = _orchestrator_sentinel_lines()
+    min_notify_seconds = _orchestrator_sentinel_min_notify_seconds()
+    resource_payload = dict(resources or {})
+    observations: list[Any] = []
+    errors: list[dict[str, Any]] = []
+
+    try:
+        from ispec.assistant import tools as assistant_tools
+
+        enabled, reason = assistant_tools._tmux_tools_status()  # type: ignore[attr-defined]
+        resource_payload["tmux"] = {"enabled": bool(enabled), "reason": reason}
+        if enabled:
+            observations, errors = observe_tmux_panes(
+                list_panes=assistant_tools._tmux_list_allowed_panes,  # type: ignore[attr-defined]
+                capture_snapshot=assistant_tools._tmux_capture_snapshot,  # type: ignore[attr-defined]
+                lines=int(lines),
+            )
+            if errors:
+                resource_payload["tmux"]["errors"] = errors
+    except Exception as exc:
+        resource_payload["tmux"] = {
+            "enabled": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+    report = build_sentinel_report(
+        observations=list(observations),
+        previous_state=previous_state,
+        resources=resource_payload,
+        min_notify_seconds=int(min_notify_seconds),
+        now=utcnow(),
+    )
+    if errors:
+        report["errors"] = errors
+    next_state = next_state_from_report(
+        report=report,
+        observations=list(observations),
+        previous_state=previous_state,
+        now=utcnow(),
+    )
+    return report, next_state, list(observations)
+
+
+def _orchestrator_sentinel_model_context(
+    *,
+    report: dict[str, Any],
+    observations: list[Any],
+) -> dict[str, Any]:
+    changed_targets = {str(item) for item in report.get("changed_panes", []) if isinstance(item, str)}
+    changed_observations: list[dict[str, Any]] = []
+    for observation in observations:
+        target = str(getattr(observation, "target", "") or "")
+        if target not in changed_targets:
+            continue
+        as_dict = observation.as_report_dict(include_content=True)
+        as_dict["content"] = _truncate_text(str(as_dict.get("content") or ""), limit=4000)
+        as_dict["normalized_text"] = _truncate_text(str(as_dict.get("normalized_text") or ""), limit=4000)
+        changed_observations.append(as_dict)
+
+    return {
+        "schema_version": 1,
+        "read_only": True,
+        "report": {
+            "summary": report.get("summary"),
+            "resources": report.get("resources"),
+            "pane_states": report.get("pane_states"),
+            "changed_panes": report.get("changed_panes"),
+            "notifications": report.get("notifications"),
+        },
+        "changed_observations": changed_observations,
+    }
+
+
+def _save_orchestrator_sentinel_state(
+    *,
+    run_id: str,
+    sentinel_state: dict[str, Any],
+) -> None:
+    with get_agent_session() as agent_db:
+        run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
+        state = _load_orchestrator_state(run)
+        state["sentinel"] = dict(sentinel_state or {})
+        _save_orchestrator_state(run=run, state=state)
+        agent_db.commit()
+
+
 def _schedule_orchestrator_tick(*, delay_seconds: int, current_command_id: int | None = None) -> int | None:
     if not _orchestrator_enabled():
         return None
@@ -2085,11 +2235,15 @@ def _task_orchestrator_tick(
     base_tick = _orchestrator_base_tick_seconds(min_tick_seconds=min_tick, max_tick_seconds=max_tick)
 
     state_for_prompt: dict[str, Any] = {}
+    sentinel_previous_state: dict[str, Any] | None = None
     prev_idle_streak = 0
     prev_error_streak = 0
     with get_agent_session() as agent_db:
         run = agent_db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
         state = _load_orchestrator_state(run)
+        sentinel_state = state.get("sentinel")
+        if isinstance(sentinel_state, dict):
+            sentinel_previous_state = dict(sentinel_state)
         prev_idle_streak = int(state.get("idle_streak") or 0)
         prev_error_streak = int(state.get("error_streak") or 0)
         state["ticks"] = int(state.get("ticks") or 0) + 1
@@ -2122,6 +2276,51 @@ def _task_orchestrator_tick(
     with get_assistant_session() as assistant_db:
         assistant_snapshot = _assistant_snapshot(assistant_db=assistant_db)
 
+    sentinel_report: dict[str, Any] | None = None
+    sentinel_next_state: dict[str, Any] | None = None
+    sentinel_observations: list[Any] = []
+    sentinel_changed = False
+    sentinel_model_summary_enabled = False
+    if _orchestrator_sentinel_enabled():
+        sentinel_report, sentinel_next_state, sentinel_observations = _orchestrator_sentinel_report(
+            previous_state=sentinel_previous_state,
+        )
+        sentinel_changed = bool(sentinel_report.get("changed_panes"))
+        sentinel_model_summary_enabled = _orchestrator_sentinel_model_summary_enabled()
+        if sentinel_changed and sentinel_model_summary_enabled:
+            summary_prompt = load_bound_prompt(_orchestrator_sentinel_summary_prompt)
+            summary_context = _orchestrator_sentinel_model_context(
+                report=sentinel_report,
+                observations=sentinel_observations,
+            )
+            summary_reply = yield InferenceRequest(
+                messages=[
+                    {"role": "system", "content": summary_prompt.text},
+                    {"role": "user", "content": json.dumps(summary_context, ensure_ascii=False)},
+                ],
+                tools=None,
+                vllm_extra_body={"temperature": 0, "max_tokens": 300},
+                observability_context=prompt_observability_context(
+                    summary_prompt,
+                    extra={"task": "orchestrator_sentinel_summary"},
+                ),
+            )
+            sentinel_report["model_summary"] = _truncate_text(summary_reply.content, limit=1200)
+            sentinel_report["model_summary_llm"] = {
+                "provider": summary_reply.provider,
+                "model": summary_reply.model,
+                "ok": bool(summary_reply.ok),
+                "meta": summary_reply.meta,
+            }
+            sentinel_next_state = next_state_from_report(
+                report=sentinel_report,
+                observations=sentinel_observations,
+                previous_state=sentinel_previous_state,
+                now=utcnow(),
+            )
+        if sentinel_next_state is not None:
+            _save_orchestrator_sentinel_state(run_id=run_id, sentinel_state=sentinel_next_state)
+
     prompt_snapshot: dict[str, Any] = dict(assistant_snapshot or {})
     # The orchestrator only needs a tiny slice of assistant state. Keeping the
     # prompt small also prevents "echo the input JSON" failures that can be
@@ -2148,6 +2347,7 @@ def _task_orchestrator_tick(
         "agent": {"agent_id": agent_id, "run_id": run_id, "command_id": int(command_id)},
         "orchestrator": state_for_prompt,
         "assistant": prompt_snapshot,
+        "sentinel": sentinel_report,
         "requested": dict(payload or {}),
     }
 
@@ -2157,19 +2357,24 @@ def _task_orchestrator_tick(
         and sessions_needing_review_count == 0
         and latest_review_id <= digest_last_review_id
     ):
-        new_idle_streak = int(prev_idle_streak) + 1
+        new_idle_streak = 0 if sentinel_changed else int(prev_idle_streak) + 1
         tick_seconds = _clamp_int(
-            _orchestrator_idle_backoff_seconds(base_seconds=base_tick, idle_streak=new_idle_streak),
+            base_tick
+            if sentinel_changed
+            else _orchestrator_idle_backoff_seconds(base_seconds=base_tick, idle_streak=new_idle_streak),
             min_value=min_tick,
             max_value=max_tick,
         )
         scheduled_tick_id = _schedule_orchestrator_tick(delay_seconds=tick_seconds, current_command_id=command_id)
+        idle_summary = "No review or digest work due; skipped orchestrator model call."
+        if sentinel_report is not None and sentinel_changed:
+            idle_summary = "Sentinel observed changed pane state; skipped command-scheduling model call."
         action_summary = {
             "requested": {},
             "scheduled": {},
             "skipped": {},
             "totals": {"requested": 0, "scheduled": 0, "skipped": 0},
-            "summary": "No review or digest work due; skipped orchestrator model call.",
+            "summary": idle_summary,
         }
         idle_decision = {
             "schema_version": _ORCHESTRATOR_DECISION_VERSION,
@@ -2193,9 +2398,11 @@ def _task_orchestrator_tick(
             state["error_streak"] = 0
             state["next_tick_seconds"] = int(tick_seconds)
             state["next_tick_command_id"] = scheduled_tick_id
-            state["next_tick_reason"] = "idle_no_work"
+            state["next_tick_reason"] = "sentinel_change" if sentinel_changed else "idle_no_work"
             state["base_tick_seconds"] = int(base_tick)
             state["requested_tick_seconds"] = None
+            if sentinel_next_state is not None:
+                state["sentinel"] = sentinel_next_state
             _save_orchestrator_state(run=run, state=state)
             agent_db.commit()
 
@@ -2209,8 +2416,13 @@ def _task_orchestrator_tick(
                 "action_summary": action_summary,
                 "scheduled_tick_command_id": scheduled_tick_id,
                 "assistant_snapshot": assistant_snapshot,
+                "sentinel": sentinel_report,
                 "severity": "info",
-                "llm": {"skipped": True, "reason": "idle_no_work"},
+                "llm": {
+                    "skipped": True,
+                    "reason": "sentinel_change" if sentinel_changed else "idle_no_work",
+                    "sentinel_model_summary": bool(sentinel_changed and sentinel_model_summary_enabled),
+                },
             },
             prompt={"skipped_idle_llm": True, "context": context},
             response={"validated": idle_decision, "llm_skipped": True},
@@ -2432,6 +2644,7 @@ def _task_orchestrator_tick(
                 "action_summary": action_summary,
                 "scheduled_tick_command_id": scheduled_tick_id,
                 "assistant_snapshot": assistant_snapshot,
+                "sentinel": sentinel_report,
                 "severity": "warning" if llm_invalid else "info",
                 "llm": {
                     "provider": reply.provider,
