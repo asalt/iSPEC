@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ispec.agent.connect import get_agent_session
+from ispec.agent_state.connect import get_agent_state_session
 from ispec.assistant.connect import get_assistant_session
 from ispec.db.connect import get_session
 from ispec.db.models import Project
@@ -17,6 +18,7 @@ class BehavioralDatastore:
     assistant_db_path: Path
     schedule_db_path: Path
     agent_db_path: Path
+    agent_state_db_path: Path
     summary: dict[str, int]
     project_ids: tuple[int, ...]
     project_titles: dict[int, str]
@@ -27,6 +29,7 @@ class BehavioralDatastore:
             "ISPEC_ASSISTANT_DB_PATH": str(self.assistant_db_path),
             "ISPEC_SCHEDULE_DB_PATH": str(self.schedule_db_path),
             "ISPEC_AGENT_DB_PATH": str(self.agent_db_path),
+            "ISPEC_AGENT_STATE_DB_PATH": str(self.agent_state_db_path),
         }
 
 
@@ -40,6 +43,7 @@ def create_behavioral_datastore(
     assistant_db_path = root_path / "ispec-assistant-behavioral.db"
     schedule_db_path = root_path / "ispec-schedule-behavioral.db"
     agent_db_path = root_path / "ispec-agent-behavioral.db"
+    agent_state_db_path = root_path / "ispec-agent-state-behavioral.db"
 
     summary = _seed_behavioral_core_db(core_db_path)
 
@@ -48,6 +52,8 @@ def create_behavioral_datastore(
     with get_schedule_session(schedule_db_path):
         pass
     with get_agent_session(agent_db_path):
+        pass
+    with get_agent_state_session(agent_state_db_path):
         pass
 
     with get_session(core_db_path) as core_db:
@@ -64,6 +70,7 @@ def create_behavioral_datastore(
         assistant_db_path=assistant_db_path,
         schedule_db_path=schedule_db_path,
         agent_db_path=agent_db_path,
+        agent_state_db_path=agent_state_db_path,
         summary=dict(summary),
         project_ids=project_ids,
         project_titles=project_titles,
