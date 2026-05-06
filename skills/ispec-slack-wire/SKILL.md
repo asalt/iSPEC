@@ -5,11 +5,28 @@ description: Send explicit one-off Slack text messages or one explicit local fil
 
 # iSPEC Slack Wire
 
-Use this skill only for explicit user-requested Slack text sends. Do not send
-Slack messages autonomously, on inferred intent, or as part of routine status
-updates unless Alex asked for a Slack send in the current task.
+Use this skill only for explicit user-requested Slack text sends or one explicit
+file upload. Do not send Slack messages autonomously, on inferred intent, or as
+part of routine status updates unless Alex asked for a Slack send in the current
+task.
 
-## Command
+## Preferred Command
+
+Use the bundled wrapper from the repo root or any working directory:
+
+```bash
+bash iSPEC/skills/ispec-slack-wire/scripts/send-to-alex.sh --text "message"
+```
+
+To upload one explicit local file:
+
+```bash
+bash iSPEC/skills/ispec-slack-wire/scripts/send-to-alex.sh --file report.pdf --text "Report is ready"
+```
+
+Use `--dry-run` first if recipient or file resolution is uncertain.
+
+## Direct CLI
 
 Prefer the iSPEC CLI:
 
@@ -38,7 +55,7 @@ the requested output of the current Codex task.
 
 ## Scope
 
-- Text and one explicit local file path.
+- Text and one explicit local file path, normally to Alex.
 - File upload uses Slack's external upload flow and requires `files:write` on
   the configured Slack bot token.
 - Auth comes from local env files such as `.env.slack` or `.env.local`.
@@ -54,4 +71,6 @@ the requested output of the current Codex task.
 - Treat this as a manual convenience wire, not a scheduler.
 - Keep messages compact and factual.
 - Do not upload env files, databases, secrets, or unrelated local files.
+- Prefer generated reports/figures/docs from the current task: PDF, PNG, JPG,
+  TXT, CSV, TSV, or similar harmless artifacts.
 - If Slack returns an error, report it; do not retry in a loop.
