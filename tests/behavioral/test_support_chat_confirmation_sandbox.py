@@ -192,3 +192,226 @@ def test_behavioral_support_chat_confirmation_round_trip_saves_into_sandbox(
         meta = json.loads(assistant_row.meta_json)
         assert meta["reply_interpretation"]["runtime_action"] == "approve_save"
         assert meta["reply_interpretation"]["applied"] is True
+
+
+def test_behavioral_support_chat_mspc_prepare_then_confirm_uses_classifier_state(
+    behavioral_datastore,
+    monkeypatch,
+):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TURN_DECISION_MODE", "own")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "3000")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
+
+    project_id = 1563
+
+    with get_session(behavioral_datastore.core_db_path) as core_db:
+        from ispec.db.models import Project
+
+        core_db.add(Project(id=project_id, prj_AddedBy="behavioral", prj_ProjectTitle="IgG antigen review"))
+        core_db.commit()
+
+    monkeypatch.setattr(
+        support_routes,
+        "openai_tools_for_user",
+        lambda _user: [
+            {"type": "function", "function": {"name": "assistant_prompt_header", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "assistant_list_tools", "parameters": {"type": "object"}}},
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_project_comment",
+                    "parameters": {"type": "object", "required": ["project_id", "comment", "confirm"]},
+                },
+            },
+        ],
+    )
+
+    def fake_turn_decision(**kwargs):
+        if str(kwargs.get("user_message") or "").strip().lower() == "confirm":
+            primary_goal = "confirm_save"
+            write_mode = "confirm_save"
+            reply_kind = "approve"
+            reason = "The user confirmed the prepared project note."
+        else:
+            primary_goal = "draft_project_comment"
+            write_mode = "draft_only"
+            reply_kind = "none"
+            reason = "The user asked for a note draft before confirmation."
+        return TurnDecisionResult(
+            ok=True,
+            mode="own",
+            source="support_chat",
+            applied=True,
+            decision=TurnDecision(
+                source="support_chat",
+                primary_goal=primary_goal,
+                needs_clarification=False,
+                clarification_reason="none",
+                tool_plan=TurnDecisionToolPlan(
+                    use_tools=True,
+                    primary_group="projects",
+                    secondary_groups=(),
+                    preferred_first_tool="create_project_comment",
+                ),
+                write_plan=TurnDecisionWritePlan(mode=write_mode),
+                response_plan=TurnDecisionResponsePlan(mode="single", contract_cap="direct"),
+                reply_interpretation=TurnDecisionReplyInterpretation(
+                    kind=reply_kind,
+                    confidence=0.96,
+                    reason=reason,
+                ),
+                confidence=0.93,
+                reason=reason,
+            ),
+        )
+
+    monkeypatch.setattr(support_routes, "run_turn_decision_pipeline", fake_turn_decision)
+    monkeypatch.setattr(support_routes, "select_support_tool_policy", lambda **_: None)
+
+    calls: list[dict[str, object]] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
+        calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        if len(calls) == 1:
+            tool_names = {
+                str(spec.get("function", {}).get("name") or "")
+                for spec in (tools or [])
+                if isinstance(spec, dict)
+            }
+            assert "create_project_comment" not in tool_names
+            return AssistantReply(
+                content=(
+                    "FINAL:\n"
+                    "Prepared note for MSPC001563:\n"
+                    "Kwangwon reported that project MSPC001563 finished an MS run for the IgG-bound antigen sample "
+                    "on the Eclipse system. Please review the chromatogram.\n\n"
+                    "Reply confirm to save this note, or send edits."
+                ),
+                provider="test",
+                model="test-model",
+                meta=None,
+            )
+        if len(calls) == 2:
+            assert tool_choice == {"type": "function", "function": {"name": "create_project_comment"}}
+            return AssistantReply(
+                content="",
+                provider="test",
+                model="test-model",
+                meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "create_project_comment",
+                            "arguments": json.dumps(
+                                {
+                                    "project_id": project_id,
+                                    "comment": (
+                                        "Kwangwon reported that project MSPC001563 finished an MS run for the "
+                                        "IgG-bound antigen sample on the Eclipse system. Please review the chromatogram."
+                                    ),
+                                    "comment_type": "assistant_note",
+                                    "confirm": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+            )
+        return AssistantReply(
+            content="FINAL:\nSaved the note to project 1563.",
+            provider="test",
+            model="test-model",
+            meta=None,
+        )
+
+    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
+
+    with (
+        get_assistant_session(behavioral_datastore.assistant_db_path) as assistant_db,
+        get_schedule_session(behavioral_datastore.schedule_db_path) as schedule_db,
+        get_session(behavioral_datastore.core_db_path) as core_db,
+    ):
+        service_user = types.SimpleNamespace(
+            id=1,
+            username="api_key",
+            role=UserRole.viewer,
+            can_write_project_comments=True,
+        )
+
+        session_id = "behavioral-mspc-confirm"
+        first = chat(
+            ChatRequest.model_validate(
+                {
+                    "sessionId": session_id,
+                    "message": (
+                        "prepare a message that is sent by kwangwon about how mspc1563 (57987), "
+                        "finished ms run for the IgG-bound antigen sample on eclipse. Take a look at the "
+                        "chromatogram. Prepare the note for review then I can confirm or deny it"
+                    ),
+                    "history": [],
+                    "ui": None,
+                }
+            ),
+            assistant_db=assistant_db,
+            core_db=core_db,
+            schedule_db=schedule_db,
+            user=service_user,
+        )
+        assert "Prepared note for MSPC001563" in (first.message or "")
+
+        support_session = (
+            assistant_db.query(SupportSession)
+            .filter(SupportSession.session_id == session_id)
+            .one()
+        )
+        persisted_state = json.loads(support_session.state_json)
+        assert persisted_state["current_project_id"] == project_id
+
+        second = chat(
+            ChatRequest.model_validate(
+                {
+                    "sessionId": session_id,
+                    "message": "confirm",
+                    "history": [],
+                    "ui": None,
+                }
+            ),
+            assistant_db=assistant_db,
+            core_db=core_db,
+            schedule_db=schedule_db,
+            user=service_user,
+        )
+
+        assert second.message == "Saved the note to project 1563."
+        comment = (
+            core_db.query(ProjectComment)
+            .filter(ProjectComment.project_id == project_id)
+            .order_by(ProjectComment.id.desc())
+            .first()
+        )
+        assert comment is not None
+        assert "IgG-bound antigen sample" in comment.com_Comment
+
+        assistant_row = (
+            assistant_db.query(SupportMessage)
+            .filter(SupportMessage.session_pk == support_session.id)
+            .filter(SupportMessage.role == "assistant")
+            .order_by(SupportMessage.id.desc())
+            .first()
+        )
+        assert assistant_row is not None
+        meta = json.loads(assistant_row.meta_json)
+        assert meta["reply_interpretation"]["awaiting_state"] == "project_comment_save_confirmation"
+        assert meta["reply_interpretation"]["runtime_kind"] == "approve"
+        assert meta["reply_interpretation"]["runtime_action"] == "approve_save"
+        assert meta["reply_interpretation"]["applied"] is True
+        assert meta["tooling"]["forced_tool_choice"] == {
+            "type": "function",
+            "function": {"name": "create_project_comment"},
+        }

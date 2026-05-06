@@ -363,6 +363,7 @@ def _normalize_reply_interpretation(
     *,
     raw_reply_interpretation: Any,
     awaiting_reply_state: dict[str, Any] | None,
+    allow_without_awaiting_state: bool,
     source: TurnDecisionSource,
     warnings: list[str],
 ) -> TurnDecisionReplyInterpretation:
@@ -376,10 +377,12 @@ def _normalize_reply_interpretation(
             warnings.append("reply_interpretation_forced_none_for_scheduled_assistant")
         return TurnDecisionReplyInterpretation(kind="none", confidence=0.0, reason=raw_reason)
 
-    if awaiting_reply_state is None:
+    if awaiting_reply_state is None and not allow_without_awaiting_state:
         if raw_kind not in {"", "none"}:
             warnings.append("reply_interpretation_ignored_without_awaiting_state")
         return TurnDecisionReplyInterpretation(kind="none", confidence=confidence, reason=raw_reason)
+    if awaiting_reply_state is None and raw_kind not in {"", "none"}:
+        warnings.append("reply_interpretation_allowed_without_awaiting_state_for_confirm_save")
 
     if raw_kind not in _REPLY_INTERPRETATION_KINDS:
         if raw_kind:
@@ -517,6 +520,7 @@ def _validate_turn_decision(
     reply_interpretation = _normalize_reply_interpretation(
         raw_reply_interpretation=raw_decision.get("reply_interpretation"),
         awaiting_reply_state=awaiting_reply_state,
+        allow_without_awaiting_state=(primary_goal == "confirm_save" or write_mode == "confirm_save"),
         source=source,
         warnings=warnings,
     )

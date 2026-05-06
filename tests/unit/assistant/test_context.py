@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ispec.assistant.context import build_ispec_context
+from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.db.models import Project
 
 
@@ -42,6 +42,11 @@ def test_build_ispec_context_includes_explicitly_mentioned_projects(db_session):
     assert isinstance(context.get("projects"), list)
     assert context["projects"][0]["id"] == int(project.id)
     assert context["projects"][0]["title"] == "Mentioned Project"
+
+
+def test_extract_project_ids_accepts_mspc_display_ids():
+    assert extract_project_ids("mspc1563 (57987) finished an MS run") == [1563]
+    assert extract_project_ids("Please review MSPC001596 and MSPC000001") == [1, 1596]
 
 
 def test_build_ispec_context_includes_project_details_for_explicit_project_lookup(db_session):

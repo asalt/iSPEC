@@ -208,3 +208,64 @@ def test_turn_decision_pipeline_normalizes_missing_reply_interpretation_to_uncle
     assert result.decision is not None
     assert result.decision.reply_interpretation.kind == "unclear"
     assert "reply_interpretation_normalized_to_unclear" in result.warnings
+
+
+def test_turn_decision_pipeline_keeps_confirm_save_reply_interpretation_without_awaiting_state() -> None:
+    groups = [
+        ToolGroup(
+            name="projects",
+            description="Project lookups and comment writes.",
+            tool_names=("get_project", "create_project_comment"),
+        )
+    ]
+
+    def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_):  # type: ignore[no-untyped-def]
+        assert tools is None
+        assert isinstance(vllm_extra_body, dict)
+        return AssistantReply(
+            content=json.dumps(
+                {
+                    "source": "support_chat",
+                    "primary_goal": "confirm_save",
+                    "needs_clarification": False,
+                    "clarification_reason": "none",
+                    "tool_plan": {
+                        "use_tools": True,
+                        "primary_group": "projects",
+                        "secondary_groups": [],
+                        "preferred_first_tool": "create_project_comment",
+                    },
+                    "write_plan": {"mode": "confirm_save"},
+                    "response_plan": {"mode": "single", "contract_cap": "direct"},
+                    "reply_interpretation": {
+                        "kind": "approve",
+                        "confidence": 0.96,
+                        "reason": "The user confirmed the prepared note.",
+                    },
+                    "confidence": 0.91,
+                    "reason": "This is a save-confirmation turn.",
+                }
+            ),
+            provider="test",
+            model="test-model",
+            meta=None,
+        )
+
+    result = run_turn_decision_pipeline(
+        generate_reply_fn=fake_generate_reply,
+        mode="own",
+        source="support_chat",
+        user_message="confirm",
+        last_assistant_message="Prepared note for MSPC001563. Reply confirm to save it.",
+        focused_project_id=1563,
+        referenced_project_ids=[],
+        groups=groups,
+        response_modes=["single"],
+        contract_caps=["direct"],
+        extra_context={"awaiting_reply_state": None},
+    )
+
+    assert result.ok is True
+    assert result.decision is not None
+    assert result.decision.reply_interpretation.kind == "approve"
+    assert "reply_interpretation_allowed_without_awaiting_state_for_confirm_save" in result.warnings

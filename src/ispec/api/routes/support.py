@@ -806,6 +806,37 @@ def _reply_interpretation_action(awaiting_state: dict[str, Any] | None, kind: st
     return mapping.get(normalized_kind)
 
 
+def _turn_decision_implies_project_comment_confirmation(
+    *,
+    turn_decision_result: Any,
+    available_tool_names: set[str],
+    focused_project_id: int | None,
+) -> dict[str, Any] | None:
+    decision = getattr(turn_decision_result, "decision", None)
+    if decision is None:
+        return None
+    if "create_project_comment" not in available_tool_names:
+        return None
+    if not isinstance(focused_project_id, int) or focused_project_id <= 0:
+        return None
+    write_plan = getattr(decision, "write_plan", None)
+    if getattr(write_plan, "mode", None) != "confirm_save":
+        return None
+    tool_plan = getattr(decision, "tool_plan", None)
+    primary_group = str(getattr(tool_plan, "primary_group", "") or "").strip()
+    preferred_tool = str(getattr(tool_plan, "preferred_first_tool", "") or "").strip()
+    if primary_group and primary_group != "projects":
+        return None
+    if preferred_tool and preferred_tool != "create_project_comment":
+        return None
+    return {
+        "name": "project_comment_save_confirmation",
+        "project_id": focused_project_id,
+        "pending_tool": "create_project_comment",
+        "source": "turn_decision_confirm_save",
+    }
+
+
 def _reply_interpretation_messages(
     *,
     action: str | None,
@@ -1740,6 +1771,12 @@ def chat(
         )
         turn_decision_runtime_applied = bool(
             turn_decision_result.ok and turn_decision_mode == "own" and turn_decision_result.decision is not None
+        )
+    if turn_decision_runtime_applied and awaiting_reply_state is None:
+        awaiting_reply_state = _turn_decision_implies_project_comment_confirmation(
+            turn_decision_result=turn_decision_result,
+            available_tool_names=available_openai_tool_names_full,
+            focused_project_id=focused_project_id,
         )
     classifier_reply_interpretation_kind = (
         turn_decision_result.decision.reply_interpretation.kind
