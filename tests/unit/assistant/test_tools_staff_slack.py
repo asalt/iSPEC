@@ -92,6 +92,127 @@ def test_assistant_enqueue_staff_slack_message_enqueues_command(tmp_path, db_ses
         assert cmd.payload_json["text"] == "Heads up to staff."
 
 
+def test_assistant_enqueue_slack_message_allows_channel_alias(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv(
+        "ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON",
+        '{"staff_ops":{"kind":"channel","channel":"C123STAFF","audience":"staff"}}',
+    )
+
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
+        payload = run_tool(
+            name="assistant_enqueue_slack_message",
+            args={
+                "to": "staff_ops",
+                "confirm": True,
+                "message": "Current project summary is ready.",
+                "message_type": "current_project_summary",
+            },
+            core_db=db_session,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=_internal_user(),
+            api_schema=None,
+            user_message="send current projects to staff ops",
+        )
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["to"] == "staff_ops"
+        assert result["channel"] == "C123STAFF"
+
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == int(result["command_id"])).one()
+        assert cmd.payload_json["channel"] == "C123STAFF"
+        assert cmd.payload_json["destination"]["alias"] == "staff_ops"
+
+
+def test_assistant_enqueue_slack_message_allows_dm_alias(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv(
+        "ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON",
+        '{"alex":{"kind":"dm","user_id":"U123ALEX","audience":"alex","allowed_message_types":["current_project_summary"]}}',
+    )
+
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
+        payload = run_tool(
+            name="assistant_enqueue_slack_message",
+            args={
+                "to": "alex",
+                "confirm": True,
+                "message": "Current projects: 14.",
+                "message_type": "current_project_summary",
+            },
+            core_db=db_session,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=_internal_user(),
+            api_schema=None,
+            user_message="send current projects to Alex",
+        )
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["to"] == "alex"
+        assert result["user_id"] == "U123ALEX"
+
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == int(result["command_id"])).one()
+        assert cmd.payload_json["user_id"] == "U123ALEX"
+        assert "channel" not in cmd.payload_json
+        assert cmd.payload_json["destination"]["kind"] == "dm"
+
+
+def test_assistant_enqueue_slack_message_refuses_unallowlisted_destination(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON", '{"alex":{"user_id":"U123ALEX"}}')
+
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
+        payload = run_tool(
+            name="assistant_enqueue_slack_message",
+            args={"to": "C123FREEFORM", "confirm": True, "message": "Should not enqueue."},
+            core_db=db_session,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=_internal_user(),
+            api_schema=None,
+            user_message="send this to channel C123FREEFORM",
+        )
+        assert payload["ok"] is False
+        assert "not allowlisted" in payload["error"]
+
+
+def test_assistant_enqueue_slack_message_checks_message_type(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setenv(
+        "ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON",
+        '{"alex":{"user_id":"U123ALEX","allowed_message_types":["report_ready"]}}',
+    )
+
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
+        payload = run_tool(
+            name="assistant_enqueue_slack_message",
+            args={
+                "to": "alex",
+                "confirm": True,
+                "message": "Current projects: 14.",
+                "message_type": "current_project_summary",
+            },
+            core_db=db_session,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=_internal_user(),
+            api_schema=None,
+            user_message="send current projects to Alex",
+        )
+        assert payload["ok"] is False
+        assert "does not allow" in payload["error"]
+
+
 def test_assistant_enqueue_staff_slack_message_refuses_when_unconfigured(tmp_path, db_session, monkeypatch):
     monkeypatch.delenv("ISPEC_SLACK_BOT_TOKEN", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)

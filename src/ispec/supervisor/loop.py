@@ -5418,14 +5418,10 @@ def _run_slack_post_message(payload: dict[str, Any]) -> CommandExecution:
         )
 
     channel = str(payload.get("channel") or "").strip()
+    user_id = str(payload.get("user_id") or payload.get("user") or "").strip()
+    email = str(payload.get("email") or "").strip()
     text = str(payload.get("text") or "").strip()
     thread_ts = str(payload.get("thread_ts") or "").strip() or None
-    if not channel:
-        return CommandExecution(
-            ok=False,
-            result={"ok": False, "error": "Missing channel."},
-            error="missing_channel",
-        )
     if not text:
         return CommandExecution(
             ok=False,
@@ -5434,6 +5430,49 @@ def _run_slack_post_message(payload: dict[str, Any]) -> CommandExecution:
         )
 
     timeout_seconds = _slack_timeout_seconds()
+    if not channel and email:
+        lookup_response = _slack_api_call(
+            token=token,
+            endpoint="users.lookupByEmail",
+            payload={"email": email},
+            timeout_seconds=timeout_seconds,
+        )
+        if lookup_response.get("ok") is not True:
+            error = str(lookup_response.get("error") or "").strip() or "unknown_error"
+            return CommandExecution(
+                ok=False,
+                result={"ok": False, "error": error, "email": email, "slack": lookup_response},
+                error=f"slack_error:{error}",
+            )
+        user_obj = lookup_response.get("user")
+        if isinstance(user_obj, dict):
+            user_id = str(user_obj.get("id") or "").strip()
+
+    if not channel and user_id:
+        open_response = _slack_api_call(
+            token=token,
+            endpoint="conversations.open",
+            payload={"users": user_id},
+            timeout_seconds=timeout_seconds,
+        )
+        if open_response.get("ok") is not True:
+            error = str(open_response.get("error") or "").strip() or "unknown_error"
+            return CommandExecution(
+                ok=False,
+                result={"ok": False, "error": error, "user_id": user_id, "slack": open_response},
+                error=f"slack_error:{error}",
+            )
+        channel_obj = open_response.get("channel")
+        if isinstance(channel_obj, dict):
+            channel = str(channel_obj.get("id") or "").strip()
+
+    if not channel:
+        return CommandExecution(
+            ok=False,
+            result={"ok": False, "error": "Missing channel or resolvable user/email."},
+            error="missing_channel",
+        )
+
     message_payload: dict[str, Any] = {"channel": channel, "text": text}
     if thread_ts:
         message_payload["thread_ts"] = thread_ts
@@ -5469,6 +5508,8 @@ def _run_slack_post_message(payload: dict[str, Any]) -> CommandExecution:
                 "ok": False,
                 "error": error,
                 "channel": channel,
+                "user_id": user_id or None,
+                "email": email or None,
                 "thread_ts": thread_ts,
                 "slack": slack_response,
             },
@@ -5480,6 +5521,8 @@ def _run_slack_post_message(payload: dict[str, Any]) -> CommandExecution:
         result={
             "ok": True,
             "channel": channel,
+            "user_id": user_id or None,
+            "email": email or None,
             "thread_ts": thread_ts,
             "slack": slack_response,
         },

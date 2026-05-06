@@ -85,6 +85,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_stats": ToolScope.staff,
     "assistant_list_tools": ToolScope.staff,
     "assistant_enqueue_dev_restart_services": ToolScope.admin,
+    "assistant_enqueue_slack_message": ToolScope.admin,
     "assistant_enqueue_staff_slack_message": ToolScope.admin,
     "assistant_list_scheduled_jobs": ToolScope.admin,
     "assistant_upsert_scheduled_job": ToolScope.admin,
@@ -140,6 +141,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
 
 _WRITE_TOOL_NAMES: set[str] = {
     "create_project_comment",
+    "assistant_enqueue_slack_message",
     "assistant_enqueue_staff_slack_message",
     "assistant_upsert_scheduled_job",
     "assistant_delete_scheduled_job",
@@ -213,6 +215,8 @@ _REPO_TOOLS_ENV = "ISPEC_ASSISTANT_ENABLE_REPO_TOOLS"
 _REPO_ROOT_ENV = "ISPEC_ASSISTANT_REPO_ROOT"
 _DEV_RESTART_ENABLED_ENV = "ISPEC_DEV_RESTART_ENABLED"
 _STAFF_SLACK_CHANNEL_ENV = "ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL"
+_ASSISTANT_SLACK_DESTINATIONS_ENV = "ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON"
+_ASSISTANT_SLACK_ALLOWED_DESTINATIONS_ENV = "ISPEC_ASSISTANT_SLACK_ALLOWED_DESTINATIONS_JSON"
 _ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_SCHEDULE_TOOLS_ENABLED"
 _TMUX_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_TMUX_TOOLS_ENABLED"
 _TMUX_TARGET_ALLOWLIST_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST"
@@ -372,6 +376,60 @@ def _staff_slack_channel() -> str | None:
     return None
 
 
+def _assistant_slack_alias_key(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+
+
+def _assistant_slack_destinations() -> dict[str, dict[str, Any]]:
+    destinations: dict[str, dict[str, Any]] = {}
+
+    staff_channel = _staff_slack_channel()
+    if staff_channel:
+        destinations["staff"] = {
+            "alias": "staff",
+            "kind": "channel",
+            "audience": "staff",
+            "channel": staff_channel,
+            "source": _STAFF_SLACK_CHANNEL_ENV,
+        }
+
+    for env_name in (_ASSISTANT_SLACK_ALLOWED_DESTINATIONS_ENV, _ASSISTANT_SLACK_DESTINATIONS_ENV):
+        raw = (os.getenv(env_name) or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for key, value in parsed.items():
+            alias = _assistant_slack_alias_key(str(key))
+            if not alias:
+                continue
+            if isinstance(value, str):
+                destinations[alias] = {"alias": alias, "channel": value.strip(), "source": env_name}
+            elif isinstance(value, dict):
+                entry = dict(value)
+                entry["alias"] = alias
+                entry.setdefault("source", env_name)
+                destinations[alias] = entry
+
+    return destinations
+
+
+def _assistant_slack_tool_status() -> tuple[bool, str | None]:
+    token = (os.getenv("ISPEC_SLACK_BOT_TOKEN") or os.getenv("SLACK_BOT_TOKEN") or "").strip()
+    if not token:
+        return False, "Slack bot token is not configured."
+    if not _assistant_slack_destinations():
+        return False, f"Configure at least one destination in {_ASSISTANT_SLACK_DESTINATIONS_ENV}."
+    return True, None
+
+
 def _staff_slack_tool_status() -> tuple[bool, str | None]:
     channel = _staff_slack_channel()
     if not channel:
@@ -380,6 +438,63 @@ def _staff_slack_tool_status() -> tuple[bool, str | None]:
     if not token:
         return False, "Slack bot token is not configured."
     return True, None
+
+
+def _resolve_assistant_slack_destination(
+    *,
+    alias: str | None,
+    message_type: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    requested = _assistant_slack_alias_key(alias or "staff")
+    if not requested:
+        return None, "Missing Slack destination alias."
+
+    destinations = _assistant_slack_destinations()
+    destination = destinations.get(requested)
+    if not isinstance(destination, dict):
+        return None, (
+            f"Slack destination {requested!r} is not allowlisted. "
+            f"Configure it in {_ASSISTANT_SLACK_DESTINATIONS_ENV}."
+        )
+
+    channel = str(destination.get("channel") or "").strip()
+    user_id = str(destination.get("user_id") or destination.get("user") or "").strip()
+    email = str(destination.get("email") or "").strip()
+    if not channel and not user_id and not email:
+        return None, f"Slack destination {requested!r} is missing channel, user_id, or email."
+
+    requested_type = _assistant_slack_alias_key(message_type)
+    allowed_types_raw = destination.get("allowed_message_types")
+    if requested_type and isinstance(allowed_types_raw, list) and allowed_types_raw:
+        allowed_types = {
+            _assistant_slack_alias_key(str(item))
+            for item in allowed_types_raw
+            if _assistant_slack_alias_key(str(item))
+        }
+        if requested_type not in allowed_types:
+            return None, (
+                f"Slack destination {requested!r} does not allow message_type={requested_type!r}."
+            )
+
+    kind = str(destination.get("kind") or "").strip().lower()
+    if not kind:
+        kind = "dm" if user_id or email or channel.startswith("D") else "channel"
+
+    resolved: dict[str, Any] = {
+        "alias": requested,
+        "kind": kind,
+        "audience": str(destination.get("audience") or "").strip() or None,
+        "source": str(destination.get("source") or "").strip() or None,
+    }
+    if channel:
+        resolved["channel"] = channel
+    if user_id:
+        resolved["user_id"] = user_id
+    if email:
+        resolved["email"] = email
+    if requested_type:
+        resolved["message_type"] = requested_type
+    return resolved, None
 
 
 def _assistant_schedule_tools_status() -> tuple[bool, str | None]:
@@ -1515,6 +1630,7 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
 
     repo_enabled = _repo_tools_enabled()
     dev_restart_enabled, _ = _dev_restart_enabled_status()
+    assistant_slack_enabled, _ = _assistant_slack_tool_status()
     staff_slack_enabled, _ = _staff_slack_tool_status()
     assistant_schedule_tools_enabled, _ = _assistant_schedule_tools_status()
     assistant_schedule_write_tools_enabled, _ = _assistant_schedule_write_tools_status()
@@ -1531,6 +1647,8 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
         if tool_name.startswith("repo_") and not repo_enabled:
             return
         if tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
+            return
+        if tool_name == "assistant_enqueue_slack_message" and not assistant_slack_enabled:
             return
         if tool_name == "assistant_enqueue_staff_slack_message" and not staff_slack_enabled:
             return
@@ -1554,6 +1672,10 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add(
         "assistant_enqueue_dev_restart_services",
         "- assistant_enqueue_dev_restart_services(services: list[str] | None = None, tmux_session: str | None = None, make_root: str | None = None, delay_seconds: int = 0, priority: int = 50, reason: str | None = None, confirm: bool)  # internal-only (dev) restarts services",
+    )
+    add(
+        "assistant_enqueue_slack_message",
+        f"- assistant_enqueue_slack_message(to: str, message: str, message_type: str | None = None, thread_ts: str | None = None, delay_seconds: int = 0, priority: int = 50, reason: str | None = None, confirm: bool)  # internal-only; posts only to configured Slack destination aliases from {_ASSISTANT_SLACK_DESTINATIONS_ENV}",
     )
     add(
         "assistant_enqueue_staff_slack_message",
@@ -1885,6 +2007,7 @@ def _assistant_list_tools_payload(
 
     repo_enabled, repo_reason = _repo_tools_enabled_status()
     dev_restart_enabled, dev_restart_reason = _dev_restart_enabled_status()
+    assistant_slack_enabled, assistant_slack_reason = _assistant_slack_tool_status()
     staff_slack_enabled, staff_slack_reason = _staff_slack_tool_status()
     assistant_schedule_tools_enabled, assistant_schedule_tools_reason = _assistant_schedule_tools_status()
     assistant_schedule_write_enabled, assistant_schedule_write_reason = _assistant_schedule_write_tools_status()
@@ -1916,6 +2039,10 @@ def _assistant_list_tools_payload(
         elif tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
             unavailable_reason = (
                 f"Dev restart tools are unavailable ({dev_restart_reason or 'disabled'})."
+            )
+        elif tool_name == "assistant_enqueue_slack_message" and not assistant_slack_enabled:
+            unavailable_reason = (
+                f"Assistant Slack messaging is unavailable ({assistant_slack_reason or 'disabled'})."
             )
         elif tool_name == "assistant_enqueue_staff_slack_message" and not staff_slack_enabled:
             unavailable_reason = (
@@ -3846,28 +3973,39 @@ def run_tool(
                 },
             }
 
-        if name == "assistant_enqueue_staff_slack_message":
+        if name in {"assistant_enqueue_slack_message", "assistant_enqueue_staff_slack_message"}:
             if agent_db is None:
                 return {"ok": False, "tool": name, "error": "agent_db is required."}
 
             if args.get("confirm") is not True:
                 return {"ok": False, "tool": name, "error": "confirm=true is required to enqueue a Slack post."}
 
-            staff_slack_enabled, staff_slack_reason = _staff_slack_tool_status()
-            if not staff_slack_enabled:
+            slack_enabled, slack_reason = (
+                _staff_slack_tool_status()
+                if name == "assistant_enqueue_staff_slack_message"
+                else _assistant_slack_tool_status()
+            )
+            if not slack_enabled:
                 return {
                     "ok": False,
                     "tool": name,
-                    "error": "Staff Slack messaging is unavailable.",
-                    "hint": staff_slack_reason or None,
+                    "error": "Assistant Slack messaging is unavailable.",
+                    "hint": slack_reason or None,
                 }
 
-            channel = _staff_slack_channel()
-            if not channel:
+            destination_alias = _safe_str(args.get("to"), max_len=80)
+            if name == "assistant_enqueue_staff_slack_message" and not destination_alias:
+                destination_alias = "staff"
+            message_type = _safe_str(args.get("message_type"), max_len=80)
+            destination, destination_error = _resolve_assistant_slack_destination(
+                alias=destination_alias,
+                message_type=message_type,
+            )
+            if destination_error:
                 return {
                     "ok": False,
                     "tool": name,
-                    "error": "Missing configured staff Slack channel.",
+                    "error": destination_error,
                 }
 
             message_text = _safe_str(args.get("message"), max_len=4000)
@@ -3890,13 +4028,20 @@ def run_tool(
             available_at = now + timedelta(seconds=delay_seconds) if delay_seconds > 0 else now
 
             command_payload: dict[str, Any] = {
-                "channel": channel,
                 "text": message_text,
+                "destination": destination,
                 "meta": {
-                    "source": "assistant_enqueue_staff_slack_message",
-                    "channel_env": _STAFF_SLACK_CHANNEL_ENV,
+                    "source": name,
+                    "destination_alias": destination.get("alias") if isinstance(destination, dict) else None,
                 },
             }
+            if isinstance(destination, dict):
+                if destination.get("channel"):
+                    command_payload["channel"] = str(destination["channel"])
+                if destination.get("user_id"):
+                    command_payload["user_id"] = str(destination["user_id"])
+                if destination.get("email"):
+                    command_payload["email"] = str(destination["email"])
             if thread_ts:
                 command_payload["thread_ts"] = thread_ts
             if reason:
@@ -3932,7 +4077,10 @@ def run_tool(
                     "queued": True,
                     "command_id": int(cmd.id),
                     "command_type": COMMAND_SLACK_POST_MESSAGE,
-                    "channel": channel,
+                    "to": destination.get("alias") if isinstance(destination, dict) else None,
+                    "destination": destination,
+                    "channel": command_payload.get("channel"),
+                    "user_id": command_payload.get("user_id"),
                     "thread_ts": thread_ts,
                     "available_at": available_at.isoformat(),
                     "priority": int(priority_int),
@@ -6096,6 +6244,50 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "assistant_enqueue_slack_message": {
+        "type": "function",
+        "function": {
+            "name": "assistant_enqueue_slack_message",
+            "description": (
+                "Internal-only: enqueue a Slack message to a configured destination alias. "
+                f"Destinations must be allowlisted in {_ASSISTANT_SLACK_DESTINATIONS_ENV}; "
+                "requires confirm=true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Configured destination alias, such as alex or staff_ops.",
+                    },
+                    "message": {"type": "string", "description": "Slack message text to post."},
+                    "text": {"type": "string", "description": "Alias for message."},
+                    "message_type": {
+                        "type": "string",
+                        "description": "Optional semantic type checked against destination allowed_message_types.",
+                    },
+                    "thread_ts": {
+                        "type": "string",
+                        "description": "Optional Slack thread timestamp to reply within an existing thread.",
+                    },
+                    "delay_seconds": {
+                        "type": "integer",
+                        "description": "Optional delay before the queued command becomes runnable (default: 0).",
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "description": "Agent command priority (default: 50).",
+                    },
+                    "reason": {"type": "string", "description": "Short reason to store in the command payload."},
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Must be true to enqueue the Slack post (safety latch).",
+                    },
+                },
+                "required": ["to", "message", "confirm"],
+            },
+        },
+    },
     "assistant_list_scheduled_jobs": {
         "type": "function",
         "function": {
@@ -6949,6 +7141,7 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
     tools: list[dict[str, Any]] = []
     repo_enabled = _repo_tools_enabled()
     dev_restart_enabled, _ = _dev_restart_enabled_status()
+    assistant_slack_enabled, _ = _assistant_slack_tool_status()
     staff_slack_enabled, _ = _staff_slack_tool_status()
     assistant_schedule_tools_enabled, _ = _assistant_schedule_tools_status()
     assistant_schedule_write_enabled, _ = _assistant_schedule_write_tools_status()
@@ -6958,6 +7151,8 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
         if _tool_requires_code_access(name) and not code_tools_enabled:
             continue
         if name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
+            continue
+        if name == "assistant_enqueue_slack_message" and not assistant_slack_enabled:
             continue
         if name == "assistant_enqueue_staff_slack_message" and not staff_slack_enabled:
             continue

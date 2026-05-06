@@ -151,3 +151,71 @@ def test_supervisor_processes_slack_post_message_command(tmp_path, monkeypatch):
         schedule_state = slack.get("weekly_meeting_ready")
         assert isinstance(schedule_state, dict)
         assert schedule_state.get("last_sent_key") == "weekly_meeting_ready:2026-01-06T09:15:00+00:00"
+
+
+def test_supervisor_processes_slack_post_message_command_to_user_id(tmp_path, monkeypatch):
+    agent_db_path = tmp_path / "agent.db"
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+
+    fixed_now = datetime(2026, 1, 6, 9, 14, tzinfo=UTC)
+    import ispec.supervisor.loop as supervisor_loop
+
+    monkeypatch.setattr(supervisor_loop, "utcnow", lambda: fixed_now)
+
+    with get_agent_session(agent_db_path) as agent_db:
+        agent_db.add(
+            AgentRun(
+                run_id="run-1",
+                agent_id="agent-1",
+                kind="supervisor",
+                status="running",
+                created_at=fixed_now,
+                updated_at=fixed_now,
+                config_json={},
+                state_json={"checks": {}},
+                summary_json={},
+            )
+        )
+        agent_db.commit()
+
+    calls: list[dict[str, object]] = []
+
+    def fake_post(url, *, headers=None, json=None, timeout=None):  # type: ignore[no-untyped-def]
+        calls.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+
+        class FakeResponse:
+            def raise_for_status(self):  # type: ignore[no-untyped-def]
+                return None
+
+            def json(self):  # type: ignore[no-untyped-def]
+                if str(url).endswith("/conversations.open"):
+                    return {"ok": True, "channel": {"id": "D123ALEX"}}
+                return {"ok": True, "channel": (json or {}).get("channel"), "ts": "123.456"}
+
+        return FakeResponse()
+
+    monkeypatch.setattr(supervisor_loop.requests, "post", fake_post)
+
+    cmd_id = _enqueue_command(
+        command_type=COMMAND_SLACK_POST_MESSAGE,
+        payload={
+            "user_id": "U123ALEX",
+            "text": "Hello from the supervisor",
+            "destination": {"alias": "alex", "kind": "dm", "user_id": "U123ALEX"},
+        },
+    )
+    assert isinstance(cmd_id, int)
+
+    processed = _process_one_command(agent_id="agent-1", run_id="run-1")
+    assert processed is True
+    assert str(calls[0]["url"]).endswith("/conversations.open")
+    assert calls[0]["json"] == {"users": "U123ALEX"}
+    assert str(calls[1]["url"]).endswith("/chat.postMessage")
+    assert calls[1]["json"] == {"channel": "D123ALEX", "text": "Hello from the supervisor"}
+
+    with get_agent_session(agent_db_path) as agent_db:
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == cmd_id).one()
+        assert cmd.status == "succeeded"
+        assert cmd.result_json["channel"] == "D123ALEX"
+        assert cmd.result_json["user_id"] == "U123ALEX"
