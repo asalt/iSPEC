@@ -2,7 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+DEFAULT_ROOT="/home/alex/tools/ispec-full"
+DERIVED_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
+if [[ -n "${ISPEC_FULL_ROOT:-}" ]]; then
+  ROOT_DIR="$(cd "${ISPEC_FULL_ROOT}" && pwd)"
+elif [[ -d "${DEFAULT_ROOT}/iSPEC" ]]; then
+  ROOT_DIR="${DEFAULT_ROOT}"
+else
+  ROOT_DIR="${DERIVED_ROOT}"
+fi
 ISPEC_BIN="${ROOT_DIR}/iSPEC/.venv/bin/ispec"
 
 TO="alex"
@@ -29,6 +37,9 @@ Options:
 
 This wrapper loads local iSPEC Slack env files when present and then delegates
 to `ispec slack send` or `ispec slack upload`.
+
+Default env lookup root: /home/alex/tools/ispec-full
+Override root with: ISPEC_FULL_ROOT=/path/to/ispec-full
 USAGE
 }
 
@@ -81,7 +92,13 @@ if [[ -z "${TO}" ]]; then
 fi
 
 ENV_ARGS=()
-for env_file in "${ROOT_DIR}/.env.local" "${ROOT_DIR}/.env.slack" "${ROOT_DIR}/.env.slack.local"; do
+for env_file in \
+  "${ROOT_DIR}/.env.local" \
+  "${ROOT_DIR}/.env.slack" \
+  "${ROOT_DIR}/.env.slack.local" \
+  "${ROOT_DIR}/iSPEC/.env.local" \
+  "${ROOT_DIR}/iSPEC/.env.slack" \
+  "${ROOT_DIR}/iSPEC/.env.slack.local"; do
   if [[ -f "${env_file}" ]]; then
     ENV_ARGS+=(--env-file "${env_file}")
   fi

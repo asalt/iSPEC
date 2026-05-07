@@ -26,6 +26,17 @@ bash iSPEC/skills/ispec-slack-wire/scripts/send-to-alex.sh --file report.pdf --t
 
 Use `--dry-run` first if recipient or file resolution is uncertain.
 
+The wrapper looks for env files under `/home/alex/tools/ispec-full` by default,
+and also supports `ISPEC_FULL_ROOT=/path/to/ispec-full` if the checkout moves.
+It loads only files that exist:
+
+- `.env.local`
+- `.env.slack`
+- `.env.slack.local`
+- `iSPEC/.env.local`
+- `iSPEC/.env.slack`
+- `iSPEC/.env.slack.local`
+
 ## Direct CLI
 
 Prefer the iSPEC CLI:
