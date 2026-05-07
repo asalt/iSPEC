@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand
 from ispec.assistant.tools import openai_tools_for_user, run_tool
@@ -125,6 +127,56 @@ def test_assistant_enqueue_slack_message_allows_channel_alias(tmp_path, db_sessi
         cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == int(result["command_id"])).one()
         assert cmd.payload_json["channel"] == "C123STAFF"
         assert cmd.payload_json["destination"]["alias"] == "staff_ops"
+
+
+def test_assistant_enqueue_slack_message_loads_channel_alias_from_json_file(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.delenv("ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON", raising=False)
+    allowlist_path = tmp_path / "assistant-slack-destinations.local.json"
+    allowlist_path.write_text(
+        json.dumps(
+            {
+                "destinations": {
+                    "proteomics_core": {
+                        "kind": "channel",
+                        "channel": "GC420B63V",
+                        "audience": "staff",
+                        "allowed_message_types": ["report_ready"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH", str(allowlist_path))
+
+    agent_db_path = tmp_path / "agent.db"
+    with get_agent_session(agent_db_path) as agent_db:
+        payload = run_tool(
+            name="assistant_enqueue_slack_message",
+            args={
+                "to": "proteomics_core",
+                "confirm": True,
+                "message": "Report is ready.",
+                "message_type": "report_ready",
+            },
+            core_db=db_session,
+            agent_db=agent_db,
+            schedule_db=None,
+            omics_db=None,
+            user=_internal_user(),
+            api_schema=None,
+            user_message="send the report note to proteomics core",
+        )
+        assert payload["ok"] is True
+        result = payload["result"]
+        assert result["to"] == "proteomics_core"
+        assert result["channel"] == "GC420B63V"
+
+        cmd = agent_db.query(AgentCommand).filter(AgentCommand.id == int(result["command_id"])).one()
+        assert cmd.payload_json["channel"] == "GC420B63V"
+        assert cmd.payload_json["destination"]["alias"] == "proteomics_core"
+        assert cmd.payload_json["destination"]["source"] == str(allowlist_path)
 
 
 def test_assistant_enqueue_slack_message_allows_dm_alias(tmp_path, db_session, monkeypatch):

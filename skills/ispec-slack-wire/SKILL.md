@@ -37,6 +37,10 @@ It loads only files that exist:
 - `iSPEC/.env.slack`
 - `iSPEC/.env.slack.local`
 
+If `configs/assistant-slack-destinations.local.json` exists, the wrapper also
+exports it as `ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH`. This lets `--to`
+resolve allowlisted channel aliases such as `proteomics_core`.
+
 ## Direct CLI
 
 Prefer the iSPEC CLI:

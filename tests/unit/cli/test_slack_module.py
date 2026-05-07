@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 
 from ispec.cli import slack
 
@@ -155,6 +156,38 @@ def test_send_slack_text_dry_run_resolves_alias_channel(monkeypatch) -> None:
     assert result["dry_run"] is True
     assert result["resolved"]["channel"] == "D123DM"
     assert result["payload"]["text"] == "hello from test"
+
+
+def test_send_slack_text_dry_run_resolves_assistant_destination_file(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("ISPEC_SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.delenv("ISPEC_SLACK_RECIPIENTS_JSON", raising=False)
+    destinations_path = tmp_path / "assistant-slack-destinations.local.json"
+    destinations_path.write_text(
+        json.dumps(
+            {
+                "destinations": {
+                    "proteomics_core": {
+                        "kind": "channel",
+                        "channel": "GC420B63V",
+                        "audience": "staff",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH", str(destinations_path))
+
+    result = slack.send_slack_text(
+        recipient="proteomics_core",
+        text="hello channel",
+        dry_run=True,
+    )
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["resolved"]["channel"] == "GC420B63V"
+    assert result["payload"]["text"] == "hello channel"
 
 
 def test_send_slack_text_resolves_email_to_dm_and_posts(monkeypatch) -> None:

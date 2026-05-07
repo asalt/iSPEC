@@ -104,6 +104,11 @@ for env_file in \
   fi
 done
 
+DEFAULT_DESTINATIONS_PATH="${ROOT_DIR}/configs/assistant-slack-destinations.local.json"
+if [[ -z "${ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH:-}" && -f "${DEFAULT_DESTINATIONS_PATH}" ]]; then
+  export ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH="${DEFAULT_DESTINATIONS_PATH}"
+fi
+
 COMMON_ARGS=(--to "${TO}")
 if [[ -n "${TIMEOUT_SECONDS}" ]]; then
   COMMON_ARGS+=(--timeout-seconds "${TIMEOUT_SECONDS}")

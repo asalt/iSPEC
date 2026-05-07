@@ -217,6 +217,8 @@ _DEV_RESTART_ENABLED_ENV = "ISPEC_DEV_RESTART_ENABLED"
 _STAFF_SLACK_CHANNEL_ENV = "ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL"
 _ASSISTANT_SLACK_DESTINATIONS_ENV = "ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON"
 _ASSISTANT_SLACK_ALLOWED_DESTINATIONS_ENV = "ISPEC_ASSISTANT_SLACK_ALLOWED_DESTINATIONS_JSON"
+_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV = "ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH"
+_ASSISTANT_SLACK_DESTINATIONS_DEFAULT_FILENAME = "assistant-slack-destinations.local.json"
 _ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_SCHEDULE_TOOLS_ENABLED"
 _TMUX_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_TMUX_TOOLS_ENABLED"
 _TMUX_TARGET_ALLOWLIST_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST"
@@ -383,6 +385,61 @@ def _assistant_slack_alias_key(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
 
 
+def _merge_assistant_slack_destinations(
+    destinations: dict[str, dict[str, Any]],
+    parsed: Any,
+    *,
+    source: str,
+) -> None:
+    if isinstance(parsed, dict) and isinstance(parsed.get("destinations"), dict):
+        parsed = parsed["destinations"]
+    if not isinstance(parsed, dict):
+        return
+
+    for key, value in parsed.items():
+        alias = _assistant_slack_alias_key(str(key))
+        if not alias:
+            continue
+        if isinstance(value, str):
+            destinations[alias] = {"alias": alias, "channel": value.strip(), "source": source}
+        elif isinstance(value, dict):
+            entry = dict(value)
+            entry["alias"] = alias
+            entry.setdefault("source", source)
+            destinations[alias] = entry
+
+
+def _assistant_slack_destinations_path() -> Path | None:
+    raw = (os.getenv(_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV) or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+
+    try:
+        from ispec.cli import dev as dev_cli
+
+        make_root = dev_cli._find_make_root(start=Path(__file__).resolve().parent)  # type: ignore[attr-defined]
+    except Exception:
+        make_root = None
+    if make_root is None:
+        return None
+
+    default_path = Path(make_root) / "configs" / _ASSISTANT_SLACK_DESTINATIONS_DEFAULT_FILENAME
+    return default_path if default_path.is_file() else None
+
+
+def _load_assistant_slack_destinations_from_path(path: Path) -> Any:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
 def _assistant_slack_destinations() -> dict[str, dict[str, Any]]:
     destinations: dict[str, dict[str, Any]] = {}
 
@@ -404,19 +461,12 @@ def _assistant_slack_destinations() -> dict[str, dict[str, Any]]:
             parsed = json.loads(raw)
         except Exception:
             continue
-        if not isinstance(parsed, dict):
-            continue
-        for key, value in parsed.items():
-            alias = _assistant_slack_alias_key(str(key))
-            if not alias:
-                continue
-            if isinstance(value, str):
-                destinations[alias] = {"alias": alias, "channel": value.strip(), "source": env_name}
-            elif isinstance(value, dict):
-                entry = dict(value)
-                entry["alias"] = alias
-                entry.setdefault("source", env_name)
-                destinations[alias] = entry
+        _merge_assistant_slack_destinations(destinations, parsed, source=env_name)
+
+    path = _assistant_slack_destinations_path()
+    if path is not None:
+        parsed = _load_assistant_slack_destinations_from_path(path)
+        _merge_assistant_slack_destinations(destinations, parsed, source=str(path))
 
     return destinations
 
@@ -426,7 +476,10 @@ def _assistant_slack_tool_status() -> tuple[bool, str | None]:
     if not token:
         return False, "Slack bot token is not configured."
     if not _assistant_slack_destinations():
-        return False, f"Configure at least one destination in {_ASSISTANT_SLACK_DESTINATIONS_ENV}."
+        return False, (
+            f"Configure at least one destination in {_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV} "
+            f"or {_ASSISTANT_SLACK_DESTINATIONS_ENV}."
+        )
     return True, None
 
 
@@ -454,7 +507,8 @@ def _resolve_assistant_slack_destination(
     if not isinstance(destination, dict):
         return None, (
             f"Slack destination {requested!r} is not allowlisted. "
-            f"Configure it in {_ASSISTANT_SLACK_DESTINATIONS_ENV}."
+            f"Configure it in {_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV} "
+            f"or {_ASSISTANT_SLACK_DESTINATIONS_ENV}."
         )
 
     channel = str(destination.get("channel") or "").strip()
@@ -1675,7 +1729,7 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     )
     add(
         "assistant_enqueue_slack_message",
-        f"- assistant_enqueue_slack_message(to: str, message: str, message_type: str | None = None, thread_ts: str | None = None, delay_seconds: int = 0, priority: int = 50, reason: str | None = None, confirm: bool)  # internal-only; posts only to configured Slack destination aliases from {_ASSISTANT_SLACK_DESTINATIONS_ENV}",
+        f"- assistant_enqueue_slack_message(to: str, message: str, message_type: str | None = None, thread_ts: str | None = None, delay_seconds: int = 0, priority: int = 50, reason: str | None = None, confirm: bool)  # internal-only; posts only to configured Slack destination aliases from {_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV} or {_ASSISTANT_SLACK_DESTINATIONS_ENV}",
     )
     add(
         "assistant_enqueue_staff_slack_message",
@@ -6250,7 +6304,8 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             "name": "assistant_enqueue_slack_message",
             "description": (
                 "Internal-only: enqueue a Slack message to a configured destination alias. "
-                f"Destinations must be allowlisted in {_ASSISTANT_SLACK_DESTINATIONS_ENV}; "
+                f"Destinations must be allowlisted in {_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV} "
+                f"or {_ASSISTANT_SLACK_DESTINATIONS_ENV}; "
                 "requires confirm=true."
             ),
             "parameters": {

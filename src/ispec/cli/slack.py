@@ -26,6 +26,12 @@ logger = get_logger(__name__)
 
 _MENTION_RE = re.compile(r"<@[^>]+>")
 _CHOOSE_RE = re.compile(r"^\s*choose\s+([01])\s*$", re.IGNORECASE)
+_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV = "ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH"
+_ASSISTANT_SLACK_DESTINATIONS_JSON_ENVS = (
+    "ISPEC_ASSISTANT_SLACK_ALLOWED_DESTINATIONS_JSON",
+    "ISPEC_ASSISTANT_SLACK_DESTINATIONS_JSON",
+)
+_ASSISTANT_SLACK_DESTINATIONS_DEFAULT_FILENAME = "assistant-slack-destinations.local.json"
 
 
 def register_subcommands(subparsers) -> None:
@@ -450,7 +456,95 @@ def _recipient_from_alias_env(alias: str) -> dict[str, str]:
             if value:
                 return {field: value}
 
+    assistant_destination = _recipient_from_assistant_destination(alias_key)
+    if assistant_destination:
+        return assistant_destination
+
     return _recipient_from_string(alias)
+
+
+def _recipient_from_assistant_destination(alias_key: str) -> dict[str, str]:
+    if not alias_key:
+        return {}
+
+    for parsed in _load_assistant_slack_destination_mappings():
+        if isinstance(parsed, dict) and isinstance(parsed.get("destinations"), dict):
+            parsed = parsed["destinations"]
+        if not isinstance(parsed, dict):
+            continue
+        entry = parsed.get(alias_key)
+        if entry is None:
+            for raw_key, raw_value in parsed.items():
+                if _slack_alias_key(str(raw_key)) == alias_key:
+                    entry = raw_value
+                    break
+        if entry is None:
+            continue
+        if isinstance(entry, str):
+            direct = _recipient_from_string(entry)
+            if direct:
+                return direct
+        if isinstance(entry, dict):
+            for field in ("channel", "user_id", "user", "email"):
+                value = str(entry.get(field) or "").strip()
+                if value:
+                    return {"user_id" if field == "user" else field: value}
+
+    return {}
+
+
+def _load_assistant_slack_destination_mappings() -> list[Any]:
+    mappings: list[Any] = []
+    for env_name in _ASSISTANT_SLACK_DESTINATIONS_JSON_ENVS:
+        raw = (os.getenv(env_name) or "").strip()
+        if not raw:
+            continue
+        try:
+            mappings.append(json.loads(raw))
+        except Exception:
+            logger.warning("Ignoring invalid %s", env_name)
+
+    path = _assistant_slack_destinations_path()
+    if path is not None:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except Exception:
+            raw = ""
+        if raw:
+            try:
+                mappings.append(json.loads(raw))
+            except Exception:
+                logger.warning("Ignoring invalid %s=%s", _ASSISTANT_SLACK_DESTINATIONS_PATH_ENV, path)
+
+    return mappings
+
+
+def _assistant_slack_destinations_path() -> Path | None:
+    raw = (os.getenv(_ASSISTANT_SLACK_DESTINATIONS_PATH_ENV) or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+
+    seen: set[Path] = set()
+    bases: list[Path] = []
+    try:
+        cwd = Path.cwd().resolve()
+        bases.extend([cwd, *cwd.parents])
+    except Exception:
+        pass
+    try:
+        here = Path(__file__).resolve()
+        bases.extend([here.parent, *here.parents])
+    except Exception:
+        pass
+
+    for base in bases:
+        if base in seen:
+            continue
+        seen.add(base)
+        candidate = base / "configs" / _ASSISTANT_SLACK_DESTINATIONS_DEFAULT_FILENAME
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _resolve_slack_send_channel(
