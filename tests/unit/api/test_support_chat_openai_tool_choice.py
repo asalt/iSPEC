@@ -555,6 +555,299 @@ def test_support_chat_confirmation_reply_saves_drafted_comment(
         assert meta["tooling"]["forced_tool_choice"] is None
 
 
+def test_support_chat_direct_save_request_forces_project_comment_tool(
+    tmp_path,
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "3000")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
+
+    db_session.add(Project(id=1602, prj_AddedBy="test", prj_ProjectTitle="Tattym Sheikh iLab request"))
+    db_session.commit()
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
+        calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        if len(calls) == 1:
+            assert tool_choice == {"type": "function", "function": {"name": "create_project_comment"}}
+            return AssistantReply(
+                content="",
+                provider="test",
+                model="test-model",
+                meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "create_project_comment",
+                            "arguments": json.dumps(
+                                {
+                                    "project_id": 1602,
+                                    "comment": (
+                                        "Antrix asked whether Tattym Sheikh was having trouble with an iLab "
+                                        "request. Shirley said Tattym had funding but needed to add the charge "
+                                        "source in iLab; the request can be initiated and billed once the charge "
+                                        "source number is available."
+                                    ),
+                                    "comment_type": "assistant_note",
+                                    "confirm": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+            )
+        return AssistantReply(
+            content="FINAL:\nSaved the note to project 1602.",
+            provider="test",
+            model="test-model",
+            meta=None,
+        )
+
+    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
+
+    db_path = tmp_path / "assistant.db"
+    with get_assistant_session(db_path) as assistant_db:
+        support_session = SupportSession(session_id="session-direct-save-1602", user_id=None)
+        assistant_db.add(support_session)
+        assistant_db.flush()
+
+        service_user = types.SimpleNamespace(
+            id=1,
+            username="api_key",
+            role=UserRole.viewer,
+            can_write_project_comments=True,
+        )
+
+        schedule_path = tmp_path / "schedule.db"
+        with get_schedule_session(schedule_path) as schedule_db:
+            response = chat(
+                ChatRequest.model_validate(
+                    {
+                        "sessionId": "session-direct-save-1602",
+                        "message": (
+                            "please make a note for project 1602 on this discussion between Antrix and Shirley "
+                            "about Tattym having funding but needing to add the charge source number into iLab; "
+                            "summarize it and save it if you're ready"
+                        ),
+                        "history": [],
+                        "ui": None,
+                    }
+                ),
+                assistant_db=assistant_db,
+                core_db=db_session,
+                schedule_db=schedule_db,
+                user=service_user,
+            )
+
+        assert response.message == "Saved the note to project 1602."
+        assert len(calls) == 2
+        comment = (
+            db_session.query(ProjectComment)
+            .filter(ProjectComment.project_id == 1602)
+            .order_by(ProjectComment.id.desc())
+            .first()
+        )
+        assert comment is not None
+        assert "charge source" in comment.com_Comment
+
+        assistant_row = (
+            assistant_db.query(support_routes.SupportMessage)
+            .filter(support_routes.SupportMessage.session_pk == support_session.id)
+            .filter(support_routes.SupportMessage.role == "assistant")
+            .order_by(support_routes.SupportMessage.id.desc())
+            .first()
+        )
+        assert assistant_row is not None
+        meta = json.loads(assistant_row.meta_json)
+        assert meta["tooling"]["forced_tool_choice"] == {
+            "type": "function",
+            "function": {"name": "create_project_comment"},
+        }
+        assert meta["tool_calls"][0]["ok"] is True
+
+
+def test_support_chat_shadow_mode_long_explicit_confirmation_can_still_save(
+    tmp_path,
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TURN_DECISION_MODE", "shadow")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "3000")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
+
+    db_session.add(Project(id=1602, prj_AddedBy="test", prj_ProjectTitle="Tattym Sheikh iLab request"))
+    db_session.commit()
+
+    monkeypatch.setattr(
+        support_routes,
+        "run_turn_decision_pipeline",
+        lambda **_: TurnDecisionResult(
+            ok=True,
+            mode="shadow",
+            source="support_chat",
+            applied=False,
+            decision=TurnDecision(
+                source="support_chat",
+                primary_goal="confirm_save",
+                needs_clarification=False,
+                clarification_reason="none",
+                tool_plan=TurnDecisionToolPlan(
+                    use_tools=True,
+                    primary_group="projects",
+                    secondary_groups=(),
+                    preferred_first_tool="create_project_comment",
+                ),
+                write_plan=TurnDecisionWritePlan(mode="confirm_save"),
+                response_plan=TurnDecisionResponsePlan(mode="single", contract_cap="direct"),
+                reply_interpretation=TurnDecisionReplyInterpretation(
+                    kind="approve",
+                    confidence=0.99,
+                    reason="The user explicitly approved saving the drafted note.",
+                ),
+                confidence=0.95,
+                reason="Shadow mode records the classifier decision but legacy runtime remains active.",
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(
+        support_routes,
+        "route_tool_groups_vllm",
+        lambda **_: (
+            {"primary": "projects", "secondary": [], "confidence": 1.0, "clarify": False},
+            AssistantReply(content="{}", provider="router", model="router", meta=None),
+        ),
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
+        calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
+        if len(calls) == 1:
+            assert tool_choice == {"type": "function", "function": {"name": "create_project_comment"}}
+            return AssistantReply(
+                content="",
+                provider="test",
+                model="test-model",
+                meta=None,
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "create_project_comment",
+                            "arguments": json.dumps(
+                                {
+                                    "project_id": 1602,
+                                    "comment": (
+                                        "Antrix and Shirley discussed Tattym Sheikh's iLab request. Shirley will "
+                                        "initiate the request and bill once the charge source number is available."
+                                    ),
+                                    "comment_type": "assistant_note",
+                                    "confirm": True,
+                                }
+                            ),
+                        },
+                    }
+                ],
+            )
+        return AssistantReply(
+            content="FINAL:\nSaved the note to project 1602.",
+            provider="test",
+            model="test-model",
+            meta=None,
+        )
+
+    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
+
+    db_path = tmp_path / "assistant.db"
+    with get_assistant_session(db_path) as assistant_db:
+        support_session = SupportSession(
+            session_id="session-long-confirm-1602",
+            user_id=None,
+            state_json=json.dumps({"current_project_id": 1602}),
+        )
+        assistant_db.add(support_session)
+        assistant_db.flush()
+        assistant_db.add(
+            SupportMessage(
+                session_pk=support_session.id,
+                role="assistant",
+                content=(
+                    "Here is a draft for the note you'd like to save for project 1602:\n\n"
+                    "Antrix and Shirley discussed Tattym Sheikh's iLab request. Shirley will initiate the "
+                    "request and bill once the charge source number is available.\n\n"
+                    "Would you like me to save this note to the project history?"
+                ),
+            )
+        )
+        assistant_db.commit()
+
+        service_user = types.SimpleNamespace(
+            id=1,
+            username="api_key",
+            role=UserRole.viewer,
+            can_write_project_comments=True,
+        )
+
+        schedule_path = tmp_path / "schedule.db"
+        with get_schedule_session(schedule_path) as schedule_db:
+            response = chat(
+                ChatRequest.model_validate(
+                    {
+                        "sessionId": "session-long-confirm-1602",
+                        "message": "excellent yes please save / commit the note it looks good",
+                        "history": [],
+                        "ui": None,
+                    }
+                ),
+                assistant_db=assistant_db,
+                core_db=db_session,
+                schedule_db=schedule_db,
+                user=service_user,
+            )
+
+        assert response.message == "Saved the note to project 1602."
+        assert len(calls) == 2
+        comment = (
+            db_session.query(ProjectComment)
+            .filter(ProjectComment.project_id == 1602)
+            .order_by(ProjectComment.id.desc())
+            .first()
+        )
+        assert comment is not None
+        assert "charge source number" in comment.com_Comment
+
+        assistant_row = (
+            assistant_db.query(support_routes.SupportMessage)
+            .filter(support_routes.SupportMessage.session_pk == support_session.id)
+            .filter(support_routes.SupportMessage.role == "assistant")
+            .order_by(support_routes.SupportMessage.id.desc())
+            .first()
+        )
+        assert assistant_row is not None
+        meta = json.loads(assistant_row.meta_json)
+        assert meta["reply_interpretation"]["legacy_kind"] == "unclear"
+        assert meta["reply_interpretation"]["classifier_kind"] == "approve"
+        assert meta["reply_interpretation"]["runtime_action"] == "clarify"
+        assert meta["tooling"]["project_comment_write_tool_reason"] == "explicit_save_request"
+        assert meta["tooling"]["forced_tool_choice"] == {
+            "type": "function",
+            "function": {"name": "create_project_comment"},
+        }
+
+
 def test_support_chat_turn_decision_owner_approve_saves_drafted_comment(
     tmp_path,
     db_session,

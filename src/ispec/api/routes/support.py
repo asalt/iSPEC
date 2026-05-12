@@ -897,6 +897,8 @@ def _project_comment_write_tool_allowed(
     action = str(reply_interpretation_action or "").strip()
     if action == "approve_save":
         return True, "reply_interpretation_approve"
+    if action == "clarify" and explicit_save_requested:
+        return True, "explicit_save_request"
     if action:
         return False, f"reply_interpretation:{action}"
     if explicit_save_requested and (not confirmation_reply or isinstance(awaiting_state, dict)):
@@ -914,6 +916,19 @@ def _project_comment_write_policy_message(*, project_id: int | None) -> dict[str
     if isinstance(project_id, int) and project_id > 0:
         text += f" The current draft context is project {project_id}."
     return {"role": "system", "content": text}
+
+
+def _project_comment_force_tool_choice_requested(message: str | None) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    if re.search(r"\b(do not|don't|dont)\s+(save|log|record|add|commit)\b", text):
+        return False
+    normalized = re.sub(r"[^\w\s]", " ", text)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not re.search(r"\b(save|commit)\b", normalized):
+        return False
+    return bool(re.search(r"\b(project|history|comment|comments|note|notes|memo|it|this)\b", normalized))
 
 
 def _write_block_reason_for_tool_payload(tool_name: str | None, tool_payload: dict[str, Any] | None) -> str | None:
@@ -2200,6 +2215,17 @@ def chat(
         tool_protocol == "openai"
         and reply_interpretation_runtime_applied
         and reply_interpretation_runtime_action == "approve_save"
+        and isinstance(focused_project_id, int)
+        and focused_project_id > 0
+        and "create_project_comment" in openai_tool_names
+    ):
+        forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
+    if (
+        tool_protocol == "openai"
+        and forced_tool_choice is None
+        and explicit_project_comment_save_request
+        and _project_comment_force_tool_choice_requested(payload.message)
+        and not confirmation_reply
         and isinstance(focused_project_id, int)
         and focused_project_id > 0
         and "create_project_comment" in openai_tool_names
