@@ -37,6 +37,16 @@ from ispec.assistant.schedules import (
     parse_weekday,
     write_assistant_schedule_rows,
 )
+from ispec.assistant.slack_tmux_bridge import (
+    BRIDGE_AGENT_ID,
+    EVENT_SLACK_ARTIFACT_REPLY,
+    EVENT_SLACK_TMUX_RELAY_SENT,
+    format_tmux_relay_message,
+    parse_event_payload,
+    recent_artifact_replies,
+    relayed_reply_event_ids,
+    stable_json,
+)
 from ispec.agent.commands import (
     COMMAND_DEV_RESTART_SERVICES,
     COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
@@ -93,6 +103,8 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_list_tmux_panes": ToolScope.admin,
     "assistant_capture_tmux_pane": ToolScope.admin,
     "assistant_compare_tmux_pane": ToolScope.admin,
+    "assistant_list_slack_artifact_replies": ToolScope.admin,
+    "assistant_relay_slack_reply_to_tmux": ToolScope.admin,
     "assistant_recent_sessions": ToolScope.staff,
     "assistant_get_session_review": ToolScope.staff,
     "assistant_prompt_header": ToolScope.staff,
@@ -146,6 +158,7 @@ _WRITE_TOOL_NAMES: set[str] = {
     "assistant_upsert_scheduled_job",
     "assistant_delete_scheduled_job",
     "assistant_set_user_brief",
+    "assistant_relay_slack_reply_to_tmux",
 }
 
 
@@ -223,6 +236,8 @@ _ASSISTANT_SCHEDULE_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_SCHEDULE_TOOLS_ENABLED"
 _TMUX_TOOLS_ENABLED_ENV = "ISPEC_ASSISTANT_TMUX_TOOLS_ENABLED"
 _TMUX_TARGET_ALLOWLIST_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST"
 _TMUX_TARGET_ALLOWLIST_PATH_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST_PATH"
+_TMUX_TARGET_BLACKLIST_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_BLACKLIST"
+_TMUX_TARGET_BLACKLIST_PATH_ENV = "ISPEC_ASSISTANT_TMUX_TARGET_BLACKLIST_PATH"
 _CODE_TOOL_USER_ALLOWLIST_FILENAME = "assistant-code-tool-users.local.txt"
 _REPO_TOOL_DEFAULT_PATH = "iSPEC/src"
 _REPO_TOOL_DEFAULT_PATH_STANDALONE = "src"
@@ -579,13 +594,21 @@ def _tmux_raw(*args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _tmux_allowlist_entries() -> list[str]:
+    return _tmux_target_list_entries(env_name=_TMUX_TARGET_ALLOWLIST_ENV, path_func=_tmux_allowlist_path)
+
+
+def _tmux_blacklist_entries() -> list[str]:
+    return _tmux_target_list_entries(env_name=_TMUX_TARGET_BLACKLIST_ENV, path_func=_tmux_blacklist_path)
+
+
+def _tmux_target_list_entries(*, env_name: str, path_func: Any) -> list[str]:
     entries: list[str] = []
 
-    raw = str(os.getenv(_TMUX_TARGET_ALLOWLIST_ENV) or "").strip()
+    raw = str(os.getenv(env_name) or "").strip()
     if raw:
         entries.extend(item.strip() for item in re.split(r"[\s,]+", raw) if item.strip())
 
-    path, configured = _tmux_allowlist_path()
+    path, configured = path_func()
     if configured and path is not None and path.is_file():
         try:
             text = path.read_text(encoding="utf-8")
@@ -621,6 +644,27 @@ def _tmux_allowlist_path() -> tuple[Path | None, bool]:
         return None, False
 
     default_path = Path(make_root) / "configs" / "tmux-pane-allowlist.local.txt"
+    return default_path, default_path.is_file()
+
+
+def _tmux_blacklist_path() -> tuple[Path | None, bool]:
+    raw = str(os.getenv(_TMUX_TARGET_BLACKLIST_PATH_ENV) or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve(), True
+
+    try:
+        from ispec.cli import dev as dev_cli
+
+        make_root = dev_cli._find_make_root(start=Path(__file__).resolve().parent)  # type: ignore[attr-defined]
+    except Exception:
+        make_root = None
+    if make_root is None:
+        return None, False
+
+    local_path = Path(make_root) / "configs" / "tmux-pane-blacklist.local.txt"
+    if local_path.is_file():
+        return local_path, True
+    default_path = Path(make_root) / "configs" / "tmux-pane-blacklist.txt"
     return default_path, default_path.is_file()
 
 
@@ -698,6 +742,39 @@ def _tmux_row_aliases(row: dict[str, Any]) -> list[str]:
             row.get("session_names"),
         ]
     )
+
+
+def _tmux_target_entry_matches_aliases(entry: str, aliases: set[str]) -> bool:
+    """Return whether one allow/deny entry matches a pane alias set.
+
+    We intentionally keep this boring: exact matches plus prefix wildcards that
+    end in "*". This matches the local observer skill without making tmux
+    routing a full glob language.
+    """
+
+    text = str(entry or "").strip()
+    if not text:
+        return False
+    if text.endswith("*"):
+        prefix = text[:-1]
+        return bool(prefix) and any(alias.startswith(prefix) for alias in aliases)
+    return text in aliases
+
+
+def _tmux_matching_target_entry(row: dict[str, Any], entries: list[str]) -> str | None:
+    aliases = {str(alias).strip() for alias in _tmux_row_aliases(row) if str(alias).strip()}
+    for entry in entries:
+        if _tmux_target_entry_matches_aliases(entry, aliases):
+            return entry
+    return None
+
+
+def _tmux_blacklist_match(row: dict[str, Any]) -> str | None:
+    return _tmux_matching_target_entry(row, _tmux_blacklist_entries())
+
+
+def _tmux_allowlist_match(row: dict[str, Any]) -> str | None:
+    return _tmux_matching_target_entry(row, _tmux_allowlist_entries())
 
 
 
@@ -840,6 +917,9 @@ def _tmux_list_candidate_panes() -> list[dict[str, Any]]:
 
 
 def _tmux_is_allowed_pane(row: dict[str, Any]) -> bool:
+    if _tmux_blacklist_match(row):
+        return False
+
     allowlist = _tmux_allowlist_entries()
     _allowlist_path, allowlist_configured = _tmux_allowlist_path()
     if not allowlist and allowlist_configured:
@@ -847,8 +927,7 @@ def _tmux_is_allowed_pane(row: dict[str, Any]) -> bool:
     if not allowlist:
         return str(row.get("session") or "").strip() == _tmux_default_session_name()
 
-    aliases = set(_tmux_row_aliases(row))
-    return any(entry in aliases for entry in allowlist)
+    return _tmux_allowlist_match(row) is not None
 
 
 
@@ -968,6 +1047,8 @@ def _tmux_capture_snapshot(
         "current_command": pane.get("current_command"),
         "pane_dead": bool(pane.get("pane_dead")),
         "pane_active": bool(pane.get("pane_active")),
+        "allowlist_match": _tmux_allowlist_match(pane),
+        "blacklist_match": _tmux_blacklist_match(pane),
         "summary": pane.get("summary") or _tmux_pane_summary(pane),
         "include_history": bool(include_history),
         "history_lines": int(history_limit) if history_limit is not None else None,
@@ -1008,6 +1089,7 @@ def _tmux_send_text(
         "capture_target": capture_target,
         "pane_id": pane.get("pane_id"),
         "pane_number": _tmux_pane_number(pane.get("pane_id")),
+        "allowlist_match": _tmux_allowlist_match(pane),
         "text_length": len(text),
         "press_enter": bool(press_enter),
     }
@@ -1692,7 +1774,7 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
 
     lines = [
         "Available tools:",
-        "- (Most tools are read-only; create_project_comment plus the internal enqueue/schedule tools perform writes.)",
+        "- (Most tools are read-only; create_project_comment plus internal enqueue/schedule/tmux-relay tools perform writes.)",
     ]
 
     def add(tool_name: str, line: str) -> None:
@@ -1710,7 +1792,12 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
             return
         if tool_name in {"assistant_upsert_scheduled_job", "assistant_delete_scheduled_job"} and not assistant_schedule_write_tools_enabled:
             return
-        if tool_name in {"assistant_list_tmux_panes", "assistant_capture_tmux_pane", "assistant_compare_tmux_pane"} and not tmux_tools_enabled:
+        if tool_name in {
+            "assistant_list_tmux_panes",
+            "assistant_capture_tmux_pane",
+            "assistant_compare_tmux_pane",
+            "assistant_relay_slack_reply_to_tmux",
+        } and not tmux_tools_enabled:
             return
         lines.append(line)
 
@@ -1758,6 +1845,14 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     add(
         "assistant_compare_tmux_pane",
         "- assistant_compare_tmux_pane(target: str, interval_seconds: int = 3, lines: int = 80, include_history: bool = false, history_lines: int | None = None)  # internal-only; compare whether a tmux pane changed over a short interval",
+    )
+    add(
+        "assistant_list_slack_artifact_replies",
+        "- assistant_list_slack_artifact_replies(limit: int = 20, include_relayed: bool = false)  # internal-only read-only; list pending Slack replies tied to sent artifact receipts",
+    )
+    add(
+        "assistant_relay_slack_reply_to_tmux",
+        "- assistant_relay_slack_reply_to_tmux(reply_event_id: int, target: str | None = None, press_enter: bool = true, confirm: bool)  # internal-only write; relay one approved Slack artifact reply into one allowlisted tmux pane",
     )
     add("assistant_recent_sessions", "- assistant_recent_sessions(limit: int = 10)")
     add("assistant_get_session_review", "- assistant_get_session_review(session_id: str)")
@@ -2110,7 +2205,12 @@ def _assistant_list_tools_payload(
             unavailable_reason = (
                 f"Assistant schedule editing is unavailable ({assistant_schedule_write_reason or 'disabled'})."
             )
-        elif tool_name in {"assistant_list_tmux_panes", "assistant_capture_tmux_pane", "assistant_compare_tmux_pane"} and not tmux_tools_enabled:
+        elif tool_name in {
+            "assistant_list_tmux_panes",
+            "assistant_capture_tmux_pane",
+            "assistant_compare_tmux_pane",
+            "assistant_relay_slack_reply_to_tmux",
+        } and not tmux_tools_enabled:
             unavailable_reason = (
                 f"tmux monitoring tools are unavailable ({tmux_tools_reason or 'disabled'})."
             )
@@ -2975,6 +3075,7 @@ def run_tool(
             "assistant_list_tmux_panes",
             "assistant_capture_tmux_pane",
             "assistant_compare_tmux_pane",
+            "assistant_relay_slack_reply_to_tmux",
         }:
             enabled, reason = _tmux_tools_status()
             if not enabled:
@@ -3209,6 +3310,7 @@ def run_tool(
                         "current_command": pane.get("current_command"),
                         "pane_dead": bool(pane.get("pane_dead")),
                         "pane_active": bool(pane.get("pane_active")),
+                        "allowlist_match": _tmux_allowlist_match(pane),
                         "summary": pane.get("summary") or _tmux_pane_summary(pane),
                     }
                 )
@@ -3281,6 +3383,114 @@ def run_tool(
                     "changed": before.get("content") != after.get("content"),
                     "before": before,
                     "after": after,
+                },
+            }
+
+        if name == "assistant_list_slack_artifact_replies":
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
+            limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=100)
+            include_relayed = bool(args.get("include_relayed") or False)
+            replies = recent_artifact_replies(
+                agent_db,
+                limit=int(limit),
+                include_relayed=bool(include_relayed),
+            )
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "count": len(replies),
+                    "include_relayed": bool(include_relayed),
+                    "replies": replies,
+                },
+            }
+
+        if name == "assistant_relay_slack_reply_to_tmux":
+            if agent_db is None:
+                return {"ok": False, "tool": name, "error": "agent_db is required."}
+            if args.get("confirm") is not True:
+                return {"ok": False, "tool": name, "error": "confirm=true is required to send text into tmux."}
+
+            reply_event_id = _safe_int(args.get("reply_event_id"))
+            if reply_event_id is None or int(reply_event_id) <= 0:
+                return {"ok": False, "tool": name, "error": "reply_event_id is required."}
+
+            row = (
+                agent_db.query(AgentEvent)
+                .filter(AgentEvent.id == int(reply_event_id))
+                .one_or_none()
+            )
+            if row is None:
+                return {"ok": False, "tool": name, "error": f"Slack artifact reply event {reply_event_id} was not found."}
+            payload = parse_event_payload(row)
+            if str(payload.get("type") or getattr(row, "event_type", "")) != EVENT_SLACK_ARTIFACT_REPLY and row.event_type != EVENT_SLACK_ARTIFACT_REPLY:
+                return {"ok": False, "tool": name, "error": "reply_event_id does not refer to a Slack artifact reply event."}
+
+            origin_tmux = payload.get("origin_tmux") if isinstance(payload.get("origin_tmux"), dict) else {}
+            routing = payload.get("routing") if isinstance(payload.get("routing"), dict) else {}
+            target = _safe_str(args.get("target"), max_len=128)
+            if not target:
+                target = (
+                    _safe_str(origin_tmux.get("pane_id"), max_len=128)
+                    or _safe_str(origin_tmux.get("capture_target"), max_len=128)
+                    or _safe_str(origin_tmux.get("preferred_alias"), max_len=128)
+                    or _safe_str(origin_tmux.get("target"), max_len=128)
+                )
+            if not target:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "No tmux target was provided and the reply receipt has no origin target.",
+                }
+
+            if int(reply_event_id) in relayed_reply_event_ids(agent_db):
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": f"Slack artifact reply event {reply_event_id} has already been relayed.",
+                }
+
+            press_enter = True if args.get("press_enter") is None else bool(args.get("press_enter"))
+            if press_enter and routing.get("submit_allowed") is not True:
+                return {
+                    "ok": False,
+                    "tool": name,
+                    "error": "This artifact receipt does not allow submit/Enter for tmux relay.",
+                }
+
+            message = format_tmux_relay_message(reply_payload=payload)
+            send_result = _tmux_send_text(target=target, text=message, press_enter=bool(press_enter))
+            relay_payload = {
+                "type": EVENT_SLACK_TMUX_RELAY_SENT,
+                "reply_event_id": int(reply_event_id),
+                "artifact_id": payload.get("artifact_id"),
+                "sent_at": datetime.now(UTC_TZ).isoformat(),
+                "tmux": send_result,
+                "press_enter": bool(press_enter),
+                "message": {"preview": message[:500], "length": len(message)},
+            }
+            event = AgentEvent(
+                agent_id=BRIDGE_AGENT_ID,
+                event_type=EVENT_SLACK_TMUX_RELAY_SENT,
+                ts=datetime.now(UTC_TZ),
+                name="slack_tmux_relay",
+                severity="info",
+                correlation_id=str(payload.get("artifact_id") or ""),
+                payload_json=stable_json(relay_payload),
+            )
+            agent_db.add(event)
+            agent_db.commit()
+            agent_db.refresh(event)
+            return {
+                "ok": True,
+                "tool": name,
+                "result": {
+                    "relayed": True,
+                    "relay_event_id": int(event.id),
+                    "reply_event_id": int(reply_event_id),
+                    "tmux": send_result,
+                    "message_preview": message[:500],
                 },
             }
 
@@ -6494,6 +6704,52 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "assistant_list_slack_artifact_replies": {
+        "type": "function",
+        "function": {
+            "name": "assistant_list_slack_artifact_replies",
+            "description": (
+                "Internal-only read-only: list recent Slack replies that were tied to artifact receipts "
+                "sent by Codex/iSPEC and are pending optional relay back to the originating tmux pane."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Max replies to return (default 20)."},
+                    "include_relayed": {
+                        "type": "boolean",
+                        "description": "If true, include replies that already have a tmux relay event.",
+                    },
+                },
+            },
+        },
+    },
+    "assistant_relay_slack_reply_to_tmux": {
+        "type": "function",
+        "function": {
+            "name": "assistant_relay_slack_reply_to_tmux",
+            "description": (
+                "Internal-only write: relay one selected Slack artifact reply into one concrete allowlisted tmux pane. "
+                "This is the write/approval half of the Slack-to-tmux bridge; use the read-only reply list first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reply_event_id": {"type": "integer", "description": "Agent event id returned by assistant_list_slack_artifact_replies."},
+                    "target": {
+                        "type": "string",
+                        "description": "Optional exact tmux target override. Defaults to the receipt origin target/pane_id.",
+                    },
+                    "press_enter": {
+                        "type": "boolean",
+                        "description": "If true, send Enter/C-m after literal text. Defaults true for approved Codex panes.",
+                    },
+                    "confirm": {"type": "boolean", "description": "Must be true to send keys into tmux."},
+                },
+                "required": ["reply_event_id", "confirm"],
+            },
+        },
+    },
     "assistant_recent_sessions": {
         "type": "function",
         "function": {
@@ -7215,7 +7471,12 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
             continue
         if name in {"assistant_upsert_scheduled_job", "assistant_delete_scheduled_job"} and not assistant_schedule_write_enabled:
             continue
-        if name in {"assistant_list_tmux_panes", "assistant_capture_tmux_pane", "assistant_compare_tmux_pane"} and not tmux_tools_enabled:
+        if name in {
+            "assistant_list_tmux_panes",
+            "assistant_capture_tmux_pane",
+            "assistant_compare_tmux_pane",
+            "assistant_relay_slack_reply_to_tmux",
+        } and not tmux_tools_enabled:
             continue
         if name.startswith("repo_") and not repo_enabled:
             continue

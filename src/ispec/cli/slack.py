@@ -13,6 +13,7 @@ import hashlib
 import json
 import sys
 import mimetypes
+import uuid
 from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,12 @@ from typing import Any
 
 import requests
 
+from ispec.assistant.slack_tmux_bridge import (
+    BRIDGE_AGENT_ID,
+    EVENT_SLACK_ARTIFACT_SENT,
+    build_artifact_sent_payload,
+    stable_json,
+)
 from ispec.logging import get_logger
 
 logger = get_logger(__name__)
@@ -106,6 +113,32 @@ def register_subcommands(subparsers) -> None:
     upload_parser.add_argument("--title", help="Optional Slack file title.")
     upload_parser.add_argument("--text", help="Optional initial Slack message/comment.")
     upload_parser.add_argument("--alt-txt", help="Optional accessibility text for images.")
+    upload_parser.add_argument(
+        "--record-artifact-receipt",
+        action="store_true",
+        help="After a successful upload, record a Slack artifact receipt in the iSPEC agent event log.",
+    )
+    upload_parser.add_argument("--artifact-id", help="Optional stable artifact id for receipt logging.")
+    upload_parser.add_argument("--origin-tmux-target", help="Human-friendly origin tmux target/alias.")
+    upload_parser.add_argument("--origin-tmux-pane-id", help="Exact origin tmux pane id, such as %1.")
+    upload_parser.add_argument("--origin-tmux-capture-target", help="Exact tmux capture/send target for receipt provenance.")
+    upload_parser.add_argument("--origin-tmux-allowlist-match", help="Allowlist entry that made the origin pane eligible.")
+    upload_parser.add_argument("--receipt-note", help="Optional receipt note/context.")
+    upload_parser.add_argument(
+        "--submit-allowed",
+        action="store_true",
+        help="Mark this artifact's origin pane as allowing Enter/C-m when a reply is explicitly relayed.",
+    )
+    upload_parser.add_argument(
+        "--ispec-server",
+        default=os.getenv("ISPEC_SLACK_ISPEC_SERVER") or os.getenv("ISPEC_API_URL") or "",
+        help="iSPEC API base URL for receipt logging.",
+    )
+    upload_parser.add_argument(
+        "--api-key",
+        default=os.getenv("ISPEC_SLACK_API_KEY") or os.getenv("ISPEC_API_KEY") or "",
+        help="Optional iSPEC API key for receipt logging.",
+    )
     upload_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -311,6 +344,44 @@ def _post_ispec_choose(
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _post_ispec_events(
+    *,
+    server: str,
+    api_key: str,
+    events: list[dict[str, Any]],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    url = server.rstrip("/") + "/api/agents/events"
+    resp = requests.post(
+        url,
+        json=events,
+        headers=_headers(api_key),
+        timeout=max(1, int(timeout_seconds)),
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _post_ispec_slack_artifact_reply(
+    *,
+    server: str,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    url = server.rstrip("/") + "/api/agents/slack/artifact-replies"
+    resp = requests.post(
+        url,
+        json=payload,
+        headers=_headers(api_key),
+        timeout=max(1, int(timeout_seconds)),
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _format_compare_choices(compare: dict[str, Any]) -> str:
@@ -881,6 +952,58 @@ def _run_upload(args) -> None:
         timeout_seconds=float(getattr(args, "timeout_seconds", 30.0)),
         dry_run=bool(getattr(args, "dry_run", False)),
     )
+    if bool(getattr(args, "record_artifact_receipt", False)):
+        artifact_id = str(getattr(args, "artifact_id", "") or "").strip() or str(uuid.uuid4())
+        origin_tmux = {
+            "target": getattr(args, "origin_tmux_target", None),
+            "preferred_alias": getattr(args, "origin_tmux_target", None),
+            "pane_id": getattr(args, "origin_tmux_pane_id", None),
+            "capture_target": getattr(args, "origin_tmux_capture_target", None),
+            "allowlist_match": getattr(args, "origin_tmux_allowlist_match", None),
+        }
+        origin_tmux = {key: value for key, value in origin_tmux.items() if value}
+        receipt_payload = build_artifact_sent_payload(
+            upload_result=result,
+            artifact_id=artifact_id,
+            origin_tmux=origin_tmux,
+            thread_ts=getattr(args, "thread_ts", None),
+            submit_allowed=bool(getattr(args, "submit_allowed", False)),
+            note=getattr(args, "receipt_note", None),
+        )
+        result["artifact_receipt"] = {
+            "artifact_id": artifact_id,
+            "payload": receipt_payload,
+            "posted": False,
+        }
+        server = str(getattr(args, "ispec_server", "") or "").strip()
+        if not server:
+            result["artifact_receipt"]["error"] = "missing_ispec_server"
+        elif result.get("ok") is True and not bool(getattr(args, "dry_run", False)):
+            event = {
+                "type": EVENT_SLACK_ARTIFACT_SENT,
+                "agent_id": BRIDGE_AGENT_ID,
+                "ts": datetime.now(UTC).isoformat(),
+                "name": "slack_artifact_sent",
+                "severity": "info",
+                "correlation_id": artifact_id,
+                "dimensions": {
+                    "artifact_id": artifact_id,
+                    "channel": receipt_payload.get("slack", {}).get("channel") if isinstance(receipt_payload.get("slack"), dict) else None,
+                    "thread_ts": receipt_payload.get("slack", {}).get("thread_ts") if isinstance(receipt_payload.get("slack"), dict) else None,
+                },
+                "value": receipt_payload,
+            }
+            try:
+                posted = _post_ispec_events(
+                    server=server,
+                    api_key=str(getattr(args, "api_key", "") or ""),
+                    events=[event],
+                    timeout_seconds=int(float(getattr(args, "timeout_seconds", 30.0))),
+                )
+                result["artifact_receipt"]["posted"] = True
+                result["artifact_receipt"]["ingest"] = posted
+            except Exception as exc:
+                result["artifact_receipt"]["error"] = str(exc)
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
 
 
@@ -1342,6 +1465,43 @@ def _run_socket_mode(args) -> None:
                         )
             return
 
+        slack_user_id = str(event.get("user") or "").strip()
+        cached: dict[str, str] = {}
+        if slack_user_id:
+            cached = _slack_user_summary(client=client, user_cache=user_cache, user_id=slack_user_id)
+
+        if thread_ts_raw:
+            try:
+                route = _post_ispec_slack_artifact_reply(
+                    server=cfg.ispec_server,
+                    api_key=cfg.api_key,
+                    payload={
+                        "team_id": team_id,
+                        "channel": channel,
+                        "channel_type": channel_type,
+                        "thread_ts": thread_ts_raw,
+                        "message_ts": event.get("ts"),
+                        "user_id": slack_user_id or None,
+                        "user_name": cached.get("user_name"),
+                        "user_display_name": cached.get("user_display_name"),
+                        "user_real_name": cached.get("user_real_name"),
+                        "text": raw_text,
+                    },
+                    timeout_seconds=cfg.timeout_seconds,
+                )
+            except Exception:
+                route = {}
+                logger.exception("Slack artifact reply route check failed channel=%s thread_ts=%s", channel, thread_ts_raw)
+            if route.get("matched") is True:
+                if str(os.getenv("ISPEC_SLACK_ARTIFACT_REPLY_ACK") or "1").strip().lower() not in {"0", "false", "no", "off"}:
+                    _safe_slack_post_message(
+                        client=client,
+                        channel=channel,
+                        thread_ts=reply_thread,
+                        text="Recorded this review for the originating Codex/tmux pane.",
+                    )
+                return
+
         # Only respond to free-form messages in DMs; keep channels quiet unless mentioned.
         if channel_type not in {"im", "mpim"}:
             return
@@ -1353,12 +1513,6 @@ def _run_socket_mode(args) -> None:
             event.get("user"),
             raw_text,
         )
-
-        slack_user_id = str(event.get("user") or "").strip()
-        if slack_user_id:
-            cached = _slack_user_summary(client=client, user_cache=user_cache, user_id=slack_user_id)
-        else:
-            cached = {}
 
         message_for_ispec = _format_message_for_ispec(text=raw_text, slack_user=cached)
         meta: dict[str, Any] = {

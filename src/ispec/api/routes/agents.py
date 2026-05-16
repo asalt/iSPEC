@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import timedelta
 from datetime import UTC, datetime
@@ -18,12 +19,35 @@ from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.models import AgentCommand, AgentEvent
 from ispec.db.connect import get_session_dep
 from ispec.db.models import Project
+from ispec.assistant.slack_tmux_bridge import (
+    BRIDGE_AGENT_ID,
+    EVENT_SLACK_ARTIFACT_REPLY,
+    build_artifact_reply_payload,
+    find_artifact_receipt_for_thread,
+    stable_json,
+)
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
 
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _allowed_slack_artifact_reply_users() -> set[str]:
+    raw_values = [
+        os.getenv("ISPEC_SLACK_ARTIFACT_REPLY_ALLOWED_USERS"),
+        os.getenv("CODEX_SLACK_DM_ALEX_USER_ID"),
+        os.getenv("SLACK_ALEX_USER_ID"),
+        os.getenv("ISPEC_SLACK_DM_ALEX_USER_ID"),
+    ]
+    users: set[str] = set()
+    for raw in raw_values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        users.update(item.strip() for item in re.split(r"[\s,]+", text) if item.strip())
+    return users
 
 
 class AgentEventIn(BaseModel):
@@ -44,6 +68,26 @@ class AgentEventIn(BaseModel):
 
 class IngestResponse(BaseModel):
     ingested: int
+
+
+class SlackArtifactReplyIn(BaseModel):
+    team_id: str | None = Field(default=None, max_length=64)
+    channel: str = Field(min_length=1, max_length=64)
+    channel_type: str | None = Field(default=None, max_length=32)
+    thread_ts: str = Field(min_length=1, max_length=64)
+    message_ts: str | None = Field(default=None, max_length=64)
+    user_id: str | None = Field(default=None, max_length=64)
+    user_name: str | None = Field(default=None, max_length=128)
+    user_display_name: str | None = Field(default=None, max_length=128)
+    user_real_name: str | None = Field(default=None, max_length=128)
+    text: str = Field(min_length=1, max_length=20_000)
+
+
+class SlackArtifactReplyResponse(BaseModel):
+    matched: bool
+    reply_event_id: int | None = None
+    artifact_id: str | None = None
+    receipt_event_id: int | None = None
 
 
 class CommandPollResponse(BaseModel):
@@ -76,6 +120,64 @@ def ingest_events(
     db.add_all(rows)
     db.commit()
     return IngestResponse(ingested=len(rows))
+
+
+@router.post("/slack/artifact-replies", response_model=SlackArtifactReplyResponse)
+def ingest_slack_artifact_reply(
+    reply: SlackArtifactReplyIn,
+    db: Session = Depends(get_agent_session_dep),
+) -> SlackArtifactReplyResponse:
+    allowed_users = _allowed_slack_artifact_reply_users()
+    if allowed_users and str(reply.user_id or "").strip() not in allowed_users:
+        return SlackArtifactReplyResponse(matched=False)
+
+    receipt = find_artifact_receipt_for_thread(
+        db,
+        channel=reply.channel,
+        thread_ts=reply.thread_ts,
+    )
+    if receipt is None:
+        return SlackArtifactReplyResponse(matched=False)
+
+    receipt_event, receipt_payload = receipt
+    now = utcnow()
+    slack_payload = {
+        "team_id": reply.team_id,
+        "channel": reply.channel,
+        "channel_type": reply.channel_type,
+        "thread_ts": reply.thread_ts,
+        "message_ts": reply.message_ts,
+        "user_id": reply.user_id,
+        "user_name": reply.user_name,
+        "user_display_name": reply.user_display_name,
+        "user_real_name": reply.user_real_name,
+    }
+    payload = build_artifact_reply_payload(
+        receipt_event=receipt_event,
+        receipt_payload=receipt_payload,
+        slack=slack_payload,
+        text=reply.text,
+    )
+    artifact_id = str(payload.get("artifact_id") or "").strip()
+    row = AgentEvent(
+        agent_id=BRIDGE_AGENT_ID,
+        event_type=EVENT_SLACK_ARTIFACT_REPLY,
+        ts=now,
+        received_at=now,
+        name="slack_artifact_reply",
+        severity="info",
+        correlation_id=artifact_id or None,
+        payload_json=stable_json(payload),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return SlackArtifactReplyResponse(
+        matched=True,
+        reply_event_id=int(row.id),
+        artifact_id=artifact_id or None,
+        receipt_event_id=int(receipt_event.id),
+    )
 
 
 @router.get("/commands/poll", response_model=CommandPollResponse)
