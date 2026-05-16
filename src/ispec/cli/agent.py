@@ -18,9 +18,12 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from ispec.agent.connect import get_agent_session
+from ispec.agent.models import AgentCommand
 
 
 def register_subcommands(subparsers) -> None:
@@ -118,6 +121,69 @@ def register_subcommands(subparsers) -> None:
         help="Run one watch tick and exit.",
     )
 
+    list_parser = subparsers.add_parser(
+        "queue-list",
+        help="List local supervisor/agent command queue rows",
+    )
+    list_parser.add_argument("--database", default=None, help="Agent DB path/URI (default: resolved env/default)")
+    list_parser.add_argument("--status", action="append", default=[], help="Status to include (repeatable)")
+    list_parser.add_argument("--command-type", action="append", default=[], help="Command type to include (repeatable)")
+    list_parser.add_argument("--limit", type=int, default=50, help="Max rows to return (default: 50)")
+    list_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain table")
+
+    cancel_parser = subparsers.add_parser(
+        "queue-cancel-stale",
+        help="Mark stale queued/running command rows as failed without processing them",
+    )
+    cancel_parser.add_argument("--database", default=None, help="Agent DB path/URI (default: resolved env/default)")
+    cancel_parser.add_argument(
+        "--older-than-hours",
+        type=float,
+        default=24.0,
+        help="Only cancel commands whose updated_at is older than this many hours (default: 24)",
+    )
+    cancel_parser.add_argument("--status", action="append", default=[], help="Status to include (default: queued,running)")
+    cancel_parser.add_argument("--command-type", action="append", default=[], help="Command type to include (repeatable)")
+    cancel_parser.add_argument("--limit", type=int, default=200, help="Max rows to cancel/list (default: 200)")
+    cancel_parser.add_argument(
+        "--reason",
+        default="manual stale queue cleanup",
+        help="Reason recorded in command error/result_json",
+    )
+    cancel_parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Actually mark matching rows failed; without this, only dry-run candidates are printed.",
+    )
+    cancel_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain table")
+
+    task_parser = subparsers.add_parser(
+        "watch-task",
+        help="Sleep once, inspect durable state for a long-running task, and optionally wake an allowlisted tmux pane",
+    )
+    task_parser.add_argument("--pid", type=int, default=None, help="PID to probe with kill(pid, 0).")
+    task_parser.add_argument("--log-file", default=None, help="Optional log file to stat.")
+    task_parser.add_argument("--output", action="append", default=[], help="Expected output file to stat; repeatable.")
+    task_parser.add_argument("--sentinel-file", default=None, help="Optional sentinel file whose existence means done.")
+    task_parser.add_argument(
+        "--sleep-seconds",
+        type=int,
+        default=180,
+        help="Initial sleep before inspection; clamped to 0..300 seconds.",
+    )
+    task_parser.add_argument("--wake-tmux-target", default=None, help="Optional exact allowlisted tmux target to wake.")
+    task_parser.add_argument(
+        "--wake-message",
+        default="Long-running task appears complete.",
+        help="Message to send if the task appears complete.",
+    )
+    task_parser.add_argument(
+        "--press-enter",
+        action="store_true",
+        help="Send Enter/C-m after the wake message. Only use for panes intended to receive submitted text.",
+    )
+    task_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain summary")
+
 
 def dispatch(args) -> None:
     if args.subcommand == "disk-free":
@@ -126,7 +192,212 @@ def dispatch(args) -> None:
     if args.subcommand == "watch":
         _run_watch(args)
         return
+    if args.subcommand == "queue-list":
+        _run_queue_list(args)
+        return
+    if args.subcommand == "queue-cancel-stale":
+        _run_queue_cancel_stale(args)
+        return
+    if args.subcommand == "watch-task":
+        _run_watch_task(args)
+        return
     raise SystemExit(f"Unknown agent subcommand: {args.subcommand}")
+
+
+def _normalize_filter_values(values: list[str] | None, *, default: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        for item in str(value or "").split(","):
+            item = item.strip()
+            if item and item not in normalized:
+                normalized.append(item)
+    return normalized or list(default)
+
+
+def _agent_command_row(row: AgentCommand) -> dict[str, Any]:
+    payload = row.payload_json if isinstance(row.payload_json, dict) else {}
+    job = payload.get("job") if isinstance(payload.get("job"), dict) else {}
+    schedule = payload.get("schedule") if isinstance(payload.get("schedule"), dict) else {}
+    return {
+        "id": int(row.id),
+        "command_type": row.command_type,
+        "status": row.status,
+        "attempts": int(row.attempts or 0),
+        "max_attempts": int(row.max_attempts or 0),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "available_at": row.available_at.isoformat() if row.available_at else None,
+        "job": str(job.get("name") or "").strip() or None,
+        "schedule": str(schedule.get("name") or "").strip() or None,
+        "error": row.error,
+    }
+
+
+def _query_agent_commands(
+    *,
+    database: str | None,
+    statuses: list[str],
+    command_types: list[str],
+    limit: int,
+    older_than_hours: float | None = None,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(5000, int(limit or 50)))
+    with get_agent_session(database) as db:
+        query = db.query(AgentCommand)
+        if statuses:
+            query = query.filter(AgentCommand.status.in_(statuses))
+        if command_types:
+            query = query.filter(AgentCommand.command_type.in_(command_types))
+        if older_than_hours is not None:
+            cutoff = datetime.now(UTC) - timedelta(hours=max(0.0, float(older_than_hours)))
+            query = query.filter(AgentCommand.updated_at <= cutoff)
+        rows = query.order_by(AgentCommand.id.asc()).limit(limit).all()
+        return [_agent_command_row(row) for row in rows]
+
+
+def _print_command_rows(payload: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    rows = payload.get("commands")
+    if not isinstance(rows, list):
+        rows = []
+    print(
+        f"ok={payload.get('ok')} dry_run={payload.get('dry_run')} "
+        f"selected={payload.get('selected')} cancelled={payload.get('cancelled')}"
+    )
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        print(
+            "\t".join(
+                [
+                    str(row.get("id") or ""),
+                    str(row.get("status") or ""),
+                    str(row.get("command_type") or ""),
+                    str(row.get("updated_at") or ""),
+                    str(row.get("job") or ""),
+                    str(row.get("schedule") or ""),
+                ]
+            )
+        )
+
+
+def _run_queue_list(args) -> None:
+    statuses = _normalize_filter_values(getattr(args, "status", None), default=["queued", "running"])
+    command_types = _normalize_filter_values(getattr(args, "command_type", None), default=[])
+    commands = _query_agent_commands(
+        database=getattr(args, "database", None),
+        statuses=statuses,
+        command_types=command_types,
+        limit=int(getattr(args, "limit", 50) or 50),
+    )
+    _print_command_rows(
+        {"ok": True, "dry_run": True, "selected": len(commands), "cancelled": 0, "commands": commands},
+        as_json=bool(getattr(args, "json", False)),
+    )
+
+
+def _run_queue_cancel_stale(args) -> None:
+    statuses = _normalize_filter_values(getattr(args, "status", None), default=["queued", "running"])
+    command_types = _normalize_filter_values(getattr(args, "command_type", None), default=[])
+    older_than_hours = max(0.0, float(getattr(args, "older_than_hours", 24.0) or 24.0))
+    limit = max(1, min(5000, int(getattr(args, "limit", 200) or 200)))
+    database = getattr(args, "database", None)
+    reason = str(getattr(args, "reason", "") or "manual stale queue cleanup").strip()
+    confirm = bool(getattr(args, "confirm", False))
+
+    candidates = _query_agent_commands(
+        database=database,
+        statuses=statuses,
+        command_types=command_types,
+        limit=limit,
+        older_than_hours=older_than_hours,
+    )
+
+    cancelled = 0
+    if confirm and candidates:
+        candidate_ids = [int(row["id"]) for row in candidates if isinstance(row.get("id"), int)]
+        now = datetime.now(UTC)
+        with get_agent_session(database) as db:
+            rows = (
+                db.query(AgentCommand)
+                .filter(AgentCommand.id.in_(candidate_ids))
+                .filter(AgentCommand.status.in_(statuses))
+                .all()
+            )
+            for row in rows:
+                result_json = dict(row.result_json or {})
+                result_json.update(
+                    {
+                        "cancelled": True,
+                        "cancelled_at": now.isoformat(),
+                        "cancel_reason": reason,
+                        "previous_status": row.status,
+                    }
+                )
+                row.status = "failed"
+                row.error = f"cancelled_stale_queue: {reason}"
+                row.ended_at = now
+                row.updated_at = now
+                row.result_json = result_json
+                cancelled += 1
+
+    _print_command_rows(
+        {
+            "ok": True,
+            "dry_run": not confirm,
+            "selected": len(candidates),
+            "cancelled": cancelled,
+            "older_than_hours": older_than_hours,
+            "statuses": statuses,
+            "command_types": command_types,
+            "commands": candidates,
+        },
+        as_json=bool(getattr(args, "json", False)),
+    )
+
+
+def _run_watch_task(args) -> None:
+    sleep_seconds = max(0, min(300, int(getattr(args, "sleep_seconds", 180) or 180)))
+    if sleep_seconds:
+        time.sleep(float(sleep_seconds))
+
+    from ispec.agent.long_task import inspect_long_task
+
+    state = inspect_long_task(
+        pid=getattr(args, "pid", None),
+        log_file=getattr(args, "log_file", None),
+        output_paths=getattr(args, "output", None) or [],
+        sentinel_file=getattr(args, "sentinel_file", None),
+    )
+    wake_target = str(getattr(args, "wake_tmux_target", "") or "").strip()
+    wake_result: dict[str, Any] | None = None
+    if state.get("should_wake") is True and wake_target:
+        from ispec.assistant.tools import _tmux_send_text
+
+        wake_result = _tmux_send_text(
+            target=wake_target,
+            text=str(getattr(args, "wake_message", "") or "Long-running task appears complete."),
+            press_enter=bool(getattr(args, "press_enter", False)),
+        )
+    payload = {
+        "ok": True,
+        "slept_seconds": sleep_seconds,
+        "state": state,
+        "wake": wake_result,
+    }
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    print(
+        "ok=True "
+        f"slept_seconds={sleep_seconds} "
+        f"complete={state.get('complete')} "
+        f"pid_alive={state.get('pid_alive')} "
+        f"outputs_ready={state.get('outputs_ready')} "
+        f"wake_sent={wake_result is not None}"
+    )
 
 
 def _utcnow_iso() -> str:
