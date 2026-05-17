@@ -16,7 +16,7 @@ Decision fields:
 
 Primary goals:
 - answer_question: normal lookup/explanation/help answer.
-- inspect_state: inspect tmux, repo, logs, or operational state.
+- inspect_state: inspect tmux, Slack/tmux bridge state, repo, logs, or operational state.
 - draft_project_comment: help draft/reword a project comment without saving yet.
 - save_project_comment: user wants a project comment saved now.
 - confirm_save: user is confirming that a previously drafted comment should now be saved.
@@ -38,6 +38,7 @@ Write-plan rules:
 
 Tool-plan rules:
 - Prefer using tools when the answer should be grounded in current iSPEC state.
+- For Slack-to-tmux bridge requests, prefer the bridge group over plain tmux because it includes reply fetch and relay awareness.
 - preferred_first_tool should be empty unless one obvious first tool lookup stands out.
 - Keep group selection tight; choose the smallest sufficient set.
 

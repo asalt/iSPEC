@@ -228,6 +228,13 @@ def _planner_tool_use_block(*, tool_names: set[str] | None = None) -> str:
         tool_use_lines.append(
             "- For code searches in the iSPEC repo (dev-only), use repo_search/repo_list_files/repo_read_file."
         )
+    if has("assistant_list_slack_artifact_replies") or has("assistant_relay_slack_reply_to_tmux"):
+        tool_use_lines.append(
+            "- For Slack/tmux bridge requests, use assistant_list_slack_artifact_replies to inspect pending replies, then assistant_relay_slack_reply_to_tmux only when explicitly requested."
+        )
+        tool_use_lines.append(
+            "- The bridge relay can send literal text and Enter with press_enter=true, but it requires confirm=true and tool-side allowlist/provenance checks; do not claim it worked without ok=true."
+        )
     if has("assistant_list_tools"):
         tool_use_lines.append(
             "- If you're unsure which tool can solve a request, call assistant_list_tools(query=...)."

@@ -1889,6 +1889,8 @@ def chat(
                 support_policy_selection.tool_name,
             }
             selected_tool_names |= grouped_tool_names.get("tmux", set())
+            for group_name in hinted_group_names:
+                selected_tool_names |= grouped_tool_names.get(group_name, set())
             if requested_tool_names_available:
                 selected_tool_names |= set(requested_tool_names_available)
             tool_router = {
@@ -1917,6 +1919,9 @@ def chat(
                 explicit_requested_tool_names=requested_tool_names_available,
                 always_include=["assistant_prompt_header", "assistant_list_tools"],
             )
+            grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
+            for group_name in hinted_group_names:
+                selected_tool_names |= grouped_tool_names.get(group_name, set())
             tool_router = {
                 "ok": True,
                 "source": "turn_decision",

@@ -71,6 +71,13 @@ _TMUX_RAW_CAPTURE_RE = re.compile(
     r"|\b(stdout|stderr|traceback|stack\s+trace|logs?)\b",
     re.IGNORECASE,
 )
+_BRIDGE_ROUTER_HINT_RE = re.compile(
+    r"\b(slack|artifact|receipt|reply|replies|review\s+thread|relay|forward)\b.*\b(tmux|pane|codex|terminal|session)\b"
+    r"|\b(tmux|pane|codex|terminal|session)\b.*\b(slack|artifact|receipt|reply|replies|review\s+thread|relay|forward)\b"
+    r"|\b(?:relay|forward|send)\b.*\b(?:back|into|to)\b.*\b(tmux|pane|codex|terminal|session)\b"
+    r"|\b(?:press|send)\s+(?:enter|c-m)\b",
+    re.IGNORECASE,
+)
 _TMUX_PANE_NUMBER_RE = re.compile(r"\bpane\s+(\d{1,4})\b", re.IGNORECASE)
 _TMUX_CLASSIFIER_MIN_CONFIDENCE = 0.6
 _TMUX_CLASSIFIER_MAX_CANDIDATES = 8
@@ -431,6 +438,8 @@ def _select_tmux_support_tool_policy(
 ) -> SupportToolPolicySelection | None:
     if not _TMUX_ROUTER_HINT_RE.search(ctx.message or ""):
         return None
+    if _BRIDGE_ROUTER_HINT_RE.search(ctx.message or ""):
+        return None
 
     panes = _tmux_policy_panes()
     if not panes:
@@ -629,7 +638,8 @@ _TOOL_POLICY_RULES: tuple[SupportToolPolicyRule, ...] = (
     ),
     SupportToolPolicyRule(
         name="tmux_inspection",
-        matches=lambda ctx: bool(_TMUX_ROUTER_HINT_RE.search(ctx.message or "")),
+        matches=lambda ctx: bool(_TMUX_ROUTER_HINT_RE.search(ctx.message or ""))
+        and not _BRIDGE_ROUTER_HINT_RE.search(ctx.message or ""),
         tool_name=lambda _ctx: "assistant_list_tmux_panes",
         build_args=lambda _ctx: {},
         build_messages=lambda _ctx: [],
@@ -641,6 +651,10 @@ _GROUP_HINT_RULES: tuple[SupportGroupHintRule, ...] = (
     SupportGroupHintRule(
         name="tmux_text_hint",
         collect_groups=lambda ctx: {"tmux"} if _TMUX_ROUTER_HINT_RE.search(ctx.message or "") else set(),
+    ),
+    SupportGroupHintRule(
+        name="bridge_text_hint",
+        collect_groups=lambda ctx: {"bridge"} if _BRIDGE_ROUTER_HINT_RE.search(ctx.message or "") else set(),
     ),
     SupportGroupHintRule(
         name="project_id_presence",

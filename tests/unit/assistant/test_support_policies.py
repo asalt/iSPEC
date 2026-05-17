@@ -76,6 +76,21 @@ def test_select_support_tool_policy_for_tmux_request_resolves_unique_pane(monkey
     assert "summarize the pane's current state" in selection.messages[0]["content"]
 
 
+def test_bridge_request_is_hinted_without_forcing_read_only_tmux_policy(monkeypatch) -> None:
+    def fail_if_called() -> list[dict]:
+        raise AssertionError("bridge-shaped requests should not force the read-only tmux resolver")
+
+    monkeypatch.setattr("ispec.assistant.support_policies._tmux_policy_panes", fail_if_called)
+
+    message = "please relay the latest Slack reply back to the 936 tmux pane and press enter"
+    groups = hinted_support_tool_groups(message=message, focused_project_id=None)
+    selection = select_support_tool_policy(message=message)
+
+    assert "bridge" in groups
+    assert "tmux" in groups
+    assert selection is None
+
+
 def test_select_support_tool_policy_for_tmux_raw_request_prefers_larger_capture(monkeypatch) -> None:
     monkeypatch.setattr(
         "ispec.assistant.support_policies._tmux_policy_panes",

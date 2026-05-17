@@ -13,6 +13,8 @@ Use this skill when Alex explicitly asks Codex to send a report/artifact over Sl
 - Codex is the actor that decides when to fetch pending Slack replies and when to relay one into tmux.
 - Slack replies can create pending review events, but they should not automatically send keys.
 - The bridge is intentionally split into a read-only fetch step and a confirmed write step.
+- Treat the bridge as one coherent capability context: tmux inspection, Slack artifact reply fetch, and explicit tmux relay belong together.
+- The context is awareness, not permission. Permissions are enforced by receipt provenance, Slack/user allowlists, tmux allowlist/blacklist checks, `confirm=true`, and explicit `press_enter`.
 
 ## Expected Flow
 
@@ -58,8 +60,9 @@ The older one-way Slack DM helper is still fine for plain notifications, but a r
 
 ## Tool Split
 
-- Read-only: `assistant_list_slack_artifact_replies`
-- Write: `assistant_relay_slack_reply_to_tmux`
+- Read-only tmux: `assistant_list_tmux_panes`, `assistant_capture_tmux_pane`, `assistant_compare_tmux_pane`
+- Read-only Slack reply fetch: `assistant_list_slack_artifact_replies`
+- Write relay: `assistant_relay_slack_reply_to_tmux`
 
 The write tool requires `confirm=true`. It sends literal text first, then sends Enter/C-m only when `press_enter=true`.
 

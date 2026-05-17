@@ -78,6 +78,21 @@ def test_generate_reply_vllm_calls_chat_completions(monkeypatch):
     assert sum(1 for item in messages if item.get("role") == "user" and item.get("content") == "Hello") == 1
 
 
+def test_planner_tool_use_block_describes_slack_tmux_bridge() -> None:
+    block = service._planner_tool_use_block(
+        tool_names={
+            "assistant_list_slack_artifact_replies",
+            "assistant_relay_slack_reply_to_tmux",
+        }
+    )
+
+    assert "Slack/tmux bridge" in block
+    assert "assistant_list_slack_artifact_replies" in block
+    assert "assistant_relay_slack_reply_to_tmux" in block
+    assert "press_enter=true" in block
+    assert "confirm=true" in block
+
+
 def test_generate_reply_vllm_passes_temperature_from_env(monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
     monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")

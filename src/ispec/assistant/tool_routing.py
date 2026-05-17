@@ -88,11 +88,25 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
     ),
     ToolGroup(
         name="tmux",
-        description="Use for questions about what is happening in tmux sessions, panes, windows, or Codex terminals; lists or reads only allowed panes.",
+        description="Read-only tmux inspection: list, capture, or compare allowed panes/windows/sessions.",
         tool_names=(
             "assistant_list_tmux_panes",
             "assistant_capture_tmux_pane",
             "assistant_compare_tmux_pane",
+        ),
+    ),
+    ToolGroup(
+        name="bridge",
+        description=(
+            "Slack-to-tmux bridge: inspect allowed tmux panes, fetch pending Slack artifact replies, "
+            "and relay an explicitly approved reply/Enter to a concrete allowlisted pane."
+        ),
+        tool_names=(
+            "assistant_list_tmux_panes",
+            "assistant_capture_tmux_pane",
+            "assistant_compare_tmux_pane",
+            "assistant_list_slack_artifact_replies",
+            "assistant_relay_slack_reply_to_tmux",
         ),
     ),
     ToolGroup(
