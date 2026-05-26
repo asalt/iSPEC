@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iSPEC Relay Cleanup Review</title>
+  <style>
+    :root {
+      --bg: #f7f3ec;
+      --paper: #fffdf8;
+      --ink: #25221e;
+      --muted: #6f665b;
+      --line: #dfd4c4;
+      --accent: #1f6f68;
+      --accent-soft: #dceee9;
+      --warn: #9a5b13;
+      --code: #f1eadf;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top left, #e8f3ef 0, transparent 32rem), var(--bg);
+      color: var(--ink);
+      font: 16px/1.55 Georgia, "Iowan Old Style", serif;
+    }
+    main {
+      max-width: 980px;
+      margin: 3rem auto;
+      padding: 0 1.25rem;
+    }
+    article {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: 0 18px 55px rgba(67, 54, 38, 0.12);
+      overflow: hidden;
+    }
+    header {
+      padding: 2rem 2.25rem;
+      background: linear-gradient(135deg, #fdf8ed, #e7f2ee);
+      border-bottom: 1px solid var(--line);
+    }
+    h1, h2, h3 {
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      letter-spacing: -0.025em;
+      line-height: 1.1;
+    }
+    h1 {
+      margin: 0 0 0.5rem;
+      font-size: clamp(2rem, 5vw, 3.5rem);
+    }
+    h2 {
+      margin: 2rem 0 0.75rem;
+      color: var(--accent);
+      font-size: 1.45rem;
+    }
+    h3 {
+      margin: 1.35rem 0 0.4rem;
+      font-size: 1.05rem;
+    }
+    section {
+      padding: 0 2.25rem 2rem;
+    }
+    code, pre {
+      font-family: "SFMono-Regular", Consolas, monospace;
+    }
+    code {
+      background: var(--code);
+      border-radius: 0.35rem;
+      padding: 0.1rem 0.3rem;
+      font-size: 0.92em;
+    }
+    pre {
+      white-space: pre-wrap;
+      background: #28231f;
+      color: #f9f1df;
+      border-radius: 14px;
+      padding: 1rem;
+      overflow-x: auto;
+      font-size: 0.9rem;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1rem 0;
+      font-size: 0.95rem;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 0.65rem 0.55rem;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--muted);
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .pill {
+      display: inline-block;
+      margin: 0.15rem 0.2rem 0.15rem 0;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: #174f4a;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 0.82rem;
+      font-weight: 650;
+    }
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #f5fbf8;
+      padding: 0.85rem 1rem;
+      border-radius: 0 12px 12px 0;
+    }
+    .warn {
+      border-left-color: var(--warn);
+      background: #fff7e9;
+    }
+    .muted {
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+<main>
+  <article>
+    <header>
+      <p class="muted">Static review packet generated after the relay baseline commit.</p>
+      <h1>Relay Cleanup Review</h1>
+      <p>The local relay path now has a committed baseline, followed by a behavior-preserving module split for easier review and future hardening.</p>
+      <span class="pill">stage-only by default</span>
+      <span class="pill">public facade preserved</span>
+      <span class="pill">Slack/tmux adapters isolated</span>
+      <span class="pill">focused tests green</span>
+    </header>
+
+    <section>
+      <h2>Commit Anchors</h2>
+      <table>
+        <tr><th>Repo</th><th>Commit</th><th>Purpose</th></tr>
+        <tr>
+          <td><code>iSPEC</code></td>
+          <td><code>43407fd Add local relay inbox and PDF support</code></td>
+          <td>Committed the working relay/PDF support slice before cleanup.</td>
+        </tr>
+        <tr>
+          <td><code>ispec-full</code></td>
+          <td><code>a13abd9 Document relay dispatcher env options</code></td>
+          <td>Committed top-level environment documentation updates separately.</td>
+        </tr>
+      </table>
+
+      <h2>Cleanup Diff Summary</h2>
+      <p>The main change is splitting <code>src/ispec/agent/relay.py</code> from a large implementation file into a stable public facade. The old import surface remains available to callers such as the API, CLI, supervisor loop, and tests.</p>
+      <pre>src/ispec/agent/relay.py | 1184 +++-------------------------------------------
+1 file changed, 74 insertions(+), 1110 deletions(-)</pre>
+      <p class="note">The new extracted modules are untracked until this cleanup is reviewed/staged, so normal <code>git diff --stat</code> reports the shrink in <code>relay.py</code> but not the added module contents.</p>
+
+      <h2>Module Map</h2>
+      <table>
+        <tr><th>File</th><th>Responsibility</th></tr>
+        <tr><td><code>relay.py</code></td><td>Public facade and re-export surface.</td></tr>
+        <tr><td><code>relay_constants.py</code></td><td>Event names, failure taxonomy, request kinds, schema version.</td></tr>
+        <tr><td><code>relay_utils.py</code></td><td>Small shared helpers for timestamps, slugs, truthy env values, truncation.</td></tr>
+        <tr><td><code>relay_config.py</code></td><td>Canonical env/config probing, Slack destination resolution, live-send/source policy helpers.</td></tr>
+        <tr><td><code>relay_normalize.py</code></td><td>Request normalization and bounded schema shaping.</td></tr>
+        <tr><td><code>relay_store.py</code></td><td>Queue insertion and receipt event persistence.</td></tr>
+        <tr><td><code>relay_tmux.py</code></td><td>Tmux allowlist/blacklist matching and write adapter.</td></tr>
+        <tr><td><code>relay_slack.py</code></td><td>Slack message, channel resolution, and PDF upload adapter.</td></tr>
+        <tr><td><code>relay_dispatcher.py</code></td><td>Policy actuator: stage/send decision, confirmation checks, adapter selection, receipts.</td></tr>
+      </table>
+
+      <h2>Behavioral Boundary</h2>
+      <p>The split keeps the same safety posture: relay requests are staged unless <code>mode=send</code>, <code>confirm=true</code>, live sending is enabled, the source/target policy passes, and the concrete adapter succeeds. Receipts remain the source of truth for outcome reporting.</p>
+      <p class="note warn">No new autonomous behavior was added here. This is integration hardening and reviewability work, not a scheduler or always-on decision loop.</p>
+
+      <h2>Tests Run</h2>
+      <pre>pytest tests/unit/agent/test_relay.py tests/unit/api/test_agents_relay.py tests/unit/supervisor/test_relay_dispatcher.py tests/unit/cli/test_agent_queue.py
+# 17 passed, 2 FastAPI deprecation warnings
+
+pytest tests/unit/api/test_agents_commands.py tests/unit/assistant/test_tools_staff_slack.py tests/unit/supervisor/test_slack_schedule.py
+# 14 passed, 2 FastAPI deprecation warnings</pre>
+
+      <h2>Review Checklist</h2>
+      <p>Recommended review order:</p>
+      <table>
+        <tr><th>Step</th><th>What to inspect</th></tr>
+        <tr><td>1</td><td>Confirm <code>relay.py</code> exports match previous external use.</td></tr>
+        <tr><td>2</td><td>Review <code>relay_dispatcher.py</code> to verify policy still owns all send decisions.</td></tr>
+        <tr><td>3</td><td>Review <code>relay_config.py</code> to confirm canonical env probing is independent of random cwd.</td></tr>
+        <tr><td>4</td><td>Review <code>relay_slack.py</code> and <code>relay_tmux.py</code> as isolated adapter surfaces.</td></tr>
+        <tr><td>5</td><td>Stage only the relay cleanup files if committing; leave unrelated existing dirty files untouched.</td></tr>
+      </table>
+
+      <h2>Known Worktree Context</h2>
+      <p>There are unrelated dirty files in the nested <code>iSPEC</code> repo from prior feature work, including support chat, classifier, legacy sync, omics import, and experiment-run tests. This cleanup intentionally did not stage or modify those areas.</p>
+    </section>
+  </article>
+</main>
+</body>
+</html>
