@@ -44,6 +44,14 @@ class PreparedSmallClassifierTask:
 
 
 _SAVE_REPLY_INTERPRETATION_LABELS = ("approve", "deny", "defer", "modify", "unclear")
+_PROJECT_COMMENT_APPROVAL_LABELS = (
+    "approve_save",
+    "deny_save",
+    "draft_only",
+    "revise_draft",
+    "requires_explicit_confirmation",
+    "unrelated_or_unclear",
+)
 
 
 @prompt_binding("assistant.small_classifier.save_reply_interpretation")
@@ -51,7 +59,27 @@ def _save_reply_interpretation_prompt() -> str:
     return load_bound_prompt(_save_reply_interpretation_prompt).text
 
 
+@prompt_binding("assistant.small_classifier.project_comment_approval")
+def _project_comment_approval_prompt() -> str:
+    return load_bound_prompt(_project_comment_approval_prompt).text
+
+
 _SMALL_CLASSIFIER_TASKS: dict[str, SmallClassifierTaskSpec] = {
+    "project_comment_approval": SmallClassifierTaskSpec(
+        name="project_comment_approval",
+        labels=_PROJECT_COMMENT_APPROVAL_LABELS,
+        required_input_keys=(
+            "user_message",
+            "prior_assistant_message",
+            "state_gate",
+            "lexical_features",
+            "pending_action",
+            "focused_project_id",
+        ),
+        binding_callable=_project_comment_approval_prompt,
+        max_tokens=96,
+        temperature=0.0,
+    ),
     "save_reply_interpretation": SmallClassifierTaskSpec(
         name="save_reply_interpretation",
         labels=_SAVE_REPLY_INTERPRETATION_LABELS,

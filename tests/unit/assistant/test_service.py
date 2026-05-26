@@ -93,6 +93,14 @@ def test_planner_tool_use_block_describes_slack_tmux_bridge() -> None:
     assert "confirm=true" in block
 
 
+def test_planner_tool_use_block_project_comment_confirmation_includes_candidate_note() -> None:
+    block = service._planner_tool_use_block(tool_names={"create_project_comment"})
+
+    assert "exact proposed note text" in block
+    assert "approve something concrete" in block
+    assert "create_project_comment(confirm=true)" in block
+
+
 def test_generate_reply_vllm_passes_temperature_from_env(monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
     monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")

@@ -80,10 +80,11 @@ def _generate_classifier_vllm_reply(
     messages: list[dict[str, Any]],
     vllm_extra_body: dict[str, Any],
     observability_context: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
 ) -> AssistantReply:
     base_url = _classifier_vllm_url()
     url = f"{base_url}/v1/chat/completions"
-    timeout = _classifier_vllm_timeout_seconds()
+    timeout = max(0.1, float(timeout_seconds)) if timeout_seconds is not None else _classifier_vllm_timeout_seconds()
     headers = _classifier_vllm_headers()
     model = _classifier_vllm_model() or "unknown"
     payload: dict[str, Any] = {
@@ -155,8 +156,14 @@ def generate_classifier_reply(
     messages: list[dict[str, Any]],
     vllm_extra_body: dict[str, Any],
     observability_context: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
 ) -> AssistantReply:
     provider = _classifier_provider()
     if provider == "vllm":
-        return _generate_classifier_vllm_reply(messages=messages, vllm_extra_body=vllm_extra_body, observability_context=observability_context)
+        return _generate_classifier_vllm_reply(
+            messages=messages,
+            vllm_extra_body=vllm_extra_body,
+            observability_context=observability_context,
+            timeout_seconds=timeout_seconds,
+        )
     return base_generate_reply_fn(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=observability_context)

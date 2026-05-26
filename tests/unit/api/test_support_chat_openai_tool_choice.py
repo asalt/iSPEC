@@ -1370,17 +1370,32 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
     def fake_route_tool_groups_vllm(**_) -> tuple[dict[str, Any] | None, AssistantReply]:
         return None, AssistantReply(content="{}", provider="router", model="router", meta=None)
 
-    calls: list[dict[str, Any]] = []
+    classifier_calls: list[dict[str, Any]] = []
+    final_calls: list[dict[str, Any]] = []
 
     def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, vllm_extra_body=None, **_) -> AssistantReply:
-        calls.append(
-            {
-                "messages": messages,
-                "tools": tools,
-                "tool_choice": tool_choice,
-                "vllm_extra_body": vllm_extra_body,
-            }
-        )
+        call = {
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "vllm_extra_body": vllm_extra_body,
+        }
+        if vllm_extra_body is not None:
+            classifier_calls.append(call)
+            return AssistantReply(
+                content=json.dumps(
+                    {
+                        "intent": "draft_only",
+                        "confidence": 0.95,
+                        "reason": "The user asked to draft a comment, not save it.",
+                    }
+                ),
+                provider="test-classifier",
+                model="test-classifier",
+                meta={"elapsed_ms": 7},
+            )
+
+        final_calls.append(call)
         tool_names = {
             str(spec.get("function", {}).get("name") or "")
             for spec in (tools or [])
@@ -1393,7 +1408,6 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
             and "Do not save or log to project history in this turn unless the user explicitly asks you to save" in str(item.get("content") or "")
             for item in (messages or [])
         )
-        assert vllm_extra_body is None
         return AssistantReply(
             content=(
                 "FINAL:\n"
@@ -1442,7 +1456,7 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
             )
 
         assert "Draft comment for project 1531" in (response.message or "")
-        assert len(calls) == 1
+        assert len(final_calls) == 1
         assert (
             db_session.query(ProjectComment)
             .filter(ProjectComment.project_id == 1531)

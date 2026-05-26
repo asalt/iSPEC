@@ -219,7 +219,10 @@ def _planner_tool_use_block(*, tool_names: set[str] | None = None) -> str:
             "- For drafting requests, write the draft text directly. Do not ask the user to emit TOOL_CALL syntax or name the create_project_comment tool."
         )
         tool_use_lines.append(
-            "- If the user explicitly asks you to add/save/log a project note/comment (e.g. 'make a note for project 1478'), call create_project_comment immediately (confirm=true) and then confirm using the tool result (include comment_id)."
+            "- If the user asks to add, save, log, track, remember, or make a note about project information and project plus note content are clear, create a concise project note with current project context and call create_project_comment(confirm=true); do not merely say it could be saved."
+        )
+        tool_use_lines.append(
+            "- If you ask for confirmation before saving a project note, include the exact proposed note text so the user can approve something concrete."
         )
         tool_use_lines.append(
             "- If you asked the user to confirm saving a drafted note and they confirm (e.g. 'yes' / 'ok'), call create_project_comment and then confirm using the tool result (include comment_id)."

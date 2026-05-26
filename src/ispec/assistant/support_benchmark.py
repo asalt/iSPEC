@@ -521,6 +521,11 @@ def assert_case_expectations(case: dict[str, Any], expect: dict[str, Any] | None
     final_meta = final_assistant.get("assistant_meta") if isinstance(final_assistant.get("assistant_meta"), dict) else {}
     response_contract = final_meta.get("response_contract") if isinstance(final_meta.get("response_contract"), dict) else {}
     reply_interpretation = final_meta.get("reply_interpretation") if isinstance(final_meta.get("reply_interpretation"), dict) else {}
+    approval_eval = (
+        final_meta.get("project_comment_approval_eval")
+        if isinstance(final_meta.get("project_comment_approval_eval"), dict)
+        else {}
+    )
     tool_calls = final_meta.get("tool_calls") if isinstance(final_meta.get("tool_calls"), list) else []
     if "assistant_message_count" in expect:
         assert len(assistant_messages) == int(expect["assistant_message_count"])
@@ -539,6 +544,12 @@ def assert_case_expectations(case: dict[str, Any], expect: dict[str, Any] | None
         assert reply_interpretation.get("runtime_kind") == expect["reply_interpretation_runtime_kind"]
     if "reply_interpretation_runtime_action" in expect:
         assert reply_interpretation.get("runtime_action") == expect["reply_interpretation_runtime_action"]
+    if "project_comment_approval_policy_decision" in expect:
+        policy = approval_eval.get("policy") if isinstance(approval_eval.get("policy"), dict) else {}
+        assert policy.get("decision") == expect["project_comment_approval_policy_decision"]
+    if "project_comment_approval_classifier_label" in expect:
+        classifier = approval_eval.get("classifier") if isinstance(approval_eval.get("classifier"), dict) else {}
+        assert classifier.get("label") == expect["project_comment_approval_classifier_label"]
     if "tool_call_names_include" in expect:
         names = {str(item.get("name") or "").strip() for item in tool_calls if isinstance(item, dict) and str(item.get("name") or "").strip()}
         for name in _string_list(expect.get("tool_call_names_include")):
@@ -554,6 +565,15 @@ def collect_turn_metrics(*, session_id: str, assistant_row: SupportMessage, wall
     prompt_stages = [str(item.get("prompt") or "").strip() for item in llm_trace if isinstance(item, dict) and str(item.get("prompt") or "").strip()]
     prompt_families = [str(item.get("prompt_family") or "").strip() for item in llm_trace if isinstance(item, dict) and str(item.get("prompt_family") or "").strip()]
     parser_fallback_used = any(bool(item.get("tool_parser_fallback_used")) for item in provider_meta_items if isinstance(item, dict))
+    approval_eval = (
+        meta.get("project_comment_approval_eval")
+        if isinstance(meta.get("project_comment_approval_eval"), dict)
+        else {}
+    )
+    approval_classifier = (
+        approval_eval.get("classifier") if isinstance(approval_eval.get("classifier"), dict) else {}
+    )
+    approval_policy = approval_eval.get("policy") if isinstance(approval_eval.get("policy"), dict) else {}
     return {
         "assistant_message_id": int(assistant_row.id),
         "wall_clock_ms": int(wall_clock_ms),
@@ -572,6 +592,10 @@ def collect_turn_metrics(*, session_id: str, assistant_row: SupportMessage, wall
         "controller_rule": (meta.get("controller", {}).get("selected_rule_name") if isinstance(meta.get("controller"), dict) else None),
         "response_contract_mode": (meta.get("response_contract", {}).get("configured_mode") if isinstance(meta.get("response_contract"), dict) else None),
         "reply_interpretation_action": (meta.get("reply_interpretation", {}).get("runtime_action") if isinstance(meta.get("reply_interpretation"), dict) else None),
+        "project_comment_approval_label": approval_classifier.get("label"),
+        "project_comment_approval_confidence": approval_classifier.get("confidence"),
+        "project_comment_approval_latency_ms": approval_classifier.get("latency_ms"),
+        "project_comment_approval_policy_decision": approval_policy.get("decision"),
         "session_id": session_id,
         "assistant_text": str(assistant_row.content or ""),
         "assistant_meta": meta,

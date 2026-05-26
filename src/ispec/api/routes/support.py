@@ -18,6 +18,7 @@ from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY, COMMAND_ORCHESTRATOR_TICK, COMMAND_SUPPORT_CHAT_TURN
 from ispec.agent.models import AgentCommand, AgentRun
 from ispec.assistant.comment_intent import decide_project_comment_intent_vllm
+from ispec.assistant.classifier_service import generate_classifier_reply
 from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.assistant.compaction import normalize_conversation_memory
 from ispec.assistant.connect import get_assistant_session_dep
@@ -29,6 +30,17 @@ from ispec.assistant.controller import (
 from ispec.assistant.formatting import split_compare_finals, split_plan_final
 from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
+from ispec.assistant.project_comment_approval import (
+    ProjectCommentApprovalSettings,
+    build_project_comment_gate,
+    decide_project_comment_policy,
+    detect_project_comment_trigger,
+    empty_project_comment_classifier,
+    forced_tool_choice_name as _forced_tool_choice_name,
+    project_comment_force_tool_choice_requested as _project_comment_force_tool_choice_requested,
+    project_comment_write_outcome as _project_comment_write_outcome,
+    run_project_comment_approval_classifier,
+)
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
 from ispec.assistant.response_contracts import (
@@ -893,6 +905,7 @@ def _project_comment_write_tool_allowed(
     confirmation_reply: bool,
     awaiting_state: dict[str, Any] | None,
     reply_interpretation_action: str | None,
+    trigger_allows_write_tool: bool = False,
 ) -> tuple[bool, str]:
     action = str(reply_interpretation_action or "").strip()
     if action == "approve_save":
@@ -903,6 +916,8 @@ def _project_comment_write_tool_allowed(
         return False, f"reply_interpretation:{action}"
     if explicit_save_requested and (not confirmation_reply or isinstance(awaiting_state, dict)):
         return True, "explicit_save_request"
+    if trigger_allows_write_tool and not confirmation_reply:
+        return True, "project_comment_trigger"
     if confirmation_reply and not isinstance(awaiting_state, dict):
         return False, "confirmation_without_pending_save"
     return False, "no_explicit_save_request"
@@ -916,19 +931,6 @@ def _project_comment_write_policy_message(*, project_id: int | None) -> dict[str
     if isinstance(project_id, int) and project_id > 0:
         text += f" The current draft context is project {project_id}."
     return {"role": "system", "content": text}
-
-
-def _project_comment_force_tool_choice_requested(message: str | None) -> bool:
-    text = str(message or "").strip().lower()
-    if not text:
-        return False
-    if re.search(r"\b(do not|don't|dont)\s+(save|log|record|add|commit)\b", text):
-        return False
-    normalized = re.sub(r"[^\w\s]", " ", text)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not re.search(r"\b(save|commit)\b", normalized):
-        return False
-    return bool(re.search(r"\b(project|history|comment|comments|note|notes|memo|it|this)\b", normalized))
 
 
 def _write_block_reason_for_tool_payload(tool_name: str | None, tool_payload: dict[str, Any] | None) -> str | None:
@@ -1821,6 +1823,68 @@ def chat(
     )
     skip_tool_router_for_reply_interpretation = bool(reply_interpretation_runtime_applied)
     explicit_project_comment_save_request = project_comment_save_requested(payload.message)
+    controller_thread_key = support_post_send_thread_key(session.session_id)
+    project_comment_approval_settings = ProjectCommentApprovalSettings.from_env(
+        assistant_provider=assistant_provider,
+        state_dir_is_dev=_state_dir_is_dev(),
+    )
+    project_comment_trigger = detect_project_comment_trigger(
+        message=payload.message,
+        legacy_confirmation_kind=legacy_reply_interpretation_kind,
+        legacy_save_requested=explicit_project_comment_save_request,
+    )
+    project_comment_approval_lexical_features = project_comment_trigger.to_lexical_features()
+    project_comment_approval_state_gate_obj = build_project_comment_gate(
+        settings=project_comment_approval_settings,
+        trigger=project_comment_trigger,
+        tool_protocol=tool_protocol,
+        available_tool_names=available_openai_tool_names_full,
+        focused_project_id=focused_project_id,
+        session_id=session.session_id,
+        thread_key=controller_thread_key,
+        current_turn_id=str(user_message.id),
+        prior_assistant_message_id=(
+            int(last_assistant_turn_row.id) if last_assistant_turn_row is not None else None
+        ),
+        prior_assistant_message=last_assistant_text_for_turn_decision,
+        user_message=payload.message,
+        awaiting_reply_state=awaiting_reply_state,
+    )
+    project_comment_approval_classifier_obj = empty_project_comment_classifier(
+        settings=project_comment_approval_settings
+    )
+    if project_comment_approval_settings.mode != "off" and project_comment_approval_state_gate_obj.eligible:
+        project_comment_approval_classifier_obj = run_project_comment_approval_classifier(
+            settings=project_comment_approval_settings,
+            gate=project_comment_approval_state_gate_obj,
+            trigger=project_comment_trigger,
+            user_message=payload.message,
+            prior_assistant_message=last_assistant_text_for_turn_decision,
+            focused_project_id=focused_project_id,
+            generate_reply_fn=generate_reply,
+            generate_classifier_reply_fn=generate_classifier_reply,
+        )
+    project_comment_approval_policy_obj, project_comment_approval_ticket_obj = decide_project_comment_policy(
+        settings=project_comment_approval_settings,
+        gate=project_comment_approval_state_gate_obj,
+        trigger=project_comment_trigger,
+        classifier=project_comment_approval_classifier_obj,
+    )
+    project_comment_approval_eval_mode = project_comment_approval_settings.mode
+    project_comment_approval_state_gate = project_comment_approval_state_gate_obj.to_dict()
+    project_comment_approval_classifier = project_comment_approval_classifier_obj.to_dict()
+    project_comment_approval_policy = project_comment_approval_policy_obj.to_dict()
+    project_comment_approval_ticket = project_comment_approval_ticket_obj.to_dict()
+    project_comment_trigger_meta = project_comment_trigger.to_dict()
+    project_comment_trigger_allows_write_tool = project_comment_trigger.kind in {"explicit_save", "direct_note_request"}
+    project_comment_approval_eval_enabled = bool(
+        project_comment_approval_eval_mode != "off"
+        and (
+            project_comment_approval_state_gate.get("eligible")
+            or isinstance(awaiting_reply_state, dict)
+            or explicit_project_comment_save_request
+        )
+    )
     project_comment_write_policy_messages: list[dict[str, str]] = []
     project_comment_write_tool_exposed = "create_project_comment" in available_openai_tool_names_full
     project_comment_write_tool_reason = "not_available"
@@ -1836,6 +1900,7 @@ def chat(
             confirmation_reply=confirmation_reply,
             awaiting_state=awaiting_reply_state,
             reply_interpretation_action=reply_interpretation_runtime_action,
+            trigger_allows_write_tool=project_comment_trigger_allows_write_tool,
         )
         if not project_comment_write_allowed:
             tool_schemas, removed_project_comment_tools = _remove_tool_names_from_openai_schemas(
@@ -2892,6 +2957,11 @@ def chat(
         for call in tool_calls
         if isinstance(call, dict) and call.get("ok") and tool_writes_data(call.get("name"))
     }
+    project_comment_write_outcome = _project_comment_write_outcome(
+        tool_calls=tool_calls,
+        focused_project_id=focused_project_id,
+        safe_int_fn=_safe_int,
+    )
     blocked_unsupported_write_claim = False
     if not successful_write_tools_final and _assistant_claims_write_success(assistant_content):
         blocked_unsupported_write_claim = True
@@ -3007,7 +3077,6 @@ def chat(
             else ([focused_project_id] if focused_project_id is not None else []),
         },
     }
-    controller_thread_key = support_post_send_thread_key(session.session_id)
     meta["controller"] = {
         "schema_version": 1,
         "source": "support_chat",
@@ -3037,6 +3106,31 @@ def chat(
         "blocked_write_tools": sorted(blocked_write_tool_names),
         "write_block_reason": write_block_reason,
     }
+    if project_comment_approval_eval_enabled:
+        meta["project_comment_approval_eval"] = {
+            "schema_version": 1,
+            "mode": project_comment_approval_eval_mode,
+            "source": "support_chat",
+            "state_gate": project_comment_approval_state_gate,
+            "trigger": project_comment_trigger_meta,
+            "lexical_features": project_comment_approval_lexical_features,
+            "classifier": project_comment_approval_classifier,
+            "policy": project_comment_approval_policy,
+            "legacy_decision": {
+                "write_tool_exposed": bool(project_comment_write_tool_exposed),
+                "write_tool_reason": project_comment_write_tool_reason,
+                "forced_tool_choice": _forced_tool_choice_name(forced_tool_choice),
+                "reply_interpretation_action": reply_interpretation_runtime_action,
+            },
+            "write_ticket_shadow": project_comment_approval_ticket,
+            "write_outcome": project_comment_write_outcome,
+            "expected_outcome": {
+                "available": False,
+                "source": "none",
+                "decision": None,
+                "notes": None,
+            },
+        }
     meta["context"] = {
         "history_messages_used": len(history_payload),
         "used_conversation_memory": bool(state_for_context.get("conversation_memory")),
