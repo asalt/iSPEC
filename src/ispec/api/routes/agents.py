@@ -17,6 +17,7 @@ from ispec.agent_state.store import append_observation, get_schema, list_heads, 
 from ispec.agent.commands import COMMAND_ASSESS_TACKLE_RESULTS, COMMAND_RUN_TACKLE_PROMPT
 from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.models import AgentCommand, AgentEvent
+from ispec.agent.relay import enqueue_relay_request, relay_config_probe
 from ispec.db.connect import get_session_dep
 from ispec.db.models import Project
 from ispec.assistant.slack_tmux_bridge import (
@@ -92,6 +93,33 @@ class SlackArtifactReplyResponse(BaseModel):
 
 class CommandPollResponse(BaseModel):
     commands: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RelayEnqueueRequest(BaseModel):
+    kind: str = Field(min_length=1, max_length=64)
+    source: dict[str, Any] | str = Field(default_factory=lambda: {"kind": "api", "id": "local"})
+    target: dict[str, Any] | str | None = None
+    body: str | None = Field(default=None, max_length=20_000)
+    text: str | None = Field(default=None, max_length=20_000)
+    attachments: list[dict[str, Any] | str] = Field(default_factory=list)
+    mode: str = Field(default="stage", max_length=32)
+    confirm: bool = False
+    message_type: str | None = Field(default=None, max_length=120)
+    thread_ts: str | None = Field(default=None, max_length=80)
+    press_enter: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    provenance: dict[str, Any] = Field(default_factory=dict)
+    request_id: str | None = Field(default=None, max_length=128)
+    priority: int = 0
+    delay_seconds: int = 0
+    max_attempts: int = 1
+
+
+class RelayEnqueueResponse(BaseModel):
+    command_id: int
+    request_id: str
+    status: str = "queued"
+    relay_request: dict[str, Any]
 
 
 @router.post("/events", response_model=IngestResponse)
@@ -187,6 +215,43 @@ def poll_commands(
     # v0: plumbing-only stub so agents can safely "pull" commands without
     # requiring inbound ports or a full queue implementation yet.
     return CommandPollResponse(commands=[])
+
+
+@router.get("/relay/config-probe")
+def relay_config_probe_endpoint(
+    target_alias: str | None = Query(default=None, max_length=120),
+    message_type: str | None = Query(default=None, max_length=120),
+) -> dict[str, Any]:
+    return relay_config_probe(target_alias=target_alias, message_type=message_type)
+
+
+@router.post("/relay/requests", response_model=RelayEnqueueResponse)
+def enqueue_relay_request_endpoint(
+    request: RelayEnqueueRequest,
+    db: Session = Depends(get_agent_session_dep),
+) -> RelayEnqueueResponse:
+    payload = request.model_dump(mode="json")
+    priority = int(payload.pop("priority", 0) or 0)
+    delay_seconds = int(payload.pop("delay_seconds", 0) or 0)
+    max_attempts = int(payload.pop("max_attempts", 1) or 1)
+    try:
+        row, event_payload = enqueue_relay_request(
+            db,
+            request=payload,
+            priority=priority,
+            delay_seconds=delay_seconds,
+            max_attempts=max_attempts,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    relay_request = event_payload.get("request") if isinstance(event_payload.get("request"), dict) else {}
+    return RelayEnqueueResponse(
+        command_id=int(row.id),
+        request_id=str(relay_request.get("request_id") or ""),
+        status=str(row.status or "queued"),
+        relay_request=relay_request,
+    )
 
 
 def _clamp_int(value: int, *, lo: int, hi: int) -> int:

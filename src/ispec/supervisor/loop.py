@@ -31,6 +31,7 @@ from ispec.agent.commands import (
     COMMAND_DEV_RESTART_SERVICES,
     COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
     COMMAND_LEGACY_SYNC_ALL,
+    COMMAND_LOCAL_RELAY_REQUEST,
     COMMAND_ORCHESTRATOR_TICK,
     COMMAND_REVIEW_REPO,
     COMMAND_REVIEW_SUPPORT_SESSION,
@@ -38,6 +39,7 @@ from ispec.agent.commands import (
     COMMAND_SUPPORT_CHAT_TURN,
 )
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
+from ispec.agent.relay import dispatch_relay_request
 from ispec.agent.policies.primitives.backoff import backoff_exponential_current
 from ispec.assistant.compaction import distill_conversation_memory
 from ispec.assistant.connect import get_assistant_db_uri, get_assistant_session
@@ -314,6 +316,15 @@ def _summarize_command_payload(command_type: str, payload: dict[str, Any]) -> st
             job_name = job.get("name")
             if isinstance(job_name, str) and job_name.strip():
                 parts.append(f"job={job_name.strip()}")
+    if command_type == COMMAND_LOCAL_RELAY_REQUEST:
+        relay_request = payload.get("relay_request")
+        if isinstance(relay_request, dict):
+            kind = relay_request.get("kind")
+            if isinstance(kind, str) and kind.strip():
+                parts.append(f"relay_kind={kind.strip()}")
+            request_id = relay_request.get("request_id")
+            if isinstance(request_id, str) and request_id.strip():
+                parts.append(f"request_id={request_id.strip()}")
     if command_type == COMMAND_ARCHIVE_AGENT_LOGS:
         older_than_days = _safe_int(payload.get("older_than_days"))
         if older_than_days is not None:
@@ -6769,6 +6780,15 @@ def _log_command_done(*, cmd: ClaimedCommand, execution: CommandExecution, durat
             schedule_name = schedule.get("name")
             if isinstance(schedule_name, str) and schedule_name.strip():
                 extra_parts.append(f"schedule={schedule_name.strip()}")
+    elif cmd.command_type == COMMAND_LOCAL_RELAY_REQUEST:
+        relay_request = cmd.payload.get("relay_request")
+        if isinstance(relay_request, dict):
+            kind = relay_request.get("kind")
+            if isinstance(kind, str) and kind.strip():
+                extra_parts.append(f"relay_kind={kind.strip()}")
+            request_id = relay_request.get("request_id")
+            if isinstance(request_id, str) and request_id.strip():
+                extra_parts.append(f"request_id={request_id.strip()}")
     elif cmd.command_type == COMMAND_RUN_SCHEDULED_ASSISTANT_PROMPT:
         job = cmd.payload.get("job")
         if isinstance(job, dict):
@@ -7064,6 +7084,13 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
             execution = _run_agent_log_archive(cmd.payload)
         elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
             execution = _run_slack_post_message(cmd.payload)
+        elif cmd.command_type == COMMAND_LOCAL_RELAY_REQUEST:
+            relay_result = dispatch_relay_request(cmd.payload, command_id=int(cmd.id))
+            execution = CommandExecution(
+                ok=bool(relay_result.get("ok")),
+                result=dict(relay_result),
+                error=None if bool(relay_result.get("ok")) else str(relay_result.get("error_type") or "relay_failed"),
+            )
         elif cmd.command_type == COMMAND_DEV_RESTART_SERVICES:
             execution = _run_dev_restart_services(cmd.payload)
         else:
@@ -7311,6 +7338,13 @@ class _SupervisorCommandProcessor:
                 execution = _run_agent_log_archive(cmd.payload)
             elif cmd.command_type == COMMAND_SLACK_POST_MESSAGE:
                 execution = _run_slack_post_message(cmd.payload)
+            elif cmd.command_type == COMMAND_LOCAL_RELAY_REQUEST:
+                relay_result = dispatch_relay_request(cmd.payload, command_id=int(cmd.id))
+                execution = CommandExecution(
+                    ok=bool(relay_result.get("ok")),
+                    result=dict(relay_result),
+                    error=None if bool(relay_result.get("ok")) else str(relay_result.get("error_type") or "relay_failed"),
+                )
             elif cmd.command_type == COMMAND_DEV_RESTART_SERVICES:
                 execution = _run_dev_restart_services(cmd.payload)
             else:

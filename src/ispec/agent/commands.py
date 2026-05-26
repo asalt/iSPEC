@@ -20,6 +20,7 @@ COMMAND_RUN_TACKLE_PROMPT = "assistant_run_tackle_prompt_v1"
 
 # Integrations
 COMMAND_SLACK_POST_MESSAGE = "slack_post_message_v1"
+COMMAND_LOCAL_RELAY_REQUEST = "local_relay_request_v1"
 
 # Data sync
 COMMAND_LEGACY_SYNC_ALL = "legacy_sync_all_v1"

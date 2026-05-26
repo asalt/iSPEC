@@ -24,6 +24,7 @@ from typing import Any
 
 from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand
+from ispec.agent.relay import enqueue_relay_request, relay_config_probe
 
 
 def register_subcommands(subparsers) -> None:
@@ -184,6 +185,70 @@ def register_subcommands(subparsers) -> None:
     )
     task_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain summary")
 
+    probe_parser = subparsers.add_parser(
+        "relay-probe",
+        help="Inspect local relay Slack config/provenance without sending anything",
+    )
+    probe_parser.add_argument("--target", default=None, help="Optional Slack destination alias to resolve.")
+    probe_parser.add_argument("--message-type", default=None, help="Optional message type for allowlist checks.")
+    probe_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain summary")
+
+    relay_parser = subparsers.add_parser(
+        "relay-enqueue",
+        help="Enqueue a local relay request; staged by default and processed by the supervisor",
+    )
+    relay_parser.add_argument("--database", default=None, help="Agent DB path/URI (default: resolved env/default)")
+    relay_parser.add_argument(
+        "--kind",
+        required=True,
+        choices=["slack_message", "tmux_send", "status_record"],
+        help="Relay request kind.",
+    )
+    relay_parser.add_argument("--source", default="codex", help="Source id/kind label for provenance.")
+    relay_parser.add_argument("--to", "--target", dest="target", default=None, help="Destination alias or tmux target.")
+    relay_parser.add_argument("--body", "--text", dest="body", default=None, help="Message body or status text.")
+    relay_parser.add_argument("--attachment", action="append", default=[], help="Attachment path to stage; repeatable.")
+    relay_parser.add_argument("--mode", choices=["stage", "send"], default="stage", help="Default: stage only.")
+    relay_parser.add_argument("--confirm", action="store_true", help="Required for live send mode.")
+    relay_parser.add_argument("--message-type", default=None, help="Optional Slack message type for allowlist checks.")
+    relay_parser.add_argument("--thread-ts", default=None, help="Optional Slack thread timestamp.")
+    relay_parser.add_argument("--press-enter", action="store_true", help="For tmux_send, include Enter if live send is enabled.")
+    relay_parser.add_argument("--metadata-json", default=None, help="Optional JSON object copied into request metadata.")
+    relay_parser.add_argument("--provenance-json", default=None, help="Optional JSON object copied into request provenance.")
+    relay_parser.add_argument("--priority", type=int, default=0)
+    relay_parser.add_argument("--delay-seconds", type=int, default=0)
+    relay_parser.add_argument("--max-attempts", type=int, default=1)
+    relay_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain summary")
+
+    pdf_parser = subparsers.add_parser(
+        "relay-pdf",
+        help="Stage or send a PDF report to a Slack destination with report-ready defaults",
+    )
+    pdf_parser.add_argument("file", help="PDF file path to attach.")
+    pdf_parser.add_argument("message", nargs="*", help="Optional message body; defaults to a short report-ready note.")
+    pdf_parser.add_argument("--database", default=None, help="Agent DB path/URI (default: resolved env/default)")
+    pdf_parser.add_argument("--to", required=True, help="Slack destination alias, e.g. alex.")
+    pdf_parser.add_argument(
+        "--send",
+        action="store_true",
+        help="Queue a live send request. This sets mode=send and confirm=true on the relay request.",
+    )
+    pdf_parser.add_argument("--body", "--text", dest="body", default=None, help="Message body override.")
+    pdf_parser.add_argument("--title", default=None, help="Optional Slack file title.")
+    pdf_parser.add_argument(
+        "--source",
+        default="cli:relay-pdf",
+        help="Source kind/id for relay policy, e.g. cli:relay-pdf or codex:936-report.",
+    )
+    pdf_parser.add_argument("--message-type", default="report_ready", help="Slack destination message type.")
+    pdf_parser.add_argument("--thread-ts", default=None, help="Optional Slack thread timestamp.")
+    pdf_parser.add_argument("--metadata-json", default=None, help="Optional JSON object copied into request metadata.")
+    pdf_parser.add_argument("--provenance-json", default=None, help="Optional JSON object copied into request provenance.")
+    pdf_parser.add_argument("--priority", type=int, default=0)
+    pdf_parser.add_argument("--delay-seconds", type=int, default=0)
+    pdf_parser.add_argument("--max-attempts", type=int, default=1)
+    pdf_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain summary")
+
 
 def dispatch(args) -> None:
     if args.subcommand == "disk-free":
@@ -200,6 +265,15 @@ def dispatch(args) -> None:
         return
     if args.subcommand == "watch-task":
         _run_watch_task(args)
+        return
+    if args.subcommand == "relay-probe":
+        _run_relay_probe(args)
+        return
+    if args.subcommand == "relay-enqueue":
+        _run_relay_enqueue(args)
+        return
+    if args.subcommand == "relay-pdf":
+        _run_relay_pdf(args)
         return
     raise SystemExit(f"Unknown agent subcommand: {args.subcommand}")
 
@@ -281,6 +355,197 @@ def _print_command_rows(payload: dict[str, Any], *, as_json: bool) -> None:
                 ]
             )
         )
+
+
+def _load_cli_json_object(raw: str | None, *, label: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception as exc:
+        raise SystemExit(f"Invalid {label}: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise SystemExit(f"Invalid {label}: expected a JSON object.")
+    return parsed
+
+
+def _print_relay_payload(payload: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(f"ok={payload.get('ok')} command_id={payload.get('command_id')} status={payload.get('status')}")
+    request = payload.get("relay_request")
+    if isinstance(request, dict):
+        print(
+            " ".join(
+                [
+                    f"request_id={request.get('request_id')}",
+                    f"kind={request.get('kind')}",
+                    f"mode={request.get('mode')}",
+                ]
+            )
+        )
+
+
+def _source_from_cli_arg(raw: str | None) -> dict[str, Any]:
+    text = str(raw or "").strip() or "cli"
+    if ":" in text:
+        kind, _, source_id = text.partition(":")
+        kind = kind.strip()
+        source_id = source_id.strip()
+        if kind and source_id:
+            source = {"kind": kind, "id": source_id}
+        else:
+            source = {"kind": "cli", "id": text}
+    else:
+        source = {"kind": "cli", "id": text}
+    try:
+        source["cwd"] = str(Path.cwd().resolve())
+    except Exception:
+        pass
+    return source
+
+
+def _enqueue_relay_cli_payload(
+    *,
+    database: str | None,
+    request: dict[str, Any],
+    priority: int,
+    delay_seconds: int,
+    max_attempts: int,
+) -> dict[str, Any]:
+    with get_agent_session(database) as db:
+        row, event_payload = enqueue_relay_request(
+            db,
+            request=request,
+            priority=int(priority or 0),
+            delay_seconds=int(delay_seconds or 0),
+            max_attempts=int(max_attempts or 1),
+        )
+        relay_request = event_payload.get("request") if isinstance(event_payload.get("request"), dict) else {}
+        return {
+            "ok": True,
+            "command_id": int(row.id),
+            "status": row.status,
+            "relay_request": relay_request,
+        }
+
+
+def _run_relay_probe(args) -> None:
+    payload = relay_config_probe(
+        target_alias=getattr(args, "target", None),
+        message_type=getattr(args, "message_type", None),
+    )
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    slack = payload.get("slack") if isinstance(payload.get("slack"), dict) else {}
+    token = slack.get("bot_token") if isinstance(slack.get("bot_token"), dict) else {}
+    target = slack.get("target") if isinstance(slack.get("target"), dict) else None
+    print(f"root={payload.get('root')}")
+    print(f"env_files_loaded={len(payload.get('env_files_loaded') or [])}")
+    print(f"slack_token_present={token.get('present')} source={token.get('source')}")
+    print(f"destinations_count={slack.get('destinations_count')}")
+    if target is not None:
+        print(f"target={target}")
+    elif slack.get("target_error"):
+        print(f"target_error={slack.get('target_error')}")
+
+
+def _run_relay_enqueue(args) -> None:
+    metadata = _load_cli_json_object(getattr(args, "metadata_json", None), label="--metadata-json")
+    provenance = _load_cli_json_object(getattr(args, "provenance_json", None), label="--provenance-json")
+    source = _source_from_cli_arg(getattr(args, "source", None) or "codex")
+
+    kind = str(getattr(args, "kind", "") or "").strip()
+    target_raw = str(getattr(args, "target", "") or "").strip()
+    if kind == "tmux_send":
+        target: dict[str, Any] | str | None = {"target": target_raw} if target_raw else None
+    else:
+        target = {"alias": target_raw} if target_raw else None
+
+    request = {
+        "kind": kind,
+        "source": source,
+        "target": target,
+        "body": getattr(args, "body", None),
+        "attachments": [{"path": path} for path in (getattr(args, "attachment", None) or [])],
+        "mode": getattr(args, "mode", "stage"),
+        "confirm": bool(getattr(args, "confirm", False)),
+        "message_type": getattr(args, "message_type", None),
+        "thread_ts": getattr(args, "thread_ts", None),
+        "press_enter": bool(getattr(args, "press_enter", False)),
+        "metadata": metadata,
+        "provenance": provenance,
+    }
+
+    try:
+        payload = _enqueue_relay_cli_payload(
+            database=getattr(args, "database", None),
+            request=request,
+            priority=int(getattr(args, "priority", 0) or 0),
+            delay_seconds=int(getattr(args, "delay_seconds", 0) or 0),
+            max_attempts=int(getattr(args, "max_attempts", 1) or 1),
+        )
+    except ValueError as exc:
+        payload = {"ok": False, "error": str(exc)}
+    _print_relay_payload(payload, as_json=bool(getattr(args, "json", False)))
+
+
+def _run_relay_pdf(args) -> None:
+    metadata = _load_cli_json_object(getattr(args, "metadata_json", None), label="--metadata-json")
+    provenance = _load_cli_json_object(getattr(args, "provenance_json", None), label="--provenance-json")
+
+    file_path = Path(str(getattr(args, "file", "") or "")).expanduser()
+    try:
+        file_path = file_path.resolve()
+    except Exception:
+        pass
+    if not file_path.is_file():
+        raise SystemExit(f"PDF file does not exist: {file_path}")
+    if file_path.suffix.lower() != ".pdf":
+        raise SystemExit(f"relay-pdf only accepts PDF files: {file_path}")
+
+    positional_message = " ".join(str(item) for item in (getattr(args, "message", None) or [])).strip()
+    body = str(getattr(args, "body", "") or positional_message).strip()
+    if not body:
+        body = f"PDF report ready: {file_path.name}"
+
+    metadata.setdefault("relay_shortcut", "relay-pdf")
+    metadata.setdefault("attachment_kind", "pdf")
+    metadata.setdefault("filename", file_path.name)
+    provenance.setdefault("source_command", "ispec agent relay-pdf")
+
+    mode = "send" if bool(getattr(args, "send", False)) else "stage"
+    attachment: dict[str, Any] = {"path": str(file_path)}
+    title = str(getattr(args, "title", "") or "").strip()
+    if title:
+        attachment["title"] = title
+    request = {
+        "kind": "slack_message",
+        "source": _source_from_cli_arg(getattr(args, "source", None)),
+        "target": {"alias": str(getattr(args, "to", "") or "").strip()},
+        "body": body,
+        "attachments": [attachment],
+        "mode": mode,
+        "confirm": mode == "send",
+        "message_type": getattr(args, "message_type", None) or "report_ready",
+        "thread_ts": getattr(args, "thread_ts", None),
+        "metadata": metadata,
+        "provenance": provenance,
+    }
+    try:
+        payload = _enqueue_relay_cli_payload(
+            database=getattr(args, "database", None),
+            request=request,
+            priority=int(getattr(args, "priority", 0) or 0),
+            delay_seconds=int(getattr(args, "delay_seconds", 0) or 0),
+            max_attempts=int(getattr(args, "max_attempts", 1) or 1),
+        )
+    except ValueError as exc:
+        payload = {"ok": False, "error": str(exc)}
+    _print_relay_payload(payload, as_json=bool(getattr(args, "json", False)))
 
 
 def _run_queue_list(args) -> None:

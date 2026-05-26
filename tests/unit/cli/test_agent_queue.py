@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from ispec.agent.connect import get_agent_session
+from ispec.agent.commands import COMMAND_LOCAL_RELAY_REQUEST
 from ispec.agent.models import AgentCommand
 from ispec.cli import agent
 
@@ -22,6 +26,18 @@ def _args(**kwargs):
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
+
+
+def test_agent_relay_pdf_parser_requires_destination_alias():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    agent.register_subcommands(subparsers)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["relay-pdf", "report.pdf"])
+
+    args = parser.parse_args(["relay-pdf", "report.pdf", "--to", "alex"])
+    assert args.to == "alex"
 
 
 def test_agent_queue_cancel_stale_dry_run_does_not_mutate(tmp_path, capsys):
@@ -147,3 +163,83 @@ def test_agent_queue_list_filters_status_and_type(tmp_path, capsys):
 
     assert payload["selected"] == 1
     assert payload["commands"][0]["command_type"] == "orchestrator_tick_v1"
+
+
+def test_agent_relay_pdf_enqueues_send_request_with_report_defaults(tmp_path, capsys):
+    agent_db_path = tmp_path / "agent.db"
+    pdf_path = tmp_path / "report.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    agent._run_relay_pdf(
+        _args(
+            database=str(agent_db_path),
+            file=str(pdf_path),
+            message=[],
+            to="alex",
+            send=True,
+            body=None,
+            title=None,
+            source="codex:936-report",
+            message_type="report_ready",
+            thread_ts=None,
+            metadata_json='{"project":"MSPC000936"}',
+            provenance_json=None,
+            priority=5,
+            delay_seconds=0,
+            max_attempts=1,
+        )
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["ok"] is True
+    assert payload["status"] == "queued"
+    request = payload["relay_request"]
+    assert request["kind"] == "slack_message"
+    assert request["mode"] == "send"
+    assert request["confirm"] is True
+    assert request["source"]["kind"] == "codex"
+    assert request["source"]["id"] == "936-report"
+    assert request["target"]["alias"] == "alex"
+    assert request["message_type"] == "report_ready"
+    assert request["body"] == "PDF report ready: report.pdf"
+    assert request["attachments"] == [{"path": str(pdf_path.resolve()), "title": None}]
+    assert request["metadata"]["relay_shortcut"] == "relay-pdf"
+    assert request["metadata"]["project"] == "MSPC000936"
+
+    with get_agent_session(agent_db_path) as db:
+        row = db.query(AgentCommand).one()
+        assert row.command_type == COMMAND_LOCAL_RELAY_REQUEST
+        assert row.priority == 5
+
+
+def test_agent_relay_pdf_defaults_to_stage_mode(tmp_path, capsys):
+    agent_db_path = tmp_path / "agent.db"
+    pdf_path = tmp_path / "report.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    agent._run_relay_pdf(
+        _args(
+            database=str(agent_db_path),
+            file=str(pdf_path),
+            message=["Custom", "message"],
+            to="alex",
+            send=False,
+            body=None,
+            title="Report title",
+            source="cli:relay-pdf",
+            message_type="report_ready",
+            thread_ts=None,
+            metadata_json=None,
+            provenance_json=None,
+            priority=0,
+            delay_seconds=0,
+            max_attempts=1,
+        )
+    )
+    payload = json.loads(capsys.readouterr().out)
+    request = payload["relay_request"]
+
+    assert request["mode"] == "stage"
+    assert request["confirm"] is False
+    assert request["body"] == "Custom message"
+    assert request["attachments"] == [{"path": str(pdf_path.resolve()), "title": "Report title"}]
