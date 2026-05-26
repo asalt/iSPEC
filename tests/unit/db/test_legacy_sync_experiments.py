@@ -425,6 +425,8 @@ def test_sync_legacy_experiment_runs_single_id_inserts_run(tmp_path, monkeypatch
             .one_or_none()
         )
         assert run is not None
+        assert run.label == "0"
+        assert run.sample_name == "57454_1_2_0"
         assert isinstance(run.ExperimentRun_CreationTS, datetime)
         assert isinstance(run.ExperimentRun_ModificationTS, datetime)
 

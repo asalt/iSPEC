@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from ispec.db.models import Experiment, ExperimentRun
 from ispec.logging import get_logger
 from ispec.omics.e2g_import import _resolve_experiment_run, _safe_float, _safe_int, _safe_str
+from ispec.omics.labels import normalize_legacy_label
 from ispec.omics.models import PSM
 
 
@@ -150,9 +151,9 @@ def _resolve_target_run(
         int(search_no) if search_no is not None else _safe_int(row.get("EXPSearchNo"))
     )
     resolved_label = (
-        str(label).strip()
+        normalize_legacy_label(label)
         if label is not None and str(label).strip()
-        else str(_safe_int(row.get("LabelFLAG")) if _safe_int(row.get("LabelFLAG")) is not None else 0)
+        else normalize_legacy_label(row.get("LabelFLAG"))
     )
 
     if resolved_experiment_id is None or resolved_run_no is None or resolved_search_no is None:

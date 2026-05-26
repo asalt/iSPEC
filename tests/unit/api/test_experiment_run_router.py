@@ -55,14 +55,17 @@ def test_experiment_run_crud(client):
         db.refresh(experiment)
         exp_id = experiment.id
 
-    payload = {"experiment_id": exp_id, "run_no": 1, "search_no": 1}
+    payload = {"experiment_id": exp_id, "run_no": 1, "search_no": 1, "label": "none"}
     resp = client.post("/experiment_runs/", json=payload)
     assert resp.status_code == 201
     run_id = resp.json()["id"]
+    assert resp.json()["label"] == "0"
+    assert resp.json()["sample_name"] == f"{exp_id}_1_1_0"
 
     resp = client.get(f"/experiment_runs/{run_id}")
     assert resp.status_code == 200
     assert resp.json()["experiment_id"] == exp_id
+    assert resp.json()["label"] == "0"
 
     resp = client.delete(f"/experiment_runs/{run_id}")
     assert resp.status_code == 200

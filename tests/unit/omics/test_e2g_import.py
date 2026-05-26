@@ -155,6 +155,98 @@ def test_import_e2g_qual_then_quant(db_session, omics_session, tmp_path):
     assert meta.get("quant", {}).get("source") == "QUANT"
 
 
+def test_import_e2g_label_none_alias_targets_numeric_zero_run(db_session, omics_session, tmp_path):
+    project = Project(id=12, prj_AddedBy="test", prj_ProjectTitle="Project 12")
+    experiment = Experiment(id=120, project_id=12, record_no="120", exp_Name="Experiment 120")
+    run = ExperimentRun(experiment_id=120, run_no=1, search_no=4, label="0")
+    db_session.add_all([project, experiment, run])
+    db_session.commit()
+    db_session.refresh(run)
+
+    qual_path = tmp_path / "120_1_4_labelnone_e2g_QUAL.tsv"
+    _write_tsv(
+        qual_path,
+        fieldnames=["EXPRecNo", "EXPRunNo", "EXPSearchNo", "LabelFLAG", "GeneID", "PSMs"],
+        rows=[
+            {
+                "EXPRecNo": "120",
+                "EXPRunNo": "1",
+                "EXPSearchNo": "4",
+                "LabelFLAG": "none",
+                "GeneID": "123",
+                "PSMs": "10",
+            }
+        ],
+    )
+
+    result = import_e2g_tsv(
+        core_session=db_session,
+        omics_session=omics_session,
+        path=qual_path,
+        kind="qual",
+    )
+
+    assert result.created_run is False
+    assert result.label == "0"
+    assert result.experiment_run_id == run.id
+
+
+def test_import_e2g_tmt_label_creates_run_with_parent_metadata(db_session, omics_session, tmp_path):
+    project = Project(id=13, prj_AddedBy="test", prj_ProjectTitle="Project 13")
+    experiment = Experiment(id=130, project_id=13, record_no="130", exp_Name="Experiment 130")
+    parent_run = ExperimentRun(
+        experiment_id=130,
+        run_no=1,
+        search_no=7,
+        label="0",
+        label_type="TMT",
+        ms_instrument="BCM-MSPC-Exploris",
+        acquisition_mode="MSPCRunner",
+        ref_database="mm2020",
+        taxon_id=10090,
+    )
+    db_session.add_all([project, experiment, parent_run])
+    db_session.commit()
+
+    qual_path = tmp_path / "130_1_7_label126_e2g_QUAL.tsv"
+    _write_tsv(
+        qual_path,
+        fieldnames=["EXPRecNo", "EXPRunNo", "EXPSearchNo", "LabelFLAG", "GeneID", "PSMs"],
+        rows=[
+            {
+                "EXPRecNo": "130",
+                "EXPRunNo": "1",
+                "EXPSearchNo": "7",
+                "LabelFLAG": "126.0",
+                "GeneID": "456",
+                "PSMs": "7",
+            }
+        ],
+    )
+
+    result = import_e2g_tsv(
+        core_session=db_session,
+        omics_session=omics_session,
+        path=qual_path,
+        kind="qual",
+    )
+
+    assert result.created_run is True
+    assert result.label == "126"
+
+    child_run = (
+        db_session.query(ExperimentRun)
+        .filter_by(experiment_id=130, run_no=1, search_no=7, label="126")
+        .one()
+    )
+    assert child_run.sample_name == "130_1_7_126"
+    assert child_run.label_type == "TMT"
+    assert child_run.ms_instrument == "BCM-MSPC-Exploris"
+    assert child_run.acquisition_mode == "MSPCRunner"
+    assert child_run.ref_database == "mm2020"
+    assert child_run.taxon_id == 10090
+
+
 def test_import_e2g_creates_missing_experiment_and_run(db_session, omics_session, tmp_path):
     qual_path = tmp_path / "200_2_1_labelnone_e2g_QUAL.tsv"
     _write_tsv(

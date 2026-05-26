@@ -24,6 +24,7 @@ from ispec.db.models import (
     ProjectComment,
 )
 from ispec.logging import get_logger
+from ispec.omics.labels import experiment_run_legacy_key, normalize_legacy_label
 
 logger = get_logger(__file__)
 
@@ -1084,14 +1085,7 @@ def _row_merge_key(row: dict[str, Any], key_fields: list[str]) -> tuple[Any, ...
 def _normalize_label_value(value: Any) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return "0"
-    if isinstance(value, (int, np.integer)):
-        return str(int(value))
-    if isinstance(value, float):
-        if value.is_integer():
-            return str(int(value))
-        return str(value)
-    text = str(value).strip()
-    return text if text else "0"
+    return normalize_legacy_label(value)
 
 
 def _fetch_legacy_rows_chunked(
@@ -1995,6 +1989,13 @@ def _build_experiment_run_record(
     label_key = record.get("label")
     label_norm = _normalize_label_value(label_key)
     record["label"] = label_norm
+    if "sample_name" in model_columns and not record.get("sample_name"):
+        record["sample_name"] = experiment_run_legacy_key(
+            experiment_id=exp_id_int,
+            run_no=run_no_int,
+            search_no=search_no_int,
+            label=label_norm,
+        )
     return (exp_id_int, run_no_int, search_no_int, label_norm), record
 
 

@@ -231,6 +231,9 @@ def _ensure_experiment_run_columns(engine: Engine) -> None:
     """Ensure legacy SQLite schemas include newer experiment_run columns."""
 
     desired: list[tuple[str, str]] = [
+        ("sample_name", "TEXT"),
+        ("sample_group", "TEXT"),
+        ("sample_metadata_json", "TEXT"),
         ("ms_instrument", "TEXT"),
         ("acquisition_mode", "TEXT"),
         ("ref_database", "TEXT"),
@@ -244,6 +247,7 @@ def _ensure_experiment_run_columns(engine: Engine) -> None:
 
     missing = [(name, ddl) for (name, ddl) in desired if name not in columns]
     if not missing:
+        _backfill_experiment_run_sample_names(engine)
         return
 
     with engine.begin() as conn:
@@ -253,6 +257,43 @@ def _ensure_experiment_run_columns(engine: Engine) -> None:
     logger.info(
         "Added missing columns experiment_run.%s", ", ".join(name for name, _ in missing)
     )
+    _backfill_experiment_run_sample_names(engine)
+
+
+def _backfill_experiment_run_sample_names(engine: Engine) -> None:
+    """Populate missing display sample names from the canonical run/sample key."""
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("experiment_run")}
+    except Exception:
+        return
+    if "sample_name" not in columns:
+        return
+
+    label_expr = """
+        CASE
+            WHEN label IS NULL THEN '0'
+            WHEN TRIM(label) = '' THEN '0'
+            WHEN LOWER(REPLACE(TRIM(label), ' ', '')) IN (
+                'none', 'labelnone', 'label_none', 'label-none', 'label=none', '0.0'
+            ) THEN '0'
+            ELSE TRIM(label)
+        END
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"""
+                UPDATE experiment_run
+                SET sample_name =
+                    CAST(experiment_id AS TEXT) || '_' ||
+                    CAST(run_no AS TEXT) || '_' ||
+                    CAST(search_no AS TEXT) || '_' ||
+                    {label_expr}
+                WHERE sample_name IS NULL OR TRIM(sample_name) = ''
+                """
+            )
+        )
 
 
 def _ensure_e2g_columns(engine: Engine) -> None:

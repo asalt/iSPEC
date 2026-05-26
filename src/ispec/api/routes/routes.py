@@ -35,6 +35,7 @@ from ispec.db.crud import (
     MSRawFileCRUD,
     LetterOfSupportCRUD,
 )
+from ispec.omics.labels import experiment_run_legacy_key
 
 from ispec.api.routes.schema import build_form_schema
 
@@ -118,6 +119,20 @@ def _reject_client(
 def _serialize_experiment_payload(payload: dict[str, object]) -> dict[str, object]:
     item = dict(payload)
     item.update(qc_flags_for_experiment_id(item.get("id")))
+    return item
+
+
+def _serialize_experiment_run_payload(payload: dict[str, object]) -> dict[str, object]:
+    item = dict(payload)
+    try:
+        item["legacy_key"] = experiment_run_legacy_key(
+            experiment_id=item.get("experiment_id"),
+            run_no=item.get("run_no"),
+            search_no=item.get("search_no"),
+            label=item.get("label"),
+        )
+    except Exception:
+        item["legacy_key"] = None
     return item
 
 
@@ -1275,7 +1290,10 @@ if _enabled("experiment_runs"):
             .all()
         )
         Read = make_pydantic_model_from_sqlalchemy(ExperimentRun, name_suffix="Read")
-        return [Read.model_validate(r).model_dump() for r in rows]
+        return [
+            _serialize_experiment_run_payload(Read.model_validate(r).model_dump())
+            for r in rows
+        ]
 
 
 if _enabled("experiment_runs") and _enabled("experiments"):
@@ -1297,7 +1315,10 @@ if _enabled("experiment_runs") and _enabled("experiments"):
         )
         rows = query.limit(limit).offset(offset).all()
         Read = make_pydantic_model_from_sqlalchemy(ExperimentRun, name_suffix="Read")
-        return [Read.model_validate(r).model_dump() for r in rows]
+        return [
+            _serialize_experiment_run_payload(Read.model_validate(r).model_dump())
+            for r in rows
+        ]
 
 
 if _enabled("experiment_to_gene"):

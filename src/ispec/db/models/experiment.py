@@ -170,7 +170,7 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
         Text,
         nullable=False,
         default="0",
-        info={"ui": {"label": "Label"}},
+        info={"ui": {"label": "LabelFLAG"}},
     )
     label_type: Mapped[str | None] = mapped_column(
         Text,
@@ -192,6 +192,21 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
                 ],
             }
         },
+    )
+    sample_name: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Sample Name"}},
+    )
+    sample_group: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Sample/Condition Group"}},
+    )
+    sample_metadata_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Sample Metadata JSON", "component": "Textarea"}},
     )
 
     ms_instrument: Mapped[str | None] = mapped_column(Text, nullable=True)

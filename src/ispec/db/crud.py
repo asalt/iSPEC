@@ -51,6 +51,7 @@ from ispec.db.models import (
     JobStatus,
     MSRawFile,
 )
+from ispec.omics.labels import experiment_run_legacy_key, normalize_legacy_label
 from ispec.omics.models import E2G, PSM
 
 
@@ -539,10 +540,7 @@ class E2GCRUD(CRUDBase):
         if not gene or not geneidtype:
             return None
 
-        label = cleaned.get("label")
-        if label is None:
-            label = "0"
-        cleaned["label"] = str(label).strip() or "0"
+        cleaned["label"] = normalize_legacy_label(cleaned.get("label"))
         cleaned["gene"] = gene
         cleaned["geneidtype"] = geneidtype
 
@@ -740,11 +738,11 @@ class ExperimentRunCRUD(CRUDBase):
         if {"experiment_id", "run_no", "search_no", "label"}.issubset(cols):
             return func.trim(
                 cast(getattr(M, "experiment_id"), T.String())
-                + "-"
+                + "_"
                 + cast(getattr(M, "run_no"), T.String())
-                + "-"
+                + "_"
                 + cast(getattr(M, "search_no"), T.String())
-                + "-"
+                + "_"
                 + func.coalesce(cast(getattr(M, "label"), T.String()), "")
             )
         return super().label_expr()
@@ -765,14 +763,17 @@ class ExperimentRunCRUD(CRUDBase):
         # avoid unique constraint violation by pre-checking
         run_no = record.get("run_no", 1)
         search_no = record.get("search_no", 1)
-        label = record.get("label")
-        if label is None:
-            label = "0"
-        if isinstance(label, str):
-            label = label.strip() or "0"
-        else:
-            label = str(label)
+        label = normalize_legacy_label(record.get("label"))
         record["label"] = label
+        if "sample_name" in ExperimentRun.__table__.columns and not (
+            record.get("sample_name") or ""
+        ).strip():
+            record["sample_name"] = experiment_run_legacy_key(
+                experiment_id=experiment_id,
+                run_no=run_no,
+                search_no=search_no,
+                label=label,
+            )
         dup = (
             session.query(ExperimentRun)
             .filter_by(

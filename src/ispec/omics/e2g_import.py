@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from ispec.db.crud import E2GCRUD
 from ispec.db.models import Experiment, ExperimentRun
 from ispec.logging import get_logger
+from ispec.omics.labels import experiment_run_legacy_key, normalize_legacy_label
 from ispec.omics.models import E2G
 
 
@@ -123,7 +124,12 @@ def _resolve_experiment_run(
 
     run = (
         core_session.query(ExperimentRun)
-        .filter_by(experiment_id=experiment_id, run_no=run_no, search_no=search_no, label=label)
+        .filter_by(
+            experiment_id=experiment_id,
+            run_no=run_no,
+            search_no=search_no,
+            label=normalize_legacy_label(label),
+        )
         .one_or_none()
     )
     if run is not None:
@@ -135,11 +141,42 @@ def _resolve_experiment_run(
             f"search_no={search_no} label={label} (sync/import runs first, or pass --create-missing-runs)."
         )
 
+    parent_run = None
+    if normalize_legacy_label(label) != "0":
+        parent_run = (
+            core_session.query(ExperimentRun)
+            .filter_by(
+                experiment_id=experiment_id,
+                run_no=run_no,
+                search_no=search_no,
+                label="0",
+            )
+            .one_or_none()
+        )
+
+    parent_values: dict[str, Any] = {}
+    if parent_run is not None:
+        for field in (
+            "label_type",
+            "ms_instrument",
+            "acquisition_mode",
+            "ref_database",
+            "taxon_id",
+        ):
+            parent_values[field] = getattr(parent_run, field, None)
+
     run = ExperimentRun(
         experiment_id=experiment_id,
         run_no=run_no,
         search_no=search_no,
-        label=label,
+        label=normalize_legacy_label(label),
+        sample_name=experiment_run_legacy_key(
+            experiment_id=experiment_id,
+            run_no=run_no,
+            search_no=search_no,
+            label=label,
+        ),
+        **{key: value for key, value in parent_values.items() if value is not None},
     )
     core_session.add(run)
     core_session.commit()
@@ -158,11 +195,14 @@ def _extract_file_run_info(path: Path) -> tuple[int, int, int, str, list[dict[st
     experiment_id = _safe_int(first.get("EXPRecNo"))
     run_no = _safe_int(first.get("EXPRunNo"))
     search_no = _safe_int(first.get("EXPSearchNo"))
-    label_flag = _safe_int(first.get("LabelFLAG"))
-    if experiment_id is None or run_no is None or search_no is None or label_flag is None:
-        raise ValueError(f"{path.name} is missing required columns/values (EXPRecNo/EXPRunNo/EXPSearchNo/LabelFLAG).")
+    raw_label = first.get("LabelFLAG")
+    if experiment_id is None or run_no is None or search_no is None or raw_label is None:
+        raise ValueError(
+            f"{path.name} is missing required columns/values "
+            "(EXPRecNo/EXPRunNo/EXPSearchNo/LabelFLAG)."
+        )
 
-    return experiment_id, run_no, search_no, str(label_flag), rows
+    return experiment_id, run_no, search_no, normalize_legacy_label(raw_label), rows
 
 
 def _row_to_e2g_record(
@@ -173,15 +213,15 @@ def _row_to_e2g_record(
     store_metadata: bool,
 ) -> dict[str, Any] | None:
     gene_id = _safe_int(row.get("GeneID"))
-    label_flag = _safe_int(row.get("LabelFLAG"))
-    if gene_id is None or label_flag is None:
+    raw_label = row.get("LabelFLAG")
+    if gene_id is None or raw_label is None:
         return None
 
     record: dict[str, Any] = {
         "experiment_run_id": experiment_run_id,
         "gene": str(gene_id),
         "geneidtype": "GeneID",
-        "label": str(label_flag),
+        "label": normalize_legacy_label(raw_label),
     }
 
     if kind == "qual":
