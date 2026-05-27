@@ -4,6 +4,7 @@ from ispec.logging import get_logger
 from .base import Base, make_timestamp_mixin
 from .core import Person, ProjectType, Project, ProjectComment, ProjectPerson
 from .experiment import Experiment, ExperimentRun, Job, JobType, JobStatus
+from .lab import Assay, Reagent
 from .omics import E2G, GeneContrast, GeneContrastStat, GSEAAnalysis, GSEAResult, PSM
 from .files import MSRawFile, ProjectFile, RawFileType, RawFileState, StorageBackend
 from .support import LetterOfSupport
@@ -23,6 +24,8 @@ __all__ = [
     "Project",
     "ProjectComment",
     "ProjectPerson",
+    "Assay",
+    "Reagent",
     "Experiment",
     "ExperimentRun",
     "E2G",

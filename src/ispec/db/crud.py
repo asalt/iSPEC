@@ -47,6 +47,8 @@ from ispec.db.models import (
     ProjectComment,
     ExperimentRun,
     Experiment,
+    Assay,
+    Reagent,
     Job,
     JobStatus,
     MSRawFile,
@@ -180,8 +182,6 @@ class CRUDBase:
         session.refresh(obj)
         return obj
 
-
-
     # hook: expression used for label; override per model if needed
     def label_expr(self):
         """Default human label for options(). Override per model if needed."""
@@ -192,18 +192,18 @@ class CRUDBase:
         def coalesce(colname: str, fallback: str = ""):
             return func.coalesce(getattr(M, colname), fallback)
 
-        if 'name' in cols:
-            return getattr(M, 'name')
-        if 'title' in cols:
-            return getattr(M, 'title')
-        if {'first_name', 'last_name'}.issubset(cols):
+        if "name" in cols:
+            return getattr(M, "name")
+        if "title" in cols:
+            return getattr(M, "title")
+        if {"first_name", "last_name"}.issubset(cols):
             # "Last, First" and trim extra spaces if one side empty
-            return func.trim(coalesce('last_name') + ', ' + coalesce('first_name'))
-        if 'code' in cols:
-            return getattr(M, 'code')
+            return func.trim(coalesce("last_name") + ", " + coalesce("first_name"))
+        if "code" in cols:
+            return getattr(M, "code")
 
         # fallback: cast id to text
-        return cast(getattr(M, 'id'), T.String())
+        return cast(getattr(M, "id"), T.String())
 
     def search_predicate(self, q: str):
         """Return a SQLAlchemy predicate for ``q`` search.
@@ -224,7 +224,9 @@ class CRUDBase:
                 continue
             if not isinstance(col.type, (T.String, T.Enum)):
                 continue
-            predicates.append(cast(getattr(M, col.name), T.String()).ilike(f"%{needle}%"))
+            predicates.append(
+                cast(getattr(M, col.name), T.String()).ilike(f"%{needle}%")
+            )
 
         if predicates:
             return or_(*predicates)
@@ -234,8 +236,6 @@ class CRUDBase:
         except Exception:
             return None
 
-
-
     def list_options(
         self,
         db: Session,
@@ -244,33 +244,32 @@ class CRUDBase:
         limit: int = 20,
         ids: Sequence[int] | None = None,
         exclude_ids: Sequence[int] | None = None,
-        order: str | None = None
+        order: str | None = None,
     ) -> list[dict[str, Any]]:
         M = self.model
-        lbl = self.label_expr().label('label')
+        lbl = self.label_expr().label("label")
 
-        id_col = getattr(M, 'id').label('value')
+        id_col = getattr(M, "id").label("value")
         stmt = select(id_col, lbl)
 
         if ids:
-            stmt = stmt.where(getattr(M, 'id').in_(ids))
+            stmt = stmt.where(getattr(M, "id").in_(ids))
         if exclude_ids:
-            stmt = stmt.where(~getattr(M, 'id').in_(exclude_ids))
+            stmt = stmt.where(~getattr(M, "id").in_(exclude_ids))
 
         if q:
             # Case-insensitive match; .ilike turns into LIKE on SQLite (still case-insensitive)
             stmt = stmt.where(lbl.ilike(f"%{q}%"))
 
         # Sort by label unless caller wants something else
-        if order == 'id':
-            stmt = stmt.order_by(getattr(M, 'id').asc())
+        if order == "id":
+            stmt = stmt.order_by(getattr(M, "id").asc())
         else:
             stmt = stmt.order_by(lbl.asc())
 
         stmt = stmt.limit(limit)
         rows: Iterable[tuple[int, str]] = db.execute(stmt).all()
-        return [{'value': v, 'label': l} for (v, l) in rows]
-
+        return [{"value": v, "label": l} for (v, l) in rows]
 
 
 class PersonCRUD(CRUDBase):
@@ -317,18 +316,20 @@ class PersonCRUD(CRUDBase):
             return None  # or return existing object or ID if desired
         return super().create(session, validated)
 
-
-
-    def label_expr(self): # override base label_expr 
+    def label_expr(self):  # override base label_expr
         # e.g., "Lastname, Firstname (email)"
         cols = self.model.__table__.columns.keys()
         expr = None
-        if {'ppl_Name_Last','ppl_Name_First'}.issubset(cols):
-            expr = getattr(self.model, 'ppl_Name_Last') + ', ' + getattr(self.model, 'ppl_Name_First')
+        if {"ppl_Name_Last", "ppl_Name_First"}.issubset(cols):
+            expr = (
+                getattr(self.model, "ppl_Name_Last")
+                + ", "
+                + getattr(self.model, "ppl_Name_First")
+            )
         else:
             expr = super().label_expr()
-        if 'ppl_email' in cols:  #this might be the wrong form name
-            expr = expr + ' (' + getattr(self.model, 'ppl_email') + ')'
+        if "ppl_email" in cols:  # this might be the wrong form name
+            expr = expr + " (" + getattr(self.model, "ppl_email") + ")"
         return func.trim(expr)
 
     # def label_expr(self):
@@ -345,9 +346,7 @@ class ProjectCRUD(CRUDBase):
     # prefix = "prj_"
 
     def __init__(self):
-        super().__init__(
-            Project, req_cols=["prj_ProjectTitle"]
-        )
+        super().__init__(Project, req_cols=["prj_ProjectTitle"])
 
     @staticmethod
     def _ensure_display_fields(project: Project) -> None:
@@ -358,7 +357,9 @@ class ProjectCRUD(CRUDBase):
         display_title = getattr(project, "prj_PRJ_DisplayTitle", None)
         if not (isinstance(display_title, str) and display_title.strip()):
             title = getattr(project, "prj_ProjectTitle", "") or ""
-            project.prj_PRJ_DisplayTitle = f"{project.prj_PRJ_DisplayID} - {title}".strip()
+            project.prj_PRJ_DisplayTitle = (
+                f"{project.prj_PRJ_DisplayID} - {title}".strip()
+            )
 
     def label_expr(self):
         cols = self.model.__table__.columns.keys()
@@ -404,11 +405,15 @@ class ProjectCRUD(CRUDBase):
         logger.info(f"Inserted into {self.model.__tablename__}: {validated}")
         return obj
 
-    def after_update(self, session: Session, project: Project, updates: dict[str, Any]) -> None:
+    def after_update(
+        self, session: Session, project: Project, updates: dict[str, Any]
+    ) -> None:
         self._ensure_display_fields(project)
         if "prj_ProjectTitle" in updates:
             title = getattr(project, "prj_ProjectTitle", "") or ""
-            project.prj_PRJ_DisplayTitle = f"{project.prj_PRJ_DisplayID} - {title}".strip()
+            project.prj_PRJ_DisplayTitle = (
+                f"{project.prj_PRJ_DisplayID} - {title}".strip()
+            )
 
 
 class ProjectCommentCRUD(CRUDBase):
@@ -473,6 +478,44 @@ class ProjectPersonCRUD(CRUDBase):
 class LetterOfSupportCRUD(CRUDBase):
     def __init__(self):
         return super().__init__(LetterOfSupport)
+
+
+class ReagentCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(Reagent, req_cols=["name"])
+
+    def label_expr(self):
+        M = self.model
+        cols = M.__table__.columns.keys()
+        if {"name", "vendor", "catalog_no"}.issubset(cols):
+            return func.trim(
+                getattr(M, "name")
+                + " "
+                + func.coalesce(getattr(M, "vendor"), "")
+                + " "
+                + func.coalesce(getattr(M, "catalog_no"), "")
+            )
+        return super().label_expr()
+
+
+class AssayCRUD(CRUDBase):
+    def __init__(self):
+        super().__init__(Assay, req_cols=["name"])
+
+    def validate_input(self, session: Session, record: dict | None) -> dict | None:
+        if session is None:
+            raise ValueError("A database session is required for validation.")
+        if record is None:
+            return None
+
+        reagent_id = record.get("primary_reagent_id")
+        if (
+            reagent_id is not None
+            and not session.query(Reagent).filter_by(id=reagent_id).first()
+        ):
+            raise ValueError(f"Invalid primary_reagent_id: {reagent_id}")
+
+        return super().validate_input(session, record)
 
 
 class E2GCRUD(CRUDBase):
@@ -552,7 +595,11 @@ class E2GCRUD(CRUDBase):
         conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
         dup = (
             session.query(E2G)
-            .filter(E2G.experiment_run_id == exp_run_id, E2G.label == cleaned["label"], or_(*conds))
+            .filter(
+                E2G.experiment_run_id == exp_run_id,
+                E2G.label == cleaned["label"],
+                or_(*conds),
+            )
             .first()
         )
         if dup:
@@ -563,7 +610,9 @@ class E2GCRUD(CRUDBase):
     def label_expr(self):
         cols = self.model.__table__.columns.keys()
         if "gene_symbol" in cols:
-            return func.coalesce(getattr(self.model, "gene_symbol"), getattr(self.model, "gene"))
+            return func.coalesce(
+                getattr(self.model, "gene_symbol"), getattr(self.model, "gene")
+            )
         return getattr(self.model, "gene")
 
     def bulk_upsert(
@@ -625,7 +674,9 @@ class E2GCRUD(CRUDBase):
             conds = [and_(E2G.geneidtype == t, E2G.gene == v) for (t, v) in pairs]
             existing = (
                 session.query(E2G)
-                .filter(E2G.experiment_run_id == exp_run_id, E2G.label == label, or_(*conds))
+                .filter(
+                    E2G.experiment_run_id == exp_run_id, E2G.label == label, or_(*conds)
+                )
                 .first()
             )
             if existing:
@@ -637,7 +688,9 @@ class E2GCRUD(CRUDBase):
                         continue
                     value = validated[field]
                     if field == "metadata_json" and value is not None:
-                        value = merge_metadata_json(getattr(existing, field, None), str(value))
+                        value = merge_metadata_json(
+                            getattr(existing, field, None), str(value)
+                        )
                     if getattr(existing, field) != value:
                         setattr(existing, field, value)
                         changed = True
@@ -687,7 +740,9 @@ class ExperimentCRUD(CRUDBase):
 
     def readonly_fields(self) -> set[str]:
         readonly = super().readonly_fields()
-        readonly.update({"project_id", "record_no", "exp_Data_FLAG", "exp_exp2gene_FLAG"})
+        readonly.update(
+            {"project_id", "record_no", "exp_Data_FLAG", "exp_exp2gene_FLAG"}
+        )
         return readonly
 
     def label_expr(self):
@@ -708,6 +763,13 @@ class ExperimentCRUD(CRUDBase):
         exists = session.query(Project).filter_by(id=project_id).first()
         if not exists:
             raise ValueError(f"Invalid project_id: {project_id}")
+
+        assay_id = record.get("assay_id")
+        if (
+            assay_id is not None
+            and not session.query(Assay).filter_by(id=assay_id).first()
+        ):
+            raise ValueError(f"Invalid assay_id: {assay_id}")
 
         # basic duplicate check on record_no within a project
         rec = (record.get("record_no") or "").strip()
@@ -765,9 +827,10 @@ class ExperimentRunCRUD(CRUDBase):
         search_no = record.get("search_no", 1)
         label = normalize_legacy_label(record.get("label"))
         record["label"] = label
-        if "sample_name" in ExperimentRun.__table__.columns and not (
-            record.get("sample_name") or ""
-        ).strip():
+        if (
+            "sample_name" in ExperimentRun.__table__.columns
+            and not (record.get("sample_name") or "").strip()
+        ):
             record["sample_name"] = experiment_run_legacy_key(
                 experiment_id=experiment_id,
                 run_no=run_no,
@@ -777,7 +840,10 @@ class ExperimentRunCRUD(CRUDBase):
         dup = (
             session.query(ExperimentRun)
             .filter_by(
-                experiment_id=experiment_id, run_no=run_no, search_no=search_no, label=label
+                experiment_id=experiment_id,
+                run_no=run_no,
+                search_no=search_no,
+                label=label,
             )
             .first()
         )
@@ -810,12 +876,15 @@ class JobCRUD(CRUDBase):
             return None
         obj.status = JobStatus.running
         from datetime import datetime, UTC
+
         obj.started_at = datetime.now(UTC)
         session.commit()
         session.refresh(obj)
         return obj
 
-    def succeed(self, session: Session, job_id: int, message: str | None = None) -> Job | None:
+    def succeed(
+        self, session: Session, job_id: int, message: str | None = None
+    ) -> Job | None:
         obj = self.get(session, job_id)
         if not obj:
             return None
@@ -823,12 +892,15 @@ class JobCRUD(CRUDBase):
         if message:
             obj.message = message
         from datetime import datetime, UTC
+
         obj.finished_at = datetime.now(UTC)
         session.commit()
         session.refresh(obj)
         return obj
 
-    def fail(self, session: Session, job_id: int, message: str | None = None) -> Job | None:
+    def fail(
+        self, session: Session, job_id: int, message: str | None = None
+    ) -> Job | None:
         obj = self.get(session, job_id)
         if not obj:
             return None
@@ -836,6 +908,7 @@ class JobCRUD(CRUDBase):
         if message:
             obj.message = message
         from datetime import datetime, UTC
+
         obj.finished_at = datetime.now(UTC)
         session.commit()
         session.refresh(obj)

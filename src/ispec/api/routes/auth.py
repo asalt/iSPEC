@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ispec.api.security import (
@@ -32,6 +33,8 @@ class UserOut(BaseModel):
     is_active: bool
     must_change_password: bool
     assistant_brief: str | None = None
+    project_count: int | None = None
+    effective_project_access: str | None = None
 
 
 class BootstrapRequest(BaseModel):
@@ -79,14 +82,33 @@ def _normalize_assistant_brief(value: str | None) -> str | None:
     return text or None
 
 
-def _user_out(user: AuthUser) -> UserOut:
+def _project_count_for_user(db: Session, *, user_id: int) -> int:
+    return int(
+        db.query(func.count(AuthUserProject.project_id))
+        .filter(AuthUserProject.user_id == user_id)
+        .scalar()
+        or 0
+    )
+
+
+def _effective_project_access(user: AuthUser, project_count: int | None) -> str:
+    if user.role == UserRole.client:
+        return "restricted" if int(project_count or 0) > 0 else "none"
+    return "all"
+
+
+def _user_out(user: AuthUser, *, project_count: int | None = None) -> UserOut:
     return UserOut(
         id=user.id,
         username=user.username,
         role=user.role,
         is_active=user.is_active,
         must_change_password=bool(getattr(user, "must_change_password", False)),
-        assistant_brief=_normalize_assistant_brief(getattr(user, "assistant_brief", None)),
+        assistant_brief=_normalize_assistant_brief(
+            getattr(user, "assistant_brief", None)
+        ),
+        project_count=project_count,
+        effective_project_access=_effective_project_access(user, project_count),
     )
 
 
@@ -95,7 +117,11 @@ def _invalidate_user_sessions(db: Session, *, user_id: int) -> None:
 
 
 @router.post("/bootstrap", response_model=UserOut, status_code=201)
-def bootstrap(payload: BootstrapRequest, response: Response, db: Session = Depends(get_session_dep)):
+def bootstrap(
+    payload: BootstrapRequest,
+    response: Response,
+    db: Session = Depends(get_session_dep),
+):
     """Create the first (admin) user if no users exist yet."""
 
     if db.query(AuthUser).count() > 0:
@@ -120,10 +146,14 @@ def bootstrap(payload: BootstrapRequest, response: Response, db: Session = Depen
 
 
 @router.post("/login", response_model=UserOut)
-def login(payload: LoginRequest, response: Response, db: Session = Depends(get_session_dep)):
+def login(
+    payload: LoginRequest, response: Response, db: Session = Depends(get_session_dep)
+):
     user = db.query(AuthUser).filter(AuthUser.username == payload.username).first()
     if user is None or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials."
+        )
 
     if not verify_password(
         payload.password,
@@ -131,7 +161,9 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_s
         hash_b64=user.password_hash,
         iterations=user.password_iterations,
     ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials."
+        )
 
     user.last_login_at = datetime.now(UTC)
     token = create_session(db, user=user)
@@ -140,7 +172,9 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_s
 
 
 @router.post("/logout")
-def logout(request: Request, response: Response, db: Session = Depends(get_session_dep)):
+def logout(
+    request: Request, response: Response, db: Session = Depends(get_session_dep)
+):
     token = request.cookies.get(session_cookie_name())
     if token:
         delete_session(db, token=token)
@@ -154,13 +188,27 @@ def me(user: AuthUser = Depends(require_user)):
 
 
 @router.get("/users", response_model=list[UserOut])
-def list_users(_: AuthUser = Depends(require_staff), db: Session = Depends(get_session_dep)):
+def list_users(
+    _: AuthUser = Depends(require_staff), db: Session = Depends(get_session_dep)
+):
     users = db.query(AuthUser).order_by(AuthUser.username.asc()).all()
-    return [_user_out(u) for u in users]
+    counts = {
+        int(user_id): int(count)
+        for user_id, count in (
+            db.query(AuthUserProject.user_id, func.count(AuthUserProject.project_id))
+            .group_by(AuthUserProject.user_id)
+            .all()
+        )
+    }
+    return [_user_out(u, project_count=counts.get(int(u.id), 0)) for u in users]
 
 
 @router.post("/users", response_model=UserOut, status_code=201)
-def create_user(payload: CreateUserRequest, _: AuthUser = Depends(require_admin), db: Session = Depends(get_session_dep)):
+def create_user(
+    payload: CreateUserRequest,
+    _: AuthUser = Depends(require_admin),
+    db: Session = Depends(get_session_dep),
+):
     existing = db.query(AuthUser).filter(AuthUser.username == payload.username).first()
     if existing is not None:
         raise HTTPException(status_code=409, detail="Username already exists.")
@@ -178,7 +226,7 @@ def create_user(payload: CreateUserRequest, _: AuthUser = Depends(require_admin)
     db.add(user)
     db.commit()
     db.refresh(user)
-    return _user_out(user)
+    return _user_out(user, project_count=0)
 
 
 @router.post("/change-password", response_model=UserOut)
@@ -194,7 +242,9 @@ def change_password(
         hash_b64=user.password_hash,
         iterations=user.password_iterations,
     ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials."
+        )
 
     salt_b64, hash_b64, iterations = hash_password(payload.new_password)
     user.password_hash = hash_b64
@@ -234,7 +284,9 @@ def reset_password(
     db.add(user)
     db.commit()
     db.refresh(user)
-    return _user_out(user)
+    return _user_out(
+        user, project_count=_project_count_for_user(db, user_id=int(user.id))
+    )
 
 
 @router.put("/users/{user_id}/assistant-brief", response_model=UserOut)
@@ -252,7 +304,9 @@ def update_user_assistant_brief(
     db.add(user)
     db.commit()
     db.refresh(user)
-    return _user_out(user)
+    return _user_out(
+        user, project_count=_project_count_for_user(db, user_id=int(user.id))
+    )
 
 
 @router.get("/users/{user_id}/projects", response_model=UserProjectsOut)
@@ -295,7 +349,8 @@ def update_user_projects(
 
     if desired:
         existing_projects = {
-            int(row[0]) for row in db.query(Project.id).filter(Project.id.in_(desired)).all()
+            int(row[0])
+            for row in db.query(Project.id).filter(Project.id.in_(desired)).all()
         }
         missing = [pid for pid in desired if pid not in existing_projects]
         if missing:

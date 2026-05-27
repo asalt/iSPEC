@@ -126,7 +126,9 @@ def _ensure_person_columns(engine: Engine) -> None:
 
     if "ppl_LegacyPersonID" not in columns:
         with engine.begin() as conn:
-            conn.execute(text('ALTER TABLE person ADD COLUMN "ppl_LegacyPersonID" INTEGER'))
+            conn.execute(
+                text('ALTER TABLE person ADD COLUMN "ppl_LegacyPersonID" INTEGER')
+            )
         logger.info("Added missing column person.ppl_LegacyPersonID")
 
     try:
@@ -146,7 +148,9 @@ def _ensure_project_comment_columns(engine: Engine) -> None:
     """Ensure legacy SQLite schemas include newer project_comment columns."""
 
     try:
-        columns = {col["name"] for col in inspect(engine).get_columns("project_comment")}
+        columns = {
+            col["name"] for col in inspect(engine).get_columns("project_comment")
+        }
     except Exception:
         return
 
@@ -189,6 +193,7 @@ def _ensure_experiment_columns(engine: Engine) -> None:
     """Ensure legacy SQLite schemas include newer experiment columns."""
 
     desired: list[tuple[str, str]] = [
+        ("assay_id", "INTEGER"),
         ("exp_LabelFLAG", "INTEGER NOT NULL DEFAULT 0"),
         ("exp_Type", "TEXT"),
         ("exp_Name", "TEXT"),
@@ -255,7 +260,8 @@ def _ensure_experiment_run_columns(engine: Engine) -> None:
             conn.execute(text(f'ALTER TABLE experiment_run ADD COLUMN "{name}" {ddl}'))
 
     logger.info(
-        "Added missing columns experiment_run.%s", ", ".join(name for name, _ in missing)
+        "Added missing columns experiment_run.%s",
+        ", ".join(name for name, _ in missing),
     )
     _backfill_experiment_run_sample_names(engine)
 
@@ -320,7 +326,9 @@ def _ensure_e2g_columns(engine: Engine) -> None:
     ]
 
     try:
-        columns = {col["name"] for col in inspect(engine).get_columns("experiment_to_gene")}
+        columns = {
+            col["name"] for col in inspect(engine).get_columns("experiment_to_gene")
+        }
     except Exception:
         return
 
@@ -330,10 +338,13 @@ def _ensure_e2g_columns(engine: Engine) -> None:
 
     with engine.begin() as conn:
         for name, ddl in missing:
-            conn.execute(text(f'ALTER TABLE experiment_to_gene ADD COLUMN "{name}" {ddl}'))
+            conn.execute(
+                text(f'ALTER TABLE experiment_to_gene ADD COLUMN "{name}" {ddl}')
+            )
 
     logger.info(
-        "Added missing columns experiment_to_gene.%s", ", ".join(name for name, _ in missing)
+        "Added missing columns experiment_to_gene.%s",
+        ", ".join(name for name, _ in missing),
     )
 
 

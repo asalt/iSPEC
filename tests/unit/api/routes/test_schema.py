@@ -1,6 +1,13 @@
 import pytest
 
-from ispec.db.models import Person, Project, ProjectComment, ProjectType
+from ispec.db.models import (
+    Assay,
+    Experiment,
+    Person,
+    Project,
+    ProjectComment,
+    ProjectType,
+)
 from ispec.db.models.support import LetterOfSupport
 from ispec.api.models.modelmaker import make_pydantic_model_from_sqlalchemy
 from ispec.api.routes.schema import build_form_schema
@@ -42,6 +49,7 @@ def test_enum_field_has_select_options():
     option_values = {opt["value"] for opt in ui["options"]}
     assert option_values >= {e.value for e in ProjectType}
 
+
 def test_cached_schemas_are_isolated_between_models():
     PersonCreate = _get_create_model()
     person_schema = build_form_schema(Person, PersonCreate)
@@ -51,6 +59,7 @@ def test_cached_schemas_are_isolated_between_models():
     project_schema = build_form_schema(Project, ProjectCreate)
 
     assert all("mutated" not in prop for prop in project_schema["properties"].values())
+
 
 def test_foreign_key_field_uses_route_prefix_mapping():
     """Foreign key fields should use SelectAsync and mapped route prefix."""
@@ -70,6 +79,32 @@ def test_foreign_key_field_uses_route_prefix_mapping():
     project_ui = schema["properties"]["project_id"]["ui"]
     assert project_ui["component"] == "SelectAsync"
     assert project_ui["optionsEndpoint"] == "/projects/options"
+
+
+def test_lab_foreign_keys_use_route_prefix_mapping():
+    AssayCreate = make_pydantic_model_from_sqlalchemy(Assay, name_suffix="Create")
+    ExperimentCreate = make_pydantic_model_from_sqlalchemy(
+        Experiment, name_suffix="Create"
+    )
+
+    mapping = {"reagent": "/reagents", "assay": "/assays"}
+
+    def prefix_for_table(name: str) -> str:
+        return mapping.get(name, f"/{name}")
+
+    assay_schema = build_form_schema(
+        Assay, AssayCreate, route_prefix_for_table=prefix_for_table
+    )
+    reagent_ui = assay_schema["properties"]["primary_reagent_id"]["ui"]
+    assert reagent_ui["component"] == "SelectAsync"
+    assert reagent_ui["optionsEndpoint"] == "/reagents/options"
+
+    experiment_schema = build_form_schema(
+        Experiment, ExperimentCreate, route_prefix_for_table=prefix_for_table
+    )
+    assay_ui = experiment_schema["properties"]["assay_id"]["ui"]
+    assert assay_ui["component"] == "SelectAsync"
+    assert assay_ui["optionsEndpoint"] == "/assays/options"
 
 
 def test_system_fields_are_marked_read_only():

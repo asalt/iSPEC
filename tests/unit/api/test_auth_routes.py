@@ -6,8 +6,13 @@ from fastapi.testclient import TestClient
 
 from ispec.api.routes.auth import router as auth_router
 from ispec.api.security import create_session, session_cookie_name
-from ispec.db.connect import get_session_dep, initialize_db, make_session_factory, sqlite_engine
-from ispec.db.models import AuthUser, UserRole
+from ispec.db.connect import (
+    get_session_dep,
+    initialize_db,
+    make_session_factory,
+    sqlite_engine,
+)
+from ispec.db.models import AuthUser, AuthUserProject, Project, UserRole
 
 pytestmark = pytest.mark.testclient
 
@@ -33,7 +38,13 @@ def auth_client(tmp_path):
         yield client
 
 
-def _create_user(session_factory, *, username: str, role: UserRole, assistant_brief: str | None = None) -> AuthUser:
+def _create_user(
+    session_factory,
+    *,
+    username: str,
+    role: UserRole,
+    assistant_brief: str | None = None,
+) -> AuthUser:
     with session_factory() as db:
         user = AuthUser(
             username=username,
@@ -84,12 +95,16 @@ def test_auth_staff_can_update_and_clear_user_assistant_brief(auth_client):
         cookies=cookies,
     )
     assert resp.status_code == 200
-    assert resp.json()["assistant_brief"] == "Developer focused on local devops workflows."
+    assert (
+        resp.json()["assistant_brief"] == "Developer focused on local devops workflows."
+    )
 
     with auth_client.session_factory() as db:  # type: ignore[attr-defined]
         refreshed = db.get(AuthUser, int(target.id))
         assert refreshed is not None
-        assert refreshed.assistant_brief == "Developer focused on local devops workflows."
+        assert (
+            refreshed.assistant_brief == "Developer focused on local devops workflows."
+        )
 
     cleared = auth_client.put(
         f"/auth/users/{int(target.id)}/assistant-brief",
@@ -103,3 +118,26 @@ def test_auth_staff_can_update_and_clear_user_assistant_brief(auth_client):
         refreshed = db.get(AuthUser, int(target.id))
         assert refreshed is not None
         assert refreshed.assistant_brief is None
+
+
+def test_auth_users_list_reports_project_access_summary(auth_client):
+    admin = _create_user(auth_client.session_factory, username="admin", role=UserRole.admin)  # type: ignore[attr-defined]
+    client_user = _create_user(auth_client.session_factory, username="demo", role=UserRole.client)  # type: ignore[attr-defined]
+    viewer = _create_user(auth_client.session_factory, username="viewer", role=UserRole.viewer)  # type: ignore[attr-defined]
+    cookies = _admin_cookie(auth_client.session_factory, admin_user_id=int(admin.id))  # type: ignore[attr-defined]
+
+    with auth_client.session_factory() as db:  # type: ignore[attr-defined]
+        project = Project(prj_AddedBy="tester", prj_ProjectTitle="Allowed Project")
+        db.add(project)
+        db.flush()
+        db.add(AuthUserProject(user_id=int(client_user.id), project_id=int(project.id)))
+        db.commit()
+
+    resp = auth_client.get("/auth/users", cookies=cookies)
+    assert resp.status_code == 200
+    by_username = {row["username"]: row for row in resp.json()}
+
+    assert by_username["demo"]["project_count"] == 1
+    assert by_username["demo"]["effective_project_access"] == "restricted"
+    assert by_username["viewer"]["project_count"] == 0
+    assert by_username["viewer"]["effective_project_access"] == "all"

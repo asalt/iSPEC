@@ -1,7 +1,16 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum as SAEnum, Float, ForeignKey, Integer, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum as SAEnum,
+    Float,
+    ForeignKey,
+    Integer,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, make_timestamp_mixin
@@ -17,6 +26,11 @@ class Experiment(ExperimentTimestamp, Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int | None] = mapped_column(
         ForeignKey("project.id", ondelete="CASCADE"), nullable=True
+    )
+    assay_id: Mapped[int | None] = mapped_column(
+        ForeignKey("assay.id"),
+        nullable=True,
+        info={"ui": {"label": "Assay", "allowClear": True}},
     )
     Experiment_LegacyImportTS: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
@@ -96,7 +110,10 @@ class Experiment(ExperimentTimestamp, Base):
             "ui": {
                 "label": "DTT",
                 "component": "RadioGroup",
-                "options": [{"value": True, "label": "Yes"}, {"value": False, "label": "No"}],
+                "options": [
+                    {"value": True, "label": "Yes"},
+                    {"value": False, "label": "No"},
+                ],
             }
         },
     )
@@ -108,7 +125,10 @@ class Experiment(ExperimentTimestamp, Base):
             "ui": {
                 "label": "IAA",
                 "component": "RadioGroup",
-                "options": [{"value": True, "label": "Yes"}, {"value": False, "label": "No"}],
+                "options": [
+                    {"value": True, "label": "Yes"},
+                    {"value": False, "label": "No"},
+                ],
             }
         },
     )
@@ -116,7 +136,9 @@ class Experiment(ExperimentTimestamp, Base):
         Text, nullable=True, info={"ui": {"label": "Amount"}}
     )
     exp_Adjustments: Mapped[str | None] = mapped_column(
-        Text, nullable=True, info={"ui": {"label": "Adjustments", "component": "Textarea"}}
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Adjustments", "component": "Textarea"}},
     )
     exp_Batch: Mapped[str | None] = mapped_column(
         Text, nullable=True, info={"ui": {"label": "Batch #"}}
@@ -140,6 +162,7 @@ class Experiment(ExperimentTimestamp, Base):
     )
 
     project: Mapped["Project"] = relationship(back_populates="experiments")
+    assay: Mapped["Assay"] = relationship("Assay", back_populates="experiments")
     runs: Mapped[list["ExperimentRun"]] = relationship(
         back_populates="experiment", cascade="all, delete-orphan"
     )

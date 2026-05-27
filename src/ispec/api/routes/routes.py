@@ -14,10 +14,12 @@ from ispec.db.models import (
     ProjectComment,
     ProjectPerson,
     E2G,
+    Assay,
     Experiment,
     ExperimentRun,
     Job,
     PSM,
+    Reagent,
     MSRawFile,
     LetterOfSupport,
 )
@@ -28,10 +30,12 @@ from ispec.db.crud import (
     ProjectCommentCRUD,
     ProjectPersonCRUD,
     E2GCRUD,
+    AssayCRUD,
     ExperimentCRUD,
     ExperimentRunCRUD,
     JobCRUD,
     PSMCRUD,
+    ReagentCRUD,
     MSRawFileCRUD,
     LetterOfSupportCRUD,
 )
@@ -50,6 +54,8 @@ JobRead = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
 _ALL_RESOURCES: set[str] = {
     "people",
     "projects",
+    "assays",
+    "reagents",
     "experiments",
     "experiment_runs",
     "experiment_to_gene",
@@ -263,7 +269,9 @@ def _add_crud_endpoints(
         message = str(getattr(exc, "orig", exc)).lower()
         if "unique" in message or "duplicate" in message:
             return HTTPException(status_code=409, detail=_duplicate_detail())
-        return HTTPException(status_code=400, detail=f"{tag} violates database constraints.")
+        return HTTPException(
+            status_code=400, detail=f"{tag} violates database constraints."
+        )
 
     @router.get("")
     @router.get("/")
@@ -343,7 +351,11 @@ def _add_crud_endpoints(
             return {"items": payload, "total": total}
         return payload
 
-    @router.get("/{item_id}", response_model=read_response_model, response_model_exclude_none=True)
+    @router.get(
+        "/{item_id}",
+        response_model=read_response_model,
+        response_model_exclude_none=True,
+    )
     def get_item(item_id: int, request: Request, db: Session = Depends(session_dep)):
         obj = crud.get(db, item_id)
         if obj is None:
@@ -402,8 +414,14 @@ def _add_crud_endpoints(
             raise HTTPException(status_code=409, detail=_duplicate_detail())
         return _serialize_row(obj)
 
-    @router.put("/{item_id}", response_model=read_response_model, response_model_exclude_none=True)
-    def update_item(item_id: int, payload: create_model, db: Session = Depends(session_dep)):
+    @router.put(
+        "/{item_id}",
+        response_model=read_response_model,
+        response_model_exclude_none=True,
+    )
+    def update_item(
+        item_id: int, payload: create_model, db: Session = Depends(session_dep)
+    ):
         obj = crud.get(db, item_id)
         if obj is None:
             raise HTTPException(status_code=404, detail=f"{tag} not found")
@@ -475,7 +493,9 @@ def _add_options_endpoints(
         mapper = sa_inspect(model)
         rel = mapper.relationships.get(field)
         if not rel:
-            raise HTTPException(status_code=404, detail=f"No relationship named '{field}'")
+            raise HTTPException(
+                status_code=404, detail=f"No relationship named '{field}'"
+            )
         target_cls = rel.mapper.class_
         crud_class_map = {
             Person: PersonCRUD,
@@ -483,6 +503,8 @@ def _add_options_endpoints(
             ProjectComment: ProjectCommentCRUD,
             Experiment: ExperimentCRUD,
             ExperimentRun: ExperimentRunCRUD,
+            Assay: AssayCRUD,
+            Reagent: ReagentCRUD,
         }
 
         target_crud_cls = crud_class_map.get(target_cls, CRUDBase)
@@ -569,7 +591,6 @@ def generate_crud_router(
       endpoints or tweak schema generation after calling it.
     """
 
-
     create_exclude_fields = set(create_exclude_fields or set())
     # Never ask users to supply timestamp mixin fields on create/update.
     create_exclude_fields.update(
@@ -611,6 +632,7 @@ def generate_crud_router(
 
     # Model-specific convenience endpoints
     if model is E2G:
+
         @router.get("/by_run/{run_id}", response_model=list[ReadModel])
         def list_genes_by_run(
             run_id: int,
@@ -631,6 +653,7 @@ def generate_crud_router(
             return [ReadModel.model_validate(r).model_dump() for r in rows]
 
     if model is PSM:
+
         @router.get("/by_run/{run_id}", response_model=list[ReadModel])
         def list_psms_by_run(
             run_id: int,
@@ -651,6 +674,7 @@ def generate_crud_router(
             return [ReadModel.model_validate(r).model_dump() for r in rows]
 
     if model is MSRawFile:
+
         @router.get("/by_run/{run_id}", response_model=list[ReadModel])
         def list_raw_files_by_run(
             run_id: int,
@@ -679,6 +703,7 @@ def generate_crud_router(
     )
 
     return router
+
 
 # person_router = generate_crud_router(
 #     model=Person,
@@ -717,6 +742,7 @@ if _enabled("people"):
 
 # ========================= Project ==============================
 if _enabled("projects"):
+
     class ProjectNav(BaseModel):
         scope: str = Field(description="Navigation scope: all | current | to-bill")
         exists: bool
@@ -814,7 +840,9 @@ if _enabled("projects"):
             ).filter(AuthUserProject.user_id == user.id)
         exists = bool(exists_query.scalar() or 0)
 
-        in_scope_query = db.query(func.count(Project.id)).filter(Project.id == project_id, *filters)
+        in_scope_query = db.query(func.count(Project.id)).filter(
+            Project.id == project_id, *filters
+        )
         if join_access:
             in_scope_query = in_scope_query.join(
                 AuthUserProject, AuthUserProject.project_id == Project.id
@@ -839,8 +867,12 @@ if _enabled("projects"):
         first_id = first_id_query.scalar()
         last_id = last_id_query.scalar()
 
-        prev_query = db.query(func.max(Project.id)).filter(Project.id < project_id, *filters)
-        next_query = db.query(func.min(Project.id)).filter(Project.id > project_id, *filters)
+        prev_query = db.query(func.max(Project.id)).filter(
+            Project.id < project_id, *filters
+        )
+        next_query = db.query(func.min(Project.id)).filter(
+            Project.id > project_id, *filters
+        )
         if join_access:
             prev_query = prev_query.join(
                 AuthUserProject, AuthUserProject.project_id == Project.id
@@ -851,8 +883,12 @@ if _enabled("projects"):
         prev_id = prev_query.scalar()
         next_id = next_query.scalar()
 
-        prev_count_query = db.query(func.count(Project.id)).filter(Project.id < project_id, *filters)
-        next_count_query = db.query(func.count(Project.id)).filter(Project.id > project_id, *filters)
+        prev_count_query = db.query(func.count(Project.id)).filter(
+            Project.id < project_id, *filters
+        )
+        next_count_query = db.query(func.count(Project.id)).filter(
+            Project.id > project_id, *filters
+        )
         if join_access:
             prev_count_query = prev_count_query.join(
                 AuthUserProject, AuthUserProject.project_id == Project.id
@@ -890,6 +926,36 @@ if _enabled("projects"):
     )
 
 
+# ========================= Reagent ==============================
+if _enabled("reagents"):
+    router.include_router(
+        generate_crud_router(
+            model=Reagent,
+            crud_class=ReagentCRUD,
+            prefix="/reagents",
+            tag="Reagent",
+            exclude_fields={"id"},
+            create_exclude_fields={"reagent_CreationTS", "reagent_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
+    )
+
+
+# ========================= Assay ==============================
+if _enabled("assays"):
+    router.include_router(
+        generate_crud_router(
+            model=Assay,
+            crud_class=AssayCRUD,
+            prefix="/assays",
+            tag="Assay",
+            exclude_fields={"id"},
+            create_exclude_fields={"assay_CreationTS", "assay_ModificationTS"},
+            route_prefix_by_table=_ROUTE_PREFIX_MAP,
+        )
+    )
+
+
 # ========================= Experiment ==============================
 if _enabled("experiments"):
     router.include_router(
@@ -899,7 +965,10 @@ if _enabled("experiments"):
             prefix="/experiments",
             tag="Experiment",
             exclude_fields={"id"},
-            create_exclude_fields={"Experiment_CreationTS", "Experiment_ModificationTS"},
+            create_exclude_fields={
+                "Experiment_CreationTS",
+                "Experiment_ModificationTS",
+            },
             route_prefix_by_table=_ROUTE_PREFIX_MAP,
         )
     )
@@ -914,7 +983,10 @@ if _enabled("experiment_runs"):
             prefix="/experiment_runs",
             tag="ExperimentRun",
             exclude_fields={"id"},
-            create_exclude_fields={"ExperimentRun_CreationTS", "ExperimentRun_ModificationTS"},
+            create_exclude_fields={
+                "ExperimentRun_CreationTS",
+                "ExperimentRun_ModificationTS",
+            },
             route_prefix_by_table=_ROUTE_PREFIX_MAP,
         )
     )
@@ -1008,7 +1080,9 @@ if _enabled("letter_of_support"):
             return {"items": payload, "total": total}
         return payload
 
-    @los_router.get("/{item_id}", response_model=LetterRead, response_model_exclude_none=True)
+    @los_router.get(
+        "/{item_id}", response_model=LetterRead, response_model_exclude_none=True
+    )
     def get_letter(item_id: int, db: Session = Depends(get_session_dep)):
         obj = los_crud.get(db, item_id)
         if obj is None:
@@ -1031,7 +1105,9 @@ if _enabled("letter_of_support"):
         if not blob:
             raise HTTPException(status_code=404, detail="File not found")
 
-        base = (getattr(obj, "los_FileName", None) or f"letter_{item_id}").strip() or f"letter_{item_id}"
+        base = (
+            getattr(obj, "los_FileName", None) or f"letter_{item_id}"
+        ).strip() or f"letter_{item_id}"
         filename = base
         lower = filename.lower()
         if not lower.endswith(default_ext):
@@ -1119,7 +1195,12 @@ if _enabled("jobs"):
             prefix="/jobs",
             tag="Job",
             exclude_fields={"id"},
-            create_exclude_fields={"job_CreationTS", "job_ModificationTS", "started_at", "finished_at"},
+            create_exclude_fields={
+                "job_CreationTS",
+                "job_ModificationTS",
+                "started_at",
+                "finished_at",
+            },
             route_prefix_by_table=_ROUTE_PREFIX_MAP,
         )
     )
@@ -1324,7 +1405,8 @@ if _enabled("experiment_runs") and _enabled("experiments"):
 if _enabled("experiment_to_gene"):
 
     @router.get(
-        "/experiment_to_gene/by_experiment/{experiment_id}", response_model=list[E2GRead]
+        "/experiment_to_gene/by_experiment/{experiment_id}",
+        response_model=list[E2GRead],
     )
     def list_genes_by_experiment(
         experiment_id: int,
@@ -1353,7 +1435,6 @@ if _enabled("experiment_to_gene"):
             query = query.filter(E2G.geneidtype == geneidtype)
         rows = query.order_by(E2G.id.asc()).limit(limit).offset(offset).all()
         return [E2GRead.model_validate(r).model_dump() for r in rows]
-
 
     @router.get(
         "/experiment_to_gene/by_project/{project_id}", response_model=list[E2GRead]
@@ -1401,6 +1482,7 @@ if _enabled("jobs"):
     ):
         _reject_client(request)
         from ispec.db.models import Job as _Job
+
         rows = (
             db.query(_Job)
             .filter(_Job.experiment_run_id == run_id)
@@ -1412,7 +1494,6 @@ if _enabled("jobs"):
         Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
         return [Read.model_validate(r).model_dump() for r in rows]
 
-
     @router.post("/jobs/{job_id}/start")
     def start_job(job_id: int, db: Session = Depends(get_session_dep)):
         crud = JobCRUD()
@@ -1422,9 +1503,10 @@ if _enabled("jobs"):
         Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
         return Read.model_validate(obj).model_dump()
 
-
     @router.post("/jobs/{job_id}/succeed")
-    def succeed_job(job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)):
+    def succeed_job(
+        job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)
+    ):
         crud = JobCRUD()
         obj = crud.succeed(db, job_id, message)
         if not obj:
@@ -1432,14 +1514,16 @@ if _enabled("jobs"):
         Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
         return Read.model_validate(obj).model_dump()
 
-
     @router.post("/jobs/{job_id}/fail")
-    def fail_job(job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)):
+    def fail_job(
+        job_id: int, message: str | None = None, db: Session = Depends(get_session_dep)
+    ):
         crud = JobCRUD()
         obj = crud.fail(db, job_id, message)
         if not obj:
             raise HTTPException(status_code=404, detail="Job not found")
         Read = make_pydantic_model_from_sqlalchemy(Job, name_suffix="Read")
         return Read.model_validate(obj).model_dump()
+
 
 # Convenience read models for list endpoints
