@@ -41,6 +41,7 @@ from ispec.assistant.project_comment_approval import (
     project_comment_write_outcome as _project_comment_write_outcome,
     run_project_comment_approval_classifier,
 )
+from ispec.assistant.reply_interpretation import interpret_reply_for_project_comment_save
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
 from ispec.assistant.response_contracts import (
@@ -118,33 +119,6 @@ _WRITE_SUCCESS_PASSIVE_RE = re.compile(
 _WRITE_RESULT_ID_RE = re.compile(r"\bcomment\s+id\b", re.IGNORECASE)
 _TRUTHY_ENV = {"1", "true", "yes", "y", "on"}
 _FALSY_ENV = {"0", "false", "no", "n", "off"}
-_REPLY_INTERPRETATION_ACTIONS: dict[str, dict[str, str]] = {
-    "project_comment_save_confirmation": {
-        "approve": "approve_save",
-        "deny": "deny_save",
-        "defer": "defer_save",
-        "modify": "modify_before_save",
-        "unclear": "clarify",
-    }
-}
-_REPLY_INTERPRETATION_POLICY_TEXT: dict[str, str] = {
-    "deny_save": (
-        "The user declined the pending save. Do not save anything. "
-        "Answer briefly that nothing was saved."
-    ),
-    "defer_save": (
-        "The user wants to wait before saving. Do not save anything. "
-        "Answer briefly that nothing was saved and they can come back later."
-    ),
-    "modify_before_save": (
-        "The user wants to change the pending draft before saving. Do not save anything. "
-        "Ask what should be revised or invite them to provide the updated wording."
-    ),
-    "clarify": (
-        "The turn is awaiting a bounded save confirmation, but the latest reply is not safely actionable. "
-        "Do not save anything. Ask a brief clarification question about whether to save, revise, or cancel."
-    ),
-}
 
 
 @cache
@@ -688,183 +662,6 @@ def _parse_assistant_provider(raw: str) -> str:
 def _parse_tool_protocol(raw: str) -> str:
     normalized = raw.strip().lower()
     return normalized if normalized in {"line", "openai"} else "line"
-
-
-def _is_confirmation_reply(message: str | None) -> bool:
-    if not message:
-        return False
-    normalized = re.sub(r"[^\w\s]", "", message.strip().lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized:
-        return False
-    if len(normalized) > 64:
-        return False
-    if normalized in {
-        "yes",
-        "y",
-        "yeah",
-        "yep",
-        "yup",
-        "ok",
-        "okay",
-        "sure",
-        "confirm",
-        "go ahead",
-        "do it",
-        "please do",
-        "please do it",
-        "no",
-        "n",
-        "nope",
-        "nah",
-    }:
-        return True
-
-    tokens = normalized.split()
-    if len(tokens) > 6:
-        return False
-    affirmative = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm"}
-    negative = {"no", "n", "nope", "nah"}
-    return any(token in affirmative for token in tokens) or any(token in negative for token in tokens)
-
-
-def _is_affirmative_reply(message: str | None) -> bool:
-    if not message:
-        return False
-    normalized = re.sub(r"[^\w\s]", "", message.strip().lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized:
-        return False
-    if len(normalized) > 64:
-        return False
-    if normalized in {
-        "yes",
-        "y",
-        "yeah",
-        "yep",
-        "yup",
-        "ok",
-        "okay",
-        "sure",
-        "confirm",
-        "go ahead",
-        "do it",
-        "please do",
-        "please do it",
-    }:
-        return True
-
-    tokens = normalized.split()
-    if len(tokens) > 6:
-        return False
-    negative = {"no", "n", "nope", "nah"}
-    if any(token in negative for token in tokens):
-        return False
-    affirmative = {"yes", "y", "yeah", "yep", "yup", "ok", "okay", "sure", "confirm"}
-    return any(token in affirmative for token in tokens)
-
-
-def _assistant_requested_project_history_save(message: str | None) -> bool:
-    text = (message or "").strip().lower()
-    if not text:
-        return False
-    if not any(token in text for token in ("save", "log", "record", "add")):
-        return False
-    if not any(token in text for token in ("history", "comment", "note", "meeting")):
-        return False
-    if any(phrase in text for phrase in ("would you like me to", "should i", "want me to", "confirm")):
-        return True
-    if "project history" in text:
-        return True
-    return "project" in text
-
-
-def _awaiting_reply_interpretation_state(
-    *,
-    tool_protocol: str,
-    available_tool_names: set[str],
-    focused_project_id: int | None,
-    last_assistant_message: str | None,
-) -> dict[str, Any] | None:
-    if str(tool_protocol or "").strip().lower() != "openai":
-        return None
-    if "create_project_comment" not in available_tool_names:
-        return None
-    if not isinstance(focused_project_id, int) or focused_project_id <= 0:
-        return None
-    if not _assistant_requested_project_history_save(last_assistant_message):
-        return None
-    return {
-        "name": "project_comment_save_confirmation",
-        "project_id": focused_project_id,
-        "pending_tool": "create_project_comment",
-    }
-
-
-def _legacy_reply_interpretation_kind(message: str | None) -> str:
-    if not _is_confirmation_reply(message):
-        return "unclear"
-    return "approve" if _is_affirmative_reply(message) else "deny"
-
-
-def _reply_interpretation_action(awaiting_state: dict[str, Any] | None, kind: str | None) -> str | None:
-    if not isinstance(awaiting_state, dict):
-        return None
-    state_name = str(awaiting_state.get("name") or "").strip()
-    if not state_name:
-        return None
-    mapping = _REPLY_INTERPRETATION_ACTIONS.get(state_name, {})
-    normalized_kind = str(kind or "").strip()
-    return mapping.get(normalized_kind)
-
-
-def _turn_decision_implies_project_comment_confirmation(
-    *,
-    turn_decision_result: Any,
-    available_tool_names: set[str],
-    focused_project_id: int | None,
-) -> dict[str, Any] | None:
-    decision = getattr(turn_decision_result, "decision", None)
-    if decision is None:
-        return None
-    if "create_project_comment" not in available_tool_names:
-        return None
-    if not isinstance(focused_project_id, int) or focused_project_id <= 0:
-        return None
-    write_plan = getattr(decision, "write_plan", None)
-    if getattr(write_plan, "mode", None) != "confirm_save":
-        return None
-    tool_plan = getattr(decision, "tool_plan", None)
-    primary_group = str(getattr(tool_plan, "primary_group", "") or "").strip()
-    preferred_tool = str(getattr(tool_plan, "preferred_first_tool", "") or "").strip()
-    if primary_group and primary_group != "projects":
-        return None
-    if preferred_tool and preferred_tool != "create_project_comment":
-        return None
-    return {
-        "name": "project_comment_save_confirmation",
-        "project_id": focused_project_id,
-        "pending_tool": "create_project_comment",
-        "source": "turn_decision_confirm_save",
-    }
-
-
-def _reply_interpretation_messages(
-    *,
-    action: str | None,
-    awaiting_state: dict[str, Any] | None,
-) -> list[dict[str, str]]:
-    if action == "approve_save" or not isinstance(awaiting_state, dict):
-        return []
-    text = _REPLY_INTERPRETATION_POLICY_TEXT.get(str(action or "").strip())
-    if not text:
-        return []
-    state_name = str(awaiting_state.get("name") or "").strip()
-    if state_name == "project_comment_save_confirmation":
-        project_id = awaiting_state.get("project_id")
-        if isinstance(project_id, int) and project_id > 0:
-            text += f" The pending draft is for project {project_id}."
-    return [{"role": "system", "content": text}]
 
 
 def _remove_tool_names_from_openai_schemas(
@@ -1725,7 +1522,6 @@ def chat(
         _requested_tool_names_from_text(payload.message, candidates=known_tool_names) if known_tool_names else []
     )
 
-    confirmation_reply = _is_confirmation_reply(payload.message)
     compare_mode_enabled = _compare_mode_enabled()
     self_review_enabled = _self_review_enabled()
     self_review_decider_enabled = _self_review_decider_enabled()
@@ -1749,21 +1545,15 @@ def chat(
         if last_assistant_turn_row is not None
         else ""
     )
-    awaiting_reply_state = _awaiting_reply_interpretation_state(
+    reply_interpretation = interpret_reply_for_project_comment_save(
         tool_protocol=tool_protocol,
         available_tool_names=available_openai_tool_names_full,
         focused_project_id=focused_project_id,
         last_assistant_message=last_assistant_text_for_turn_decision,
+        user_message=payload.message,
     )
-    legacy_reply_interpretation_kind = (
-        _legacy_reply_interpretation_kind(payload.message)
-        if awaiting_reply_state is not None
-        else "none"
-    )
-    legacy_reply_interpretation_action = _reply_interpretation_action(
-        awaiting_reply_state,
-        legacy_reply_interpretation_kind,
-    )
+    confirmation_reply = reply_interpretation.is_confirmation_reply
+    awaiting_reply_state = reply_interpretation.awaiting_state_dict()
     if assistant_provider == "vllm" and turn_decision_mode != "off":
         turn_decision_result = run_turn_decision_pipeline(
             generate_reply_fn=generate_reply,
@@ -1789,39 +1579,15 @@ def chat(
         turn_decision_runtime_applied = bool(
             turn_decision_result.ok and turn_decision_mode == "own" and turn_decision_result.decision is not None
         )
-    if turn_decision_runtime_applied and awaiting_reply_state is None:
-        awaiting_reply_state = _turn_decision_implies_project_comment_confirmation(
-            turn_decision_result=turn_decision_result,
-            available_tool_names=available_openai_tool_names_full,
-            focused_project_id=focused_project_id,
-        )
-    classifier_reply_interpretation_kind = (
-        turn_decision_result.decision.reply_interpretation.kind
-        if turn_decision_result is not None and turn_decision_result.decision is not None
-        else "none"
+    reply_interpretation = reply_interpretation.with_turn_decision(
+        turn_decision_result=turn_decision_result,
+        turn_decision_runtime_applied=turn_decision_runtime_applied,
+        available_tool_names=available_openai_tool_names_full,
+        focused_project_id=focused_project_id,
     )
-    classifier_reply_interpretation_action = _reply_interpretation_action(
-        awaiting_reply_state,
-        classifier_reply_interpretation_kind,
-    )
-    reply_interpretation_runtime_applied = bool(
-        turn_decision_runtime_applied and awaiting_reply_state is not None
-    )
-    reply_interpretation_runtime_kind = (
-        classifier_reply_interpretation_kind
-        if reply_interpretation_runtime_applied
-        else legacy_reply_interpretation_kind
-    )
-    reply_interpretation_runtime_action = (
-        classifier_reply_interpretation_action
-        if reply_interpretation_runtime_applied
-        else legacy_reply_interpretation_action
-    )
-    reply_interpretation_policy_messages = _reply_interpretation_messages(
-        action=reply_interpretation_runtime_action if reply_interpretation_runtime_applied else None,
-        awaiting_state=awaiting_reply_state,
-    )
-    skip_tool_router_for_reply_interpretation = bool(reply_interpretation_runtime_applied)
+    awaiting_reply_state = reply_interpretation.awaiting_state_dict()
+    reply_interpretation_policy_messages = list(reply_interpretation.policy_messages)
+    skip_tool_router_for_reply_interpretation = bool(reply_interpretation.applied)
     explicit_project_comment_save_request = project_comment_save_requested(payload.message)
     controller_thread_key = support_post_send_thread_key(session.session_id)
     project_comment_approval_settings = ProjectCommentApprovalSettings.from_env(
@@ -1830,7 +1596,7 @@ def chat(
     )
     project_comment_trigger = detect_project_comment_trigger(
         message=payload.message,
-        legacy_confirmation_kind=legacy_reply_interpretation_kind,
+        legacy_confirmation_kind=reply_interpretation.kind,
         legacy_save_requested=explicit_project_comment_save_request,
     )
     project_comment_approval_lexical_features = project_comment_trigger.to_lexical_features()
@@ -1899,7 +1665,9 @@ def chat(
             explicit_save_requested=explicit_project_comment_save_request,
             confirmation_reply=confirmation_reply,
             awaiting_state=awaiting_reply_state,
-            reply_interpretation_action=reply_interpretation_runtime_action,
+            reply_interpretation_action=(
+                reply_interpretation.runtime_action if reply_interpretation.runtime_action != "none" else None
+            ),
             trigger_allows_write_tool=project_comment_trigger_allows_write_tool,
         )
         if not project_comment_write_allowed:
@@ -2080,8 +1848,8 @@ def chat(
 
     if (
         tool_protocol == "openai"
-        and reply_interpretation_runtime_applied
-        and reply_interpretation_runtime_action != "approve_save"
+        and reply_interpretation.applied
+        and reply_interpretation.runtime_action != "approve_save"
     ):
         tool_schemas, additional_removed_write_tools = _remove_write_tools_from_openai_schemas(tool_schemas)
         if additional_removed_write_tools:
@@ -2235,7 +2003,7 @@ def chat(
     comment_intent_messages: list[dict[str, Any]] = []
     if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
         write_mode = turn_decision_result.decision.write_plan.mode
-        if not (reply_interpretation_runtime_applied and reply_interpretation_runtime_action != "approve_save"):
+        if not (reply_interpretation.applied and reply_interpretation.runtime_action != "approve_save"):
             comment_intent_messages = comment_intent_messages_for_write_mode(
                 write_mode=write_mode,
                 missing_comment_text=(
@@ -2283,8 +2051,8 @@ def chat(
     forced_tool_choice: str | dict[str, Any] | None = None
     if (
         tool_protocol == "openai"
-        and reply_interpretation_runtime_applied
-        and reply_interpretation_runtime_action == "approve_save"
+        and reply_interpretation.applied
+        and reply_interpretation.runtime_action == "approve_save"
         and isinstance(focused_project_id, int)
         and focused_project_id > 0
         and "create_project_comment" in openai_tool_names
@@ -2303,15 +2071,17 @@ def chat(
         forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
     if (
         tool_protocol == "openai"
+        and forced_tool_choice is None
+        and turn_decision_result is not None
+        and getattr(turn_decision_result, "mode", None) == "shadow"
         and confirmation_reply
-        and not _project_comment_intent_hints_enabled()
-        and _is_affirmative_reply(payload.message)
+        and reply_interpretation.is_affirmative_reply
+        and reply_interpretation.has_pending_save
         and isinstance(focused_project_id, int)
         and focused_project_id > 0
         and "create_project_comment" in openai_tool_names
     ):
-        if _assistant_requested_project_history_save(last_assistant_text):
-            forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
+        forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
     if (
         tool_protocol == "openai"
         and forced_tool_choice is None
@@ -3014,9 +2784,9 @@ def chat(
                 if isinstance(awaiting_reply_state, dict)
                 else None
             ),
-            "reply_interpretation_kind": reply_interpretation_runtime_kind,
-            "reply_interpretation_action": reply_interpretation_runtime_action,
-            "reply_interpretation_applied": reply_interpretation_runtime_applied,
+            "reply_interpretation_kind": reply_interpretation.runtime_kind,
+            "reply_interpretation_action": reply_interpretation.runtime_action,
+            "reply_interpretation_applied": reply_interpretation.applied,
         }
         turn_decision_meta["runtime"] = runtime_snapshot
 
@@ -3055,15 +2825,15 @@ def chat(
                     "turn_decision": turn_decision_result.decision.write_plan.mode,
                     "runtime": runtime_write_mode,
                 }
-            if classifier_reply_interpretation_kind != reply_interpretation_runtime_kind:
+            if reply_interpretation.classifier_kind != reply_interpretation.runtime_kind:
                 divergence["reply_interpretation_kind"] = {
-                    "turn_decision": classifier_reply_interpretation_kind,
-                    "runtime": reply_interpretation_runtime_kind,
+                    "turn_decision": reply_interpretation.classifier_kind,
+                    "runtime": reply_interpretation.runtime_kind,
                 }
-            if classifier_reply_interpretation_action != reply_interpretation_runtime_action:
+            if reply_interpretation.classifier_action != reply_interpretation.runtime_action:
                 divergence["reply_interpretation_action"] = {
-                    "turn_decision": classifier_reply_interpretation_action,
-                    "runtime": reply_interpretation_runtime_action,
+                    "turn_decision": reply_interpretation.classifier_action,
+                    "runtime": reply_interpretation.runtime_action,
                 }
             if divergence:
                 turn_decision_meta["divergence"] = divergence
@@ -3120,7 +2890,7 @@ def chat(
                 "write_tool_exposed": bool(project_comment_write_tool_exposed),
                 "write_tool_reason": project_comment_write_tool_reason,
                 "forced_tool_choice": _forced_tool_choice_name(forced_tool_choice),
-                "reply_interpretation_action": reply_interpretation_runtime_action,
+                "reply_interpretation_action": reply_interpretation.runtime_action,
             },
             "write_ticket_shadow": project_comment_approval_ticket,
             "write_outcome": project_comment_write_outcome,
@@ -3143,32 +2913,10 @@ def chat(
         meta["tool_router"] = tool_router
     if turn_decision_meta is not None:
         meta["turn_decision"] = turn_decision_meta
-    if isinstance(awaiting_reply_state, dict) or classifier_reply_interpretation_kind != "none":
-        meta["reply_interpretation"] = {
-            "awaiting_state": (
-                str(awaiting_reply_state.get("name") or "").strip()
-                if isinstance(awaiting_reply_state, dict)
-                else None
-            ),
-            "legacy_kind": legacy_reply_interpretation_kind,
-            "legacy_action": legacy_reply_interpretation_action,
-            "classifier_kind": classifier_reply_interpretation_kind,
-            "classifier_action": classifier_reply_interpretation_action,
-            "classifier_confidence": (
-                turn_decision_result.decision.reply_interpretation.confidence
-                if turn_decision_result is not None and turn_decision_result.decision is not None
-                else 0.0
-            ),
-            "classifier_reason": (
-                turn_decision_result.decision.reply_interpretation.reason
-                if turn_decision_result is not None and turn_decision_result.decision is not None
-                else ""
-            ),
-            "runtime_kind": reply_interpretation_runtime_kind,
-            "runtime_action": reply_interpretation_runtime_action,
-            "applied": reply_interpretation_runtime_applied,
-            "removed_write_tools": reply_interpretation_removed_write_tools,
-        }
+    if reply_interpretation.should_log_meta:
+        meta["reply_interpretation"] = reply_interpretation.meta(
+            removed_write_tools=reply_interpretation_removed_write_tools
+        )
     if comment_intent_decision is not None or comment_intent_reply is not None:
         meta["comment_intent"] = {
             "enabled": _project_comment_intent_hints_enabled(),
