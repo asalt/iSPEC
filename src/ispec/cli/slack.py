@@ -1046,6 +1046,25 @@ def _safe_slack_update_message(*, client: Any, channel: str, message_ts: str, te
         return False
 
 
+def _ack_ignored_slack_event(*, event_name: str, event: dict[str, Any] | None, ack: Any, logger: Any) -> None:
+    try:
+        ack()
+    except Exception:
+        pass
+    try:
+        payload = event if isinstance(event, dict) else {}
+        logger.debug(
+            "Slack ignored event event=%s type=%s subtype=%s user=%s channel=%s",
+            event_name,
+            payload.get("type"),
+            payload.get("subtype"),
+            payload.get("user"),
+            payload.get("channel"),
+        )
+    except Exception:
+        pass
+
+
 def _run_socket_mode(args) -> None:
     try:
         from slack_bolt import App
@@ -1161,6 +1180,18 @@ def _run_socket_mode(args) -> None:
             )
         except Exception:
             logger.info("Slack app_home_opened")
+
+    @app.event("file_created")
+    def _on_file_created(event, logger, ack):  # type: ignore[no-untyped-def]
+        _ack_ignored_slack_event(event_name="file_created", event=event, ack=ack, logger=logger)
+
+    @app.event("file_shared")
+    def _on_file_shared(event, logger, ack):  # type: ignore[no-untyped-def]
+        _ack_ignored_slack_event(event_name="file_shared", event=event, ack=ack, logger=logger)
+
+    @app.event("reaction_added")
+    def _on_reaction_added(event, logger, ack):  # type: ignore[no-untyped-def]
+        _ack_ignored_slack_event(event_name="reaction_added", event=event, ack=ack, logger=logger)
 
     @app.event("app_mention")
     def _on_mention(event, say, context, client, ack):  # type: ignore[no-untyped-def]

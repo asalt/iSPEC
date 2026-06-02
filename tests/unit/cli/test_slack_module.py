@@ -315,3 +315,23 @@ def test_upload_slack_file_uses_external_upload_flow(monkeypatch, tmp_path) -> N
     assert calls[3]["json"]["files"] == [{"id": "F123", "title": "Report"}]
     assert calls[3]["json"]["channel_id"] == "D123"
     assert calls[3]["json"]["initial_comment"] == "report ready"
+
+
+def test_ack_ignored_slack_event_acks_and_logs_debug() -> None:
+    ack_calls = []
+    debug_calls = []
+
+    class Logger:
+        def debug(self, *args):  # type: ignore[no-untyped-def]
+            debug_calls.append(args)
+
+    slack._ack_ignored_slack_event(
+        event_name="file_shared",
+        event={"type": "file_shared", "user": "U123", "channel": "D123"},
+        ack=lambda: ack_calls.append("ack"),
+        logger=Logger(),
+    )
+
+    assert ack_calls == ["ack"]
+    assert debug_calls
+    assert debug_calls[0][1] == "file_shared"
