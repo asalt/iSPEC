@@ -120,6 +120,43 @@ def test_auth_staff_can_update_and_clear_user_assistant_brief(auth_client):
         assert refreshed.assistant_brief is None
 
 
+def test_auth_admin_can_create_user_but_editor_cannot(auth_client):
+    admin = _create_user(auth_client.session_factory, username="admin", role=UserRole.admin)  # type: ignore[attr-defined]
+    editor = _create_user(auth_client.session_factory, username="editor", role=UserRole.editor)  # type: ignore[attr-defined]
+    admin_cookies = _admin_cookie(auth_client.session_factory, admin_user_id=int(admin.id))  # type: ignore[attr-defined]
+    editor_cookies = _admin_cookie(auth_client.session_factory, admin_user_id=int(editor.id))  # type: ignore[attr-defined]
+
+    editor_resp = auth_client.post(
+        "/auth/users",
+        json={
+            "username": "blocked-client",
+            "password": "temporary-password",
+            "role": "client",
+            "must_change_password": True,
+        },
+        cookies=editor_cookies,
+    )
+    assert editor_resp.status_code == 403
+
+    admin_resp = auth_client.post(
+        "/auth/users",
+        json={
+            "username": "demo-client",
+            "password": "temporary-password",
+            "role": "client",
+            "must_change_password": True,
+        },
+        cookies=admin_cookies,
+    )
+    assert admin_resp.status_code == 201
+    body = admin_resp.json()
+    assert body["username"] == "demo-client"
+    assert body["role"] == "client"
+    assert body["must_change_password"] is True
+    assert body["project_count"] == 0
+    assert body["effective_project_access"] == "none"
+
+
 def test_auth_users_list_reports_project_access_summary(auth_client):
     admin = _create_user(auth_client.session_factory, username="admin", role=UserRole.admin)  # type: ignore[attr-defined]
     client_user = _create_user(auth_client.session_factory, username="demo", role=UserRole.client)  # type: ignore[attr-defined]
@@ -141,3 +178,72 @@ def test_auth_users_list_reports_project_access_summary(auth_client):
     assert by_username["demo"]["effective_project_access"] == "restricted"
     assert by_username["viewer"]["project_count"] == 0
     assert by_username["viewer"]["effective_project_access"] == "all"
+
+
+def test_auth_staff_can_replace_user_project_grants(auth_client):
+    editor = _create_user(auth_client.session_factory, username="editor", role=UserRole.editor)  # type: ignore[attr-defined]
+    client_user = _create_user(auth_client.session_factory, username="demo", role=UserRole.client)  # type: ignore[attr-defined]
+    cookies = _admin_cookie(auth_client.session_factory, admin_user_id=int(editor.id))  # type: ignore[attr-defined]
+
+    with auth_client.session_factory() as db:  # type: ignore[attr-defined]
+        project_1 = Project(prj_AddedBy="tester", prj_ProjectTitle="Allowed One")
+        project_2 = Project(prj_AddedBy="tester", prj_ProjectTitle="Allowed Two")
+        db.add(project_1)
+        db.add(project_2)
+        db.flush()
+        project_1_id = int(project_1.id)
+        project_2_id = int(project_2.id)
+        db.add(AuthUserProject(user_id=int(client_user.id), project_id=project_1_id))
+        db.commit()
+
+    resp = auth_client.put(
+        f"/auth/users/{int(client_user.id)}/projects",
+        json={"project_ids": [project_2_id, project_1_id, project_1_id]},
+        cookies=cookies,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "user_id": int(client_user.id),
+        "project_ids": [project_2_id, project_1_id],
+    }
+
+    listed = auth_client.get(
+        f"/auth/users/{int(client_user.id)}/projects",
+        cookies=cookies,
+    )
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "user_id": int(client_user.id),
+        "project_ids": [project_1_id, project_2_id],
+    }
+
+
+def test_auth_project_grants_reject_unknown_project_without_mutating(auth_client):
+    editor = _create_user(auth_client.session_factory, username="editor", role=UserRole.editor)  # type: ignore[attr-defined]
+    client_user = _create_user(auth_client.session_factory, username="demo", role=UserRole.client)  # type: ignore[attr-defined]
+    cookies = _admin_cookie(auth_client.session_factory, admin_user_id=int(editor.id))  # type: ignore[attr-defined]
+
+    with auth_client.session_factory() as db:  # type: ignore[attr-defined]
+        project = Project(prj_AddedBy="tester", prj_ProjectTitle="Allowed")
+        db.add(project)
+        db.flush()
+        project_id = int(project.id)
+        db.add(AuthUserProject(user_id=int(client_user.id), project_id=project_id))
+        db.commit()
+
+    rejected = auth_client.put(
+        f"/auth/users/{int(client_user.id)}/projects",
+        json={"project_ids": [project_id, 999999]},
+        cookies=cookies,
+    )
+    assert rejected.status_code == 404
+
+    listed = auth_client.get(
+        f"/auth/users/{int(client_user.id)}/projects",
+        cookies=cookies,
+    )
+    assert listed.status_code == 200
+    assert listed.json() == {
+        "user_id": int(client_user.id),
+        "project_ids": [project_id],
+    }
