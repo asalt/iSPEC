@@ -114,6 +114,37 @@ def test_reply_interpretation_turn_decision_deny_overrides_runtime_action():
     assert reply.policy_messages
 
 
+def test_reply_interpretation_turn_decision_unclear_does_not_demote_short_approval():
+    reply = _pending_reply("correct i confirm")
+    reply = reply.with_turn_decision(
+        turn_decision_result=_turn_decision_result(reply_kind="unclear"),
+        turn_decision_runtime_applied=True,
+        available_tool_names={"create_project_comment"},
+        focused_project_id=1602,
+    )
+
+    assert reply.is_confirmation_reply is True
+    assert reply.is_affirmative_reply is True
+    assert reply.classifier_kind == "unclear"
+    assert reply.runtime_kind == "approve"
+    assert reply.runtime_action == "approve_save"
+
+
+def test_reply_interpretation_short_denial_blocks_classifier_approval():
+    reply = _pending_reply("no dont commit it")
+    reply = reply.with_turn_decision(
+        turn_decision_result=_turn_decision_result(reply_kind="approve"),
+        turn_decision_runtime_applied=True,
+        available_tool_names={"create_project_comment"},
+        focused_project_id=1602,
+    )
+
+    assert reply.classifier_kind == "approve"
+    assert reply.runtime_kind == "deny"
+    assert reply.runtime_action == "deny_save"
+    assert reply.policy_messages
+
+
 def test_reply_interpretation_turn_decision_can_create_pending_state():
     reply = interpret_reply_for_project_comment_save(
         tool_protocol="openai",

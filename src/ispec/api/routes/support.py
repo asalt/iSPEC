@@ -117,6 +117,12 @@ _WRITE_SUCCESS_PASSIVE_RE = re.compile(
     re.IGNORECASE,
 )
 _WRITE_RESULT_ID_RE = re.compile(r"\bcomment\s+id\b", re.IGNORECASE)
+_HISTORICAL_WRITE_REFERENCE_RE = re.compile(
+    r"\b(?:prior|previous|earlier|first|original)\s+(?:note|comment|history|entry|memo)\b"
+    r"[^.!?\n]{0,240}\b(?:was|were|had|has|have|is)\s+(?:been\s+)?"
+    r"(?:saved|added|logged|recorded|created|written|updated|committed)\b",
+    re.IGNORECASE,
+)
 _TRUTHY_ENV = {"1", "true", "yes", "y", "on"}
 _FALSY_ENV = {"0", "false", "no", "n", "off"}
 
@@ -775,6 +781,7 @@ def _assistant_claims_write_success(message: str | None) -> bool:
     text = (message or "").strip()
     if not text:
         return False
+    text = _HISTORICAL_WRITE_REFERENCE_RE.sub("", text)
     if _WRITE_RESULT_ID_RE.search(text):
         return True
     if _WRITE_SUCCESS_NOTE_RE.search(text):
@@ -1654,6 +1661,10 @@ def chat(
     project_comment_write_policy_messages: list[dict[str, str]] = []
     project_comment_write_tool_exposed = "create_project_comment" in available_openai_tool_names_full
     project_comment_write_tool_reason = "not_available"
+    project_comment_save_authorized = bool(
+        reply_interpretation.has_pending_save
+        and reply_interpretation.runtime_action == "approve_save"
+    )
     reply_interpretation_removed_write_tools: list[str] = []
     if (
         tool_protocol == "openai"
@@ -2401,6 +2412,7 @@ def chat(
                         user=user,
                         api_schema=api_schema,
                         user_message=payload.message,
+                        project_comment_save_authorized=project_comment_save_authorized,
                     )
                     _maybe_block_write_tools_for_turn(tool_name, tool_payload)
                     if used_tool_calls >= max_tool_calls:
@@ -2458,6 +2470,7 @@ def chat(
                     user=user,
                     api_schema=api_schema,
                     user_message=payload.message,
+                    project_comment_save_authorized=project_comment_save_authorized,
                 )
                 tool_calls.append(
                     {
@@ -2508,6 +2521,7 @@ def chat(
                     user=user,
                     api_schema=api_schema,
                     user_message=payload.message,
+                    project_comment_save_authorized=project_comment_save_authorized,
                 )
                 tool_calls.append(
                     {
@@ -2612,6 +2626,7 @@ def chat(
                 user=user,
                 api_schema=api_schema,
                 user_message=payload.message,
+                project_comment_save_authorized=project_comment_save_authorized,
             )
             _maybe_block_write_tools_for_turn(tool_name, tool_payload)
         tool_calls.append(

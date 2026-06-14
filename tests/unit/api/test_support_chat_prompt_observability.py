@@ -7,7 +7,7 @@ from ispec.api.routes import support as support_routes
 from ispec.api.routes.support import ChatRequest, chat
 from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportMessage, SupportSession
-from ispec.assistant.service import AssistantReply
+from ispec.assistant.service import AssistantReply, _render_base_system_prompt
 from ispec.prompt.sync import sync_prompts
 from ispec.schedule.connect import get_schedule_session
 
@@ -91,3 +91,12 @@ def test_support_chat_passes_and_persists_prompt_observability(tmp_path, db_sess
         assert len(str(meta["prompt_sha256"] or "")) == 64
         assert meta["llm_trace"][0]["prompt_family"] == "assistant.answer.system"
         assert meta["llm_trace"][0]["prompt_version_num"] == 1
+
+
+def test_base_system_prompt_preserves_project_note_status_and_correction_boundary():
+    prompt = _render_base_system_prompt().text
+
+    assert "Preserve the user's implied operational status" in prompt
+    assert "do not rewrite it as completed work" in prompt
+    assert "do not assume the approval/write protocol failed" in prompt
+    assert "prefer adding a corrective note rather than overwriting history" in prompt

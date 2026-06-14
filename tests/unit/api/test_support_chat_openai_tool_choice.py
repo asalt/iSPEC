@@ -21,6 +21,19 @@ from ispec.db.models import Project, ProjectComment, UserRole
 from ispec.schedule.connect import get_schedule_session
 
 
+def test_write_claim_guard_allows_historical_prior_note_reference():
+    assert support_routes._assistant_claims_write_success(  # noqa: SLF001
+        "Correction to prior note: the raw file upload is not complete yet. "
+        "The prior note was saved after normal draft-and-confirm approval, "
+        "but the approved draft incorrectly implied completion."
+    ) is False
+
+
+def test_write_claim_guard_still_catches_current_save_claim():
+    assert support_routes._assistant_claims_write_success("Saved the note. Comment ID is 556.") is True  # noqa: SLF001
+    assert support_routes._assistant_claims_write_success("The note has been successfully added.") is True  # noqa: SLF001
+
+
 def test_support_chat_does_not_force_openai_tool_choice_for_generic_tool_request(
     tmp_path,
     db_session,

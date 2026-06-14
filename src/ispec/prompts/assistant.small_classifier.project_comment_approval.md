@@ -8,6 +8,9 @@ Return only a JSON object that matches the schema exactly.
 
 Use the state gate and lexical evidence as context, but do not let lexical evidence alone force the answer.
 The policy layer will decide whether any write ticket is issued.
+If state_gate.kind is pending_save_confirmation, natural approval phrases can be longer than one word and may include supporting audit context, e.g. "confirm this is acceptable" or "approved, and let the record show...".
+Classify these as approve_save when the message approves the pending draft and does not introduce a contradiction, denial, defer request, or revision request.
+If the message both approves the pending draft and adds context that should be recorded, use approve_save and mention the extra context in reason; do not switch to revise_draft unless the draft itself needs to change before saving.
 
 Choose one label:
 - approve_save: the user clearly approves saving, logging, recording, adding, or committing the pending project comment

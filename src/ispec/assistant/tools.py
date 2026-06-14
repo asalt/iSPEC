@@ -2985,6 +2985,7 @@ def run_tool(
     user: AuthUser | None = None,
     api_schema: dict[str, Any] | None = None,
     user_message: str | None = None,
+    project_comment_save_authorized: bool = False,
 ) -> dict[str, Any]:
     # the large try block is not great - but these if statements for
     # resolving tool call results is probably fine
@@ -3620,7 +3621,7 @@ def run_tool(
                     "tool": name,
                     "error": "User requested not to save yet.",
                 }
-            if not _project_comment_save_requested(user_msg):
+            if not project_comment_save_authorized and not _project_comment_save_requested(user_msg):
                 return {
                     "ok": False,
                     "tool": name,

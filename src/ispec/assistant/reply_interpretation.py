@@ -174,8 +174,15 @@ class ReplyInterpretation:
             classifier_action = mapped_classifier_action
 
         applied = bool(turn_decision_runtime_applied and awaiting_save is not None)
-        runtime_kind = classifier_kind if applied else self.kind
-        runtime_action = classifier_action if applied else self.action
+        runtime_kind = self.kind
+        runtime_action = self.action
+        if applied:
+            runtime_kind, runtime_action = _merge_pending_save_reply_decision(
+                lexical_kind=self.kind,
+                lexical_action=self.action,
+                classifier_kind=classifier_kind,
+                classifier_action=classifier_action,
+            )
         policy_messages = tuple(
             reply_interpretation_messages(
                 action=runtime_action if applied else None,
@@ -359,6 +366,24 @@ def reply_interpretation_action(
         return None
     mapping = _REPLY_INTERPRETATION_ACTIONS.get(state.name, {})
     return mapping.get(str(kind or "").strip())
+
+
+def _merge_pending_save_reply_decision(
+    *,
+    lexical_kind: ReplyInterpretationKind,
+    lexical_action: ReplyInterpretationAction,
+    classifier_kind: ReplyInterpretationKind,
+    classifier_action: ReplyInterpretationAction,
+) -> tuple[ReplyInterpretationKind, ReplyInterpretationAction]:
+    if lexical_action in {"deny_save", "defer_save", "modify_before_save"}:
+        return lexical_kind, lexical_action
+    if classifier_action in {"approve_save", "deny_save", "defer_save", "modify_before_save"}:
+        return classifier_kind, classifier_action
+    if lexical_action == "approve_save":
+        return lexical_kind, lexical_action
+    if classifier_action == "clarify":
+        return classifier_kind, classifier_action
+    return classifier_kind, classifier_action
 
 
 def turn_decision_implies_project_comment_confirmation(

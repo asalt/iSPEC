@@ -10,8 +10,30 @@ from ispec.assistant import project_comment_approval as pc_approval
 from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportSession
 from ispec.assistant.service import AssistantReply
+from ispec.assistant.small_classifier import build_small_classifier_task
 from ispec.db.models import Project, ProjectComment, UserRole
 from ispec.schedule.connect import get_schedule_session
+
+
+def test_project_comment_approval_classifier_prompt_handles_compound_approval_context() -> None:
+    prepared = build_small_classifier_task(
+        "project_comment_approval",
+        payload={
+            "user_message": "confirm this is acceptable. and let the record show the prior note was user error.",
+            "prior_assistant_message": "Please confirm if this corrected note is acceptable before I save it.",
+            "state_gate": {"kind": "pending_save_confirmation"},
+            "trigger": {"kind": "confirmation"},
+            "lexical_features": {"legacy_confirmation_kind": "unclear"},
+            "pending_action": "create_project_comment",
+            "focused_project_id": 1546,
+        },
+    )
+    prompt_text = "\n".join(str(item.get("content") or "") for item in prepared.messages)
+
+    assert "approval phrases can be longer than one word" in prompt_text
+    assert "confirm this is acceptable" in prompt_text
+    assert "approve_save when the message approves the pending draft" in prompt_text
+    assert "mention the extra context in reason" in prompt_text
 
 
 def test_project_comment_approval_policy_issues_shadow_ticket_for_high_confidence_approval() -> None:
