@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field, create_model as pydantic_create_model
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from ispec.authz import scope_project_query, uses_explicit_project_access
 from ispec.db.connect import get_session_dep
 from typing import Type, Callable
 from ispec.omics.connect import get_omics_session_dep
@@ -102,13 +103,13 @@ def _enabled(resource: str) -> bool:
     return resource.lstrip("/").lower() in EXPOSED_RESOURCES
 
 
-_CLIENT_PROJECT_ONLY_DETAIL = "Client accounts can only access projects."
+_SCOPED_PROJECT_ONLY_DETAIL = "Scoped accounts can only access projects."
 
 
-def _reject_client(
+def _reject_scoped_user(
     request: Request | None,
     *,
-    detail: str = _CLIENT_PROJECT_ONLY_DETAIL,
+    detail: str = _SCOPED_PROJECT_ONLY_DETAIL,
 ) -> None:
     if request is None:
         return
@@ -116,9 +117,7 @@ def _reject_client(
     if user is None:
         return
 
-    from ispec.db.models import UserRole
-
-    if user.role == UserRole.client:
+    if uses_explicit_project_access(user):
         raise HTTPException(status_code=403, detail=detail)
 
 
@@ -222,11 +221,9 @@ def _add_schema_endpoint(
     def get_schema(request: Request):  # pragma: no cover - trivial wrapper
         user = getattr(request.state, "user", None)
         if user is not None:
-            from ispec.db.models import UserRole
-
-            if user.role == UserRole.client and model is not Project:
+            if uses_explicit_project_access(user) and model is not Project:
                 raise HTTPException(
-                    status_code=403, detail="Client accounts can only access projects."
+                    status_code=403, detail="Scoped accounts can only access projects."
                 )
 
         return build_form_schema(
@@ -291,17 +288,13 @@ def _add_crud_endpoints(
 
         user = getattr(request.state, "user", None)
         if user is not None:
-            from ispec.db.models import AuthUserProject, UserRole
-
-            if user.role == UserRole.client:
+            if uses_explicit_project_access(user):
                 if model is not Project:
                     raise HTTPException(
                         status_code=403,
-                        detail="Client accounts can only access projects.",
+                        detail="Scoped accounts can only access projects.",
                     )
-                query = query.join(
-                    AuthUserProject, AuthUserProject.project_id == Project.id
-                ).filter(AuthUserProject.user_id == user.id)
+                query = scope_project_query(query, user)
 
         if ids:
             query = query.filter(getattr(model, "id").in_(ids))
@@ -363,23 +356,17 @@ def _add_crud_endpoints(
 
         user = getattr(request.state, "user", None)
         if user is not None:
-            from ispec.db.models import AuthUserProject, UserRole
-
-            if user.role == UserRole.client:
+            if uses_explicit_project_access(user):
                 if model is not Project:
                     raise HTTPException(
                         status_code=403,
-                        detail="Client accounts can only access projects.",
+                        detail="Scoped accounts can only access projects.",
                     )
                 allowed = bool(
-                    (
-                        db.query(AuthUserProject.project_id)
-                        .filter(
-                            AuthUserProject.user_id == user.id,
-                            AuthUserProject.project_id == int(item_id),
-                        )
-                        .first()
-                    )
+                    scope_project_query(
+                        db.query(Project).filter(Project.id == int(item_id)),
+                        user,
+                    ).first()
                 )
                 if not allowed:
                     raise HTTPException(status_code=404, detail=f"{tag} not found")
@@ -460,12 +447,10 @@ def _add_options_endpoints(
     ):
         user = getattr(request.state, "user", None)
         if user is not None:
-            from ispec.db.models import UserRole
-
-            if user.role == UserRole.client:
+            if uses_explicit_project_access(user):
                 raise HTTPException(
                     status_code=403,
-                    detail="Client accounts cannot access options endpoints.",
+                    detail="Scoped accounts cannot access options endpoints.",
                 )
 
         return crud.list_options(db, q=q, limit=limit, ids=ids, exclude_ids=exclude_ids)
@@ -480,12 +465,10 @@ def _add_options_endpoints(
     ):
         user = getattr(request.state, "user", None)
         if user is not None:
-            from ispec.db.models import UserRole
-
-            if user.role == UserRole.client:
+            if uses_explicit_project_access(user):
                 raise HTTPException(
                     status_code=403,
-                    detail="Client accounts cannot access options endpoints.",
+                    detail="Scoped accounts cannot access options endpoints.",
                 )
 
         from sqlalchemy import inspect as sa_inspect
@@ -643,7 +626,7 @@ def generate_crud_router(
             offset: int = Query(default=0, ge=0),
             db: Session = Depends(session_dep),
         ):
-            _reject_client(request)
+            _reject_scoped_user(request)
             query = db.query(E2G).filter(E2G.experiment_run_id == run_id)
             if q:
                 query = query.filter(E2G.gene.ilike(f"%{q}%"))
@@ -663,7 +646,7 @@ def generate_crud_router(
             offset: int = Query(default=0, ge=0),
             db: Session = Depends(session_dep),
         ):
-            _reject_client(request)
+            _reject_scoped_user(request)
             query = db.query(PSM).filter(PSM.experiment_run_id == run_id)
             if q:
                 # lightweight search over common text fields
@@ -684,7 +667,7 @@ def generate_crud_router(
             offset: int = Query(default=0, ge=0),
             db: Session = Depends(session_dep),
         ):
-            _reject_client(request)
+            _reject_scoped_user(request)
             query = db.query(MSRawFile).filter(MSRawFile.experiment_run_id == run_id)
             if q:
                 query = query.filter(MSRawFile.uri.ilike(f"%{q}%"))
@@ -758,43 +741,34 @@ if _enabled("projects"):
     @router.get("/projects/stats")
     def project_stats(request: Request, db: Session = Depends(get_session_dep)):
         from sqlalchemy import func
-        from ispec.db.models import AuthUserProject, UserRole
 
         user = getattr(request.state, "user", None)
-        join_access = bool(user is not None and user.role == UserRole.client)
+        join_access = uses_explicit_project_access(user)
 
         total_query = db.query(func.count(Project.id))
         if join_access:
-            total_query = total_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            total_query = scope_project_query(total_query, user)
         total = total_query.scalar() or 0
 
         current_query = db.query(func.count(Project.id)).filter(
             Project.prj_Current_FLAG.is_(True)
         )
         if join_access:
-            current_query = current_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            current_query = scope_project_query(current_query, user)
         current = current_query.scalar() or 0
 
         to_bill_query = db.query(func.count(Project.id)).filter(
             Project.prj_Billing_ReadyToBill.is_(True)
         )
         if join_access:
-            to_bill_query = to_bill_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            to_bill_query = scope_project_query(to_bill_query, user)
         to_bill = to_bill_query.scalar() or 0
 
         paid_query = db.query(func.count(Project.id)).filter(
             Project.prj_PaymentReceived.is_(True)
         )
         if join_access:
-            paid_query = paid_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            paid_query = scope_project_query(paid_query, user)
         paid = paid_query.scalar() or 0
 
         return {
@@ -812,10 +786,9 @@ if _enabled("projects"):
         db: Session = Depends(get_session_dep),
     ):
         from sqlalchemy import func
-        from ispec.db.models import AuthUserProject, UserRole
 
         user = getattr(request.state, "user", None)
-        join_access = bool(user is not None and user.role == UserRole.client)
+        join_access = uses_explicit_project_access(user)
 
         scope_raw = (scope or "all").strip().lower()
         if scope_raw in {"", "all"}:
@@ -835,33 +808,23 @@ if _enabled("projects"):
 
         exists_query = db.query(func.count(Project.id)).filter(Project.id == project_id)
         if join_access:
-            exists_query = exists_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            exists_query = scope_project_query(exists_query, user)
         exists = bool(exists_query.scalar() or 0)
 
         in_scope_query = db.query(func.count(Project.id)).filter(
             Project.id == project_id, *filters
         )
         if join_access:
-            in_scope_query = in_scope_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            in_scope_query = scope_project_query(in_scope_query, user)
         in_scope = bool(in_scope_query.scalar() or 0)
 
         total_count_query = db.query(func.count(Project.id)).filter(*filters)
         first_id_query = db.query(func.min(Project.id)).filter(*filters)
         last_id_query = db.query(func.max(Project.id)).filter(*filters)
         if join_access:
-            total_count_query = total_count_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
-            first_id_query = first_id_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
-            last_id_query = last_id_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            total_count_query = scope_project_query(total_count_query, user)
+            first_id_query = scope_project_query(first_id_query, user)
+            last_id_query = scope_project_query(last_id_query, user)
 
         total_count = int(total_count_query.scalar() or 0)
         first_id = first_id_query.scalar()
@@ -874,12 +837,8 @@ if _enabled("projects"):
             Project.id > project_id, *filters
         )
         if join_access:
-            prev_query = prev_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
-            next_query = next_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            prev_query = scope_project_query(prev_query, user)
+            next_query = scope_project_query(next_query, user)
         prev_id = prev_query.scalar()
         next_id = next_query.scalar()
 
@@ -890,12 +849,8 @@ if _enabled("projects"):
             Project.id > project_id, *filters
         )
         if join_access:
-            prev_count_query = prev_count_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
-            next_count_query = next_count_query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)
+            prev_count_query = scope_project_query(prev_count_query, user)
+            next_count_query = scope_project_query(next_count_query, user)
         prev_count = int(prev_count_query.scalar() or 0)
         next_count = int(next_count_query.scalar() or 0)
 
@@ -1263,7 +1218,7 @@ if _enabled("experiments"):
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         rows = (
             db.query(Experiment)
             .filter(Experiment.project_id == project_id)
@@ -1287,7 +1242,7 @@ if _enabled("project_comment"):
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         from ispec.db.models import Person as _Person
 
         rows = (
@@ -1324,7 +1279,7 @@ if _enabled("project_person"):
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         from ispec.db.models import Person as _Person
 
         rows = (
@@ -1361,7 +1316,7 @@ if _enabled("experiment_runs"):
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         rows = (
             db.query(ExperimentRun)
             .filter(ExperimentRun.experiment_id == experiment_id)
@@ -1387,7 +1342,7 @@ if _enabled("experiment_runs") and _enabled("experiments"):
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         query = (
             db.query(ExperimentRun)
             .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
@@ -1418,7 +1373,7 @@ if _enabled("experiment_to_gene"):
         core_db: Session = Depends(get_session_dep),
         omics_db: Session = Depends(get_omics_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         run_ids = [
             int(row[0])
             for row in core_db.query(ExperimentRun.id)
@@ -1449,7 +1404,7 @@ if _enabled("experiment_to_gene"):
         core_db: Session = Depends(get_session_dep),
         omics_db: Session = Depends(get_omics_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         run_ids = [
             int(row[0])
             for row in core_db.query(ExperimentRun.id)
@@ -1480,7 +1435,7 @@ if _enabled("jobs"):
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
-        _reject_client(request)
+        _reject_scoped_user(request)
         from ispec.db.models import Job as _Job
 
         rows = (

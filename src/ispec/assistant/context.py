@@ -6,14 +6,17 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session, defer
 
+from ispec.authz import (
+    get_project_for_user,
+    scope_project_query,
+    uses_explicit_project_access,
+)
 from ispec.db.models import (
     AuthUser,
-    AuthUserProject,
     Person,
     Project,
     ProjectComment,
     ProjectFile,
-    UserRole,
 )
 
 
@@ -253,28 +256,14 @@ def build_ispec_context(
     context: dict[str, Any] = {}
     state = state or {}
 
-    is_client = bool(user is not None and user.role == UserRole.client)
-    include_project_comments = not is_client
+    is_scoped_user = uses_explicit_project_access(user)
+    include_project_comments = not is_scoped_user
 
     def get_project(project_id: int) -> Project | None:
-        if not is_client:
-            return db.get(Project, project_id)
-        return (
-            db.query(Project)
-            .join(AuthUserProject, AuthUserProject.project_id == Project.id)
-            .filter(
-                Project.id == project_id,
-                AuthUserProject.user_id == user.id,  # type: ignore[union-attr]
-            )
-            .first()
-        )
+        return get_project_for_user(db, user=user, project_id=project_id)
 
-    if is_client:
-        accessible_query = (
-            db.query(Project)
-            .join(AuthUserProject, AuthUserProject.project_id == Project.id)
-            .filter(AuthUserProject.user_id == user.id)  # type: ignore[union-attr]
-        )
+    if is_scoped_user:
+        accessible_query = scope_project_query(db.query(Project), user)
         try:
             accessible_total = int(accessible_query.order_by(None).count())
         except Exception:
@@ -335,10 +324,8 @@ def build_ispec_context(
 
     if "current" in lowered and "project" in lowered:
         query = db.query(Project).filter(Project.prj_Current_FLAG.is_(True))
-        if is_client:
-            query = query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)  # type: ignore[union-attr]
+        if is_scoped_user:
+            query = scope_project_query(query, user)
         rows = query.order_by(Project.id.asc()).limit(max_items).all()
         context["current_projects"] = [
             {"id": int(p.id), "title": p.prj_ProjectTitle, "status": p.prj_Status}
@@ -347,10 +334,8 @@ def build_ispec_context(
 
     if ("to be billed" in lowered) or ("to-bill" in lowered) or ("ready to bill" in lowered):
         query = db.query(Project).filter(Project.prj_Billing_ReadyToBill.is_(True))
-        if is_client:
-            query = query.join(
-                AuthUserProject, AuthUserProject.project_id == Project.id
-            ).filter(AuthUserProject.user_id == user.id)  # type: ignore[union-attr]
+        if is_scoped_user:
+            query = scope_project_query(query, user)
         rows = query.order_by(Project.id.asc()).limit(max_items).all()
         context["to_bill_projects"] = [
             {"id": int(p.id), "title": p.prj_ProjectTitle, "status": p.prj_Status}
@@ -360,10 +345,8 @@ def build_ispec_context(
     for status in _PROJECT_STATUSES:
         if status in lowered and "project" in lowered:
             query = db.query(Project).filter(Project.prj_Status == status)
-            if is_client:
-                query = query.join(
-                    AuthUserProject, AuthUserProject.project_id == Project.id
-                ).filter(AuthUserProject.user_id == user.id)  # type: ignore[union-attr]
+            if is_scoped_user:
+                query = scope_project_query(query, user)
             rows = query.order_by(Project.id.asc()).limit(max_items).all()
             context.setdefault("projects_by_status", {})[status] = [
                 {"id": int(p.id), "title": p.prj_ProjectTitle}
@@ -409,7 +392,7 @@ def build_ispec_context(
                 "items": file_items[:20],
             }
 
-    if is_client and focused_project_id is not None:
+    if is_scoped_user and focused_project_id is not None:
         project = get_project(focused_project_id)
         if project is not None:
             note_query = (
@@ -434,7 +417,7 @@ def build_ispec_context(
             if note_total > len(note_rows):
                 context["current_project_notes_truncated"] = True
 
-    if is_client:
+    if is_scoped_user:
         return context
 
     person_ids = extract_person_ids(message)

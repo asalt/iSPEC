@@ -28,8 +28,9 @@ from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from ispec.authz import get_project_for_user
 from ispec.db.connect import get_session_dep
-from ispec.db.models import AuthSession, AuthUser, AuthUserProject, Project, UserRole
+from ispec.db.models import AuthSession, AuthUser, Project, ProjectAccessMode, UserRole
 
 _API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 _BEARER = HTTPBearer(auto_error=False)
@@ -48,6 +49,7 @@ class _ApiKeyServiceUser:
     id: int = 0
     username: str = "api_key"
     role: UserRole = UserRole.viewer
+    project_access_mode: ProjectAccessMode = ProjectAccessMode.all_projects
     is_active: bool = True
     must_change_password: bool = False
     assistant_brief: str | None = None
@@ -323,25 +325,11 @@ def get_project_or_404_for_user(
 ) -> Project:
     """Fetch a project if it exists and the user can access it.
 
-    Staff/admin bypass project scoping. Client users must be explicitly mapped
+    Staff/admin bypass project scoping. Scoped users must be explicitly mapped
     via ``auth_user_project``.
     """
 
-    if user is not None and user.role == UserRole.client:
-        project = (
-            db.query(Project)
-            .join(AuthUserProject, AuthUserProject.project_id == Project.id)
-            .filter(
-                Project.id == project_id,
-                AuthUserProject.user_id == user.id,
-            )
-            .first()
-        )
-        if project is None:
-            raise HTTPException(status_code=404, detail="project not found")
-        return project
-
-    project = db.get(Project, project_id)
+    project = get_project_for_user(db, user=user, project_id=project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return project

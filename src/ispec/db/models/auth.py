@@ -19,6 +19,11 @@ class UserRole(str, enum.Enum):
     client = "client"
 
 
+class ProjectAccessMode(str, enum.Enum):
+    all_projects = "all_projects"
+    explicit_projects = "explicit_projects"
+
+
 class AuthUser(AuthTimestamp, Base):
     __tablename__ = "auth_user"
 
@@ -34,6 +39,10 @@ class AuthUser(AuthTimestamp, Base):
         SAEnum(UserRole, native_enum=True, validate_strings=True),
         default=UserRole.editor,
     )
+    project_access_mode: Mapped[ProjectAccessMode | None] = mapped_column(
+        SAEnum(ProjectAccessMode, native_enum=True, validate_strings=True),
+        nullable=True,
+    )
     assistant_brief: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -44,7 +53,9 @@ class AuthUser(AuthTimestamp, Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     project_access: Mapped[list["AuthUserProject"]] = relationship(
-        back_populates="user", cascade="all, delete-orphan"
+        back_populates="user",
+        cascade="all, delete-orphan",
+        foreign_keys="AuthUserProject.user_id",
     )
 
 
@@ -75,6 +86,17 @@ class AuthUserProject(Base):
         primary_key=True,
         index=True,
     )
+    granted_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("auth_user.id"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(UTC))
 
-    user: Mapped["AuthUser"] = relationship(back_populates="project_access")
+    user: Mapped["AuthUser"] = relationship(
+        back_populates="project_access",
+        foreign_keys=[user_id],
+    )
+    granted_by: Mapped["AuthUser | None"] = relationship(
+        foreign_keys=[granted_by_user_id],
+    )

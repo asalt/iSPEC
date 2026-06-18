@@ -11,7 +11,7 @@ from ispec.assistant.connect import get_assistant_session
 from ispec.assistant.models import SupportSession
 from ispec.assistant.service import AssistantReply
 from ispec.assistant.small_classifier import build_small_classifier_task
-from ispec.db.models import Project, ProjectComment, UserRole
+from ispec.db.models import Project, ProjectAccessMode, ProjectComment, UserRole
 from ispec.schedule.connect import get_schedule_session
 
 
@@ -224,6 +224,7 @@ def test_project_comment_approval_eval_metadata_records_shadow_ticket_and_write_
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -364,6 +365,7 @@ def test_project_comment_approval_eval_keeps_tool_exposed_for_typo_note_candidat
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 

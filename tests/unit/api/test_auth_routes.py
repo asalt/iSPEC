@@ -152,6 +152,7 @@ def test_auth_admin_can_create_user_but_editor_cannot(auth_client):
     body = admin_resp.json()
     assert body["username"] == "demo-client"
     assert body["role"] == "client"
+    assert body["project_access_mode"] == "explicit_projects"
     assert body["must_change_password"] is True
     assert body["project_count"] == 0
     assert body["effective_project_access"] == "none"
@@ -175,9 +176,11 @@ def test_auth_users_list_reports_project_access_summary(auth_client):
     by_username = {row["username"]: row for row in resp.json()}
 
     assert by_username["demo"]["project_count"] == 1
+    assert by_username["demo"]["project_access_mode"] == "explicit_projects"
     assert by_username["demo"]["effective_project_access"] == "restricted"
     assert by_username["viewer"]["project_count"] == 0
-    assert by_username["viewer"]["effective_project_access"] == "all"
+    assert by_username["viewer"]["project_access_mode"] == "explicit_projects"
+    assert by_username["viewer"]["effective_project_access"] == "none"
 
 
 def test_auth_staff_can_replace_user_project_grants(auth_client):
@@ -216,6 +219,18 @@ def test_auth_staff_can_replace_user_project_grants(auth_client):
         "user_id": int(client_user.id),
         "project_ids": [project_1_id, project_2_id],
     }
+
+    with auth_client.session_factory() as db:  # type: ignore[attr-defined]
+        rows = (
+            db.query(AuthUserProject)
+            .filter(AuthUserProject.user_id == int(client_user.id))
+            .order_by(AuthUserProject.project_id.asc())
+            .all()
+        )
+        assert [int(row.granted_by_user_id) for row in rows] == [
+            int(editor.id),
+            int(editor.id),
+        ]
 
 
 def test_auth_project_grants_reject_unknown_project_without_mutating(auth_client):

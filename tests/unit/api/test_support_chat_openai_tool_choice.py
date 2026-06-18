@@ -17,7 +17,7 @@ from ispec.assistant.turn_decision import (
     TurnDecisionToolPlan,
     TurnDecisionWritePlan,
 )
-from ispec.db.models import Project, ProjectComment, UserRole
+from ispec.db.models import Project, ProjectAccessMode, ProjectComment, UserRole
 from ispec.schedule.connect import get_schedule_session
 
 
@@ -210,6 +210,7 @@ def test_support_chat_retries_after_unsupported_write_claim_and_saves_note(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -299,6 +300,7 @@ def test_support_chat_blocks_repeated_unsupported_write_claim(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -406,6 +408,7 @@ def test_support_chat_draft_request_returns_draft_without_writing(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -523,6 +526,7 @@ def test_support_chat_confirmation_reply_saves_drafted_comment(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -635,6 +639,7 @@ def test_support_chat_direct_save_request_forces_project_comment_tool(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -811,6 +816,7 @@ def test_support_chat_shadow_mode_long_explicit_confirmation_can_still_save(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -988,6 +994,7 @@ def test_support_chat_turn_decision_owner_approve_saves_drafted_comment(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -1150,6 +1157,7 @@ def test_support_chat_turn_decision_owner_deny_does_not_save_and_removes_write_t
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -1320,6 +1328,7 @@ def test_support_chat_turn_decision_shadow_records_reply_interpretation_mismatch
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -1455,6 +1464,7 @@ def test_support_chat_project_comment_intent_hint_guides_draft_request(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -2236,6 +2246,7 @@ def test_support_chat_blocks_write_tool_after_policy_denial(tmp_path, db_session
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 

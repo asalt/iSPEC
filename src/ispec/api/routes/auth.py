@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ispec.authz import effective_project_access_mode
 from ispec.api.security import (
     clear_session_cookie,
     create_session,
@@ -20,7 +21,7 @@ from ispec.api.security import (
     verify_password,
 )
 from ispec.db.connect import get_session_dep
-from ispec.db.models import AuthSession, AuthUser, AuthUserProject, Project, UserRole
+from ispec.db.models import AuthSession, AuthUser, AuthUserProject, Project, ProjectAccessMode, UserRole
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -30,6 +31,7 @@ class UserOut(BaseModel):
     id: int
     username: str
     role: UserRole
+    project_access_mode: ProjectAccessMode | None = None
     is_active: bool
     must_change_password: bool
     assistant_brief: str | None = None
@@ -92,7 +94,7 @@ def _project_count_for_user(db: Session, *, user_id: int) -> int:
 
 
 def _effective_project_access(user: AuthUser, project_count: int | None) -> str:
-    if user.role == UserRole.client:
+    if effective_project_access_mode(user) == ProjectAccessMode.explicit_projects:
         return "restricted" if int(project_count or 0) > 0 else "none"
     return "all"
 
@@ -102,6 +104,7 @@ def _user_out(user: AuthUser, *, project_count: int | None = None) -> UserOut:
         id=user.id,
         username=user.username,
         role=user.role,
+        project_access_mode=effective_project_access_mode(user),
         is_active=user.is_active,
         must_change_password=bool(getattr(user, "must_change_password", False)),
         assistant_brief=_normalize_assistant_brief(
@@ -183,8 +186,11 @@ def logout(
 
 
 @router.get("/me", response_model=UserOut)
-def me(user: AuthUser = Depends(require_user)):
-    return _user_out(user)
+def me(user: AuthUser = Depends(require_user), db: Session = Depends(get_session_dep)):
+    return _user_out(
+        user,
+        project_count=_project_count_for_user(db, user_id=int(user.id)),
+    )
 
 
 @router.get("/users", response_model=list[UserOut])
@@ -335,7 +341,7 @@ def list_user_projects(
 def update_user_projects(
     user_id: int,
     payload: UserProjectsUpdate,
-    _: AuthUser = Depends(require_staff),
+    granting_user: AuthUser = Depends(require_staff),
     db: Session = Depends(get_session_dep),
 ):
     user = db.get(AuthUser, user_id)
@@ -361,7 +367,13 @@ def update_user_projects(
 
     db.query(AuthUserProject).filter(AuthUserProject.user_id == user_id).delete()
     for project_id in desired:
-        db.add(AuthUserProject(user_id=user_id, project_id=project_id))
+        db.add(
+            AuthUserProject(
+                user_id=user_id,
+                project_id=project_id,
+                granted_by_user_id=int(granting_user.id),
+            )
+        )
     db.commit()
 
     return UserProjectsOut(user_id=user_id, project_ids=desired)
