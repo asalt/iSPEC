@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-from ispec.assistant.tools import _tmux_find_allowed_pane, _tmux_is_allowed_pane, _tmux_list_candidate_panes, openai_tools_for_user, run_tool
+from ispec.assistant.tools import (
+    _tmux_capture_snapshot,
+    _tmux_find_allowed_pane,
+    _tmux_is_allowed_pane,
+    _tmux_list_candidate_panes,
+    openai_tools_for_user,
+    run_tool,
+)
 from ispec.db.models import AuthUser, UserRole
 
 
 def _internal_user() -> AuthUser:
     return AuthUser(
-        username="viewer",
+        username="editor",
         password_hash="hash",
         password_salt="salt",
         password_iterations=1,
-        role=UserRole.viewer,
+        role=UserRole.editor,
         is_active=True,
     )
 
@@ -145,6 +152,29 @@ def test_assistant_capture_tmux_pane_returns_snapshot(db_session, monkeypatch):
     assert payload["ok"] is True
     assert payload["result"]["target"] == "ispecfull:codex.1"
     assert payload["result"]["last_nonempty_line"] == "Codex ready"
+
+
+def test_tmux_capture_snapshot_exposes_recent_tail(monkeypatch):
+    pane = _sample_pane()
+    monkeypatch.setattr(
+        "ispec.assistant.tools._tmux_capture_text",
+        lambda **_: "line 1\nline 2\nline 3\nline 4\nline 5\n\n\n",
+    )
+
+    snapshot = _tmux_capture_snapshot(
+        pane=pane,
+        lines=3,
+        include_history=False,
+    )
+
+    assert snapshot["visible_line_count"] == 3
+    assert snapshot["last_nonempty_line"] == "line 5"
+    assert snapshot["recent_tail"] == {
+        "line_count": 3,
+        "text": "line 3\nline 4\nline 5",
+    }
+    assert snapshot["content"] == snapshot["recent_tail"]["text"]
+    assert "Capture includes 3 trailing visible lines" in snapshot["activity_summary"]
 
 
 def test_assistant_compare_tmux_pane_reports_change(db_session, monkeypatch):

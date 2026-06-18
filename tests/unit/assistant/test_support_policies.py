@@ -74,6 +74,8 @@ def test_select_support_tool_policy_for_tmux_request_resolves_unique_pane(monkey
     assert selection.meta["selected_target"] == "%0"
     assert selection.meta["strategy"] == "unique_candidate"
     assert "summarize the pane's current state" in selection.messages[0]["content"]
+    assert "recent_tail.text / content" in selection.messages[0]["content"]
+    assert "Do not summarize only the final line" in selection.messages[0]["content"]
 
 
 def test_bridge_request_is_hinted_without_forcing_read_only_tmux_policy(monkeypatch) -> None:

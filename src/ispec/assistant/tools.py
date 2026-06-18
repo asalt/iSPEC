@@ -981,7 +981,7 @@ def _tmux_capture_text(*, target: str, history_lines: int | None = None) -> str:
     return str(proc.stdout or "")
 
 
-def _tmux_activity_summary(*, pane: dict[str, Any], last_nonempty_line: str | None) -> str:
+def _tmux_activity_summary(*, pane: dict[str, Any], visible_line_count: int) -> str:
     alias = str(pane.get("preferred_alias") or pane.get("target") or pane.get("pane_id") or "pane").strip() or "pane"
     current_command = str(pane.get("current_command") or "").strip()
     pane_title = str(pane.get("pane_title") or "").strip()
@@ -993,8 +993,7 @@ def _tmux_activity_summary(*, pane: dict[str, Any], last_nonempty_line: str | No
     if pane_title:
         state_bits.append(f"title={pane_title!r}")
     summary = ", ".join(state_bits) + "."
-    if last_nonempty_line:
-        summary += f" Last visible non-empty line: {last_nonempty_line!r}."
+    summary += f" Capture includes {int(visible_line_count)} trailing visible lines."
     return summary
 
 
@@ -1022,6 +1021,7 @@ def _tmux_capture_snapshot(
         content_end -= 1
     content_lines = all_lines[:content_end] or all_lines
     visible_lines = content_lines[-lines_int:]
+    recent_tail_text = "\n".join(visible_lines)
     last_nonempty_line = None
     for line in reversed(visible_lines):
         stripped = line.strip()
@@ -1057,8 +1057,12 @@ def _tmux_capture_snapshot(
         "trailing_blank_line_count": max(len(all_lines) - content_end, 0),
         "visible_line_count": len(visible_lines),
         "last_nonempty_line": last_nonempty_line,
-        "activity_summary": _tmux_activity_summary(pane=pane, last_nonempty_line=last_nonempty_line),
-        "content": "\n".join(visible_lines),
+        "activity_summary": _tmux_activity_summary(pane=pane, visible_line_count=len(visible_lines)),
+        "recent_tail": {
+            "line_count": len(visible_lines),
+            "text": recent_tail_text,
+        },
+        "content": recent_tail_text,
     }
 
 
