@@ -79,6 +79,11 @@ from ispec.assistant.tools import (
     run_tool,
     tool_writes_data,
 )
+from ispec.assistant.work_bag import (
+    append_work_bag_entries,
+    build_work_bag_entries_from_tool_calls,
+    work_bag_context_summary,
+)
 from ispec.db.connect import get_session_dep
 from ispec.db.models import AuthUser, UserRole
 from ispec.omics.connect import get_omics_session_dep
@@ -864,6 +869,10 @@ def _prompt_state_from_session_state(state: dict[str, Any]) -> dict[str, Any]:
         prompt_state["conversation_summary"] = summary
         if summary_up_to_id > 0:
             prompt_state["conversation_summary_up_to_id"] = int(summary_up_to_id)
+
+    work_bag = work_bag_context_summary(state)
+    if work_bag is not None:
+        prompt_state["work_bag"] = work_bag
 
     return prompt_state
 
@@ -2413,6 +2422,7 @@ def chat(
                         api_schema=api_schema,
                         user_message=payload.message,
                         project_comment_save_authorized=project_comment_save_authorized,
+                        support_session_id=session.session_id,
                     )
                     _maybe_block_write_tools_for_turn(tool_name, tool_payload)
                     if used_tool_calls >= max_tool_calls:
@@ -2471,6 +2481,7 @@ def chat(
                     api_schema=api_schema,
                     user_message=payload.message,
                     project_comment_save_authorized=project_comment_save_authorized,
+                    support_session_id=session.session_id,
                 )
                 tool_calls.append(
                     {
@@ -2522,6 +2533,7 @@ def chat(
                     api_schema=api_schema,
                     user_message=payload.message,
                     project_comment_save_authorized=project_comment_save_authorized,
+                    support_session_id=session.session_id,
                 )
                 tool_calls.append(
                     {
@@ -2627,6 +2639,7 @@ def chat(
                 api_schema=api_schema,
                 user_message=payload.message,
                 project_comment_save_authorized=project_comment_save_authorized,
+                support_session_id=session.session_id,
             )
             _maybe_block_write_tools_for_turn(tool_name, tool_payload)
         tool_calls.append(
@@ -3064,6 +3077,21 @@ def chat(
     assistant_db.add(assistant_message)
     session.updated_at = utcnow()
     assistant_db.flush()
+
+    work_bag_entries = build_work_bag_entries_from_tool_calls(
+        tool_calls=tool_calls,
+        user_message_id=int(user_message.id),
+        assistant_message_id=int(assistant_message.id),
+        created_at=utcnow().isoformat(),
+        source="support_chat",
+    )
+    if append_work_bag_entries(state, work_bag_entries):
+        meta["work_bag"] = {
+            "appended": len(work_bag_entries),
+            "entry_ids": [str(entry.get("entry_id") or "") for entry in work_bag_entries],
+        }
+        session.state_json = _dump_state(state)
+        assistant_db.flush()
 
     state, post_send_meta = _enqueue_support_post_send_prepare(
         assistant_db=assistant_db,

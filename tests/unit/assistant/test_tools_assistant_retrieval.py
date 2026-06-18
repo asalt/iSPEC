@@ -87,6 +87,63 @@ def test_assistant_get_message_context_returns_window(tmp_path, db_session):
         assert ids == messages[1:4]
 
 
+def test_assistant_recent_session_work_bag_defaults_to_current_session(tmp_path, db_session):
+    assistant_db_path = tmp_path / "assistant.db"
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        session = SupportSession(
+            session_id="s1",
+            user_id=None,
+            state_json=json.dumps(
+                {
+                    "work_bag": {
+                        "schema_version": 1,
+                        "entries": [
+                            {
+                                "entry_id": "wb:a2:t1",
+                                "created_at": "2026-06-15T00:00:00+00:00",
+                                "source": "support_chat",
+                                "kind": "write",
+                                "tool_name": "create_project_comment",
+                                "status": "succeeded",
+                                "refs": [
+                                    {"kind": "project", "id": 1499},
+                                    {"kind": "project_comment", "id": 555},
+                                ],
+                                "summary": "Saved project comment 555 on project 1499.",
+                                "omitted": ["raw_arguments", "raw_result", "prompt_text"],
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        assistant_db.add(session)
+        assistant_db.commit()
+
+    with get_assistant_session(assistant_db_path) as assistant_db:
+        payload = run_tool(
+            name="assistant_recent_session_work_bag",
+            args={"limit": 10},
+            core_db=db_session,
+            assistant_db=assistant_db,
+            schedule_db=None,
+            omics_db=None,
+            user=None,
+            api_schema=None,
+            support_session_id="s1",
+        )
+
+    assert payload["ok"] is True
+    result = payload["result"]
+    assert result["session_id"] == "s1"
+    assert result["total_entries"] == 1
+    assert result["entries"][0]["refs"] == [
+        {"kind": "project", "id": 1499},
+        {"kind": "project_comment", "id": 555},
+    ]
+    assert "raw_arguments" in result["entries"][0]["omitted"]
+
+
 def test_assistant_search_internal_logs_finds_agent_step(tmp_path, db_session):
     agent_db_path = tmp_path / "agent.db"
     with get_agent_session(agent_db_path) as agent_db:

@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, defer
 
 from ispec.agent.archive import get_agent_archive_session_if_available
 from ispec.agent.connect import get_agent_session
+from ispec.authz import get_project_for_user, scope_project_query, uses_explicit_project_access
 from ispec.backup import load_backup_status
 from ispec.assistant.context import person_summary, project_summary
 from ispec.assistant.models import (
@@ -47,6 +48,7 @@ from ispec.assistant.slack_tmux_bridge import (
     relayed_reply_event_ids,
     stable_json,
 )
+from ispec.assistant.work_bag import recent_work_bag_payload
 from ispec.agent.commands import (
     COMMAND_DEV_RESTART_SERVICES,
     COMMAND_LEGACY_PUSH_PROJECT_COMMENTS,
@@ -56,7 +58,6 @@ from ispec.agent.commands import (
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.db.models import (
     AuthUser,
-    AuthUserProject,
     E2G,
     Experiment,
     ExperimentRun,
@@ -64,7 +65,6 @@ from ispec.db.models import (
     Project,
     ProjectComment,
     ProjectFile,
-    UserRole,
 )
 from ispec.schedule.models import ScheduleRequest, ScheduleSlot
 
@@ -106,6 +106,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "assistant_list_slack_artifact_replies": ToolScope.admin,
     "assistant_relay_slack_reply_to_tmux": ToolScope.admin,
     "assistant_recent_sessions": ToolScope.staff,
+    "assistant_recent_session_work_bag": ToolScope.staff,
     "assistant_get_session_review": ToolScope.staff,
     "assistant_prompt_header": ToolScope.staff,
     "assistant_search_messages": ToolScope.admin,
@@ -1744,9 +1745,9 @@ def _scope_error(scope: ToolScope, user: AuthUser | None) -> str | None:
         return None
     if scope == ToolScope.user:
         return None
-    # For now we treat all internal/staff roles as equivalent. The only
-    # restricted role is "client" (external user).
-    if user.role == UserRole.client:
+    # Explicit-project users are external/scoped users regardless of the legacy
+    # role label that produced that mode.
+    if uses_explicit_project_access(user):
         return "Staff access required."
     if scope in {ToolScope.staff, ToolScope.admin}:
         return None
@@ -1855,6 +1856,10 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
         "- assistant_relay_slack_reply_to_tmux(reply_event_id: int, target: str | None = None, press_enter: bool = true, confirm: bool)  # internal-only write; relay one approved Slack artifact reply into one allowlisted tmux pane",
     )
     add("assistant_recent_sessions", "- assistant_recent_sessions(limit: int = 10)")
+    add(
+        "assistant_recent_session_work_bag",
+        "- assistant_recent_session_work_bag(session_id: str | None = null, limit: int = 12)  # compact session-local recent tool/write/job statuses",
+    )
     add("assistant_get_session_review", "- assistant_get_session_review(session_id: str)")
     add(
         "assistant_prompt_header",
@@ -2151,7 +2156,7 @@ def _assistant_list_tools_payload(
     # user-facing. Today this is primarily for internal/staff use.
     role = getattr(user, "role", None)
     include_unavailable_effective = bool(include_unavailable) and (
-        user is None or role in {UserRole.viewer, UserRole.editor, UserRole.admin}
+        user is None or not uses_explicit_project_access(user)
     )
 
     repo_enabled, repo_reason = _repo_tools_enabled_status()
@@ -2221,7 +2226,7 @@ def _assistant_list_tools_payload(
         elif tool_name in _WRITE_TOOL_NAMES:
             if user is None:
                 unavailable_reason = "Authentication required for write tools."
-            elif role == UserRole.client and tool_name != "create_project_comment":
+            elif uses_explicit_project_access(user) and tool_name != "create_project_comment":
                 unavailable_reason = "Write access required."
 
         if unavailable_reason is None and scope_err:
@@ -2389,7 +2394,7 @@ def _range_bounds_local(start: date, end: date) -> tuple[datetime, datetime]:
 def _require_admin(user: AuthUser | None) -> str | None:
     if user is None:
         return "Not authenticated."
-    if user.role == UserRole.client:
+    if uses_explicit_project_access(user):
         return "Staff access required."
     return None
 
@@ -2986,6 +2991,7 @@ def run_tool(
     api_schema: dict[str, Any] | None = None,
     user_message: str | None = None,
     project_comment_save_authorized: bool = False,
+    support_session_id: str | None = None,
 ) -> dict[str, Any]:
     # the large try block is not great - but these if statements for
     # resolving tool call results is probably fine
@@ -3605,7 +3611,7 @@ def run_tool(
             if user is None:
                 return {"ok": False, "tool": name, "error": "Not authenticated."}
 
-            is_client_user = user.role == UserRole.client
+            is_scoped_user = uses_explicit_project_access(user)
 
             confirm = args.get("confirm")
             if confirm is not True:
@@ -3637,20 +3643,12 @@ def run_tool(
                 return {"ok": False, "tool": name, "error": "comment text is required."}
 
             comment_type = _safe_str(args.get("comment_type"), max_len=64) or "assistant_note"
-            if is_client_user:
+            if is_scoped_user:
                 comment_type = "client_note"
 
-            if is_client_user:
-                project = (
-                    core_db.query(Project)
-                    .join(AuthUserProject, AuthUserProject.project_id == Project.id)
-                    .filter(Project.id == int(project_id), AuthUserProject.user_id == user.id)
-                    .first()
-                )
-            else:
-                project = core_db.get(Project, int(project_id))
+            project = get_project_for_user(core_db, user=user, project_id=int(project_id))
             if project is None:
-                if is_client_user:
+                if is_scoped_user:
                     return {
                         "ok": False,
                         "tool": name,
@@ -3658,7 +3656,7 @@ def run_tool(
                     }
                 return {"ok": False, "tool": name, "error": f"Project {project_id} not found."}
 
-            person_id = _safe_int(args.get("person_id")) if not is_client_user else None
+            person_id = _safe_int(args.get("person_id")) if not is_scoped_user else None
             if person_id is not None and person_id > 0:
                 person = core_db.get(Person, int(person_id))
                 if person is None:
@@ -4650,6 +4648,43 @@ def run_tool(
                 )
 
             return {"ok": True, "tool": name, "result": {"limit": limit, "sessions": items}}
+
+        if name == "assistant_recent_session_work_bag":
+            if assistant_db is None:
+                return {"ok": False, "tool": name, "error": "assistant_db is required."}
+
+            session_id = (
+                _safe_str(args.get("session_id"), max_len=256)
+                or _safe_str(args.get("id"), max_len=256)
+                or _safe_str(support_session_id, max_len=256)
+            )
+            if not session_id:
+                return {"ok": False, "tool": name, "error": "Missing argument: session_id"}
+
+            limit = _clamp_int(_safe_int(args.get("limit")), default=12, min_value=1, max_value=50)
+            session = assistant_db.query(SupportSession).filter(SupportSession.session_id == session_id).first()
+            if session is None:
+                return {"ok": False, "tool": name, "error": "Session not found.", "session_id": session_id}
+
+            state: dict[str, Any] = {}
+            raw_state = getattr(session, "state_json", None)
+            if raw_state:
+                try:
+                    parsed_state = json.loads(raw_state)
+                    if isinstance(parsed_state, dict):
+                        state = parsed_state
+                except Exception:
+                    state = {}
+
+            return {
+                "ok": True,
+                "tool": name,
+                "result": recent_work_bag_payload(
+                    state,
+                    session_id=session.session_id,
+                    limit=limit,
+                ),
+            }
 
         if name == "assistant_get_session_review":
             if assistant_db is None:
@@ -5949,11 +5984,8 @@ def run_tool(
             current_only = bool(args.get("current_only"))
 
             query = core_db.query(Project)
-            if user is not None and user.role == UserRole.client:
-                query = query.join(
-                    AuthUserProject,
-                    AuthUserProject.project_id == Project.id,
-                ).filter(AuthUserProject.user_id == user.id)
+            if uses_explicit_project_access(user):
+                query = scope_project_query(query, user)
 
             if current_only:
                 query = query.filter(Project.prj_Current_FLAG.is_(True))
@@ -6009,11 +6041,8 @@ def run_tool(
             limit = _clamp_int(_safe_int(args.get("limit")), default=50, min_value=1, max_value=500)
 
             project_query = core_db.query(Project).filter(Project.id == project_id)
-            if user is not None and user.role == UserRole.client:
-                project_query = project_query.join(
-                    AuthUserProject,
-                    AuthUserProject.project_id == Project.id,
-                ).filter(AuthUserProject.user_id == user.id)
+            if uses_explicit_project_access(user):
+                project_query = scope_project_query(project_query, user)
             project = project_query.first()
             if project is None:
                 return {"ok": False, "tool": name, "error": f"Project {project_id} not found."}
@@ -6764,6 +6793,23 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "assistant_recent_session_work_bag": {
+        "type": "function",
+        "function": {
+            "name": "assistant_recent_session_work_bag",
+            "description": "Return compact recent tool/write/job status entries for a support session.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Support session_id. Defaults to the current support session when available.",
+                    },
+                    "limit": {"type": "integer", "description": "Max entries to return (default 12)."},
+                },
+            },
+        },
+    },
     "assistant_get_session_review": {
         "type": "function",
         "function": {
@@ -7194,7 +7240,7 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "comment": {"type": "string", "description": "Comment text to store."},
                     "comment_type": {
                         "type": "string",
-                        "description": "Optional comment type label (e.g. meeting_note, assistant_note). For client users this is stored as client_note.",
+                        "description": "Optional comment type label (e.g. meeting_note, assistant_note). For scoped users this is stored as client_note.",
                     },
                     "person_id": {
                         "type": "integer",
@@ -7484,7 +7530,7 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
         if name in _WRITE_TOOL_NAMES:
             if user is None:
                 continue
-            if user.role == UserRole.client and name != "create_project_comment":
+            if uses_explicit_project_access(user) and name != "create_project_comment":
                 continue
         scope = _TOOL_SCOPES.get(name, ToolScope.staff)
         if _scope_error(scope, user) is None:

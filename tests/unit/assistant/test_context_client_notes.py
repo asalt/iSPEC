@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import pytest
+
 from ispec.assistant.context import build_ispec_context
 from ispec.assistant.tools import run_tool
 from ispec.db.models import AuthUser, AuthUserProject, Person, Project, ProjectComment, UserRole
 
 
-def test_build_ispec_context_includes_client_notes_for_current_project(db_session):
+@pytest.mark.parametrize("role", [UserRole.client, UserRole.viewer])
+def test_build_ispec_context_includes_scoped_user_notes_for_current_project(db_session, role):
     project = Project(id=20, prj_AddedBy="test", prj_ProjectTitle="Client Notes Project")
     user = AuthUser(
-        username="client",
+        username=str(role.value),
         password_hash="hash",
         password_salt="salt",
         password_iterations=1,
-        role=UserRole.client,
+        role=role,
         is_active=True,
     )
     db_session.add_all([project, user])

@@ -96,7 +96,42 @@ def test_support_chat_passes_and_persists_prompt_observability(tmp_path, db_sess
 def test_base_system_prompt_preserves_project_note_status_and_correction_boundary():
     prompt = _render_base_system_prompt().text
 
-    assert "Preserve the user's implied operational status" in prompt
-    assert "do not rewrite it as completed work" in prompt
+    assert "Consider the user's implied operational status carefully" in prompt
+    assert "preserve that status conservatively" in prompt
+    assert "avoid rewriting it as completed work" in prompt
     assert "do not assume the approval/write protocol failed" in prompt
     assert "prefer adding a corrective note rather than overwriting history" in prompt
+
+
+def test_prompt_state_includes_compact_work_bag_summary_only():
+    state = {
+        "work_bag": {
+            "schema_version": 1,
+            "entries": [
+                {
+                    "entry_id": f"wb:a{i}:t1",
+                    "created_at": "2026-06-15T00:00:00+00:00",
+                    "source": "support_chat",
+                    "kind": "write",
+                    "tool_name": "create_project_comment",
+                    "status": "succeeded",
+                    "refs": [{"kind": "project_comment", "id": i}],
+                    "summary": f"entry {i}",
+                    "omitted": ["raw_arguments", "raw_result", "prompt_text"],
+                }
+                for i in range(5)
+            ],
+        }
+    }
+
+    prompt_state = support_routes._prompt_state_from_session_state(state)  # noqa: SLF001
+    work_bag = prompt_state["work_bag"]
+
+    assert work_bag["entry_count"] == 5
+    assert len(work_bag["recent_entries"]) == 3
+    assert [entry["entry_id"] for entry in work_bag["recent_entries"]] == [
+        "wb:a2:t1",
+        "wb:a3:t1",
+        "wb:a4:t1",
+    ]
+    assert work_bag["full_available_via_tool"] == "assistant_recent_session_work_bag"

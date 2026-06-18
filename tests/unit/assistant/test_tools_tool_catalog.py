@@ -6,11 +6,11 @@ from ispec.db.models import AuthUser, UserRole
 
 def test_assistant_list_tools_filters_unavailable_by_default(db_session):
     user = AuthUser(
-        username="viewer",
+        username="editor",
         password_hash="hash",
         password_salt="salt",
         password_iterations=1,
-        role=UserRole.viewer,
+        role=UserRole.editor,
         is_active=True,
     )
     payload = run_tool(
@@ -26,6 +26,7 @@ def test_assistant_list_tools_filters_unavailable_by_default(db_session):
     assert payload["result"]["available_tools"]
     tool_names = {item["name"] for item in payload["result"]["available_tools"]}
     assert "assistant_stats" in tool_names
+    assert "assistant_recent_session_work_bag" in tool_names
     assert "assistant_recent_agent_commands" in tool_names
 
 
@@ -34,11 +35,11 @@ def test_assistant_list_tools_can_include_unavailable_for_internal(db_session, m
     # Keep this test stable even if the runner exports ISPEC_STATE_DIR=.pids.
     monkeypatch.setenv("ISPEC_STATE_DIR", "/tmp/ispec-state")
     user = AuthUser(
-        username="viewer",
+        username="editor",
         password_hash="hash",
         password_salt="salt",
         password_iterations=1,
-        role=UserRole.viewer,
+        role=UserRole.editor,
         is_active=True,
     )
     payload = run_tool(
@@ -63,11 +64,11 @@ def test_assistant_list_tools_includes_repo_tools_when_enabled(db_session, monke
     monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_REPO_TOOLS", "1")
     monkeypatch.setattr("ispec.assistant.tools._code_tool_access_status", lambda user: (True, None))
     user = AuthUser(
-        username="viewer",
+        username="editor",
         password_hash="hash",
         password_salt="salt",
         password_iterations=1,
-        role=UserRole.viewer,
+        role=UserRole.editor,
         is_active=True,
     )
     payload = run_tool(
@@ -86,11 +87,11 @@ def test_assistant_list_tools_includes_repo_tools_when_enabled(db_session, monke
 
 def test_assistant_list_tools_query_reports_unavailable_matches(db_session):
     user = AuthUser(
-        username="viewer",
+        username="editor",
         password_hash="hash",
         password_salt="salt",
         password_iterations=1,
-        role=UserRole.viewer,
+        role=UserRole.editor,
         is_active=True,
     )
     payload = run_tool(
@@ -114,14 +115,14 @@ def test_assistant_list_tools_reports_code_tools_unavailable_for_non_allowlisted
     monkeypatch.setenv("ISPEC_ASSISTANT_ENABLE_REPO_TOOLS", "1")
     monkeypatch.setattr(
         "ispec.assistant.tools._code_tool_access_status",
-        lambda user: (False, "Code tools are unavailable for viewer; add that username to /tmp/assistant-code-tool-users.local.txt."),
+        lambda user: (False, "Code tools are unavailable for editor; add that username to /tmp/assistant-code-tool-users.local.txt."),
     )
     user = AuthUser(
-        username="viewer",
+        username="editor",
         password_hash="hash",
         password_salt="salt",
         password_iterations=1,
-        role=UserRole.viewer,
+        role=UserRole.editor,
         is_active=True,
     )
     payload = run_tool(

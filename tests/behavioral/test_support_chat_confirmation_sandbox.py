@@ -670,6 +670,16 @@ def test_behavioral_support_chat_corrective_note_compound_confirm_routes_to_writ
         assert wrong_note in comments[0].com_Comment
         assert "raw file upload to OneDrive is not complete yet" in comments[1].com_Comment
         assert "normal draft-and-confirm approval" in comments[1].com_Comment
+        assistant_db.refresh(support_session)
+        final_state = json.loads(support_session.state_json)
+        work_bag_entries = final_state["work_bag"]["entries"]
+        assert work_bag_entries
+        latest_work = work_bag_entries[-1]
+        assert latest_work["tool_name"] == "create_project_comment"
+        assert latest_work["status"] == "succeeded"
+        assert {"kind": "project", "id": project_id} in latest_work["refs"]
+        assert {"kind": "project_comment", "id": int(comments[1].id)} in latest_work["refs"]
+        assert "raw_arguments" in latest_work["omitted"]
 
         assistant_row = (
             assistant_db.query(SupportMessage)

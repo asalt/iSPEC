@@ -8,7 +8,15 @@ from ispec.agent.commands import COMMAND_LEGACY_PUSH_PROJECT_COMMENTS
 from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand
 from ispec.assistant.tools import openai_tools_for_user, run_tool
-from ispec.db.models import AuthUser, AuthUserProject, Person, Project, ProjectComment, UserRole
+from ispec.db.models import (
+    AuthUser,
+    AuthUserProject,
+    Person,
+    Project,
+    ProjectAccessMode,
+    ProjectComment,
+    UserRole,
+)
 
 
 def _make_user(username: str, *, role: UserRole) -> AuthUser:
@@ -38,6 +46,7 @@ def test_create_project_comment_tool_visible_for_service_viewer():
     user = types.SimpleNamespace(
         username="api_key",
         role=UserRole.viewer,
+        project_access_mode=ProjectAccessMode.all_projects,
         can_write_project_comments=True,
     )
     tool_names = {tool["function"]["name"] for tool in openai_tools_for_user(user)}
@@ -52,6 +61,7 @@ def test_create_project_comment_allows_service_viewer_write(db_session):
     user = types.SimpleNamespace(
         username="api_key",
         role=UserRole.viewer,
+        project_access_mode=ProjectAccessMode.all_projects,
         can_write_project_comments=True,
     )
     payload = run_tool(
@@ -66,10 +76,11 @@ def test_create_project_comment_allows_service_viewer_write(db_session):
     assert payload["ok"] is True
 
 
-def test_create_project_comment_requires_client_project_access(db_session):
+@pytest.mark.parametrize("role", [UserRole.client, UserRole.viewer])
+def test_create_project_comment_requires_explicit_project_access(db_session, role):
     allowed = Project(id=10, prj_AddedBy="test", prj_ProjectTitle="Allowed Project")
     denied = Project(id=11, prj_AddedBy="test", prj_ProjectTitle="Denied Project")
-    user = _make_user("client", role=UserRole.client)
+    user = _make_user(str(role.value), role=role)
     db_session.add_all([allowed, denied, user])
     db_session.commit()
     db_session.refresh(user)
@@ -110,7 +121,7 @@ def test_create_project_comment_requires_client_project_access(db_session):
     comment = db_session.get(ProjectComment, comment_id)
     assert comment is not None
     assert comment.project_id == int(allowed.id)
-    assert comment.com_AddedBy == "client"
+    assert comment.com_AddedBy == str(role.value)
     assert comment.com_CommentType == "client_note"
     assert "Client note" in (comment.com_Comment or "")
 
