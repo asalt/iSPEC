@@ -244,6 +244,7 @@ def _ensure_experiment_run_columns(engine: Engine) -> None:
         ("acquisition_mode", "TEXT"),
         ("ref_database", "TEXT"),
         ("taxon_id", "INTEGER"),
+        ("ExperimentRun_LegacyModificationTS", "DATETIME"),
     ]
 
     try:

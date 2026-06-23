@@ -101,6 +101,12 @@ def test_model_metadata_matches_database(alembic_cfg: Config, live_conn) -> None
 
     assert model_tables.issubset(db_tables)
 
+    inspector = inspect(engine)
+    experiment_run_columns = {
+        col["name"] for col in inspector.get_columns("experiment_run")
+    }
+    assert "ExperimentRun_LegacyModificationTS" in experiment_run_columns
+
 
 def test_upgrade_is_idempotent(alembic_cfg: Config, live_conn) -> None:
     command.upgrade(alembic_cfg, "head")

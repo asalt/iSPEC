@@ -660,7 +660,7 @@ def _fetch_legacy_project_comment_keys(
     payload, _fields_mode = _fetch_legacy_rows_best_effort(
         url=url,
         params=params,
-        modes=["repeat", "csv", "none"],
+        modes=["csv", "repeat", "none"],
         fields=list(fields),
         expected_fields=set(fields),
         required_fields=[source.project_field, source.note_field],
@@ -768,7 +768,7 @@ def scan_recent_legacy_project_comment_projects(
     payload, fields_mode = _fetch_legacy_rows_best_effort(
         url=url,
         params=params,
-        modes=["repeat", "csv", "none"],
+        modes=["csv", "repeat", "none"],
         fields=list(fields),
         expected_fields=set(fields),
         required_fields=list(fields),
@@ -1948,6 +1948,13 @@ def _build_experiment_run_record(
         if created_dt is not None:
             record["ExperimentRun_CreationTS"] = created_dt
 
+    if "ExperimentRun_LegacyModificationTS" in model_columns:
+        legacy_modified_dt = _normalize_datetime(
+            _coerce_datetime(item.get(plan.legacy_modified_field))
+        )
+        if legacy_modified_dt is not None:
+            record["ExperimentRun_LegacyModificationTS"] = legacy_modified_dt
+
     exp_id = record.get("experiment_id")
     run_no = record.get("run_no")
     search_no = record.get("search_no")
@@ -2222,7 +2229,7 @@ def sync_legacy_projects(
             seen_cursors.add(cursor_key)
 
             url = f"{base_url}/api/v2/legacy/tables/{plan.legacy_table}/rows"
-            modes = [fields_mode] if fields_mode else ["repeat", "csv", "none"]
+            modes = [fields_mode] if fields_mode else ["csv", "repeat", "none"]
             threshold_missing = max(1, int(0.1 * len(expected_fields)))
 
             required_fields = [plan.legacy_pk_field, plan.legacy_modified_field]
@@ -2459,7 +2466,7 @@ def sync_legacy_people(
                 break
             seen_cursors.add(cursor_key)
 
-            modes = [fields_mode] if fields_mode else ["repeat", "csv", "none"]
+            modes = [fields_mode] if fields_mode else ["csv", "repeat", "none"]
             threshold_missing = max(1, int(0.1 * len(expected_fields)))
 
             payload, fields_mode = _fetch_legacy_rows_best_effort(
@@ -2628,7 +2635,7 @@ def sync_legacy_project_comments(
     payload, fields_mode = _fetch_legacy_rows_best_effort(
         url=url,
         params=params,
-        modes=["repeat", "csv", "none"],
+        modes=["csv", "repeat", "none"],
         fields=list(fields),
         expected_fields=expected_fields,
         required_fields=required_fields,
@@ -2882,7 +2889,7 @@ def sync_legacy_experiments(
                 break
             seen_cursors.add(cursor_key)
 
-            modes = [fields_mode] if fields_mode else ["repeat", "csv", "none"]
+            modes = [fields_mode] if fields_mode else ["csv", "repeat", "none"]
             threshold_missing = max(1, int(0.1 * len(expected_fields)))
             payload, fields_mode = _fetch_legacy_rows_best_effort(
                 url=url,
@@ -3089,7 +3096,7 @@ def sync_legacy_experiment_runs(
     payload, fields_mode = _fetch_legacy_rows_best_effort(
         url=url,
         params=params,
-        modes=["repeat", "csv", "none"],
+        modes=["csv", "repeat", "none"],
         fields=list(fields),
         expected_fields=expected_fields,
         required_fields=required_fields,

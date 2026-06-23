@@ -187,6 +187,11 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
     ExperimentRun_LegacyImportTS: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )
+    ExperimentRun_LegacyModificationTS: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        info={"ui": {"label": "Legacy Modified", "readOnly": True}},
+    )
     run_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     search_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     label: Mapped[str] = mapped_column(

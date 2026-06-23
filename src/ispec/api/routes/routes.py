@@ -1344,17 +1344,27 @@ if _enabled("experiment_runs") and _enabled("experiments"):
     ):
         _reject_scoped_user(request)
         query = (
-            db.query(ExperimentRun)
+            db.query(ExperimentRun, Experiment)
             .join(Experiment, ExperimentRun.experiment_id == Experiment.id)
             .filter(Experiment.project_id == project_id)
             .order_by(ExperimentRun.id.desc())
         )
         rows = query.limit(limit).offset(offset).all()
         Read = make_pydantic_model_from_sqlalchemy(ExperimentRun, name_suffix="Read")
-        return [
-            _serialize_experiment_run_payload(Read.model_validate(r).model_dump())
-            for r in rows
-        ]
+        payload = []
+        for run, experiment in rows:
+            item = _serialize_experiment_run_payload(Read.model_validate(run).model_dump())
+            item.update(
+                {
+                    "experiment_record_no": getattr(experiment, "record_no", None),
+                    "experiment_name": getattr(experiment, "exp_Name", None),
+                    "experiment_cell_tissue": getattr(experiment, "exp_CellTissue", None),
+                    "experiment_genotype": getattr(experiment, "exp_Genotype", None),
+                    "experiment_treatment": getattr(experiment, "exp_Treatment", None),
+                }
+            )
+            payload.append(item)
+        return payload
 
 
 if _enabled("experiment_to_gene"):

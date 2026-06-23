@@ -429,6 +429,7 @@ def test_sync_legacy_experiment_runs_single_id_inserts_run(tmp_path, monkeypatch
         assert run.sample_name == "57454_1_2_0"
         assert isinstance(run.ExperimentRun_CreationTS, datetime)
         assert isinstance(run.ExperimentRun_ModificationTS, datetime)
+        assert run.ExperimentRun_LegacyModificationTS == datetime(2025, 12, 6, 4, 5, 6)
 
         # Single-id sync should not advance the incremental cursor.
         assert session.query(LegacySyncState).count() == 0
