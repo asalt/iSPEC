@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from ispec.api.routes.auth import router as auth_router
-from ispec.api.security import create_session, session_cookie_name
+from ispec.api.security import create_session, hash_password, session_cookie_name
 from ispec.db.connect import (
     get_session_dep,
     initialize_db,
@@ -181,6 +181,39 @@ def test_auth_users_list_reports_project_access_summary(auth_client):
     assert by_username["viewer"]["project_count"] == 0
     assert by_username["viewer"]["project_access_mode"] == "explicit_projects"
     assert by_username["viewer"]["effective_project_access"] == "none"
+
+
+def test_auth_login_reports_scoped_project_access_summary(auth_client):
+    salt_b64, hash_b64, iterations = hash_password("temporary-password")
+    with auth_client.session_factory() as db:  # type: ignore[attr-defined]
+        project = Project(prj_AddedBy="tester", prj_ProjectTitle="Allowed Project")
+        user = AuthUser(
+            username="demo-client",
+            password_hash=hash_b64,
+            password_salt=salt_b64,
+            password_iterations=iterations,
+            role=UserRole.client,
+            is_active=True,
+            must_change_password=True,
+        )
+        db.add_all([project, user])
+        db.flush()
+        db.add(AuthUserProject(user_id=int(user.id), project_id=int(project.id)))
+        db.commit()
+
+    resp = auth_client.post(
+        "/auth/login",
+        json={"username": "demo-client", "password": "temporary-password"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["username"] == "demo-client"
+    assert body["role"] == "client"
+    assert body["project_access_mode"] == "explicit_projects"
+    assert body["must_change_password"] is True
+    assert body["project_count"] == 1
+    assert body["effective_project_access"] == "restricted"
 
 
 def test_auth_staff_can_replace_user_project_grants(auth_client):

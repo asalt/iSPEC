@@ -171,7 +171,10 @@ def login(
     user.last_login_at = datetime.now(UTC)
     token = create_session(db, user=user)
     set_session_cookie(response, token=token)
-    return _user_out(user)
+    return _user_out(
+        user,
+        project_count=_project_count_for_user(db, user_id=int(user.id)),
+    )
 
 
 @router.post("/logout")
@@ -266,7 +269,10 @@ def change_password(
     # Rotate session token after password change (defense-in-depth).
     token = create_session(db, user=user)
     set_session_cookie(response, token=token)
-    return _user_out(user)
+    return _user_out(
+        user,
+        project_count=_project_count_for_user(db, user_id=int(user.id)),
+    )
 
 
 @router.post("/users/{user_id}/reset-password", response_model=UserOut)
