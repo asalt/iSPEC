@@ -355,6 +355,7 @@ def _ensure_auth_user_columns(engine: Engine) -> None:
 
     desired: list[tuple[str, str]] = [
         ("assistant_brief", "TEXT"),
+        ("person_id", "INTEGER"),
         ("project_access_mode", "TEXT"),
         ("must_change_password", "BOOLEAN NOT NULL DEFAULT 0"),
         ("last_login_at", "DATETIME"),

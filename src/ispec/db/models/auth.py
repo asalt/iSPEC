@@ -39,6 +39,11 @@ class AuthUser(AuthTimestamp, Base):
         SAEnum(UserRole, native_enum=True, validate_strings=True),
         default=UserRole.editor,
     )
+    person_id: Mapped[int | None] = mapped_column(
+        ForeignKey("person.id"),
+        nullable=True,
+        index=True,
+    )
     project_access_mode: Mapped[ProjectAccessMode | None] = mapped_column(
         SAEnum(ProjectAccessMode, native_enum=True, validate_strings=True),
         nullable=True,
@@ -57,6 +62,7 @@ class AuthUser(AuthTimestamp, Base):
         cascade="all, delete-orphan",
         foreign_keys="AuthUserProject.user_id",
     )
+    person: Mapped["Person | None"] = relationship(back_populates="auth_users")
 
 
 class AuthSession(Base):

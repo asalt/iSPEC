@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from ispec.authz import effective_project_access_mode
 from ispec.api.security import (
@@ -21,7 +21,15 @@ from ispec.api.security import (
     verify_password,
 )
 from ispec.db.connect import get_session_dep
-from ispec.db.models import AuthSession, AuthUser, AuthUserProject, Project, ProjectAccessMode, UserRole
+from ispec.db.models import (
+    AuthSession,
+    AuthUser,
+    AuthUserProject,
+    Person,
+    Project,
+    ProjectAccessMode,
+    UserRole,
+)
 
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -31,6 +39,8 @@ class UserOut(BaseModel):
     id: int
     username: str
     role: UserRole
+    person_id: int | None = None
+    person_label: str | None = None
     project_access_mode: ProjectAccessMode | None = None
     is_active: bool
     must_change_password: bool
@@ -53,6 +63,7 @@ class CreateUserRequest(BaseModel):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=8, max_length=1024)
     role: UserRole = UserRole.editor
+    person_id: int | None = Field(default=None, ge=1)
     must_change_password: bool = False
 
 
@@ -68,6 +79,10 @@ class ResetPasswordRequest(BaseModel):
 
 class UserAssistantBriefUpdate(BaseModel):
     assistant_brief: str | None = Field(default=None, max_length=500)
+
+
+class UserPersonUpdate(BaseModel):
+    person_id: int | None = Field(default=None, ge=1)
 
 
 class UserProjectsOut(BaseModel):
@@ -99,11 +114,26 @@ def _effective_project_access(user: AuthUser, project_count: int | None) -> str:
     return "all"
 
 
+def _person_label(person: Person | None) -> str | None:
+    if person is None:
+        return None
+    first = str(getattr(person, "ppl_Name_First", "") or "").strip()
+    last = str(getattr(person, "ppl_Name_Last", "") or "").strip()
+    email = str(getattr(person, "ppl_Email", "") or "").strip()
+    name = " ".join(part for part in [first, last] if part).strip()
+    if name and email:
+        return f"{name} <{email}>"
+    return name or email or f"Person {int(person.id)}"
+
+
 def _user_out(user: AuthUser, *, project_count: int | None = None) -> UserOut:
+    person = getattr(user, "person", None)
     return UserOut(
         id=user.id,
         username=user.username,
         role=user.role,
+        person_id=getattr(user, "person_id", None),
+        person_label=_person_label(person),
         project_access_mode=effective_project_access_mode(user),
         is_active=user.is_active,
         must_change_password=bool(getattr(user, "must_change_password", False)),
@@ -117,6 +147,15 @@ def _user_out(user: AuthUser, *, project_count: int | None = None) -> UserOut:
 
 def _invalidate_user_sessions(db: Session, *, user_id: int) -> None:
     db.query(AuthSession).filter(AuthSession.user_id == user_id).delete()
+
+
+def _require_person(db: Session, person_id: int | None) -> Person | None:
+    if person_id is None:
+        return None
+    person = db.get(Person, person_id)
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found.")
+    return person
 
 
 @router.post("/bootstrap", response_model=UserOut, status_code=201)
@@ -200,7 +239,12 @@ def me(user: AuthUser = Depends(require_user), db: Session = Depends(get_session
 def list_users(
     _: AuthUser = Depends(require_staff), db: Session = Depends(get_session_dep)
 ):
-    users = db.query(AuthUser).order_by(AuthUser.username.asc()).all()
+    users = (
+        db.query(AuthUser)
+        .options(selectinload(AuthUser.person))
+        .order_by(AuthUser.username.asc())
+        .all()
+    )
     counts = {
         int(user_id): int(count)
         for user_id, count in (
@@ -222,6 +266,8 @@ def create_user(
     if existing is not None:
         raise HTTPException(status_code=409, detail="Username already exists.")
 
+    _require_person(db, payload.person_id)
+
     salt_b64, hash_b64, iterations = hash_password(payload.password)
     user = AuthUser(
         username=payload.username,
@@ -229,6 +275,7 @@ def create_user(
         password_salt=salt_b64,
         password_iterations=iterations,
         role=payload.role,
+        person_id=payload.person_id,
         is_active=True,
         must_change_password=bool(payload.must_change_password),
     )
@@ -236,6 +283,59 @@ def create_user(
     db.commit()
     db.refresh(user)
     return _user_out(user, project_count=0)
+
+
+@router.get("/people/{person_id}/users", response_model=list[UserOut])
+def list_person_users(
+    person_id: int,
+    _: AuthUser = Depends(require_staff),
+    db: Session = Depends(get_session_dep),
+):
+    _require_person(db, person_id)
+    users = (
+        db.query(AuthUser)
+        .options(selectinload(AuthUser.person))
+        .filter(AuthUser.person_id == person_id)
+        .order_by(AuthUser.username.asc())
+        .all()
+    )
+    counts: dict[int, int] = {}
+    user_ids = [int(user.id) for user in users]
+    if user_ids:
+        counts = {
+            int(user_id): int(count)
+            for user_id, count in (
+                db.query(
+                    AuthUserProject.user_id,
+                    func.count(AuthUserProject.project_id),
+                )
+                .filter(AuthUserProject.user_id.in_(user_ids))
+                .group_by(AuthUserProject.user_id)
+                .all()
+            )
+        }
+    return [_user_out(u, project_count=counts.get(int(u.id), 0)) for u in users]
+
+
+@router.put("/users/{user_id}/person", response_model=UserOut)
+def update_user_person(
+    user_id: int,
+    payload: UserPersonUpdate,
+    _: AuthUser = Depends(require_staff),
+    db: Session = Depends(get_session_dep),
+):
+    user = db.get(AuthUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    _require_person(db, payload.person_id)
+    user.person_id = payload.person_id
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return _user_out(
+        user, project_count=_project_count_for_user(db, user_id=int(user.id))
+    )
 
 
 @router.post("/change-password", response_model=UserOut)

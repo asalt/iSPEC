@@ -12,7 +12,7 @@ from ispec.db.connect import (
     make_session_factory,
     sqlite_engine,
 )
-from ispec.db.models import AuthUser, AuthUserProject, Project, UserRole
+from ispec.db.models import AuthUser, AuthUserProject, Person, Project, UserRole
 
 pytestmark = pytest.mark.testclient
 
@@ -68,6 +68,27 @@ def _admin_cookie(session_factory, *, admin_user_id: int) -> dict[str, str]:
         assert admin is not None
         token = create_session(db, user=admin)
     return {session_cookie_name(): token}
+
+
+def _create_person(
+    session_factory,
+    *,
+    first: str = "Gene",
+    last: str = "Driver",
+    email: str | None = "gene.driver@example.test",
+) -> Person:
+    with session_factory() as db:
+        person = Person(
+            ppl_AddedBy="tester",
+            ppl_Name_First=first,
+            ppl_Name_Last=last,
+            ppl_Email=email,
+        )
+        db.add(person)
+        db.commit()
+        db.refresh(person)
+        db.expunge(person)
+        return person
 
 
 def test_auth_me_returns_assistant_brief(auth_client):
@@ -156,6 +177,57 @@ def test_auth_admin_can_create_user_but_editor_cannot(auth_client):
     assert body["must_change_password"] is True
     assert body["project_count"] == 0
     assert body["effective_project_access"] == "none"
+
+
+def test_auth_admin_can_create_user_linked_to_person(auth_client):
+    admin = _create_user(auth_client.session_factory, username="admin", role=UserRole.admin)  # type: ignore[attr-defined]
+    person = _create_person(auth_client.session_factory)  # type: ignore[attr-defined]
+    admin_cookies = _admin_cookie(auth_client.session_factory, admin_user_id=int(admin.id))  # type: ignore[attr-defined]
+
+    resp = auth_client.post(
+        "/auth/users",
+        json={
+            "username": "gened",
+            "password": "temporary-password",
+            "role": "client",
+            "person_id": int(person.id),
+            "must_change_password": True,
+        },
+        cookies=admin_cookies,
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["username"] == "gened"
+    assert body["person_id"] == int(person.id)
+    assert body["person_label"] == "Gene Driver <gene.driver@example.test>"
+
+    linked = auth_client.get(f"/auth/people/{int(person.id)}/users", cookies=admin_cookies)
+    assert linked.status_code == 200
+    assert [row["username"] for row in linked.json()] == ["gened"]
+
+
+def test_auth_staff_can_link_and_clear_user_person(auth_client):
+    editor = _create_user(auth_client.session_factory, username="editor", role=UserRole.editor)  # type: ignore[attr-defined]
+    target = _create_user(auth_client.session_factory, username="demo", role=UserRole.client)  # type: ignore[attr-defined]
+    person = _create_person(auth_client.session_factory, first="Demo", last="Client", email=None)  # type: ignore[attr-defined]
+    cookies = _admin_cookie(auth_client.session_factory, admin_user_id=int(editor.id))  # type: ignore[attr-defined]
+
+    linked = auth_client.put(
+        f"/auth/users/{int(target.id)}/person",
+        json={"person_id": int(person.id)},
+        cookies=cookies,
+    )
+    assert linked.status_code == 200
+    assert linked.json()["person_id"] == int(person.id)
+    assert linked.json()["person_label"] == "Demo Client"
+
+    cleared = auth_client.put(
+        f"/auth/users/{int(target.id)}/person",
+        json={"person_id": None},
+        cookies=cookies,
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["person_id"] is None
 
 
 def test_auth_users_list_reports_project_access_summary(auth_client):

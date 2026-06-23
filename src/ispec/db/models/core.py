@@ -39,6 +39,7 @@ class Person(PplTimestamp, Base):
 
     comments: Mapped[list["ProjectComment"]] = relationship(back_populates="person")
     projects: Mapped[list["ProjectPerson"]] = relationship(back_populates="person")
+    auth_users: Mapped[list["AuthUser"]] = relationship(back_populates="person")
 
 
 class ProjectType(str, enum.Enum):
