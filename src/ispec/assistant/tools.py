@@ -748,14 +748,16 @@ def _tmux_row_aliases(row: dict[str, Any]) -> list[str]:
 def _tmux_target_entry_matches_aliases(entry: str, aliases: set[str]) -> bool:
     """Return whether one allow/deny entry matches a pane alias set.
 
-    We intentionally keep this boring: exact matches plus prefix wildcards that
-    end in "*". This matches the local observer skill without making tmux
-    routing a full glob language.
+    We intentionally keep this boring: exact matches, one explicit match-all
+    entry, and prefix wildcards that end in "*". This matches the local
+    observer skill without making tmux routing a full glob language.
     """
 
     text = str(entry or "").strip()
     if not text:
         return False
+    if text == "*":
+        return bool(aliases)
     if text.endswith("*"):
         prefix = text[:-1]
         return bool(prefix) and any(alias.startswith(prefix) for alias in aliases)

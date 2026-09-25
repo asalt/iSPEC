@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ispec.assistant.tools import (
     _tmux_is_allowed_pane,
     _tmux_allowlist_entries,
@@ -77,6 +79,31 @@ def test_tmux_allowlist_supports_prefix_wildcards_and_blacklist_wins(monkeypatch
             "target_aliases": ["codex2-secret:fish"],
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("blacklist", "allowed"),
+    [("", True), ("any-local-session", False), ("*", False)],
+)
+def test_tmux_allowlist_supports_explicit_match_all(monkeypatch, tmp_path, blacklist, allowed):
+    allowlist_path = tmp_path / "tmux-pane-allowlist.txt"
+    allowlist_path.write_text("*\n", encoding="utf-8")
+
+    monkeypatch.setenv("ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST_PATH", str(allowlist_path))
+    monkeypatch.delenv("ISPEC_ASSISTANT_TMUX_TARGET_BLACKLIST_PATH", raising=False)
+    monkeypatch.delenv("ISPEC_ASSISTANT_TMUX_TARGET_ALLOWLIST", raising=False)
+    monkeypatch.setenv("ISPEC_ASSISTANT_TMUX_TARGET_BLACKLIST", blacklist)
+
+    actual = _tmux_is_allowed_pane(
+        {
+            "pane_id": "%42",
+            "session": "any-local-session",
+            "target": "any-local-session:codex.1",
+            "preferred_alias": "any-local-session:codex",
+            "target_aliases": ["any-local-session:codex"],
+        }
+    )
+    assert actual is allowed
 
 
 def test_tmux_send_text_uses_literal_send_then_enter(monkeypatch):
