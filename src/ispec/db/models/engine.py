@@ -84,6 +84,7 @@ def initialize_db(engine: Engine):
     _ensure_legacy_import_tracking_columns(engine)
     _ensure_experiment_columns(engine)
     _ensure_experiment_run_columns(engine)
+    _ensure_legacy_sync_state_columns(engine)
     _ensure_e2g_columns(engine)
     _ensure_auth_user_columns(engine)
     _ensure_auth_user_project_columns(engine)
@@ -245,6 +246,22 @@ def _ensure_experiment_run_columns(engine: Engine) -> None:
         ("ref_database", "TEXT"),
         ("taxon_id", "INTEGER"),
         ("ExperimentRun_LegacyModificationTS", "DATETIME"),
+        ("legacy_source_baseline_json", "TEXT"),
+        ("legacy_source_conflicts_json", "TEXT"),
+        ("legacy_grouper_started", "BOOLEAN"),
+        ("legacy_grouper_completed", "BOOLEAN"),
+        ("legacy_grouper_failed", "BOOLEAN"),
+        ("legacy_grouper_version", "TEXT"),
+        ("legacy_grouper_filter_stamp", "TEXT"),
+        ("legacy_grouper_ref_database", "TEXT"),
+        ("legacy_grouper_input_file", "TEXT"),
+        ("legacy_grouper_matched_psm_count", "INTEGER"),
+        ("legacy_grouper_unmatched_psm_count", "INTEGER"),
+        ("legacy_e2g_import_started", "BOOLEAN"),
+        ("legacy_e2g_import_completed", "BOOLEAN"),
+        ("legacy_e2g_import_fix_requested", "BOOLEAN"),
+        ("legacy_e2g_imported_at", "DATETIME"),
+        ("legacy_e2g_import_error", "TEXT"),
     ]
 
     try:
@@ -266,6 +283,19 @@ def _ensure_experiment_run_columns(engine: Engine) -> None:
         ", ".join(name for name, _ in missing),
     )
     _backfill_experiment_run_sample_names(engine)
+
+
+def _ensure_legacy_sync_state_columns(engine: Engine) -> None:
+    """Ensure older cursor tables can store composite legacy primary keys."""
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns("legacy_sync_state")}
+    except Exception:
+        return
+    if "since_pk_json" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text('ALTER TABLE legacy_sync_state ADD COLUMN "since_pk_json" TEXT'))
+    logger.info("Added missing column legacy_sync_state.since_pk_json")
 
 
 def _backfill_experiment_run_sample_names(engine: Engine) -> None:

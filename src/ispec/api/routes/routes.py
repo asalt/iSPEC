@@ -40,6 +40,7 @@ from ispec.db.crud import (
     MSRawFileCRUD,
     LetterOfSupportCRUD,
 )
+from ispec.db.experiment_run_status import legacy_experiment_run_display_status
 from ispec.omics.labels import experiment_run_legacy_key
 
 from ispec.api.routes.schema import build_form_schema
@@ -138,6 +139,7 @@ def _serialize_experiment_run_payload(payload: dict[str, object]) -> dict[str, o
         )
     except Exception:
         item["legacy_key"] = None
+    item.update(legacy_experiment_run_display_status(item))
     return item
 
 
@@ -250,11 +252,21 @@ def _add_crud_endpoints(
             is_qc=(bool, False),
             qc_instrument=(str | None, None),
         )
+    elif model is ExperimentRun:
+        read_response_model = pydantic_create_model(
+            f"{read_model.__name__}WithLegacyStatus",
+            __base__=read_model,
+            legacy_key=(str | None, None),
+            legacy_grouping_status=(str, "unknown"),
+            legacy_import_status=(str, "unknown"),
+        )
 
     def _serialize_row(row) -> dict[str, object]:
         payload = read_model.model_validate(row).model_dump()
         if model is Experiment:
             return _serialize_experiment_payload(payload)
+        if model is ExperimentRun:
+            return _serialize_experiment_run_payload(payload)
         return payload
 
     def _duplicate_detail() -> str:
@@ -941,6 +953,13 @@ if _enabled("experiment_runs"):
             create_exclude_fields={
                 "ExperimentRun_CreationTS",
                 "ExperimentRun_ModificationTS",
+                "ExperimentRun_LegacyImportTS",
+                "ExperimentRun_LegacyModificationTS",
+            }
+            | {
+                column.name
+                for column in ExperimentRun.__table__.columns
+                if column.name.startswith("legacy_")
             },
             route_prefix_by_table=_ROUTE_PREFIX_MAP,
         )

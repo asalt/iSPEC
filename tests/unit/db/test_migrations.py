@@ -106,11 +106,68 @@ def test_model_metadata_matches_database(alembic_cfg: Config, live_conn) -> None
         col["name"] for col in inspector.get_columns("experiment_run")
     }
     assert "ExperimentRun_LegacyModificationTS" in experiment_run_columns
+    assert "legacy_grouper_completed" in experiment_run_columns
+    assert "legacy_e2g_imported_at" in experiment_run_columns
+    assert "legacy_e2g_import_error" in experiment_run_columns
+    assert "legacy_source_baseline_json" in experiment_run_columns
+    assert "legacy_source_conflicts_json" in experiment_run_columns
+
+    legacy_sync_columns = {
+        col["name"] for col in inspector.get_columns("legacy_sync_state")
+    }
+    assert "since_pk_json" in legacy_sync_columns
 
 
 def test_upgrade_is_idempotent(alembic_cfg: Config, live_conn) -> None:
     command.upgrade(alembic_cfg, "head")
     command.upgrade(alembic_cfg, "head")
+
+
+def test_source_baseline_upgrade_preserves_unbaselined_rows(
+    alembic_cfg: Config, live_conn
+) -> None:
+    _, conn = live_conn
+    command.upgrade(alembic_cfg, "head")
+    conn.execute(
+        Base.metadata.tables["project"]
+        .insert()
+        .values(
+            id=1494,
+            prj_AddedBy="test",
+            prj_ProjectTitle="P",
+        )
+    )
+    conn.execute(
+        Base.metadata.tables["experiment"]
+        .insert()
+        .values(
+            id=57454,
+            project_id=1494,
+            record_no="57454",
+        )
+    )
+    conn.execute(
+        Base.metadata.tables["experiment_run"]
+        .insert()
+        .values(
+            experiment_id=57454,
+            run_no=1,
+            search_no=2,
+            label="0",
+            ms_instrument="local correction",
+        )
+    )
+    command.downgrade(alembic_cfg, "0008_experiment_run_legacy_status")
+    assert "legacy_source_baseline_json" not in {
+        column["name"] for column in inspect(conn).get_columns("experiment_run")
+    }
+    command.upgrade(alembic_cfg, "head")
+    assert conn.execute(
+        text(
+            "SELECT ms_instrument, legacy_source_baseline_json, legacy_source_conflicts_json "
+            "FROM experiment_run WHERE experiment_id = 57454"
+        )
+    ).one() == ("local correction", None, None)
 
 
 def test_roundtrip_each_revision(alembic_cfg: Config, live_conn) -> None:

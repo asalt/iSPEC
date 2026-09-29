@@ -192,6 +192,16 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
         nullable=True,
         info={"ui": {"label": "Legacy Modified", "readOnly": True}},
     )
+    legacy_source_baseline_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Legacy Source Baseline", "readOnly": True}},
+    )
+    legacy_source_conflicts_json: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Legacy Source Conflicts", "readOnly": True}},
+    )
     run_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     search_no: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     label: Mapped[str] = mapped_column(
@@ -244,6 +254,85 @@ class ExperimentRun(ExperimentRunTimestamp, Base):
 
     db_search_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     gpgrouper_flag: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Read-only metadata reported by the legacy FileMaker grouping/import flow.
+    # These remain nullable so "not reported" is distinct from an explicit false.
+    legacy_grouper_started: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        info={"ui": {"label": "Legacy Grouper Started", "readOnly": True}},
+    )
+    legacy_grouper_completed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        info={"ui": {"label": "Legacy Grouper Completed", "readOnly": True}},
+    )
+    legacy_grouper_failed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        info={"ui": {"label": "Legacy Grouper Failed", "readOnly": True}},
+    )
+    legacy_grouper_version: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Legacy Grouper Version", "readOnly": True}},
+    )
+    legacy_grouper_filter_stamp: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Legacy Grouper Filter Stamp", "readOnly": True}},
+    )
+    legacy_grouper_ref_database: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Legacy Grouper Reference DB", "readOnly": True}},
+    )
+    legacy_grouper_input_file: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={"ui": {"label": "Legacy Grouper Input File", "readOnly": True}},
+    )
+    legacy_grouper_matched_psm_count: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        info={"ui": {"label": "Legacy Matched PSMs", "readOnly": True}},
+    )
+    legacy_grouper_unmatched_psm_count: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        info={"ui": {"label": "Legacy Unmatched PSMs", "readOnly": True}},
+    )
+    legacy_e2g_import_started: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        info={"ui": {"label": "Legacy E2G Import Started", "readOnly": True}},
+    )
+    legacy_e2g_import_completed: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        info={"ui": {"label": "Legacy E2G Import Completed", "readOnly": True}},
+    )
+    legacy_e2g_import_fix_requested: Mapped[bool | None] = mapped_column(
+        Boolean,
+        nullable=True,
+        info={"ui": {"label": "Legacy E2G Import Needs Fix", "readOnly": True}},
+    )
+    legacy_e2g_imported_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+        info={"ui": {"label": "Legacy E2G Imported At", "readOnly": True}},
+    )
+    legacy_e2g_import_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        info={
+            "ui": {
+                "label": "Legacy E2G Import Error",
+                "component": "Textarea",
+                "readOnly": True,
+            }
+        },
+    )
 
     experiment: Mapped["Experiment"] = relationship(back_populates="runs")
     raw_files: Mapped[list["MSRawFile"]] = relationship(

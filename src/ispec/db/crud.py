@@ -792,6 +792,7 @@ class ExperimentRunCRUD(CRUDBase):
     def readonly_fields(self) -> set[str]:
         readonly = super().readonly_fields()
         readonly.update({"experiment_id", "run_no", "search_no"})
+        readonly.update(name for name in self.get_columns() if name.startswith("legacy_"))
         return readonly
 
     def label_expr(self):

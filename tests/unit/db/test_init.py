@@ -70,9 +70,45 @@ def test_initialize_db_repairs_experiment_run_sample_columns(tmp_path):
     assert "sample_name" in after_columns
     assert "sample_group" in after_columns
     assert "sample_metadata_json" in after_columns
+    assert "legacy_grouper_started" in after_columns
+    assert "legacy_grouper_completed" in after_columns
+    assert "legacy_grouper_failed" in after_columns
+    assert "legacy_e2g_imported_at" in after_columns
+    assert "legacy_e2g_import_error" in after_columns
+    assert "legacy_source_baseline_json" in after_columns
+    assert "legacy_source_conflicts_json" in after_columns
 
     with engine.begin() as conn:
         sample_name = conn.execute(
             text("SELECT sample_name FROM experiment_run WHERE experiment_id = 56774")
         ).scalar_one()
+        snapshots = conn.execute(
+            text(
+                "SELECT legacy_source_baseline_json, legacy_source_conflicts_json "
+                "FROM experiment_run WHERE experiment_id = 56774"
+            )
+        ).one()
     assert sample_name == "56774_1_7_0"
+    assert snapshots == (None, None)
+
+
+def test_initialize_db_repairs_composite_legacy_cursor_column(tmp_path):
+    db_url = f"sqlite:///{tmp_path}/legacy-cursor.db"
+    engine = sqlite_engine(db_url)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE legacy_sync_state (
+                    legacy_table TEXT PRIMARY KEY,
+                    since DATETIME,
+                    since_pk INTEGER
+                )
+                """
+            )
+        )
+
+    initialize_db(engine)
+
+    columns = {col["name"] for col in inspect(engine).get_columns("legacy_sync_state")}
+    assert "since_pk_json" in columns

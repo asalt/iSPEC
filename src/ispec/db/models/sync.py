@@ -22,3 +22,4 @@ class LegacySyncState(LegacySyncTimestamp, Base):
     legacy_table: Mapped[str] = mapped_column(Text, primary_key=True)
     since: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     since_pk: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    since_pk_json: Mapped[str | None] = mapped_column(Text, nullable=True)

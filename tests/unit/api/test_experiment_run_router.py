@@ -127,6 +127,10 @@ def test_experiment_runs_by_project_includes_parent_experiment_metadata(full_cli
                 ms_instrument="BCM-MSPC-Ultra2",
                 ref_database="GENCODE_hs",
                 taxon_id=9606,
+                legacy_grouper_started=True,
+                legacy_grouper_completed=True,
+                legacy_e2g_import_started=True,
+                legacy_e2g_import_fix_requested=True,
             )
         )
         db.commit()
@@ -143,3 +147,65 @@ def test_experiment_runs_by_project_includes_parent_experiment_metadata(full_cli
     assert rows[0]["experiment_cell_tissue"] == "peripheral blood"
     assert rows[0]["experiment_genotype"] == "051526-370-mono mi16 m"
     assert rows[0]["experiment_treatment"] == "miRNA mimic"
+    assert rows[0]["legacy_grouping_status"] == "complete"
+    assert rows[0]["legacy_import_status"] == "needs_fix"
+
+
+def test_experiment_run_detail_includes_derived_legacy_status(client):
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        project = Project(prj_AddedBy="tester", prj_ProjectTitle="P1")
+        db.add(project)
+        db.flush()
+        experiment = Experiment(project_id=project.id, record_no="58150")
+        db.add(experiment)
+        db.flush()
+        run = ExperimentRun(
+            experiment_id=experiment.id,
+            run_no=1,
+            search_no=4,
+            label="0",
+            legacy_grouper_started=True,
+            legacy_e2g_import_error="legacy import failed",
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+
+    resp = client.get(f"/experiment_runs/{run_id}")
+    assert resp.status_code == 200
+    assert resp.json()["legacy_grouping_status"] == "running"
+    assert resp.json()["legacy_import_status"] == "failed"
+
+
+def test_run_source_snapshots_cannot_be_supplied_or_changed_through_api(full_client):
+    with full_client.session_factory() as db:
+        db.add(Project(id=1494, prj_AddedBy="test", prj_ProjectTitle="P"))
+        db.add(Experiment(id=57454, project_id=1494, record_no="57454"))
+        db.commit()
+
+    snapshots = {
+        "legacy_source_baseline_json": '{"forged": "baseline"}',
+        "legacy_source_conflicts_json": '{"forged": "conflict"}',
+    }
+    payload = {"experiment_id": 57454, "run_no": 1, "search_no": 2, "label": "0"}
+    response = full_client.post("/experiment_runs/", json={**payload, **snapshots})
+    assert response.status_code == 201
+    run_id = response.json()["id"]
+    with full_client.session_factory() as db:
+        run = db.get(ExperimentRun, run_id)
+        assert run.legacy_source_baseline_json is None
+        assert run.legacy_source_conflicts_json is None
+        run.legacy_source_baseline_json = '{"saved": "baseline"}'
+        run.legacy_source_conflicts_json = '{"saved": "conflict"}'
+        db.commit()
+
+    response = full_client.put(
+        f"/experiment_runs/{run_id}",
+        json={**payload, **snapshots, "ms_instrument": "local correction"},
+    )
+    assert response.status_code == 200
+    with full_client.session_factory() as db:
+        run = db.get(ExperimentRun, run_id)
+        assert run.ms_instrument == "local correction"
+        assert run.legacy_source_baseline_json == '{"saved": "baseline"}'
+        assert run.legacy_source_conflicts_json == '{"saved": "conflict"}'
