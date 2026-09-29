@@ -123,6 +123,58 @@ def snapshot(path, lane):
     return count, cursor
 
 
+def test_forward_cursor_respects_server_ordering_without_skips_or_repeats(
+    tmp_path, monkeypatch, lane
+):
+    path = tmp_path / "sync.db"
+    seed(path, lane)
+    rows = [page(lane, number, has_more=False)[0]["items"][0] for number in (1, 2)]
+    # Equal timestamps require the PK tie-breaker to advance, not skip a row.
+    rows[1][lane.modified] = rows[0][lane.modified]
+    requests = []
+
+    def fetch(**kwargs):
+        params = kwargs["params"]
+        requests.append(dict(params))
+        pk_fields = (params.get("pk_fields") or lane.pk).split(",")
+        ordering = params.get("order_by", ",".join([lane.modified, *pk_fields]))
+        remaining = list(rows)
+        if params.get("since"):
+            since_pk = tuple(int(part) for part in str(params["since_pk"]).split(","))
+            after = (params["since"], *since_pk)
+            remaining = [
+                row
+                for row in rows
+                if (row[lane.modified], *(row[key] for key in pk_fields)) > after
+            ]
+        for field in reversed(ordering.split(",")):
+            remaining.sort(
+                key=lambda row: row[field.lstrip("-")], reverse=field.startswith("-")
+            )
+        selected = remaining[: params["limit"]]
+        result = {"items": selected, "has_more": len(remaining) > len(selected)}
+        if selected:
+            last = selected[-1]
+            result["next_since"] = last[lane.modified]
+            result["next_since_pk"] = (
+                [last[key] for key in pk_fields]
+                if lane.name == "runs"
+                else last[lane.pk]
+            )
+        return result, "csv"
+
+    monkeypatch.setattr(legacy_sync, "_fetch_legacy_rows_best_effort", fetch)
+    summary = sync(path, lane)
+    assert summary["inserted"] == 2
+    assert summary["items"] == 2
+    assert summary["duplicates_skipped"] == 0
+    assert len(requests) == 2
+    assert requests[1]["since_pk"] == ("1001,1,1" if lane.name == "runs" else 1001)
+    summary = sync(path, lane)
+    assert summary["items"] == 0
+    assert summary["inserted"] == 0
+
+
 @pytest.mark.parametrize("existing_cursor", [False, True])
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_fetch_never_holds_writer_lock(

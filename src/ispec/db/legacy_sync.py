@@ -2282,7 +2282,7 @@ def sync_legacy_projects(
             params: dict[str, Any] = {
                 "modified_field": plan.legacy_modified_field,
                 "limit": int(limit),
-                "order_by": f"-{plan.legacy_modified_field},-{plan.legacy_pk_field}",
+                "order_by": f"{plan.legacy_modified_field},{plan.legacy_pk_field}",
             }
             if cursor_since_dt is not None:
                 params["since"] = _format_cursor_datetime(cursor_since_dt)
@@ -2514,7 +2514,7 @@ def sync_legacy_people(
                 "pk_field": plan.legacy_pk_field,
                 "modified_field": plan.legacy_modified_field,
                 "limit": int(limit),
-                "order_by": f"-{plan.legacy_modified_field},-{plan.legacy_pk_field}",
+                "order_by": f"{plan.legacy_modified_field},{plan.legacy_pk_field}",
             }
             if cursor_since_dt is not None:
                 params["since"] = _format_cursor_datetime(cursor_since_dt)
@@ -2931,7 +2931,7 @@ def sync_legacy_experiments(
                 "pk_field": plan.legacy_pk_field,
                 "modified_field": plan.legacy_modified_field,
                 "limit": int(limit),
-                "order_by": f"-{plan.legacy_modified_field},-{plan.legacy_pk_field}",
+                "order_by": f"{plan.legacy_modified_field},{plan.legacy_pk_field}",
             }
             if cursor_since_dt is not None:
                 params["since"] = _format_cursor_datetime(cursor_since_dt)
