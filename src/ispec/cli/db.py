@@ -1044,6 +1044,11 @@ def register_subcommands(subparsers):
         help="Write raw legacy API payload(s) to a JSON file (ends with .json) or a directory path. Also supports ISPEC_LEGACY_DUMP_JSON/ISPEC_LEGACY_DUMP_DIR.",
     )
 
+    sync_status_parser = subparsers.add_parser(
+        "legacy-sync-status", help="Show durable sync receipts and schedule status (no remote calls)",
+    )
+    sync_status_parser.add_argument("--agent-database", default=None)
+
     audit_parser = subparsers.add_parser(
         "audit-imports",
         help="Write DB/import audit artifacts (JSON + legacy gap matrix TSV).",
@@ -1373,6 +1378,13 @@ def dispatch(args):
             recent_days=getattr(args, "recent_days", None),
         )
         logger.info("local project comments push summary: %s", summary)
+    elif args.subcommand == "legacy-sync-status":
+        import json
+        from ispec.agent.connect import get_agent_session
+        from ispec.agent.legacy_sync_status import legacy_sync_status
+
+        with get_agent_session(getattr(args, "agent_database", None)) as db:
+            print(json.dumps(legacy_sync_status(db), indent=2, default=str))
     elif args.subcommand == "sync-legacy-experiments":
         from ispec.db.legacy_sync import sync_legacy_experiments
 

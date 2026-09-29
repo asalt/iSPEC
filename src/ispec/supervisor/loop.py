@@ -6121,17 +6121,15 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
 
 
 def _legacy_sync_enabled() -> bool:
-    return _is_truthy(os.getenv("ISPEC_LEGACY_SYNC_ENABLED"))
+    from ispec.agent.legacy_sync_status import sync_enabled
+
+    return sync_enabled()
 
 
 def _legacy_sync_interval_seconds() -> int:
-    raw = (os.getenv("ISPEC_LEGACY_SYNC_INTERVAL_SECONDS") or "").strip()
-    if not raw:
-        return 24 * 3600
-    parsed = _safe_int(raw)
-    if parsed is None:
-        return 24 * 3600
-    return _clamp_int(int(parsed), min_value=60, max_value=7 * 24 * 3600)
+    from ispec.agent.legacy_sync_status import sync_interval_seconds
+
+    return sync_interval_seconds()
 
 
 def _legacy_sync_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[str, Any], int]:
@@ -6140,7 +6138,9 @@ def _legacy_sync_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[s
     max_pages = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_PAGES"))
     if max_pages is not None and max_pages <= 0:
         max_pages = None
-    max_project_comments = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_PROJECT_COMMENTS")) or 25
+    max_project_comments = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_PROJECT_COMMENTS"))
+    if max_project_comments is None:
+        max_project_comments = 25
     recent_project_comment_days = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_RECENT_PROJECT_COMMENT_DAYS"))
     if recent_project_comment_days is None:
         recent_project_comment_days = 30
@@ -6202,7 +6202,14 @@ def _ensure_legacy_sync_scheduled_commands(*, agent_id: str, run_id: str) -> dic
         if existing is not None:
             return {"ok": True, "scheduled": 0, "skipped": 1, "reason": "already_enqueued"}
 
-        last_attempted_at = _parse_iso_datetime(legacy_state.get("last_attempted_at"))
+        from ispec.agent.legacy_sync_status import as_utc, last_sync_attempt
+
+        # Durable receipts survive supervisor restarts and summary-state loss.
+        last_attempt = last_sync_attempt(db)
+        last_attempted_at = (
+            as_utc(last_attempt.ended_at or last_attempt.updated_at)
+            if last_attempt is not None else None
+        )
         if last_attempted_at is not None:
             elapsed = (now - last_attempted_at).total_seconds()
             if elapsed < float(interval_seconds):
@@ -6247,6 +6254,8 @@ def _record_legacy_sync_attempt(
     execution: CommandExecution,
     ended_at: datetime,
 ) -> None:
+    if (execution.result or {}).get("sync_run", {}).get("dry_run"):
+        return
     scheduler_state = _load_scheduler_state(run)
     legacy_state = scheduler_state.get("legacy_sync")
     if not isinstance(legacy_state, dict):
@@ -6269,7 +6278,18 @@ def _record_legacy_sync_attempt(
     _save_scheduler_state(run=run, state=scheduler_state)
 
 
-def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
+def _run_legacy_sync_all(payload: dict[str, Any], *, command_id: int | None = None) -> CommandExecution:
+    from ispec.db.legacy_sync_observability import LegacySyncFailure, safe_sync_error
+
+    def record_progress(sync_run: dict[str, Any]) -> None:
+        if command_id is None:
+            return
+        with get_agent_session() as db:
+            row = db.get(AgentCommand, command_id)
+            if row is not None:
+                row.result_json = {"sync_run": sync_run}
+                row.updated_at = utcnow()
+
     try:
         from ispec.db.legacy_sync_all import sync_legacy_all
 
@@ -6285,7 +6305,9 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
         else:
             backfill_missing_bool = bool(backfill_missing)
 
-        max_project_comments = _safe_int(payload.get("max_project_comments")) or 25
+        max_project_comments = _safe_int(payload.get("max_project_comments"))
+        if max_project_comments is None:
+            max_project_comments = 25
         recent_project_comment_days = _safe_int(payload.get("recent_project_comment_days"))
         if recent_project_comment_days is not None and recent_project_comment_days <= 0:
             recent_project_comment_days = None
@@ -6307,10 +6329,14 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
             recent_project_comment_days=recent_project_comment_days,
             recent_project_comment_scan_limit=recent_project_comment_scan_limit,
             dump_json=payload.get("dump_json"),
+            command_id=command_id,
+            progress=record_progress,
         )
-        return CommandExecution(ok=True, result=dict(summary))
+        return CommandExecution(ok=bool(summary.get("ok", True)), result=dict(summary))
+    except LegacySyncFailure as exc:
+        return CommandExecution(ok=False, result=exc.summary, error=str(exc))
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
+        error = safe_sync_error(exc)
         return CommandExecution(ok=False, result={"ok": False, "error": error}, error=error)
 
 
@@ -7073,7 +7099,7 @@ def _process_one_command(*, agent_id: str, run_id: str) -> bool:
         elif cmd.command_type == COMMAND_REVIEW_REPO:
             execution = _run_repo_review(payload=cmd.payload, agent_id=agent_id, run_id=run_id)
         elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
-            execution = _run_legacy_sync_all(cmd.payload)
+            execution = _run_legacy_sync_all(cmd.payload, command_id=int(cmd.id))
         elif cmd.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS:
             execution = _run_legacy_push_project_comments(cmd.payload)
         elif cmd.command_type == COMMAND_ARCHIVE_AGENT_LOGS:
@@ -7327,7 +7353,7 @@ class _SupervisorCommandProcessor:
                     command_id=int(cmd.id),
                 )
             elif cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
-                execution = _run_legacy_sync_all(cmd.payload)
+                execution = _run_legacy_sync_all(cmd.payload, command_id=int(cmd.id))
             elif cmd.command_type == COMMAND_LEGACY_PUSH_PROJECT_COMMENTS:
                 execution = _run_legacy_push_project_comments(cmd.payload)
             elif cmd.command_type == COMMAND_ARCHIVE_AGENT_LOGS:

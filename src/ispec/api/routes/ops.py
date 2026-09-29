@@ -17,6 +17,7 @@ from ispec.agent_state.store import list_heads
 from ispec.db.connect import get_session_dep
 from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.commands import COMMAND_LEGACY_SYNC_ALL
+from ispec.agent.legacy_sync_status import legacy_sync_status
 from ispec.agent.models import AgentCommand, AgentRun, AgentStep
 from ispec.api.models.modelmaker import make_pydantic_model_from_sqlalchemy
 from ispec.api.routes.schema import build_form_schema
@@ -398,6 +399,15 @@ def run_legacy_sync(
         message="Legacy sync command queued.",
         payload=dict(cmd.payload_json or {}),
     )
+
+
+@router.get("/legacy-sync/status")
+def get_legacy_sync_status(
+    agent_db: Session = Depends(get_agent_session_dep),
+    user: AuthUser | None = Depends(require_assistant_access),
+) -> dict[str, Any]:
+    _require_legacy_sync_operator(user)
+    return legacy_sync_status(agent_db)
 
 
 @router.get("/schema/catalog")

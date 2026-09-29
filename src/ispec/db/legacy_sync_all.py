@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ispec.logging import get_logger
+from .legacy_sync_observability import SyncReport
 
 from .legacy_sync import (
     scan_recent_legacy_project_comment_projects,
@@ -57,6 +58,8 @@ def sync_legacy_all(
     recent_project_comment_days: int | None = None,
     recent_project_comment_scan_limit: int | None = None,
     dump_json: str | Path | None = None,
+    command_id: int | None = None,
+    progress=None,
 ) -> dict[str, Any]:
     """Convenience wrapper to sync the core legacy metadata needed by iSPEC.
 
@@ -69,11 +72,16 @@ def sync_legacy_all(
     2) Fetch project history comments for a bounded set of touched/recent projects
     """
 
+    report = SyncReport(dry_run=dry_run, command_id=command_id, progress=progress)
     normalized_dump = _normalize_dump_target(dump_json)
     if dump_json is not None and normalized_dump != dump_json:
-        logger.info("sync_legacy_all: normalized dump target to directory=%s", normalized_dump)
+        logger.info(
+            "sync_legacy_all: normalized dump target to directory=%s", normalized_dump
+        )
 
-    projects = sync_legacy_projects(
+    projects = report.phase(
+        "projects",
+        sync_legacy_projects,
         legacy_url=legacy_url,
         mapping_path=mapping_path,
         schema_path=schema_path,
@@ -88,7 +96,9 @@ def sync_legacy_all(
         dump_json=normalized_dump,
     )
 
-    people = sync_legacy_people(
+    people = report.phase(
+        "people",
+        sync_legacy_people,
         legacy_url=legacy_url,
         mapping_path=mapping_path,
         schema_path=schema_path,
@@ -101,7 +111,9 @@ def sync_legacy_all(
         dump_json=normalized_dump,
     )
 
-    experiments = sync_legacy_experiments(
+    experiments = report.phase(
+        "experiments",
+        sync_legacy_experiments,
         legacy_url=legacy_url,
         mapping_path=mapping_path,
         schema_path=schema_path,
@@ -116,7 +128,9 @@ def sync_legacy_all(
 
     touched_projects = _coerce_int_list(projects.get("touched_ids"))
 
-    experiment_runs = sync_legacy_experiment_runs_incremental(
+    experiment_runs = report.phase(
+        "experiment_runs",
+        sync_legacy_experiment_runs_incremental,
         legacy_url=legacy_url,
         mapping_path=mapping_path,
         schema_path=schema_path,
@@ -133,18 +147,24 @@ def sync_legacy_all(
     if recent_comment_scan_limit_value is None:
         recent_comment_scan_limit_value = max(1000, int(limit))
 
-    recent_comment_projects = scan_recent_legacy_project_comment_projects(
+    recent_comment_projects = report.phase(
+        "recent_comment_scan",
+        scan_recent_legacy_project_comment_projects,
         legacy_url=legacy_url,
         schema_path=schema_path,
-        recent_days=recent_project_comment_days,
+        recent_days=recent_project_comment_days if max_project_comments > 0 else None,
         limit=max(1, int(recent_comment_scan_limit_value)),
         dump_json=normalized_dump,
     )
-    recent_comment_project_ids = _coerce_int_list(recent_comment_projects.get("project_ids"))
+    recent_comment_project_ids = _coerce_int_list(
+        recent_comment_projects.get("project_ids")
+    )
 
     comment_project_ids: list[int] = []
     seen_comment_projects: set[int] = set()
     for candidate_project_id in [*touched_projects, *recent_comment_project_ids]:
+        if len(comment_project_ids) >= max(0, int(max_project_comments)):
+            break
         project_int = int(candidate_project_id)
         if project_int in seen_comment_projects:
             continue
@@ -156,7 +176,9 @@ def sync_legacy_all(
     comments_totals = {"items": 0, "inserted": 0, "updated": 0, "conflicted": 0}
     comments_rows: list[dict[str, Any]] = []
     for project_id in comment_project_ids:
-        summary = sync_legacy_project_comments(
+        summary = report.phase(
+            f"project_comments:{project_id}",
+            sync_legacy_project_comments,
             legacy_url=legacy_url,
             schema_path=schema_path,
             db_file_path=db_file_path,
@@ -168,29 +190,34 @@ def sync_legacy_all(
         for key in comments_totals:
             comments_totals[key] += int(summary.get(key) or 0)
 
-    return {
-        "ok": True,
-        "projects": projects,
-        "people": people,
-        "experiments": experiments,
-        "project_comments": {
-            "requested": len(comment_project_ids),
-            "candidate_projects": comment_project_ids[:10],
-            "source_counts": {
-                "project_sync_touched": len(touched_projects),
-                "recent_comment_scan": len(recent_comment_project_ids),
+    report.summary.update(
+        {
+            "ok": True,
+            "projects": projects,
+            "people": people,
+            "experiments": experiments,
+            "project_comments": {
+                "requested": len(comment_project_ids),
+                "candidate_projects": comment_project_ids[:10],
+                "source_counts": {
+                    "project_sync_touched": len(touched_projects),
+                    "recent_comment_scan": len(recent_comment_project_ids),
+                },
+                "recent_scan": {
+                    "items": int(recent_comment_projects.get("items") or 0),
+                    "projects": int(recent_comment_projects.get("projects") or 0),
+                    "legacy_table": recent_comment_projects.get("legacy_table"),
+                    "has_more": bool(recent_comment_projects.get("has_more")),
+                    "recent_days": recent_comment_projects.get("recent_days"),
+                    "recent_window_start": recent_comment_projects.get(
+                        "recent_window_start"
+                    ),
+                    "disabled": bool(recent_comment_projects.get("disabled")),
+                },
+                "totals": comments_totals,
+                "summaries": comments_rows[:10],
             },
-            "recent_scan": {
-                "items": int(recent_comment_projects.get("items") or 0),
-                "projects": int(recent_comment_projects.get("projects") or 0),
-                "legacy_table": recent_comment_projects.get("legacy_table"),
-                "has_more": bool(recent_comment_projects.get("has_more")),
-                "recent_days": recent_comment_projects.get("recent_days"),
-                "recent_window_start": recent_comment_projects.get("recent_window_start"),
-                "disabled": bool(recent_comment_projects.get("disabled")),
-            },
-            "totals": comments_totals,
-            "summaries": comments_rows[:10],
-        },
-        "experiment_runs": experiment_runs,
-    }
+            "experiment_runs": experiment_runs,
+        }
+    )
+    return report.finish()
