@@ -15,6 +15,16 @@ from sqlalchemy import Boolean, DateTime, Float, Integer
 from sqlalchemy.exc import MultipleResultsFound
 
 from ispec.db.connect import get_db_path, get_session
+from ispec.db.legacy_contracts import (
+    EXPERIMENT_RUN_COMPOSITE_PK_FIELDS,
+    EXPERIMENT_RUN_STATUS_FIELD_MAP,
+)
+from ispec.db.legacy_reconciliation import reconcile_source_fields
+from ispec.db.legacy_sync_transactions import (
+    begin_sync_page,
+    finish_sync_page,
+    read_sync_cursor,
+)
 from ispec.db.models import (
     Experiment,
     ExperimentRun,
@@ -266,6 +276,45 @@ def _format_cursor_datetime(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _coerce_composite_cursor(value: Any, *, expected_size: int) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+
+    raw_values: Any = value
+    if isinstance(value, str):
+        text_value = value.strip()
+        if not text_value:
+            return None
+        if text_value.startswith("["):
+            try:
+                raw_values = json.loads(text_value)
+            except json.JSONDecodeError as exc:
+                raise ValueError("invalid JSON composite cursor") from exc
+        else:
+            raw_values = [part.strip() for part in text_value.split(",")]
+
+    if not isinstance(raw_values, (list, tuple)):
+        raw_values = [raw_values]
+    if len(raw_values) != expected_size:
+        raise ValueError(
+            f"composite cursor requires {expected_size} values; got {len(raw_values)}"
+        )
+
+    normalized: list[int] = []
+    for part in raw_values:
+        try:
+            normalized.append(int(float(part)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid composite cursor component: {part!r}") from exc
+    return tuple(normalized)
+
+
+def _composite_cursor_json(values: tuple[int, ...] | None) -> str | None:
+    if values is None:
+        return None
+    return json.dumps(list(values), separators=(",", ":"))
+
+
 def _can_update_imported(
     *,
     obj: Any,
@@ -396,10 +445,15 @@ def _legacy_basic_auth():
 @dataclass(frozen=True)
 class LegacyTablePlan:
     legacy_table: str
-    legacy_pk_field: str
+    legacy_pk_fields: tuple[str, ...]
     legacy_modified_field: str
     legacy_created_field: str | None
     field_map: dict[str, str]
+
+    @property
+    def legacy_pk_field(self) -> str:
+        """Return the first PK field for legacy endpoints that filter one ID."""
+        return self.legacy_pk_fields[0]
 
 
 @dataclass(frozen=True)
@@ -427,9 +481,13 @@ def _load_table_plan(mapping_path: Path, *, legacy_table: str) -> LegacyTablePla
     if not isinstance(pk, dict):
         raise KeyError(f"legacy mapping missing pk section for {legacy_table}")
 
-    field_map = table.get("field_map", {})
-    if not isinstance(field_map, dict):
+    raw_field_map = table.get("field_map", {})
+    if not isinstance(raw_field_map, dict):
         raise KeyError(f"legacy mapping missing field_map for {legacy_table}")
+    field_map = {str(k): str(v) for k, v in raw_field_map.items()}
+    if legacy_table == "iSPEC_ExperimentRuns":
+        for legacy_field, local_field in EXPERIMENT_RUN_STATUS_FIELD_MAP.items():
+            field_map.setdefault(legacy_field, local_field)
 
     modified = table.get("modified_ts")
     if not isinstance(modified, str) or not modified.strip():
@@ -438,16 +496,24 @@ def _load_table_plan(mapping_path: Path, *, legacy_table: str) -> LegacyTablePla
     created = table.get("created_ts")
     created_field = created if isinstance(created, str) and created.strip() else None
 
-    pk_field = pk.get("legacy")
-    if not isinstance(pk_field, str) or not pk_field.strip():
+    raw_pk_fields = pk.get("legacy")
+    if isinstance(raw_pk_fields, str):
+        pk_fields = (raw_pk_fields.strip(),) if raw_pk_fields.strip() else ()
+    elif isinstance(raw_pk_fields, list):
+        pk_fields = tuple(str(field).strip() for field in raw_pk_fields if str(field).strip())
+    else:
+        pk_fields = ()
+    if not pk_fields:
         raise KeyError(f"legacy mapping missing pk.legacy for {legacy_table}")
+    if legacy_table == "iSPEC_ExperimentRuns" and len(pk_fields) == 1:
+        pk_fields = EXPERIMENT_RUN_COMPOSITE_PK_FIELDS
 
     return LegacyTablePlan(
         legacy_table=legacy_table,
-        legacy_pk_field=pk_field,
+        legacy_pk_fields=pk_fields,
         legacy_modified_field=modified,
         legacy_created_field=created_field,
-        field_map={str(k): str(v) for k, v in field_map.items()},
+        field_map=field_map,
     )
 
 
@@ -989,7 +1055,7 @@ def sync_project_comments_to_legacy(
 
 
 def _plan_fields_to_fetch(plan: LegacyTablePlan) -> list[str]:
-    fields: list[str] = [plan.legacy_pk_field, plan.legacy_modified_field]
+    fields: list[str] = [*plan.legacy_pk_fields, plan.legacy_modified_field]
     if plan.legacy_created_field:
         fields.append(plan.legacy_created_field)
     for field in plan.field_map:
@@ -1983,7 +2049,11 @@ def _build_experiment_run_record(
             )
         record["label"] = _normalize_label_value(label_value)
 
-    if "label_type" in model_columns and "label_type" not in record:
+    if (
+        "label_type" in model_columns
+        and "label_type" not in record
+        and ("exprun_LabelType" in item or "label_type" in item)
+    ):
         label_type_value = item.get("exprun_LabelType") or item.get("label_type")
         if isinstance(label_type_value, str):
             label_type_value = label_type_value.strip() or None
@@ -2011,6 +2081,7 @@ def _apply_experiment_run_record(
     *,
     key: tuple[int, int, int, str],
     record: dict[str, Any],
+    source: str,
     dry_run: bool,
     backfill_missing: bool,
 ) -> str:
@@ -2029,52 +2100,66 @@ def _apply_experiment_run_record(
     except MultipleResultsFound:
         return "conflicted"
 
+    bookkeeping_fields = {
+        "ExperimentRun_LegacyImportTS",
+        "ExperimentRun_LegacyModificationTS",
+    }
+    internal_fields = {
+        "id",
+        "experiment_id",
+        "run_no",
+        "search_no",
+        "label",
+        "ExperimentRun_ModificationTS",
+        "legacy_source_baseline_json",
+        "legacy_source_conflicts_json",
+    }
+    source_values = {
+        field: value
+        for field, value in record.items()
+        if field not in bookkeeping_fields | internal_fields
+    }
     if existing is None:
         if session.get(Experiment, exp_id_int) is None:
             _ensure_placeholder_experiment(session, exp_id_int, project_id=None)
         if not dry_run:
-            session.add(ExperimentRun(**record))
+            initial = reconcile_source_fields(
+                current=source_values,
+                incoming=source_values,
+                baseline_json=None,
+                conflicts_json=None,
+                source=source,
+            )
+            insert_record = dict(record)
+            insert_record.pop("ExperimentRun_ModificationTS", None)
+            insert_record["legacy_source_baseline_json"] = initial.baseline_json
+            insert_record["legacy_source_conflicts_json"] = initial.conflicts_json
+            session.add(ExperimentRun(**insert_record))
         return "inserted"
 
-    if _can_update_imported(
-        obj=existing,
-        added_by_field="__legacy_added_by__",  # ExperimentRun has no AddedBy column
-        created_field="ExperimentRun_CreationTS",
-        modified_field="ExperimentRun_ModificationTS",
-        import_ts_field="ExperimentRun_LegacyImportTS",
-    ):
-        if not dry_run:
-            for key_name, value in record.items():
-                if hasattr(existing, key_name):
-                    setattr(existing, key_name, value)
-        return "updated"
-
-    if not backfill_missing:
+    reconciliation = reconcile_source_fields(
+        current={field: getattr(existing, field) for field in source_values},
+        incoming=source_values,
+        baseline_json=existing.legacy_source_baseline_json,
+        conflicts_json=existing.legacy_source_conflicts_json,
+        source=source,
+        backfill_missing=backfill_missing,
+    )
+    if not dry_run:
+        for field, value in reconciliation.updates.items():
+            setattr(existing, field, value)
+        for field in bookkeeping_fields.intersection(record):
+            setattr(existing, field, record[field])
+        existing.legacy_source_baseline_json = reconciliation.baseline_json
+        existing.legacy_source_conflicts_json = reconciliation.conflicts_json
+    if reconciliation.conflict_fields:
+        logger.info(
+            "legacy run %s has unresolved source conflicts: %s",
+            key,
+            reconciliation.conflict_fields,
+        )
         return "conflicted"
-
-    changed = False
-    for key_name, value in record.items():
-        if key_name == "ExperimentRun_LegacyImportTS":
-            continue
-        if not hasattr(existing, key_name):
-            continue
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-
-        current = getattr(existing, key_name, None)
-        missing_current = current is None
-        if isinstance(current, str):
-            missing_current = missing_current or not current.strip()
-
-        if not missing_current:
-            continue
-        if not dry_run:
-            setattr(existing, key_name, value)
-        changed = True
-
-    return "backfilled" if changed else "conflicted"
+    return "updated"
 
 
 def _apply_project_record(
@@ -2179,20 +2264,10 @@ def sync_legacy_projects(
     dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
 
     with get_session(file_path=db_file_path) as session:
-        cursor_state: LegacySyncState | None = None
-        if project_id is None:
-            cursor_state = session.get(LegacySyncState, plan.legacy_table)
-            if cursor_state is None:
-                cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
-                session.add(cursor_state)
-                session.flush()
-
-        if cursor_state is not None and reset_cursor:
-            cursor_state.since = None
-            cursor_state.since_pk = None
-
-        cursor_since_dt = cursor_state.since if cursor_state is not None else None
-        cursor_since_pk = cursor_state.since_pk if cursor_state is not None else None
+        cursor_table = plan.legacy_table if project_id is None else None
+        checkpoint = read_sync_cursor(session, cursor_table)
+        cursor_since_dt = checkpoint.since if checkpoint and not reset_cursor else None
+        cursor_since_pk = checkpoint.since_pk if checkpoint and not reset_cursor else None
 
         if since:
             cursor_since_dt = _normalize_datetime(_coerce_datetime(since))
@@ -2277,6 +2352,9 @@ def sync_legacy_projects(
             if not items:
                 break
 
+            cursor_state = begin_sync_page(
+                session, table=cursor_table, expected=checkpoint, dry_run=dry_run
+            )
             last_modified_dt: datetime | None = None
             last_pk: int | None = None
 
@@ -2320,7 +2398,7 @@ def sync_legacy_projects(
                 last_modified_dt = item_modified_dt
                 last_pk = legacy_project_id
 
-            if project_id is None and not dry_run and cursor_state is not None:
+            if project_id is None:
                 next_since = payload.get("next_since")
                 next_since_pk = payload.get("next_since_pk")
 
@@ -2331,18 +2409,19 @@ def sync_legacy_projects(
 
                 cursor_since_pk = int(next_since_pk) if next_since_pk is not None else last_pk
 
-                cursor_state.since = cursor_since_dt
-                cursor_state.since_pk = cursor_since_pk
+                if not dry_run:
+                    if cursor_state is None:
+                        cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
+                        session.add(cursor_state)
+                    cursor_state.since = cursor_since_dt
+                    cursor_state.since_pk = cursor_since_pk
 
-                session.flush()
+            checkpoint = finish_sync_page(session, cursor=cursor_state, dry_run=dry_run)
 
             if not has_more:
                 break
             if project_id is not None:
                 break
-
-        if dry_run:
-            session.rollback()
 
     result: dict[str, Any] = {
         "pages": pages,
@@ -2414,20 +2493,10 @@ def sync_legacy_people(
     dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
 
     with get_session(file_path=db_file_path) as session:
-        cursor_state: LegacySyncState | None = None
-        if person_id is None:
-            cursor_state = session.get(LegacySyncState, plan.legacy_table)
-            if cursor_state is None:
-                cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
-                session.add(cursor_state)
-                session.flush()
-
-        if cursor_state is not None and reset_cursor:
-            cursor_state.since = None
-            cursor_state.since_pk = None
-
-        cursor_since_dt = cursor_state.since if cursor_state is not None else None
-        cursor_since_pk = cursor_state.since_pk if cursor_state is not None else None
+        cursor_table = plan.legacy_table if person_id is None else None
+        checkpoint = read_sync_cursor(session, cursor_table)
+        cursor_since_dt = checkpoint.since if checkpoint and not reset_cursor else None
+        cursor_since_pk = checkpoint.since_pk if checkpoint and not reset_cursor else None
 
         if since:
             cursor_since_dt = _normalize_datetime(_coerce_datetime(since))
@@ -2510,6 +2579,9 @@ def sync_legacy_people(
             if not items:
                 break
 
+            cursor_state = begin_sync_page(
+                session, table=cursor_table, expected=checkpoint, dry_run=dry_run
+            )
             last_modified_dt: datetime | None = None
             last_pk: int | None = None
 
@@ -2552,7 +2624,7 @@ def sync_legacy_people(
                 last_modified_dt = item_modified_dt
                 last_pk = legacy_person_id
 
-            if person_id is None and not dry_run and cursor_state is not None:
+            if person_id is None:
                 next_since = payload.get("next_since")
                 next_since_pk = payload.get("next_since_pk")
 
@@ -2563,18 +2635,19 @@ def sync_legacy_people(
 
                 cursor_since_pk = int(next_since_pk) if next_since_pk is not None else last_pk
 
-                cursor_state.since = cursor_since_dt
-                cursor_state.since_pk = cursor_since_pk
+                if not dry_run:
+                    if cursor_state is None:
+                        cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
+                        session.add(cursor_state)
+                    cursor_state.since = cursor_since_dt
+                    cursor_state.since_pk = cursor_since_pk
 
-                session.flush()
+            checkpoint = finish_sync_page(session, cursor=cursor_state, dry_run=dry_run)
 
             if not has_more:
                 break
             if person_id is not None:
                 break
-
-        if dry_run:
-            session.rollback()
 
     result: dict[str, Any] = {
         "pages": pages,
@@ -2839,20 +2912,10 @@ def sync_legacy_experiments(
 
     url = f"{base_url}/api/v2/legacy/tables/{plan.legacy_table}/rows"
     with get_session(file_path=db_file_path) as session:
-        cursor_state: LegacySyncState | None = None
-        if experiment_id is None:
-            cursor_state = session.get(LegacySyncState, plan.legacy_table)
-            if cursor_state is None:
-                cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
-                session.add(cursor_state)
-                session.flush()
-
-        if cursor_state is not None and reset_cursor:
-            cursor_state.since = None
-            cursor_state.since_pk = None
-
-        cursor_since_dt = cursor_state.since if cursor_state is not None else None
-        cursor_since_pk = cursor_state.since_pk if cursor_state is not None else None
+        cursor_table = plan.legacy_table if experiment_id is None else None
+        checkpoint = read_sync_cursor(session, cursor_table)
+        cursor_since_dt = checkpoint.since if checkpoint and not reset_cursor else None
+        cursor_since_pk = checkpoint.since_pk if checkpoint and not reset_cursor else None
 
         if since:
             cursor_since_dt = _normalize_datetime(_coerce_datetime(since))
@@ -2934,6 +2997,9 @@ def sync_legacy_experiments(
             if not items:
                 break
 
+            cursor_state = begin_sync_page(
+                session, table=cursor_table, expected=checkpoint, dry_run=dry_run
+            )
             last_modified_dt: datetime | None = None
             last_pk: int | None = None
 
@@ -2985,7 +3051,7 @@ def sync_legacy_experiments(
                 last_modified_dt = item_modified_dt
                 last_pk = exp_id
 
-            if experiment_id is None and not dry_run and cursor_state is not None:
+            if experiment_id is None:
                 next_since = payload.get("next_since")
                 next_since_pk = payload.get("next_since_pk")
 
@@ -2996,18 +3062,19 @@ def sync_legacy_experiments(
 
                 cursor_since_pk = int(next_since_pk) if next_since_pk is not None else last_pk
 
-                cursor_state.since = cursor_since_dt
-                cursor_state.since_pk = cursor_since_pk
+                if not dry_run:
+                    if cursor_state is None:
+                        cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
+                        session.add(cursor_state)
+                    cursor_state.since = cursor_since_dt
+                    cursor_state.since_pk = cursor_since_pk
 
-                session.flush()
+            checkpoint = finish_sync_page(session, cursor=cursor_state, dry_run=dry_run)
 
             if not has_more:
                 break
             if experiment_id is not None:
                 break
-
-        if dry_run:
-            session.rollback()
 
     result: dict[str, Any] = {
         "pages": pages,
@@ -3141,6 +3208,7 @@ def sync_legacy_experiment_runs(
                 session,
                 key=run_key,
                 record=record,
+                source=url,
                 dry_run=dry_run,
                 backfill_missing=backfill_missing,
             )
@@ -3161,4 +3229,256 @@ def sync_legacy_experiment_runs(
         "updated": updated,
         "backfilled": backfilled,
         "conflicted": conflicted,
+    }
+
+
+def sync_legacy_experiment_runs_incremental(
+    *,
+    legacy_url: str | None = None,
+    mapping_path: str | Path | None = None,
+    schema_path: str | Path | None = None,
+    db_file_path: str | None = None,
+    limit: int = 1000,
+    max_pages: int | None = None,
+    reset_cursor: bool = False,
+    since: str | None = None,
+    since_pk: str | list[int] | tuple[int, ...] | None = None,
+    dry_run: bool = False,
+    backfill_missing: bool = False,
+    dump_json: str | Path | None = None,
+) -> dict[str, Any]:
+    """Incrementally sync all legacy ExperimentRuns with a composite cursor."""
+
+    resolved_mapping = (
+        Path(mapping_path).expanduser().resolve()
+        if mapping_path
+        else default_mapping_path()
+    )
+    resolved_schema = (
+        Path(schema_path).expanduser().resolve()
+        if schema_path
+        else default_schema_path()
+    )
+    base_url = _resolve_legacy_url(legacy_url=legacy_url, schema_path=resolved_schema)
+    plan = _load_table_plan(resolved_mapping, legacy_table="iSPEC_ExperimentRuns")
+    fields = _plan_fields_to_fetch(plan)
+    model_columns = set(ExperimentRun.__table__.columns.keys())
+
+    merge_key_fields: list[str] = []
+    for required_local in ("experiment_id", "run_no", "search_no"):
+        legacy_field = next(
+            (
+                legacy
+                for legacy, local in plan.field_map.items()
+                if local == required_local
+            ),
+            None,
+        )
+        if legacy_field and legacy_field not in merge_key_fields:
+            merge_key_fields.append(legacy_field)
+
+    cursor_pk_fields = plan.legacy_pk_fields
+    if len(cursor_pk_fields) == 1 and len(merge_key_fields) >= 3:
+        # Older local mapping files only named EXPRecNo as the table PK.
+        cursor_pk_fields = tuple(merge_key_fields[:3])
+    if len(cursor_pk_fields) < 3:
+        raise ValueError(
+            "global ExperimentRun sync requires composite legacy PK fields "
+            "(EXPRecNo, RunNo, SearchNo)"
+        )
+
+    expected_fields = set(fields)
+    required_fields = [plan.legacy_modified_field, *cursor_pk_fields]
+    if plan.legacy_created_field:
+        required_fields.append(plan.legacy_created_field)
+
+    if not db_file_path:
+        db_file_path = (os.getenv("ISPEC_DB_PATH") or "").strip() or get_db_path()
+
+    inserted = updated = backfilled = conflicted = duplicates_skipped = 0
+    pages = total_items = 0
+    processed_keys: set[tuple[int, int, int, str]] = set()
+    seen_cursors: set[tuple[str, tuple[int, ...]]] = set()
+    fields_mode: str | None = None
+    dump_file, dump_dir = _resolve_legacy_dump_targets(dump_json)
+    url = f"{base_url}/api/v2/legacy/tables/{plan.legacy_table}/rows"
+    threshold_missing = max(1, int(0.1 * len(expected_fields)))
+
+    cursor_since_dt: datetime | None = None
+    cursor_since_pk: tuple[int, ...] | None = None
+    with get_session(file_path=db_file_path) as session:
+        checkpoint = read_sync_cursor(session, plan.legacy_table)
+        cursor_since_dt = checkpoint.since if checkpoint and not reset_cursor else None
+        stored_pk_json = checkpoint.since_pk_json if checkpoint and not reset_cursor else None
+        try:
+            cursor_since_pk = _coerce_composite_cursor(
+                stored_pk_json,
+                expected_size=len(cursor_pk_fields),
+            )
+        except ValueError:
+            logger.warning(
+                "ignoring invalid stored composite cursor for %s: %r",
+                plan.legacy_table,
+                stored_pk_json,
+            )
+
+        if since:
+            cursor_since_dt = _normalize_datetime(_coerce_datetime(since))
+        if since_pk is not None:
+            cursor_since_pk = _coerce_composite_cursor(
+                since_pk,
+                expected_size=len(cursor_pk_fields),
+            )
+
+        while max_pages is None or pages < max(0, int(max_pages)):
+            effective_since = cursor_since_dt or datetime(1900, 1, 1)
+            effective_pk = cursor_since_pk or tuple(0 for _ in cursor_pk_fields)
+            cursor_key = (_format_cursor_datetime(effective_since), effective_pk)
+            if cursor_key in seen_cursors:
+                logger.warning(
+                    "legacy ExperimentRun cursor repeated; stopping at %s", cursor_key
+                )
+                break
+            seen_cursors.add(cursor_key)
+            pages += 1
+
+            params: dict[str, Any] = {
+                "modified_field": plan.legacy_modified_field,
+                "pk_fields": ",".join(cursor_pk_fields),
+                "since": cursor_key[0],
+                "since_pk": ",".join(str(part) for part in effective_pk),
+                "limit": int(limit),
+            }
+            modes = [fields_mode] if fields_mode else ["csv", "repeat", "none"]
+            payload, fields_mode = _fetch_legacy_rows_best_effort(
+                url=url,
+                params=params,
+                modes=modes,
+                fields=list(fields),
+                expected_fields=expected_fields,
+                required_fields=required_fields,
+                merge_key_fields=merge_key_fields,
+                threshold_missing=threshold_missing,
+                log_label="legacy experiment runs incremental",
+            )
+
+            dump_path = _legacy_dump_path_for_request(
+                dump_file,
+                dump_dir,
+                table=plan.legacy_table,
+                page=pages,
+                mode=fields_mode,
+                id_value=None,
+            )
+            if dump_path is not None:
+                _dump_legacy_payload(payload, path=dump_path)
+                logger.info("legacy experiment runs dumped payload to %s", dump_path)
+
+            items = list(payload.get("items") or payload.get("rows") or [])
+            total_items += len(items)
+            if not items:
+                break
+
+            cursor_state = begin_sync_page(
+                session, table=plan.legacy_table, expected=checkpoint, dry_run=dry_run
+            )
+            last_modified_dt: datetime | None = None
+            last_cursor_pk: tuple[int, ...] | None = None
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_modified_dt = _normalize_datetime(
+                    _coerce_datetime(item.get(plan.legacy_modified_field))
+                )
+                try:
+                    item_cursor_pk = _coerce_composite_cursor(
+                        [item.get(field) for field in cursor_pk_fields],
+                        expected_size=len(cursor_pk_fields),
+                    )
+                except ValueError:
+                    item_cursor_pk = None
+                if item_modified_dt is not None:
+                    last_modified_dt = item_modified_dt
+                if item_cursor_pk is not None:
+                    last_cursor_pk = item_cursor_pk
+
+                built = _build_experiment_run_record(
+                    item, plan=plan, model_columns=model_columns
+                )
+                if built is None:
+                    conflicted += 1
+                    continue
+                run_key, record = built
+                if run_key in processed_keys:
+                    duplicates_skipped += 1
+                    continue
+                processed_keys.add(run_key)
+                record["ExperimentRun_LegacyImportTS"] = (
+                    _normalize_datetime(datetime.now(UTC)) or datetime.utcnow()
+                )
+                outcome = _apply_experiment_run_record(
+                    session,
+                    key=run_key,
+                    record=record,
+                    source=url,
+                    dry_run=dry_run,
+                    backfill_missing=backfill_missing,
+                )
+                if outcome == "inserted":
+                    inserted += 1
+                elif outcome == "updated":
+                    updated += 1
+                elif outcome == "backfilled":
+                    backfilled += 1
+                else:
+                    conflicted += 1
+
+            next_since = payload.get("next_since")
+            next_since_pk = payload.get("next_since_pk")
+            if isinstance(next_since, str) and next_since.strip():
+                cursor_since_dt = _normalize_datetime(_coerce_datetime(next_since))
+            elif last_modified_dt is not None:
+                cursor_since_dt = last_modified_dt
+            if next_since_pk is not None:
+                cursor_since_pk = _coerce_composite_cursor(
+                    next_since_pk,
+                    expected_size=len(cursor_pk_fields),
+                )
+            elif last_cursor_pk is not None:
+                cursor_since_pk = last_cursor_pk
+
+            if not dry_run:
+                if cursor_state is None:
+                    cursor_state = LegacySyncState(legacy_table=plan.legacy_table)
+                    session.add(cursor_state)
+                cursor_state.since = cursor_since_dt
+                cursor_state.since_pk = None
+                cursor_state.since_pk_json = _composite_cursor_json(cursor_since_pk)
+
+            checkpoint = finish_sync_page(session, cursor=cursor_state, dry_run=dry_run)
+
+            has_more_raw = payload.get("has_more")
+            has_more = (
+                bool(has_more_raw)
+                if has_more_raw is not None
+                else len(items) >= int(limit)
+            )
+            if not has_more:
+                break
+
+    return {
+        "mode": "incremental",
+        "pages": pages,
+        "items": total_items,
+        "inserted": inserted,
+        "updated": updated,
+        "backfilled": backfilled,
+        "conflicted": conflicted,
+        "duplicates_skipped": duplicates_skipped,
+        "cursor": {
+            "since": _format_cursor_datetime(cursor_since_dt)
+            if cursor_since_dt
+            else None,
+            "since_pk": list(cursor_since_pk) if cursor_since_pk else None,
+        },
     }
