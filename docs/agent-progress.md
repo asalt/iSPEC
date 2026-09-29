@@ -224,6 +224,11 @@ It documents `dev-tmux`, `dev-status`, `dev-stop`, `dev-restart`, `dev-pids`, an
 
 ## What’s Next (Not Implemented Yet)
 
+- User-facing Chats panel for support-chat history:
+  - list prior `support_session` rows for the current user
+  - load/review full visible transcripts without blindly replaying them as model context
+  - provide explicit “New chat” vs “resume this chat” UI controls
+  - keep model context selection server-side via recent turns, summaries/compaction, route context, and tool receipts
 - Queue manipulation semantics (cancel / reprioritize) for pending work.
 - DB pressure management (archiving/pruning very old heavy `agent_step` runs).
 - Further tuning of backoff intervals and “how often we should check things” for supervisor + orchestrator.
