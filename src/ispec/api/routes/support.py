@@ -1670,6 +1670,7 @@ def chat(
     project_comment_write_policy_messages: list[dict[str, str]] = []
     project_comment_write_tool_exposed = "create_project_comment" in available_openai_tool_names_full
     project_comment_write_tool_reason = "not_available"
+    # Evaluation tickets are observations, never live write authorization.
     project_comment_save_authorized = bool(
         reply_interpretation.has_pending_save
         and reply_interpretation.runtime_action == "approve_save"

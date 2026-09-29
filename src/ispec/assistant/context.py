@@ -21,6 +21,7 @@ from ispec.db.models import (
 
 
 _PROJECT_ID_RE = re.compile(r"\b(?:project|prj)\s*#?\s*(\d{1,9})\b", re.IGNORECASE)
+_PROJECT_ID_BEFORE_LABEL_RE = re.compile(r"\b(\d{1,9})\s+(?:project|prj)\b", re.IGNORECASE)
 _PRJ_RE = re.compile(r"\bPRJ\s*#?\s*(\d{1,9})\b", re.IGNORECASE)
 _MSPC_RE = re.compile(r"\bMSPC\s*0*(\d{1,9})\b", re.IGNORECASE)
 _PERSON_ID_RE = re.compile(r"\b(?:person|ppl)\s*#?\s*(\d{1,9})\b", re.IGNORECASE)
@@ -79,7 +80,7 @@ def _truncate(value: str | None, limit: int = 280) -> str | None:
 
 def extract_project_ids(text: str) -> list[int]:
     ids: set[int] = set()
-    for regex in (_PROJECT_ID_RE, _PRJ_RE, _MSPC_RE):
+    for regex in (_PROJECT_ID_RE, _PROJECT_ID_BEFORE_LABEL_RE, _PRJ_RE, _MSPC_RE):
         for match in regex.finditer(text or ""):
             parsed = _safe_int(match.group(1))
             if parsed is not None:
