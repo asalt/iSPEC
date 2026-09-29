@@ -8,7 +8,10 @@ from ispec.agent.commands import COMMAND_LEGACY_SYNC_ALL
 from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand, AgentRun
 from ispec.concurrency.thread_context import set_main_thread
-from ispec.supervisor.loop import _ensure_legacy_sync_scheduled_commands
+from ispec.supervisor.loop import (
+    _ensure_legacy_sync_scheduled_commands,
+    _legacy_sync_interval_seconds,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +37,11 @@ def _seed_supervisor_run(agent_db_path, *, now: datetime) -> None:
         agent_db.commit()
 
 
+def test_legacy_sync_defaults_to_daily(monkeypatch):
+    monkeypatch.delenv("ISPEC_LEGACY_SYNC_INTERVAL_SECONDS", raising=False)
+    assert _legacy_sync_interval_seconds() == 24 * 3600
+
+
 def test_supervisor_seeds_legacy_sync_command_with_recent_comment_window(tmp_path, monkeypatch):
     agent_db_path = tmp_path / "agent.db"
     monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
@@ -41,7 +49,6 @@ def test_supervisor_seeds_legacy_sync_command_with_recent_comment_window(tmp_pat
     monkeypatch.setenv("ISPEC_LEGACY_SYNC_INTERVAL_SECONDS", "1800")
     monkeypatch.setenv("ISPEC_LEGACY_SYNC_LIMIT", "222")
     monkeypatch.setenv("ISPEC_LEGACY_SYNC_MAX_PROJECT_COMMENTS", "11")
-    monkeypatch.setenv("ISPEC_LEGACY_SYNC_MAX_EXPERIMENT_RUNS", "9")
     monkeypatch.setenv("ISPEC_LEGACY_SYNC_RECENT_PROJECT_COMMENT_DAYS", "45")
     monkeypatch.setenv("ISPEC_LEGACY_SYNC_RECENT_PROJECT_COMMENT_SCAN_LIMIT", "3333")
 
@@ -64,7 +71,6 @@ def test_supervisor_seeds_legacy_sync_command_with_recent_comment_window(tmp_pat
         )
         assert cmd.payload_json["limit"] == 222
         assert cmd.payload_json["max_project_comments"] == 11
-        assert cmd.payload_json["max_experiment_runs"] == 9
         assert cmd.payload_json["recent_project_comment_days"] == 45
         assert cmd.payload_json["recent_project_comment_scan_limit"] == 3333
         assert cmd.payload_json["meta"]["run_id"] == "run-1"

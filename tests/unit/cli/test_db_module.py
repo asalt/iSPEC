@@ -145,6 +145,40 @@ def test_register_subcommands_parses_archive_agent_logs_command():
     assert args.archive_events is False
 
 
+def test_register_subcommands_parses_incremental_experiment_run_sync():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    db.register_subcommands(subparsers)
+
+    args = parser.parse_args(
+        [
+            "sync-legacy-experiment-runs",
+            "--database",
+            "db.sqlite",
+            "--max-pages",
+            "2",
+            "--since-pk",
+            "57454,1,2",
+        ]
+    )
+
+    assert args.experiment_id is None
+    assert args.max_pages == 2
+    assert args.since_pk == "57454,1,2"
+
+
+def test_register_subcommands_parses_targeted_experiment_run_sync():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    db.register_subcommands(subparsers)
+
+    args = parser.parse_args(
+        ["sync-legacy-experiment-runs", "--experiment-id", "57454"]
+    )
+
+    assert args.experiment_id == 57454
+
+
 def test_dispatch_calls_correct_operations(monkeypatch):
     init_mock = MagicMock()
     status_mock = MagicMock()
@@ -287,6 +321,93 @@ def test_dispatch_archive_agent_logs_calls_helper(monkeypatch):
         archive_events=True,
         archive_commands=False,
         archive_journal_mode="DELETE",
+    )
+
+
+def test_dispatch_experiment_run_sync_uses_incremental_mode_without_id(monkeypatch):
+    incremental_mock = MagicMock(return_value={"mode": "incremental"})
+    targeted_mock = MagicMock()
+    monkeypatch.setattr(
+        "ispec.db.legacy_sync.sync_legacy_experiment_runs_incremental",
+        incremental_mock,
+    )
+    monkeypatch.setattr(
+        "ispec.db.legacy_sync.sync_legacy_experiment_runs", targeted_mock
+    )
+
+    db.dispatch(
+        types.SimpleNamespace(
+            subcommand="sync-legacy-experiment-runs",
+            database="db.sqlite",
+            experiment_id=None,
+            limit=100,
+            max_pages=2,
+            reset_cursor=False,
+            since=None,
+            since_pk=None,
+            dry_run=True,
+            backfill_missing=True,
+            dump_json=None,
+            legacy_url="http://legacy.example",
+            mapping=None,
+            schema=None,
+        )
+    )
+
+    targeted_mock.assert_not_called()
+    incremental_mock.assert_called_once_with(
+        legacy_url="http://legacy.example",
+        mapping_path=None,
+        schema_path=None,
+        db_file_path="db.sqlite",
+        limit=100,
+        dry_run=True,
+        backfill_missing=True,
+        dump_json=None,
+        max_pages=2,
+        reset_cursor=False,
+        since=None,
+        since_pk=None,
+    )
+
+
+def test_dispatch_experiment_run_sync_uses_targeted_mode_with_id(monkeypatch):
+    incremental_mock = MagicMock()
+    targeted_mock = MagicMock(return_value={"mode": "targeted"})
+    monkeypatch.setattr(
+        "ispec.db.legacy_sync.sync_legacy_experiment_runs_incremental",
+        incremental_mock,
+    )
+    monkeypatch.setattr(
+        "ispec.db.legacy_sync.sync_legacy_experiment_runs", targeted_mock
+    )
+
+    db.dispatch(
+        types.SimpleNamespace(
+            subcommand="sync-legacy-experiment-runs",
+            database="db.sqlite",
+            experiment_id=57454,
+            limit=100,
+            dry_run=False,
+            backfill_missing=True,
+            dump_json=None,
+            legacy_url="http://legacy.example",
+            mapping=None,
+            schema=None,
+        )
+    )
+
+    incremental_mock.assert_not_called()
+    targeted_mock.assert_called_once_with(
+        experiment_id=57454,
+        legacy_url="http://legacy.example",
+        mapping_path=None,
+        schema_path=None,
+        db_file_path="db.sqlite",
+        limit=100,
+        dry_run=False,
+        backfill_missing=True,
+        dump_json=None,
     )
 
 

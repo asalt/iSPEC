@@ -5,7 +5,7 @@ from ispec.db import legacy_sync_all
 
 def test_sync_legacy_all_combines_touched_and_recent_comment_projects(monkeypatch):
     comment_calls: list[int] = []
-    run_calls: list[int] = []
+    run_calls: list[dict] = []
 
     monkeypatch.setattr(
         legacy_sync_all,
@@ -41,26 +41,28 @@ def test_sync_legacy_all_combines_touched_and_recent_comment_projects(monkeypatc
         return {"items": 1, "inserted": 1, "updated": 0, "conflicted": 0}
 
     def fake_sync_runs(**kwargs):
-        run_calls.append(int(kwargs["experiment_id"]))
-        return {"inserted": 1, "updated": 0, "backfilled": 0, "conflicted": 0}
+        run_calls.append(dict(kwargs))
+        return {"mode": "incremental", "inserted": 1, "updated": 0}
 
     monkeypatch.setattr(legacy_sync_all, "sync_legacy_project_comments", fake_sync_comments)
-    monkeypatch.setattr(legacy_sync_all, "sync_legacy_experiment_runs", fake_sync_runs)
+    monkeypatch.setattr(
+        legacy_sync_all, "sync_legacy_experiment_runs_incremental", fake_sync_runs
+    )
 
     summary = legacy_sync_all.sync_legacy_all(
         recent_project_comment_days=30,
         max_project_comments=5,
-        max_experiment_runs=5,
     )
 
     assert comment_calls == [1498, 1501]
-    assert run_calls == [88]
+    assert len(run_calls) == 1
     assert summary["project_comments"]["requested"] == 2
     assert summary["project_comments"]["candidate_projects"] == [1498, 1501]
     assert summary["project_comments"]["source_counts"]["project_sync_touched"] == 1
     assert summary["project_comments"]["source_counts"]["recent_comment_scan"] == 2
     assert summary["project_comments"]["recent_scan"]["recent_days"] == 30
     assert summary["project_comments"]["totals"]["inserted"] == 2
+    assert summary["experiment_runs"]["mode"] == "incremental"
 
 
 def test_sync_legacy_all_skips_recent_comment_scan_when_disabled(monkeypatch):
@@ -102,14 +104,13 @@ def test_sync_legacy_all_skips_recent_comment_scan_when_disabled(monkeypatch):
     )
     monkeypatch.setattr(
         legacy_sync_all,
-        "sync_legacy_experiment_runs",
+        "sync_legacy_experiment_runs_incremental",
         lambda **kwargs: {"inserted": 0, "updated": 0, "backfilled": 0, "conflicted": 0},
     )
 
     summary = legacy_sync_all.sync_legacy_all(
         recent_project_comment_days=None,
         max_project_comments=5,
-        max_experiment_runs=5,
     )
 
     assert comment_calls == [1498]

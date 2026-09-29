@@ -6127,10 +6127,10 @@ def _legacy_sync_enabled() -> bool:
 def _legacy_sync_interval_seconds() -> int:
     raw = (os.getenv("ISPEC_LEGACY_SYNC_INTERVAL_SECONDS") or "").strip()
     if not raw:
-        return 3600
+        return 24 * 3600
     parsed = _safe_int(raw)
     if parsed is None:
-        return 3600
+        return 24 * 3600
     return _clamp_int(int(parsed), min_value=60, max_value=7 * 24 * 3600)
 
 
@@ -6141,7 +6141,6 @@ def _legacy_sync_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[s
     if max_pages is not None and max_pages <= 0:
         max_pages = None
     max_project_comments = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_PROJECT_COMMENTS")) or 25
-    max_experiment_runs = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_MAX_EXPERIMENT_RUNS")) or 25
     recent_project_comment_days = _safe_int(os.getenv("ISPEC_LEGACY_SYNC_RECENT_PROJECT_COMMENT_DAYS"))
     if recent_project_comment_days is None:
         recent_project_comment_days = 30
@@ -6162,7 +6161,6 @@ def _legacy_sync_payload_from_env(*, agent_id: str, run_id: str) -> tuple[dict[s
         "max_pages": int(max_pages) if isinstance(max_pages, int) else None,
         "backfill_missing": bool(backfill_missing),
         "max_project_comments": int(max_project_comments),
-        "max_experiment_runs": int(max_experiment_runs),
         "recent_project_comment_days": (
             int(recent_project_comment_days)
             if isinstance(recent_project_comment_days, int)
@@ -6288,7 +6286,6 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
             backfill_missing_bool = bool(backfill_missing)
 
         max_project_comments = _safe_int(payload.get("max_project_comments")) or 25
-        max_experiment_runs = _safe_int(payload.get("max_experiment_runs")) or 25
         recent_project_comment_days = _safe_int(payload.get("recent_project_comment_days"))
         if recent_project_comment_days is not None and recent_project_comment_days <= 0:
             recent_project_comment_days = None
@@ -6307,7 +6304,6 @@ def _run_legacy_sync_all(payload: dict[str, Any]) -> CommandExecution:
             dry_run=bool(payload.get("dry_run") or False),
             backfill_missing=bool(backfill_missing_bool),
             max_project_comments=int(max_project_comments),
-            max_experiment_runs=int(max_experiment_runs),
             recent_project_comment_days=recent_project_comment_days,
             recent_project_comment_scan_limit=recent_project_comment_scan_limit,
             dump_json=payload.get("dump_json"),

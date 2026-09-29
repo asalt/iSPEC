@@ -914,7 +914,7 @@ def register_subcommands(subparsers):
 
     sync_runs_parser = subparsers.add_parser(
         "sync-legacy-experiment-runs",
-        help="Sync legacy iSPEC ExperimentRuns for a specific experiment",
+        help="Incrementally sync all legacy ExperimentRuns, or repair one experiment",
     )
     sync_runs_parser.add_argument(
         "--database",
@@ -930,8 +930,7 @@ def register_subcommands(subparsers):
         "--experiment-id",
         dest="experiment_id",
         type=int,
-        required=True,
-        help="Experiment EXPRecNo to sync runs for",
+        help="Optional Experiment EXPRecNo for a targeted repair (does not advance cursor)",
     )
     sync_runs_parser.add_argument(
         "--mapping",
@@ -943,7 +942,22 @@ def register_subcommands(subparsers):
         dest="schema",
         help="Path to ispec-legacy-schema.json (default: iSPEC/data/ispec-legacy-schema.json)",
     )
-    sync_runs_parser.add_argument("--limit", type=int, default=5000)
+    sync_runs_parser.add_argument("--limit", type=int, default=1000)
+    sync_runs_parser.add_argument("--max-pages", type=int, default=None)
+    sync_runs_parser.add_argument(
+        "--reset-cursor",
+        action="store_true",
+        help="Reset the global ExperimentRun cursor before syncing",
+    )
+    sync_runs_parser.add_argument(
+        "--since",
+        help="Override the global modified timestamp cursor (ISO-8601)",
+    )
+    sync_runs_parser.add_argument(
+        "--since-pk",
+        dest="since_pk",
+        help="Override the global composite cursor as EXPRecNo,RunNo,SearchNo",
+    )
     sync_runs_parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -962,7 +976,7 @@ def register_subcommands(subparsers):
 
     sync_all_parser = subparsers.add_parser(
         "sync-legacy-all",
-        help="Sync core legacy metadata (projects/people/experiments) and then fetch a small number of related comments/runs",
+        help="Incrementally sync core legacy metadata/runs and fetch bounded recent comments",
     )
     sync_all_parser.add_argument(
         "--database",
@@ -1009,13 +1023,6 @@ def register_subcommands(subparsers):
         type=int,
         default=25,
         help="Max number of recently touched projects to fetch comments for (default: 25).",
-    )
-    sync_all_parser.add_argument(
-        "--max-experiment-runs",
-        dest="max_experiment_runs",
-        type=int,
-        default=25,
-        help="Max number of recently touched experiments to fetch runs for (default: 25).",
     )
     sync_all_parser.add_argument(
         "--recent-project-comment-days",
@@ -1386,19 +1393,35 @@ def dispatch(args):
         )
         logger.info("legacy experiments sync summary: %s", summary)
     elif args.subcommand == "sync-legacy-experiment-runs":
-        from ispec.db.legacy_sync import sync_legacy_experiment_runs
-
-        summary = sync_legacy_experiment_runs(
-            legacy_url=getattr(args, "legacy_url", None),
-            mapping_path=getattr(args, "mapping", None),
-            schema_path=getattr(args, "schema", None),
-            db_file_path=getattr(args, "database", None),
-            experiment_id=int(getattr(args, "experiment_id")),
-            limit=int(getattr(args, "limit", 5000)),
-            dry_run=bool(getattr(args, "dry_run", False)),
-            backfill_missing=bool(getattr(args, "backfill_missing", False)),
-            dump_json=getattr(args, "dump_json", None),
+        from ispec.db.legacy_sync import (
+            sync_legacy_experiment_runs,
+            sync_legacy_experiment_runs_incremental,
         )
+
+        experiment_id = getattr(args, "experiment_id", None)
+        common = {
+            "legacy_url": getattr(args, "legacy_url", None),
+            "mapping_path": getattr(args, "mapping", None),
+            "schema_path": getattr(args, "schema", None),
+            "db_file_path": getattr(args, "database", None),
+            "limit": int(getattr(args, "limit", 1000)),
+            "dry_run": bool(getattr(args, "dry_run", False)),
+            "backfill_missing": bool(getattr(args, "backfill_missing", False)),
+            "dump_json": getattr(args, "dump_json", None),
+        }
+        if experiment_id is not None:
+            summary = sync_legacy_experiment_runs(
+                experiment_id=int(experiment_id),
+                **common,
+            )
+        else:
+            summary = sync_legacy_experiment_runs_incremental(
+                max_pages=getattr(args, "max_pages", None),
+                reset_cursor=bool(getattr(args, "reset_cursor", False)),
+                since=getattr(args, "since", None),
+                since_pk=getattr(args, "since_pk", None),
+                **common,
+            )
         logger.info("legacy experiment runs sync summary: %s", summary)
     elif args.subcommand == "sync-legacy-all":
         from ispec.db.legacy_sync_all import sync_legacy_all
@@ -1414,7 +1437,6 @@ def dispatch(args):
             dry_run=bool(getattr(args, "dry_run", False)),
             backfill_missing=bool(getattr(args, "backfill_missing", True)),
             max_project_comments=int(getattr(args, "max_project_comments", 25)),
-            max_experiment_runs=int(getattr(args, "max_experiment_runs", 25)),
             recent_project_comment_days=getattr(args, "recent_project_comment_days", None),
             recent_project_comment_scan_limit=getattr(args, "recent_project_comment_scan_limit", None),
             dump_json=getattr(args, "dump_json", None),

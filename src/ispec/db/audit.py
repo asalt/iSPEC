@@ -158,15 +158,33 @@ def _legacy_sync_state_rows(db_path: Path | None) -> list[dict[str, Any]]:
     inspector = inspect(engine)
     if "legacy_sync_state" not in set(inspector.get_table_names()):
         return []
+    cursor_columns = {
+        column["name"] for column in inspector.get_columns("legacy_sync_state")
+    }
+    select_fields = "legacy_table, since, since_pk"
+    if "since_pk_json" in cursor_columns:
+        select_fields += ", since_pk_json"
 
     with engine.connect() as conn:
-        rows = conn.execute(
+        raw_rows = conn.execute(
             text(
-                "SELECT legacy_table, since, since_pk "
-                "FROM legacy_sync_state ORDER BY legacy_table ASC"
+                f"SELECT {select_fields} FROM legacy_sync_state "
+                "ORDER BY legacy_table ASC"
             )
         ).mappings()
-        return [dict(row) for row in rows]
+        rows: list[dict[str, Any]] = []
+        for raw_row in raw_rows:
+            row = dict(raw_row)
+            raw_composite = row.pop("since_pk_json", None)
+            if raw_composite:
+                try:
+                    composite = json.loads(raw_composite)
+                except (TypeError, ValueError):
+                    composite = None
+                if isinstance(composite, list):
+                    row["since_pk"] = composite
+            rows.append(row)
+        return rows
 
 
 def _known_workflows(scripts_dir: Path) -> dict[str, Any]:

@@ -7,7 +7,7 @@ from ispec.logging import get_logger
 
 from .legacy_sync import (
     scan_recent_legacy_project_comment_projects,
-    sync_legacy_experiment_runs,
+    sync_legacy_experiment_runs_incremental,
     sync_legacy_experiments,
     sync_legacy_people,
     sync_legacy_project_comments,
@@ -54,7 +54,6 @@ def sync_legacy_all(
     dry_run: bool = False,
     backfill_missing: bool = True,
     max_project_comments: int = 25,
-    max_experiment_runs: int = 25,
     recent_project_comment_days: int | None = None,
     recent_project_comment_scan_limit: int | None = None,
     dump_json: str | Path | None = None,
@@ -66,10 +65,8 @@ def sync_legacy_all(
     - supervisor/orchestrator periodic sync
 
     Strategy:
-    1) Incremental sync of projects/people/experiments (cursor-based)
-    2) Then, for a small number of recently touched projects/experiments:
-       - fetch project history comments (project_comment)
-       - fetch experiment runs (experiment_run)
+    1) Incremental sync of projects/people/experiments/experiment runs
+    2) Fetch project history comments for a bounded set of touched/recent projects
     """
 
     normalized_dump = _normalize_dump_target(dump_json)
@@ -114,13 +111,23 @@ def sync_legacy_all(
         reset_cursor=bool(reset_cursor),
         dry_run=bool(dry_run),
         backfill_missing=bool(backfill_missing),
-        collect_ids=True,
-        max_collected_ids=max(0, int(max_experiment_runs)),
         dump_json=normalized_dump,
     )
 
     touched_projects = _coerce_int_list(projects.get("touched_ids"))
-    touched_experiments = _coerce_int_list(experiments.get("touched_ids"))
+
+    experiment_runs = sync_legacy_experiment_runs_incremental(
+        legacy_url=legacy_url,
+        mapping_path=mapping_path,
+        schema_path=schema_path,
+        db_file_path=db_file_path,
+        limit=int(limit),
+        max_pages=max_pages,
+        reset_cursor=bool(reset_cursor),
+        dry_run=bool(dry_run),
+        backfill_missing=bool(backfill_missing),
+        dump_json=normalized_dump,
+    )
 
     recent_comment_scan_limit_value = recent_project_comment_scan_limit
     if recent_comment_scan_limit_value is None:
@@ -161,23 +168,6 @@ def sync_legacy_all(
         for key in comments_totals:
             comments_totals[key] += int(summary.get(key) or 0)
 
-    runs_totals = {"inserted": 0, "updated": 0, "backfilled": 0, "conflicted": 0}
-    runs_rows: list[dict[str, Any]] = []
-    for exp_id in touched_experiments[: max(0, int(max_experiment_runs))]:
-        summary = sync_legacy_experiment_runs(
-            legacy_url=legacy_url,
-            mapping_path=mapping_path,
-            schema_path=schema_path,
-            db_file_path=db_file_path,
-            experiment_id=int(exp_id),
-            dry_run=bool(dry_run),
-            backfill_missing=bool(backfill_missing),
-            dump_json=normalized_dump,
-        )
-        runs_rows.append({"experiment_id": int(exp_id), "summary": summary})
-        for key in runs_totals:
-            runs_totals[key] += int(summary.get(key) or 0)
-
     return {
         "ok": True,
         "projects": projects,
@@ -202,10 +192,5 @@ def sync_legacy_all(
             "totals": comments_totals,
             "summaries": comments_rows[:10],
         },
-        "experiment_runs": {
-            "requested": len(touched_experiments[: max(0, int(max_experiment_runs))]),
-            "totals": runs_totals,
-            "summaries": runs_rows[:10],
-        },
+        "experiment_runs": experiment_runs,
     }
-

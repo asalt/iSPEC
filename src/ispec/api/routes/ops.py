@@ -259,7 +259,6 @@ class LegacySyncRunRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1)
     max_pages: int | None = Field(default=None, ge=0)
     max_project_comments: int | None = Field(default=None, ge=0)
-    max_experiment_runs: int | None = Field(default=None, ge=0)
     recent_project_comment_days: int | None = Field(default=None, ge=0)
     recent_project_comment_scan_limit: int | None = Field(default=None, ge=0)
     backfill_missing: bool | None = None
@@ -707,13 +706,25 @@ def snapshot(
             .all()
         )
         for row in rows:
+            composite_since_pk = None
+            if row.since_pk_json:
+                try:
+                    parsed_since_pk = json.loads(row.since_pk_json)
+                    if isinstance(parsed_since_pk, list):
+                        composite_since_pk = parsed_since_pk
+                except (TypeError, ValueError):
+                    composite_since_pk = None
             legacy_cursors.append(
                 {
                     "legacy_table": row.legacy_table,
                     "since": (
                         row.since.isoformat() if getattr(row, "since", None) else None
                     ),
-                    "since_pk": int(row.since_pk) if row.since_pk is not None else None,
+                    "since_pk": (
+                        composite_since_pk
+                        if composite_since_pk is not None
+                        else int(row.since_pk) if row.since_pk is not None else None
+                    ),
                     "updated_at": (
                         row.legsync_ModificationTS.isoformat()
                         if getattr(row, "legsync_ModificationTS", None)
