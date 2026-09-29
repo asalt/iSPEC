@@ -121,6 +121,38 @@ def test_assistant_list_tmux_panes_returns_allowed_items(db_session, monkeypatch
     assert result["items"][0]["target"] == "ispecfull:codex.1"
 
 
+def test_assistant_list_tmux_panes_filters_exact_targets(db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_TMUX_TOOLS_ENABLED", "1")
+    monkeypatch.setattr("ispec.assistant.tools._tmux_tools_status", lambda: (True, None))
+    monkeypatch.setattr("ispec.assistant.tools._code_tool_access_status", lambda user: (True, None))
+    monkeypatch.setattr(
+        "ispec.assistant.tools._tmux_list_allowed_panes",
+        lambda: [
+            _sample_pane(target="1574-24:node.1", pane_id="%28"),
+            _sample_pane(target="siteannot-46:node.1", pane_id="%50"),
+            _sample_pane(target="drying-rack-34:node.1", pane_id="%38"),
+            _sample_pane(target="unrelated:node.1", pane_id="%99"),
+        ],
+    )
+    monkeypatch.setattr("ispec.assistant.tools._tmux_allowlist_entries", lambda: ["*"])
+
+    payload = run_tool(
+        name="assistant_list_tmux_panes",
+        args={"targets": ["%28", "%50", "%38"], "limit": 3},
+        core_db=db_session,
+        schedule_db=None,
+        user=_internal_user(),
+        api_schema=None,
+        user_message="list these three panes",
+    )
+
+    assert payload["ok"] is True
+    result = payload["result"]
+    assert result["targets"] == ["%28", "%50", "%38"]
+    assert result["count"] == 3
+    assert {item["pane_id"] for item in result["items"]} == {"%28", "%50", "%38"}
+
+
 def test_assistant_capture_tmux_pane_returns_snapshot(db_session, monkeypatch):
     pane = _sample_pane()
     monkeypatch.setenv("ISPEC_ASSISTANT_TMUX_TOOLS_ENABLED", "1")

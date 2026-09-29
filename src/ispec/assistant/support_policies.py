@@ -240,14 +240,22 @@ def _tmux_list_session_name(panes: list[dict[str, Any]], *, message: str) -> str
         for name in _tmux_unique_strings([row.get("session_names")])
         if name
     }
-    for alias in sorted(session_groups):
-        if _tmux_word_alias_match(message, alias):
-            return alias
+    matched_session_groups = [
+        alias for alias in sorted(session_groups) if _tmux_word_alias_match(message, alias)
+    ]
+    if len(matched_session_groups) == 1:
+        return matched_session_groups[0]
+    if len(matched_session_groups) > 1:
+        return None
     if len(session_groups) == 1:
         return next(iter(session_groups))
-    for alias in sorted(session_names):
-        if _tmux_word_alias_match(message, alias):
-            return alias
+    matched_session_names = [
+        alias for alias in sorted(session_names) if _tmux_word_alias_match(message, alias)
+    ]
+    if len(matched_session_names) == 1:
+        return matched_session_names[0]
+    if len(matched_session_names) > 1:
+        return None
     if len(sessions) == 1:
         return next(iter(sessions))
     return None
@@ -499,7 +507,11 @@ def _select_tmux_support_tool_policy(
         for row in candidate_panes
         if str(row.get("session") or "").strip()
     }
-    descriptor_matches = _tmux_descriptor_matches(ctx.message, candidate_panes, ignored_tokens=ignored_tokens)
+    descriptor_matches = (
+        []
+        if explicit_matches or session_alias_matches
+        else _tmux_descriptor_matches(ctx.message, candidate_panes, ignored_tokens=ignored_tokens)
+    )
     narrowed_panes = descriptor_matches or candidate_panes
 
     if not _tmux_prefers_list(ctx.message) and len(narrowed_panes) == 1:
@@ -558,7 +570,24 @@ def _select_tmux_support_tool_policy(
             )
 
     list_session_name = _tmux_list_session_name(narrowed_panes, message=ctx.message)
-    list_args = {"session_name": list_session_name} if list_session_name else {}
+    list_targets = (
+        [
+            str(row.get("capture_target") or row.get("pane_id") or "").strip()
+            for row in narrowed_panes
+            if str(row.get("capture_target") or row.get("pane_id") or "").strip()
+        ]
+        if explicit_matches or len(session_alias_matches) > 1
+        else []
+    )
+    if list_targets:
+        list_args: dict[str, Any] = {
+            "targets": list_targets,
+            "limit": min(100, len(list_targets)),
+        }
+    elif list_session_name:
+        list_args = {"session_name": list_session_name}
+    else:
+        list_args = {}
     scope_label = f"session {list_session_name!r}" if list_session_name else None
     return SupportToolPolicySelection(
         rule_name="tmux_list_choices",

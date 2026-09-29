@@ -228,6 +228,54 @@ def test_select_support_tool_policy_for_tmux_list_request_prefers_listing(monkey
     assert selection.meta["strategy"] == "list_session"
 
 
+def test_tmux_list_request_preserves_multiple_explicit_sessions(monkeypatch) -> None:
+    panes = [
+        _pane(
+            session="1574-24",
+            session_group=None,
+            target="1574-24:node.1",
+            capture_target="%28",
+            title="1574 analysis",
+            command="node",
+        ),
+        _pane(
+            session="siteannot-46",
+            session_group=None,
+            target="siteannot-46:node.1",
+            capture_target="%50",
+            title="site-annotate",
+            command="node",
+        ),
+        _pane(
+            session="drying-rack-34",
+            session_group=None,
+            target="drying-rack-34:node.1",
+            capture_target="%38",
+            title="drying rack",
+            command="node",
+        ),
+    ]
+    monkeypatch.setattr("ispec.assistant.support_policies._tmux_policy_panes", lambda: panes)
+
+    selection = select_support_tool_policy(
+        message=(
+            "List the available tmux panes. Include whether you can see the sessions named "
+            "1574-24, siteannot-46, and drying-rack-34. Do not send any keys."
+        )
+    )
+
+    assert selection is not None
+    assert selection.tool_name == "assistant_list_tmux_panes"
+    assert selection.args == {
+        "targets": ["%28", "%50", "%38"],
+        "limit": 3,
+    }
+    assert selection.meta is not None
+    assert selection.meta["strategy"] == "list_all"
+    assert selection.meta["candidate_count"] == 3
+    assert selection.meta["selected_session_name"] is None
+
+
 def test_hinted_support_tool_groups_accumulates_project_and_file_hints() -> None:
     hinted = hinted_support_tool_groups(
         message="can you check the results files for project 1598?",

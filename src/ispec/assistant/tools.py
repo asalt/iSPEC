@@ -3270,11 +3270,19 @@ def run_tool(
             query = _safe_str(args.get("query"), max_len=256)
             session_name = _safe_str(args.get("session_name"), max_len=128)
             limit = _clamp_int(_safe_int(args.get("limit")), default=20, min_value=1, max_value=100)
+            targets = [
+                target
+                for raw_target in _tmux_unique_strings([args.get("targets")])[:20]
+                if (target := _safe_str(raw_target, max_len=128)) is not None
+            ]
+            target_filters = set(targets)
             query_tokens = _tokenize(query or "")
             session_filter = str(session_name or "").strip().lower()
             panes = _tmux_list_allowed_panes()
             items: list[dict[str, Any]] = []
             for pane in panes:
+                if target_filters and not target_filters.intersection(_tmux_row_aliases(pane)):
+                    continue
                 pane_session_names = {
                     value.lower()
                     for value in _tmux_unique_strings([pane.get("session_names"), pane.get("session"), pane.get("session_group")])
@@ -3336,6 +3344,7 @@ def run_tool(
                     "count": len(items),
                     "query": query,
                     "session_name": session_name,
+                    "targets": targets,
                     "allowlist": _tmux_allowlist_entries() or [f"session:{_tmux_default_session_name()}"],
                     "items": items,
                 },
@@ -6682,6 +6691,12 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
                     "session_name": {
                         "type": "string",
                         "description": "Optional exact session or session-group filter such as ispecfull or ispec.",
+                    },
+                    "targets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 20,
+                        "description": "Optional exact pane handles returned by this tool, used to re-list a bounded set of panes.",
                     },
                     "limit": {"type": "integer", "description": "Max panes to return (default 20)."},
                 },
