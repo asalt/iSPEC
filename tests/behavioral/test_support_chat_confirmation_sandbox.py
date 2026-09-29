@@ -19,7 +19,7 @@ from ispec.assistant.turn_decision import (
     TurnDecisionWritePlan,
 )
 from ispec.db.connect import get_session
-from ispec.db.models import ProjectComment, UserRole
+from ispec.db.models import ProjectAccessMode, ProjectComment, UserRole
 from ispec.schedule.connect import get_schedule_session
 
 
@@ -153,6 +153,7 @@ def test_behavioral_support_chat_confirmation_round_trip_saves_into_sandbox(
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -341,6 +342,7 @@ def test_behavioral_support_chat_mspc_prepare_then_compound_confirm_survives_cau
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 
@@ -609,6 +611,7 @@ def test_behavioral_support_chat_corrective_note_compound_confirm_routes_to_writ
             id=1,
             username="api_key",
             role=UserRole.viewer,
+            project_access_mode=ProjectAccessMode.all_projects,
             can_write_project_comments=True,
         )
 

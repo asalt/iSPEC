@@ -100,6 +100,9 @@ def test_support_chat_can_count_projects_via_tool_even_with_messy_tool_output(
 def test_support_chat_policy_fallback_counts_total_projects_when_model_skips_tools(
     tmp_path, db_session, monkeypatch
 ):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TURN_DECISION_MODE", "off")
+    monkeypatch.setenv("ISPEC_ASSISTANT_COMPACTION_ENABLED", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
     monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
@@ -116,6 +119,14 @@ def test_support_chat_policy_fallback_counts_total_projects_when_model_skips_too
     db_session.commit()
 
     calls: list[dict[str, Any]] = []
+
+    def fake_route_tool_groups(**_):
+        return (
+            {"primary": "projects", "secondary": [], "confidence": 1.0, "clarify": False},
+            AssistantReply(content="{}", provider="test", model="test-router", meta=None),
+        )
+
+    monkeypatch.setattr(support_routes, "route_tool_groups_vllm", fake_route_tool_groups)
 
     def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_) -> AssistantReply:
         calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})

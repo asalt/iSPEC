@@ -51,7 +51,9 @@ def crud_client(tmp_path):
         name_suffix="Create",
         exclude_fields={"id", "ppl_CreationTS", "ppl_ModificationTS"},
     )
-    _add_crud_endpoints(router, crud, ReadModel, CreateModel, tag="Person")
+    _add_crud_endpoints(
+        router, crud, ReadModel, CreateModel, tag="Person", session_dep=get_session_dep
+    )
 
     app = FastAPI()
     app.include_router(router)
@@ -111,7 +113,7 @@ def options_client(tmp_path):
 
     router = APIRouter(prefix="/people", tags=["Person"])
     crud = PersonCRUD()
-    _add_options_endpoints(router, crud, model=Person)
+    _add_options_endpoints(router, crud, model=Person, session_dep=get_session_dep)
 
     app = FastAPI()
     app.include_router(router)
