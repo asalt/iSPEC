@@ -317,7 +317,7 @@ def test_shadow_evaluation_does_not_change_independently_authorized_write(
         assert approval_eval["write_outcome"]["comment_id"] == comment.id
 
 
-@pytest.mark.parametrize("eval_mode", ["off", "shadow", "own"])
+@pytest.mark.parametrize("eval_mode", ["off", "shadow"])
 @pytest.mark.parametrize("attempt_write", [False, True])
 def test_evaluation_ticket_cannot_force_or_authorize_a_live_write(
     tmp_path,

@@ -492,6 +492,7 @@ def generate_reply(
     stage: Literal["planner", "answer", "review"] = "answer",
     vllm_extra_body: dict[str, Any] | None = None,
     observability_context: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
 ) -> AssistantReply:
     provider = (os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub").strip().lower()
     if messages is None:
@@ -515,6 +516,7 @@ def generate_reply(
             tool_choice=tool_choice,
             extra_body=vllm_extra_body,
             observability_context=observability_context,
+            **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
         )
     return AssistantReply(
         content=(
@@ -817,10 +819,11 @@ def _generate_vllm_reply(
     tool_choice: str | dict[str, Any] | None = None,
     extra_body: dict[str, Any] | None = None,
     observability_context: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
 ) -> AssistantReply:
     base_url = _vllm_url()
     url = f"{base_url}/v1/chat/completions"
-    timeout = _vllm_timeout_seconds()
+    timeout = max(0.1, float(timeout_seconds)) if timeout_seconds is not None else _vllm_timeout_seconds()
     headers = _vllm_headers()
 
     try:

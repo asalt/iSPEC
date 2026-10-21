@@ -32,6 +32,7 @@ from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
 from ispec.assistant.project_comment_approval import (
     ProjectCommentApprovalSettings,
+    ProjectCommentAuthorization,
     build_project_comment_gate,
     decide_project_comment_policy,
     detect_project_comment_trigger,
@@ -1652,6 +1653,20 @@ def chat(
         trigger=project_comment_trigger,
         classifier=project_comment_approval_classifier_obj,
     )
+    project_comment_authorization = None
+    if project_comment_approval_settings.mode == "own":
+        project_comment_authorization = ProjectCommentAuthorization(
+            gate=project_comment_approval_state_gate_obj, ticket=project_comment_approval_ticket_obj,
+        )
+        if project_comment_approval_state_gate_obj.eligible:
+            reply_interpretation = reply_interpretation.with_approval_policy(
+                label=project_comment_approval_classifier_obj.label,
+                confidence=project_comment_approval_classifier_obj.confidence,
+                reason="; ".join(project_comment_approval_policy_obj.reasons),
+                authorized=project_comment_approval_ticket_obj.issued,
+            )
+            reply_interpretation_policy_messages = list(reply_interpretation.policy_messages)
+            skip_tool_router_for_reply_interpretation = True
     project_comment_approval_eval_mode = project_comment_approval_settings.mode
     project_comment_approval_state_gate = project_comment_approval_state_gate_obj.to_dict()
     project_comment_approval_classifier = project_comment_approval_classifier_obj.to_dict()
@@ -1670,9 +1685,10 @@ def chat(
     project_comment_write_policy_messages: list[dict[str, str]] = []
     project_comment_write_tool_exposed = "create_project_comment" in available_openai_tool_names_full
     project_comment_write_tool_reason = "not_available"
-    # Evaluation tickets are observations, never live write authorization.
+    # Shadow evaluation never changes this legacy path. Own mode uses a scoped ticket.
     project_comment_save_authorized = bool(
-        reply_interpretation.has_pending_save
+        project_comment_authorization is None
+        and reply_interpretation.has_pending_save
         and reply_interpretation.runtime_action == "approve_save"
     )
     reply_interpretation_removed_write_tools: list[str] = []
@@ -1682,15 +1698,19 @@ def chat(
         and isinstance(tool_schemas, list)
         and project_comment_write_tool_exposed
     ):
-        project_comment_write_allowed, project_comment_write_tool_reason = _project_comment_write_tool_allowed(
-            explicit_save_requested=explicit_project_comment_save_request,
-            confirmation_reply=confirmation_reply,
-            awaiting_state=awaiting_reply_state,
-            reply_interpretation_action=(
-                reply_interpretation.runtime_action if reply_interpretation.runtime_action != "none" else None
-            ),
-            trigger_allows_write_tool=project_comment_trigger_allows_write_tool,
-        )
+        if project_comment_authorization is not None:
+            project_comment_write_allowed = project_comment_authorization.ticket.issued
+            project_comment_write_tool_reason = "approval_policy:" + project_comment_approval_policy_obj.decision
+        else:
+            project_comment_write_allowed, project_comment_write_tool_reason = _project_comment_write_tool_allowed(
+                explicit_save_requested=explicit_project_comment_save_request,
+                confirmation_reply=confirmation_reply,
+                awaiting_state=awaiting_reply_state,
+                reply_interpretation_action=(
+                    reply_interpretation.runtime_action if reply_interpretation.runtime_action != "none" else None
+                ),
+                trigger_allows_write_tool=project_comment_trigger_allows_write_tool,
+            )
         if not project_comment_write_allowed:
             tool_schemas, removed_project_comment_tools = _remove_tool_names_from_openai_schemas(
                 tool_schemas,
@@ -2022,7 +2042,9 @@ def chat(
     comment_intent_decision: dict[str, Any] | None = None
     comment_intent_reply = None
     comment_intent_messages: list[dict[str, Any]] = []
-    if turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
+    if project_comment_authorization is not None and project_comment_approval_state_gate_obj.eligible:
+        pass  # This bounded policy owns the decision; do not run a competing intent pass.
+    elif turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
         write_mode = turn_decision_result.decision.write_plan.mode
         if not (reply_interpretation.applied and reply_interpretation.runtime_action != "approve_save"):
             comment_intent_messages = comment_intent_messages_for_write_mode(
@@ -2423,6 +2445,9 @@ def chat(
                         api_schema=api_schema,
                         user_message=payload.message,
                         project_comment_save_authorized=project_comment_save_authorized,
+                        **({"project_comment_authorization": project_comment_authorization,
+                            "support_turn_id": str(user_message.id)}
+                           if project_comment_authorization is not None else {}),
                         support_session_id=session.session_id,
                     )
                     _maybe_block_write_tools_for_turn(tool_name, tool_payload)
@@ -2482,6 +2507,9 @@ def chat(
                     api_schema=api_schema,
                     user_message=payload.message,
                     project_comment_save_authorized=project_comment_save_authorized,
+                    **({"project_comment_authorization": project_comment_authorization,
+                        "support_turn_id": str(user_message.id)}
+                       if project_comment_authorization is not None else {}),
                     support_session_id=session.session_id,
                 )
                 tool_calls.append(
@@ -2534,6 +2562,9 @@ def chat(
                     api_schema=api_schema,
                     user_message=payload.message,
                     project_comment_save_authorized=project_comment_save_authorized,
+                    **({"project_comment_authorization": project_comment_authorization,
+                        "support_turn_id": str(user_message.id)}
+                       if project_comment_authorization is not None else {}),
                     support_session_id=session.session_id,
                 )
                 tool_calls.append(
@@ -2640,6 +2671,9 @@ def chat(
                 api_schema=api_schema,
                 user_message=payload.message,
                 project_comment_save_authorized=project_comment_save_authorized,
+                **({"project_comment_authorization": project_comment_authorization,
+                    "support_turn_id": str(user_message.id)}
+                   if project_comment_authorization is not None else {}),
                 support_session_id=session.session_id,
             )
             _maybe_block_write_tools_for_turn(tool_name, tool_payload)
@@ -2921,7 +2955,12 @@ def chat(
                 "forced_tool_choice": _forced_tool_choice_name(forced_tool_choice),
                 "reply_interpretation_action": reply_interpretation.runtime_action,
             },
-            "write_ticket_shadow": project_comment_approval_ticket,
+            **({"write_ticket": {
+                **project_comment_approval_ticket,
+                "consumed": project_comment_authorization.consumed,
+                "attempted_comment_hash": project_comment_authorization.attempted_comment_hash,
+            }} if project_comment_authorization is not None
+               else {"write_ticket_shadow": project_comment_approval_ticket}),
             "write_outcome": project_comment_write_outcome,
             "expected_outcome": {
                 "available": False,

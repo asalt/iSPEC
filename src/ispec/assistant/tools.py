@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 import time as time_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import Text, cast, func, or_
@@ -29,6 +29,8 @@ from ispec.assistant.models import (
     SupportSessionReview,
 )
 from ispec.assistant.prompt_header import build_prompt_header, header_legend
+if TYPE_CHECKING:
+    from ispec.assistant.project_comment_approval import ProjectCommentAuthorization
 from ispec.assistant.schedules import (
     ASSISTANT_SCHEDULE_PATH_ENV,
     assistant_schedule_path,
@@ -2997,6 +2999,8 @@ def run_tool(
     api_schema: dict[str, Any] | None = None,
     user_message: str | None = None,
     project_comment_save_authorized: bool = False,
+    project_comment_authorization: ProjectCommentAuthorization | None = None,
+    support_turn_id: str | None = None,
     support_session_id: str | None = None,
 ) -> dict[str, Any]:
     # the large try block is not great - but these if statements for
@@ -3633,7 +3637,7 @@ def run_tool(
                 return {"ok": False, "tool": name, "error": "confirm=true is required to write project history."}
 
             user_msg = (user_message or "").strip().lower()
-            if user_msg and (
+            if project_comment_authorization is None and user_msg and (
                 re.search(r"\b(do not|don't|dont)\s+(save|log|record|add|commit)\b", user_msg)
                 or re.search(r"\bnot\s+(?:save|commit)\b", user_msg)
             ):
@@ -3642,7 +3646,8 @@ def run_tool(
                     "tool": name,
                     "error": "User requested not to save yet.",
                 }
-            if not project_comment_save_authorized and not _project_comment_save_requested(user_msg):
+            if (project_comment_authorization is None and not project_comment_save_authorized
+                    and not _project_comment_save_requested(user_msg)):
                 return {
                     "ok": False,
                     "tool": name,
@@ -3656,6 +3661,14 @@ def run_tool(
             comment_text = _safe_str(args.get("comment"), max_len=20_000)
             if comment_text is None or not comment_text.strip():
                 return {"ok": False, "tool": name, "error": "comment text is required."}
+
+            if project_comment_authorization is not None:
+                approval_error = project_comment_authorization.consume(
+                    project_id=project_id, session_id=support_session_id, turn_id=support_turn_id,
+                    user_message=user_message, comment=comment_text,
+                )
+                if approval_error:
+                    return {"ok": False, "tool": name, "error": approval_error}
 
             comment_type = _safe_str(args.get("comment_type"), max_len=64) or "assistant_note"
             if is_scoped_user:

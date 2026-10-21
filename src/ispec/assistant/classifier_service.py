@@ -166,4 +166,7 @@ def generate_classifier_reply(
             observability_context=observability_context,
             timeout_seconds=timeout_seconds,
         )
-    return base_generate_reply_fn(messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=observability_context)
+    return base_generate_reply_fn(
+        messages=messages, tools=None, vllm_extra_body=vllm_extra_body, observability_context=observability_context,
+        **({"timeout_seconds": timeout_seconds} if timeout_seconds is not None else {}),
+    )

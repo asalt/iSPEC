@@ -220,6 +220,24 @@ class ReplyInterpretation:
             "removed_write_tools": list(removed_write_tools),
         }
 
+    def with_approval_policy(self, *, label: str | None, confidence: float, reason: str,
+                             authorized: bool) -> "ReplyInterpretation":
+        kind, action = ("approve", "approve_save") if authorized else {
+            "deny_save": ("deny", "deny_save"),
+            "draft_only": ("defer", "defer_save"),
+            "revise_draft": ("modify", "modify_before_save"),
+        }.get(label, ("unclear", "clarify"))
+        return ReplyInterpretation(
+            short_reply=self.short_reply, awaiting_save=self.awaiting_save,
+            kind=self.kind, action=self.action,
+            classifier_kind=kind, classifier_action=action,
+            classifier_confidence=confidence, classifier_reason=reason,
+            runtime_kind=kind, runtime_action=action, applied=True,
+            policy_messages=tuple(reply_interpretation_messages(
+                action=action, awaiting_state=self.awaiting_save,
+            )),
+        )
+
 
 def normalize_short_reply(message: str | None) -> str:
     normalized = re.sub(r"[^\w\s]", "", str(message or "").strip().lower())

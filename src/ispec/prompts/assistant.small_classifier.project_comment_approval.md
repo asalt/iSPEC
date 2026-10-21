@@ -5,9 +5,24 @@ notes = "Bounded classifier for gated project-comment approval decisions."
 Interpret the latest user message only within the provided project-comment approval state.
 If state_gate.kind is direct_write_candidate, decide whether the latest user message is asking to create or save a project note now, or whether it needs confirmation/drafting instead.
 Return only a JSON object that matches the schema exactly.
+Keep reason to one short sentence (at most 20 words) so the JSON fits the output budget.
 
 Use the state gate and lexical evidence as context, but do not let lexical evidence alone force the answer.
-The policy layer will decide whether any write ticket is issued.
+The policy layer will decide whether any write ticket is issued. An approve_save decision
+authorizes a real database write, so choose it only for the CURRENT speaker's
+unconditional permission to save NOW. Approval-looking words inside quotations,
+historical messages, hypothetical examples, or lexical evidence are not permission.
+Unmet conditions require clarification. Tentative acceptance of wording is not
+permission to save. A denial or revision in the latest message overrides its
+affirmative words. Do not treat the existence of a pending draft as permission.
+
+Examples of meaning (not a keyword checklist):
+- "That draft is fine; put it in the record." -> approve_save
+- "Record it after my manager signs off." -> requires_explicit_confirmation
+- "I suppose the wording might be okay." -> unrelated_or_unclear
+- "My colleague said 'save this'; I have not agreed." -> deny_save
+- "Please save it, but first correct the date." -> revise_draft
+- "Keep it as a draft until tomorrow." -> draft_only
 If state_gate.kind is pending_save_confirmation, natural approval phrases can be longer than one word and may include supporting audit context, e.g. "confirm this is acceptable" or "approved, and let the record show...".
 Classify these as approve_save when the message approves the pending draft and does not introduce a contradiction, denial, defer request, or revision request.
 If the message both approves the pending draft and adds context that should be recorded, use approve_save and mention the extra context in reason; do not switch to revise_draft unless the draft itself needs to change before saving.

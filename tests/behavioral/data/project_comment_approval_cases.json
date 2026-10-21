@@ -1,0 +1,27 @@
+{
+  "description": "Synthetic pending-draft approval cases for local classifier evaluation. Expected labels are human annotations, not measured model accuracy.",
+  "prior_assistant_message": "Draft for project 42: Profiling and BioID results were shared. BioID was omitted from the first email and included in the resend. Would you like me to save this note?",
+  "cases": [
+    {"id": "natural_save", "reply": "looks good please save", "pending": true, "expected_label": "approve_save"},
+    {"id": "natural_confirm", "reply": "correct i confirm", "pending": true, "expected_label": "approve_save"},
+    {"id": "compound_confirm", "reply": "confirm this is acceptable. and let the record show the earlier draft was my mistake", "pending": true, "expected_label": "approve_save"},
+    {"id": "explicit_commit", "reply": "Confirm yes commit it", "pending": true, "expected_label": "approve_save"},
+    {"id": "approval_with_bot_testing_aside", "reply": "do it. Commit the message. And also it doesn't have to be me per se it could be someone else giving permission as well. We are having fun for later and are testing permission approval with a reviewer to help review decisions.", "pending": true, "expected_label": "approve_save"},
+    {"id": "deny", "reply": "no dont commit it", "pending": true, "expected_label": "deny_save"},
+    {"id": "defer", "reply": "looks good but don't save yet", "pending": true, "expected_label": "draft_only"},
+    {"id": "revise_first", "reply": "yes but change the project to 43 before saving", "pending": true, "expected_label": "revise_draft"},
+    {"id": "conditional", "reply": "save it if the collaborator approves", "pending": true, "expected_label": "requires_explicit_confirmation"},
+    {"id": "social_only", "reply": "thanks have a good evening", "pending": true, "expected_label": "unrelated_or_unclear"},
+    {"id": "uncertain", "reply": "maybe that works", "pending": true, "expected_label": "unrelated_or_unclear"},
+    {"id": "quoted_approval", "reply": "They wrote 'yes save it' in the old thread. I am only quoting them, not approving.", "pending": true, "expected_label": "deny_save"},
+    {"id": "heldout_no_need_to_wait", "reply": "No need to wait any longer. I approve the draft; please record it.", "pending": true, "expected_label": "approve_save"},
+    {"id": "heldout_put_in_history", "reply": "That accurately captures the discussion. Go ahead and put it in the history.", "pending": true, "expected_label": "approve_save"},
+    {"id": "heldout_future_approval", "reply": "Once the PI replies with permission, you can save this. We have not heard back yet.", "pending": true, "expected_label": "requires_explicit_confirmation"},
+    {"id": "heldout_question_about_protocol", "reply": "If I type confirm, will you save it immediately? I'm asking how this works.", "pending": true, "expected_label": "unrelated_or_unclear"},
+    {"id": "heldout_mixed_no", "reply": "Yes the text looks good, but no, do not add it to the database.", "pending": true, "expected_label": "deny_save"},
+    {"id": "heldout_need_to_check", "reply": "That sounds about right but I need to check the sample count before approving.", "pending": true, "expected_label": "draft_only"},
+    {"id": "heldout_quoted_cancellation", "reply": "The words 'go ahead and save' are an example for testing. Cancel the pending save.", "pending": true, "expected_label": "deny_save"},
+    {"id": "heldout_correct_count_first", "reply": "Approved except the count is 12, not 24. Show me the corrected draft before recording it.", "pending": true, "expected_label": "revise_draft"},
+    {"id": "no_pending_action", "reply": "looks good please save", "pending": false, "expected_label": null}
+  ]
+}

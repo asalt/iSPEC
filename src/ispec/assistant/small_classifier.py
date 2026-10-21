@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -77,7 +78,7 @@ _SMALL_CLASSIFIER_TASKS: dict[str, SmallClassifierTaskSpec] = {
             "focused_project_id",
         ),
         binding_callable=_project_comment_approval_prompt,
-        max_tokens=96,
+        max_tokens=160,
         temperature=0.0,
     ),
     "save_reply_interpretation": SmallClassifierTaskSpec(
@@ -156,6 +157,12 @@ def normalize_small_classifier_decision(
     label = str(decision.get("label") or "").strip()
     if label not in task.labels:
         return None
+    if task_name == "project_comment_approval":
+        raw = decision.get("confidence")
+        if (isinstance(raw, bool) or not isinstance(raw, (int, float))
+                or not math.isfinite(raw) or not 0 <= raw <= 1
+                or not isinstance(decision.get("reason"), str)):
+            return None
     try:
         confidence = float(decision.get("confidence") or 0.0)
     except Exception:

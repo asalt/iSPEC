@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Callable, Literal
 
 from ispec.assistant.context import extract_project_ids
@@ -40,7 +41,7 @@ _PENDING_TOOL = "create_project_comment"
 class ProjectCommentApprovalSettings:
     mode: ApprovalMode
     timeout_ms: int = 6000
-    approve_threshold: float = 0.80
+    approve_threshold: float = 0.75
     decision_threshold: float = 0.60
     ticket_ttl_seconds: int = 120
 
@@ -62,7 +63,7 @@ class ProjectCommentApprovalSettings:
             timeout_ms=_int_env("ISPEC_ASSISTANT_PROJECT_COMMENT_APPROVAL_TIMEOUT_MS", default=6000, low=500, high=30_000),
             approve_threshold=_float_env(
                 "ISPEC_ASSISTANT_PROJECT_COMMENT_APPROVAL_APPROVE_THRESHOLD",
-                default=0.80,
+                default=0.75,
                 low=0.0,
                 high=1.0,
             ),
@@ -256,6 +257,47 @@ class ProjectCommentWriteTicket:
             "single_use": self.single_use,
             "shadow_only": self.shadow_only,
         }
+
+
+@dataclass(kw_only=True)
+class ProjectCommentAuthorization:
+    """Server-created, request-local authorization; never accepted from tool JSON."""
+
+    gate: ProjectCommentGate
+    ticket: ProjectCommentWriteTicket
+    consumed: bool = False
+    attempted_comment_hash: str | None = None
+
+    def consume(
+        self, *, project_id: int, session_id: str | None, turn_id: str | None,
+        user_message: str | None, comment: str,
+    ) -> str | None:
+        from ispec.assistant.models import utcnow
+
+        ticket, gate = self.ticket, self.gate
+        if self.consumed:
+            return "Project-comment approval was already used in this turn."
+        if not gate.eligible or not ticket.issued or ticket.shadow_only:
+            return "No live project-comment approval; ask whether to save, revise, or cancel."
+        if (
+            ticket.tool_name != _PENDING_TOOL or gate.pending_tool != _PENDING_TOOL
+            or project_id != ticket.project_id or project_id != gate.project_id
+            or not session_id or session_id != ticket.session_id or session_id != gate.session_id
+            or not turn_id or turn_id != ticket.current_turn_id or turn_id != gate.current_turn_id
+            or not ticket.thread_key or ticket.thread_key != gate.thread_key
+            or ticket.pending_draft_hash != gate.pending_draft_hash
+            or stable_hash(user_message) != gate.source_message_hash
+        ):
+            return "Project-comment approval does not match this project/conversation/turn."
+        try:
+            if not ticket.expires_at or utcnow() >= datetime.fromisoformat(ticket.expires_at):
+                return "Project-comment approval expired; ask for confirmation again."
+        except (TypeError, ValueError):
+            return "Invalid project-comment approval expiry."
+        # Consume before the DB attempt, including failures: never retry an uncertain write.
+        self.consumed = True
+        self.attempted_comment_hash = stable_hash(comment)
+        return None
 
 
 def _int_env(key: str, *, default: int, low: int, high: int) -> int:
@@ -469,6 +511,12 @@ def build_project_comment_gate(
     if not isinstance(focused_project_id, int) or focused_project_id <= 0:
         return ProjectCommentGate(eligible=False, kind="none", reason="missing_project_id", **base)
     if isinstance(awaiting_reply_state, dict):
+        if settings.mode == "own" and (
+            awaiting_reply_state.get("project_id") != focused_project_id
+            or awaiting_reply_state.get("pending_tool") != _PENDING_TOOL
+            or not base["pending_draft_hash"]
+        ):
+            return ProjectCommentGate(eligible=False, kind="none", reason="pending_state_mismatch", **base)
         return ProjectCommentGate(eligible=True, kind="pending_save_confirmation", reason="awaiting_project_comment_save_confirmation", **base)
     if trigger.kind in {"explicit_save", "direct_note_request"}:
         return ProjectCommentGate(eligible=True, kind="direct_write_candidate", reason="project_comment_write_candidate", **base)
@@ -492,6 +540,7 @@ def run_project_comment_approval_classifier(
 ) -> ProjectCommentClassifierResult:
     if not gate.eligible:
         return ProjectCommentClassifierResult.empty(timeout_ms=settings.timeout_ms)
+    started = time.monotonic()
     try:
         prepared = build_small_classifier_task(
             "project_comment_approval",
@@ -525,7 +574,7 @@ def run_project_comment_approval_classifier(
             "project_comment_approval",
             parsed if isinstance(parsed, dict) else None,
         )
-        if decision is None:
+        if decision is None or latency_ms > settings.timeout_ms:
             return ProjectCommentClassifierResult(
                 ran=True,
                 ok=False,
@@ -536,7 +585,8 @@ def run_project_comment_approval_classifier(
                 model=reply.model,
                 latency_ms=latency_ms,
                 timeout_ms=settings.timeout_ms,
-                error=reply.error or "invalid_classifier_json",
+                error=("classifier_timeout" if latency_ms > settings.timeout_ms
+                       else reply.error or "invalid_classifier_json"),
             )
         return ProjectCommentClassifierResult(
             ran=True,
@@ -559,7 +609,7 @@ def run_project_comment_approval_classifier(
             reason="",
             provider=None,
             model=None,
-            latency_ms=0,
+            latency_ms=int((time.monotonic() - started) * 1000),
             timeout_ms=settings.timeout_ms,
             error=f"{type(exc).__name__}: {exc}",
         )
@@ -583,14 +633,17 @@ def decide_project_comment_policy(
     else:
         label = str(classifier.label or "")
         confidence = float(classifier.confidence or 0.0)
-        if trigger.command_protocol == "explicit_deny":
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            policy_decision = "classifier_unavailable"
+            reasons.append("invalid_confidence")
+        elif trigger.command_protocol == "explicit_deny" and settings.mode != "own":
             policy_decision = "no_ticket"
             reasons.append("explicit_command_protocol_deny")
         elif confidence < float(settings.decision_threshold):
             policy_decision = "ask_explicit_confirmation"
             reasons.append("confidence_below_decision_threshold")
         elif label == "approve_save" and confidence >= float(settings.approve_threshold):
-            policy_decision = "shadow_ticket"
+            policy_decision = "write_ticket" if settings.mode == "own" else "shadow_ticket"
             issued = True
             reasons.append("approve_save_above_threshold")
         elif label == "approve_save":
@@ -625,7 +678,7 @@ def decide_project_comment_policy(
     return (
         ProjectCommentPolicyDecision(
             decision=policy_decision,
-            live_applied=False,
+            live_applied=settings.mode == "own" and gate.eligible,
             approve_threshold=float(settings.approve_threshold),
             decision_threshold=float(settings.decision_threshold),
             reasons=tuple(reasons),
@@ -644,7 +697,7 @@ def decide_project_comment_policy(
             expires_at=expires_at,
             ttl_seconds=int(settings.ticket_ttl_seconds),
             single_use=True,
-            shadow_only=True,
+            shadow_only=settings.mode != "own",
         ),
     )
 
