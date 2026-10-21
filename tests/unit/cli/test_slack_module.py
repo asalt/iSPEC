@@ -133,7 +133,7 @@ def test_session_id_for_dm_rotates_by_utc_day_bucket() -> None:
         now=datetime(2026, 4, 2, 23, 59, tzinfo=UTC),
     )
 
-    assert session_id == "slack:T123:D456:dm24:20260402"
+    assert session_id == "slack:T123:D456:dm24:20260402:root"
 
 
 def test_thread_session_id_stays_thread_scoped() -> None:
@@ -224,8 +224,9 @@ def test_send_slack_text_resolves_email_to_dm_and_posts(monkeypatch) -> None:
         "users.lookupByEmail",
         "conversations.open",
         "chat.postMessage",
+        "auth.test",
     ]
-    assert calls[-1]["json"] == {"channel": "D123", "text": "hello by email"}
+    assert calls[-2]["json"] == {"channel": "D123", "text": "hello by email"}
 
 
 def test_upload_slack_file_dry_run_resolves_file_and_alias(monkeypatch, tmp_path) -> None:
@@ -307,6 +308,7 @@ def test_upload_slack_file_uses_external_upload_flow(monkeypatch, tmp_path) -> N
         "files.getUploadURLExternal",
         "abc",
         "files.completeUploadExternal",
+        "auth.test",
     ]
     assert calls[1]["json"] is None
     assert calls[1]["data"]["filename"] == "report.txt"

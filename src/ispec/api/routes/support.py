@@ -6,9 +6,12 @@ import re
 import json
 import time
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from ispec.assistant.slack_outbound import outbound_context_message
+from ispec.assistant.slack_thread_context import SlackThreadContext, render_thread_context
+from ispec.assistant.slack_participants import render_participant_mentions
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -42,6 +45,7 @@ from ispec.assistant.project_comment_approval import (
     project_comment_write_outcome as _project_comment_write_outcome,
     run_project_comment_approval_classifier,
 )
+from ispec.assistant.reply_delivery import RETAINED_REPLY, ReplyRetention
 from ispec.assistant.reply_interpretation import interpret_reply_for_project_comment_save
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
@@ -422,6 +426,8 @@ class ChatResponse(BaseModel):
     messageId: int | None = None
     message: str | None = None
     compare: ChatComparePayload | None = None
+    responseStatus: Literal["ok", "unavailable"] = "ok"
+    retention: ReplyRetention | None = None
 
 
 class ChooseResponse(ChatResponse):
@@ -1351,7 +1357,10 @@ def _wait_for_queued_chat_response(
         if time.monotonic() >= deadline:
             raise HTTPException(
                 status_code=504,
-                detail=f"Timed out waiting for queued chat command {command_id}.",
+                detail={
+                    "responseStatus": "unavailable",
+                    "retention": ReplyRetention(storage="agent_command", recordId=command_id).model_dump(),
+                },
             )
         time.sleep(max(0.1, float(poll_seconds)))
 
@@ -1523,6 +1532,9 @@ def chat(
     max_tokens = _max_prompt_tokens()
     assistant_provider = _assistant_provider()
 
+    slack_thread_context = SlackThreadContext.from_meta(payload.meta)
+    slack_thread_prompt = render_thread_context(slack_thread_context, max_tokens=min(2400, max_tokens // 2))
+
     tool_protocol = _tool_protocol()
     max_tool_calls = _max_tool_calls()
     used_tool_calls = 0
@@ -1591,6 +1603,7 @@ def chat(
                 "available_write_tools": available_write_tool_names_full,
                 "awaiting_reply_state": awaiting_reply_state,
                 "ui": ui_payload or {},
+                **({"quoted_slack_thread": list(slack_thread_prompt.messages)} if slack_thread_prompt.messages else {}),
             },
         )
         turn_decision_runtime_applied = bool(
@@ -1817,6 +1830,7 @@ def chat(
                 user_message=payload.message,
                 groups=groups,
                 generate_reply_fn=generate_reply,
+                **({"context_messages": slack_thread_prompt.messages} if slack_thread_prompt.messages else {}),
             )
             tool_router = {
                 "ok": bool(router_reply.ok),
@@ -1996,6 +2010,12 @@ def chat(
             {"role": "user", "content": payload.message},
         ]
         tokens = estimate_tokens_for_messages(base_messages)
+        recent_exchange = [{"role": row.role, "content": row.content} for row in history_rows[-2:]]
+        budget_thread_prompt = render_thread_context(
+            slack_thread_context,
+            max_tokens=max(0, max_tokens - tokens - estimate_tokens_for_messages(recent_exchange)),
+        )
+        tokens += estimate_tokens_for_messages(budget_thread_prompt.messages)
 
         selected_rev: list[SupportMessage] = []
         for row in reversed(history_rows):
@@ -2031,6 +2051,8 @@ def chat(
         for row in selected_history
         if row.role in {"user", "assistant", "system"} and row.content
     ]
+    # Quoted delivery evidence is not input to approval/tool-selection predicates.
+    history_payload = outbound_context_message(payload.meta) + history_payload
     last_assistant_text = next(
         (
             str(item.get("content") or "")
@@ -2295,6 +2317,14 @@ def chat(
         ]
         tokens = estimate_tokens_for_messages(base_messages)
         trimmed_rev: list[dict[str, Any]] = []
+        # Keep the recent exchange (including a pending draft), then thread
+        # evidence, before spending the remaining budget on older history.
+        recent_exchange = [{"role": row.role, "content": row.content} for row in selected_history[-2:]]
+        round_thread_prompt = render_thread_context(
+            slack_thread_context,
+            max_tokens=max(0, max_tokens - tokens - estimate_tokens_for_messages(recent_exchange)),
+        )
+        tokens += estimate_tokens_for_messages(round_thread_prompt.messages)
         for item in reversed(history_payload):
             message_tokens = estimate_tokens_for_messages([item])
             if tokens + message_tokens > max_tokens:
@@ -2302,7 +2332,7 @@ def chat(
             tokens += message_tokens
             trimmed_rev.append(item)
         trimmed_history = list(reversed(trimmed_rev))
-        history_for_llm = trimmed_history
+        history_for_llm = trimmed_history + list(round_thread_prompt.messages)
 
         messages_for_llm: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -2315,6 +2345,7 @@ def chat(
             *reply_interpretation_policy_messages,
             *comment_intent_messages,
             *trimmed_history,
+            *round_thread_prompt.messages,
             {"role": "user", "content": payload.message},
             *tool_messages,
         ]
@@ -2336,6 +2367,7 @@ def chat(
             "tools_count": tool_schemas_count if tools_for_call is not None else 0,
             "tool_choice": effective_tool_choice,
             "history_messages": len(trimmed_history),
+            "slack_thread_context": round_thread_prompt.metadata,
             "tool_messages": len(tool_messages),
             "prompt_family": system_prompt_observability.get("prompt_family"),
             "prompt_version_num": system_prompt_observability.get("prompt_version_num"),
@@ -2701,7 +2733,7 @@ def chat(
         trace_step["executed_tools"] = [tool_name]
 
     if reply is None:
-        history_for_llm = history_payload
+        history_for_llm = history_payload + list(round_thread_prompt.messages)
         reply = generate_reply(
             messages=[
                 {"role": "system", "content": answer_prompt.text},
@@ -2710,6 +2742,7 @@ def chat(
                 *project_comment_write_policy_messages,
                 *reply_interpretation_policy_messages,
                 *history_payload,
+                *round_thread_prompt.messages,
                 {"role": "user", "content": payload.message},
                 *tool_messages,
                 {"role": "system", "content": f"{TOOL_CALL_PREFIX} limit exceeded; answer without tools."},
@@ -2971,6 +3004,7 @@ def chat(
         }
     meta["context"] = {
         "history_messages_used": len(history_payload),
+        "slack_thread_context": slack_thread_prompt.metadata,
         "used_conversation_memory": bool(state_for_context.get("conversation_memory")),
         "used_conversation_summary": bool(state_for_context.get("conversation_summary")),
         "context_state_keys": sorted(state_for_context.keys()),
@@ -3106,6 +3140,12 @@ def chat(
             ),
         )
 
+    if not final_reply.ok:
+        assistant_content = RETAINED_REPLY
+
+    if slack_thread_context is not None:
+        assistant_content = render_participant_mentions(assistant_content, slack_thread_context.participants)
+
     assistant_message = SupportMessage(
         session_pk=session.id,
         role="assistant",
@@ -3156,10 +3196,19 @@ def chat(
         session.state_json = _dump_state(state)
         assistant_db.flush()
 
+    retention = None
+    if not final_reply.ok:
+        # A flush/assigned ID is not proof of durable retention. Do not return
+        # the acknowledgement if this commit fails.
+        assistant_db.commit()
+        retention = ReplyRetention(storage="support_message", recordId=int(user_message.id))
+
     return ChatResponse(
         sessionId=session.session_id,
         messageId=int(assistant_message.id),
         message=assistant_message.content,
+        responseStatus="ok" if final_reply.ok else "unavailable",
+        retention=retention,
     )
 
 

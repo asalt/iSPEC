@@ -20,6 +20,14 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from ispec.slack_delivery import log_delivery
+from ispec.assistant.slack_inbox import SlackInbox, load_capture_channels
+from ispec.assistant.slack_participants import MAX_PARTICIPANTS, USER_MENTION, SlackParticipant
+
+from ispec.assistant.reply_delivery import (
+    SlackEventClaims,
+    chat_reply_text,
+)
 
 from ispec.assistant.slack_tmux_bridge import (
     BRIDGE_AGENT_ID,
@@ -31,7 +39,6 @@ from ispec.logging import get_logger
 
 logger = get_logger(__name__)
 
-_MENTION_RE = re.compile(r"<@[^>]+>")
 _CHOOSE_RE = re.compile(r"^\s*choose\s+([01])\s*$", re.IGNORECASE)
 _ASSISTANT_SLACK_DESTINATIONS_PATH_ENV = "ISPEC_ASSISTANT_SLACK_DESTINATIONS_PATH"
 _ASSISTANT_SLACK_DESTINATIONS_JSON_ENVS = (
@@ -42,6 +49,9 @@ _ASSISTANT_SLACK_DESTINATIONS_DEFAULT_FILENAME = "assistant-slack-destinations.l
 
 
 def register_subcommands(subparsers) -> None:
+    from ispec.cli.slack_inbox import register as register_inbox
+
+    register_inbox(subparsers)
     run_parser = subparsers.add_parser("run", help="Run the Slack bot (Socket Mode)")
     run_parser.add_argument(
         "--ispec-server",
@@ -153,6 +163,11 @@ def register_subcommands(subparsers) -> None:
 
 
 def dispatch(args) -> None:
+    if args.subcommand == "inbox":
+        from ispec.cli.slack_inbox import dispatch as dispatch_inbox
+
+        dispatch_inbox(args)
+        return
     if args.subcommand == "run":
         _run_socket_mode(args)
         return
@@ -187,7 +202,6 @@ def _clean_slack_text(text: str, *, bot_user_id: str | None) -> str:
         return ""
     if bot_user_id:
         raw = raw.replace(f"<@{bot_user_id}>", "")
-    raw = _MENTION_RE.sub("", raw)
     return raw.strip()
 
 
@@ -214,7 +228,8 @@ def _dm_day_bucket(now: datetime | None = None) -> str:
 
 def _session_id_for_dm(*, team_id: str | None, channel: str, now: datetime | None = None) -> str:
     safe_team = team_id or "unknown"
-    return f"slack:{safe_team}:{channel}:dm24:{_dm_day_bucket(now)}"
+    # Do not reuse older daily sessions that mixed root messages with threads.
+    return f"slack:{safe_team}:{channel}:dm24:{_dm_day_bucket(now)}:root"
 
 
 def _pending_key(*, channel: str, thread_ts: str | None) -> str:
@@ -260,7 +275,7 @@ def _slack_user_summary(
     summary: dict[str, str] = {"user_id": user_id}
     try:
         info = client.users_info(user=user_id)
-        user_obj = info.get("user") if isinstance(info, dict) else None
+        user_obj = info.get("user")  # SlackResponse supports .get(), but is not a dict.
         if isinstance(user_obj, dict):
             name = str(user_obj.get("name") or "").strip()
             if name:
@@ -302,6 +317,31 @@ def _format_message_for_ispec(*, text: str, slack_user: dict[str, str] | None) -
     return f"[{speaker}] {text}" if speaker else text
 
 
+def _slack_participant_map(*, client, user_cache, meta, text) -> list[dict[str, str]]:
+    """Resolve current/thread authors and actual mentions; no workspace-wide fetch."""
+    ids = [str(meta.get("slack", {}).get("user_id") or "")]
+    ids.extend(USER_MENTION.findall(text))
+    thread = meta.get("slack_thread_context") or {}
+    for row in thread.get("messages", []):
+        ids.append(str(row.get("user_id") or ""))
+        ids.extend(USER_MENTION.findall(str(row.get("text") or "")))
+    # Plain names can reuse profiles already encountered in this receiver process.
+    for user_id, person in list(user_cache.items()):
+        names = (person.get(key) for key in ("user_name", "user_display_name", "user_real_name"))
+        if any(name and re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", text, re.I) for name in names):
+            ids.append(user_id)
+    participants = []
+    valid_ids = (uid for uid in dict.fromkeys(ids) if re.fullmatch(r"[UW][A-Z0-9]{1,79}", uid))
+    for user_id in list(valid_ids)[:MAX_PARTICIPANTS]:
+        summary = _slack_user_summary(client=client, user_cache=user_cache, user_id=user_id)
+        participant = SlackParticipant(**{
+            key: str(summary.get(key) or "")[:100 if key != "user_id" else 80]
+            for key in SlackParticipant.model_fields
+        })
+        participants.append(participant.model_dump())
+    return participants
+
+
 def _post_ispec_chat(
     *,
     server: str,
@@ -311,6 +351,21 @@ def _post_ispec_chat(
     meta: dict[str, Any] | None,
     timeout_seconds: int,
 ) -> dict[str, Any]:
+    meta = dict(meta or {})
+    meta.pop("slack_outbound_context", None)
+    scope = meta.get("slack")
+    if isinstance(scope, dict) and api_key:
+        try:
+            context_response = requests.post(
+                server.rstrip("/") + "/api/agents/slack/outbound-context",
+                json=scope, headers=_headers(api_key), timeout=min(5, max(1, timeout_seconds)),
+            )
+            context_response.raise_for_status()
+            meta["slack_outbound_context"] = context_response.json().get("messages", [])
+            meta["slack_outbound_context_status"] = "loaded"
+        except Exception as exc:
+            meta["slack_outbound_context_status"] = "unavailable"
+            logger.warning("Slack outbound context unavailable error_type=%s", type(exc).__name__)
     url = server.rstrip("/") + "/api/support/chat"
     resp = requests.post(
         url,
@@ -746,7 +801,13 @@ def send_slack_text(
         if response.get("ok") is not True:
             return {"ok": False, "error": error, "resolved": resolved, "slack": response}
 
-    return {"ok": True, "resolved": resolved, "slack": response}
+    retention = log_delivery(
+        response=response, channel=resolved["channel"], text=message_text,
+        thread_ts=thread_ts, recipient_id=resolved.get("user_id"), source="slack_cli.send",
+        lookup_identity=lambda: _slack_direct_api_call(token=token, endpoint="auth.test", payload={}, timeout_seconds=5),
+        secrets=(token,),
+    )
+    return {"ok": True, "resolved": resolved, "slack": response, "retention": retention}
 
 
 def _slack_upload_max_bytes() -> int:
@@ -905,13 +966,15 @@ def upload_slack_file(
             "slack": complete_response,
         }
 
-    return {
-        "ok": True,
-        "resolved": resolved,
-        "file": file_info,
-        "file_id": file_id,
-        "slack": complete_response,
-    }
+    retention = log_delivery(
+        response=complete_response, channel=resolved["channel"], text=text,
+        thread_ts=thread_ts, recipient_id=resolved.get("user_id"), source="slack_cli.upload",
+        attachments=[{**file_info, "file_id": file_id, "title": title}],
+        lookup_identity=lambda: _slack_direct_api_call(token=token, endpoint="auth.test", payload={}, timeout_seconds=5),
+        secrets=(token,),
+    )
+    return {"ok": True, "resolved": resolved, "file": file_info,
+            "file_id": file_id, "slack": complete_response, "retention": retention}
 
 
 def _message_text_from_args(args) -> str:
@@ -1091,8 +1154,12 @@ def _run_socket_mode(args) -> None:
 
     pending_compare: dict[str, dict[str, Any]] = {}
     user_cache: dict[str, dict[str, str]] = {}
+    event_claims = SlackEventClaims()
+    inbox = SlackInbox(channels=load_capture_channels(os.getenv("ISPEC_SLACK_INBOX_CONFIG")))
+    logger.info("Slack durable inbox ready passive_channels=%s", len(inbox.channels))
 
     app = App(token=cfg.bot_token)
+    app.middleware(inbox.middleware)
 
     api_key_fingerprint = ""
     if cfg.api_key:
@@ -1159,9 +1226,9 @@ def _run_socket_mode(args) -> None:
     @app.error
     def _on_slack_error(error, body, logger):  # type: ignore[no-untyped-def]
         try:
-            logger.exception("Slack handler error: %s body=%s", error, body)
+            logger.error("Slack handler failed error_type=%s", type(error).__name__)
         except Exception:
-            logger.exception("Slack handler error: %s", error)
+            logger.error("Slack handler failed")
 
     @app.event("app_home_opened")
     def _on_app_home_opened(event, body, logger, ack):  # type: ignore[no-untyped-def]
@@ -1189,11 +1256,20 @@ def _run_socket_mode(args) -> None:
     def _on_file_shared(event, logger, ack):  # type: ignore[no-untyped-def]
         _ack_ignored_slack_event(event_name="file_shared", event=event, ack=ack, logger=logger)
 
+    @app.event("file_deleted")
+    def _on_file_deleted(event, logger, ack):  # type: ignore[no-untyped-def]
+        _ack_ignored_slack_event(event_name="file_deleted", event=event, ack=ack, logger=logger)
+
     @app.event("reaction_added")
     def _on_reaction_added(event, logger, ack):  # type: ignore[no-untyped-def]
         _ack_ignored_slack_event(event_name="reaction_added", event=event, ack=ack, logger=logger)
 
+    @app.event("reaction_removed")
+    def _on_reaction_removed(event, logger, ack):  # type: ignore[no-untyped-def]
+        _ack_ignored_slack_event(event_name="reaction_removed", event=event, ack=ack, logger=logger)
+
     @app.event("app_mention")
+    @inbox.handler
     def _on_mention(event, say, context, client, ack):  # type: ignore[no-untyped-def]
         try:
             ack()
@@ -1211,9 +1287,15 @@ def _run_socket_mode(args) -> None:
             return
 
         team_id = context.get("team_id")
-        session_id = _session_id(team_id=team_id, channel=channel, thread_ts=thread_ts)
+        if event.get("channel_type") in {"im", "mpim"} and not event.get("thread_ts"):
+            session_id = _session_id_for_dm(team_id=team_id, channel=channel)
+            thread_ts = None
+        else:
+            session_id = _session_id(team_id=team_id, channel=channel, thread_ts=thread_ts)
 
         text = _clean_slack_text(str(event.get("text") or ""), bot_user_id=context.get("bot_user_id"))
+        if not inbox.claim(context, fallback=event_claims, team_id=team_id, event=event, route="reply"):
+            return
         if not text:
             _safe_say(
                 say=say,
@@ -1230,6 +1312,7 @@ def _run_socket_mode(args) -> None:
         message_for_ispec = _format_message_for_ispec(text=text, slack_user=slack_user)
         meta: dict[str, Any] = {
             "source": "slack",
+            "slack_inbox_id": context.get("slack_inbox_id"),
             "slack": {
                 "event": "app_mention",
                 "team_id": team_id,
@@ -1244,6 +1327,10 @@ def _run_socket_mode(args) -> None:
             },
         }
 
+        meta["slack_thread_context"] = inbox.thread_context(meta)
+        meta["slack_participants"] = _slack_participant_map(
+            client=client, user_cache=user_cache, meta=meta, text=text,
+        )
         logger.info(
             "Slack app_mention channel=%s thread_ts=%s user=%s text=%r",
             channel,
@@ -1280,33 +1367,20 @@ def _run_socket_mode(args) -> None:
                             choice_index=choice_index,
                             timeout_seconds=cfg.timeout_seconds,
                         )
-                    except requests.HTTPError as exc:
-                        body = ""
-                        try:
-                            body = exc.response.text if exc.response is not None else ""
-                        except Exception:
-                            body = ""
-                        _send_or_update(
-                            say=say,
-                            client=client,
-                            channel=channel,
-                            thread_ts=thread_ts,
-                            pending_ts=pending_reply_ts,
-                            text=f"iSPEC API error: {exc}\n{body}".strip(),
-                        )
-                        return
                     except Exception as exc:
+                        logger.warning("iSPEC reply request failed error_type=%s", type(exc).__name__)
                         _send_or_update(
                             say=say,
                             client=client,
                             channel=channel,
                             thread_ts=thread_ts,
                             pending_ts=pending_reply_ts,
-                            text=f"iSPEC API call failed: {exc}",
+                            text=inbox.failed_reply(context, exc),
                         )
                         return
                     pending_compare.pop(key, None)
-                    message = str(payload.get("message") or "").strip()
+                    inbox.backend_result(context, payload)
+                    message = chat_reply_text(payload)
                     if message:
                         _send_or_update(
                             say=say,
@@ -1341,34 +1415,21 @@ def _run_socket_mode(args) -> None:
                 meta=meta,
                 timeout_seconds=cfg.timeout_seconds,
             )
-        except requests.HTTPError as exc:
-            body = ""
-            try:
-                body = exc.response.text if exc.response is not None else ""
-            except Exception:
-                body = ""
-            _send_or_update(
-                say=say,
-                client=client,
-                channel=channel,
-                thread_ts=thread_ts,
-                pending_ts=pending_reply_ts,
-                text=f"iSPEC API error: {exc}\n{body}".strip(),
-            )
-            return
         except Exception as exc:
+            logger.warning("iSPEC reply request failed error_type=%s", type(exc).__name__)
             _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=thread_ts,
                 pending_ts=pending_reply_ts,
-                text=f"iSPEC API call failed: {exc}",
+                text=inbox.failed_reply(context, exc),
             )
             return
 
+        inbox.backend_result(context, payload)
         compare = payload.get("compare") if isinstance(payload.get("compare"), dict) else None
-        message = str(payload.get("message") or "").strip()
+        message = chat_reply_text(payload)
         if compare is not None:
             key = _pending_key(channel=channel, thread_ts=thread_ts)
             pending_compare[key] = {
@@ -1405,6 +1466,7 @@ def _run_socket_mode(args) -> None:
         )
 
     @app.event("message")
+    @inbox.handler
     def _on_message(event, say, client, context, ack):  # type: ignore[no-untyped-def]
         """Handle DMs and thread followups (choose 0/1)."""
 
@@ -1424,6 +1486,14 @@ def _run_socket_mode(args) -> None:
 
         raw_text = _unescape_slack_text(str(event.get("text") or ""))
         if not raw_text:
+            return
+
+        # Channel mentions have their own handler; do not also route them as
+        # artifact replies. Bot/subtype messages were already ignored above.
+        bot_user_id = str(context.get("bot_user_id") or "")
+        if channel_type not in {"im", "mpim"} and bot_user_id and f"<@{bot_user_id}>" in raw_text:
+            return
+        if not inbox.claim(context, fallback=event_claims, team_id=team_id, event=event, route="reply"):
             return
 
         thread_ts_raw = str(event.get("thread_ts") or "")
@@ -1457,34 +1527,21 @@ def _run_socket_mode(args) -> None:
                             choice_index=choice_index,
                             timeout_seconds=cfg.timeout_seconds,
                         )
-                    except requests.HTTPError as exc:
-                        body = ""
-                        try:
-                            body = exc.response.text if exc.response is not None else ""
-                        except Exception:
-                            body = ""
-                        _send_or_update(
-                            say=say,
-                            client=client,
-                            channel=channel,
-                            thread_ts=reply_thread,
-                            pending_ts=pending_reply_ts,
-                            text=f"iSPEC API error: {exc}\n{body}".strip(),
-                        )
-                        return
                     except Exception as exc:
+                        logger.warning("iSPEC reply request failed error_type=%s", type(exc).__name__)
                         _send_or_update(
                             say=say,
                             client=client,
                             channel=channel,
                             thread_ts=reply_thread,
                             pending_ts=pending_reply_ts,
-                            text=f"iSPEC API call failed: {exc}",
+                            text=inbox.failed_reply(context, exc),
                         )
                         return
 
                     pending_compare.pop(pending_key, None)
-                    message = str(payload.get("message") or "").strip()
+                    inbox.backend_result(context, payload)
+                    message = chat_reply_text(payload)
                     if message:
                         _send_or_update(
                             say=say,
@@ -1537,7 +1594,10 @@ def _run_socket_mode(args) -> None:
         if channel_type not in {"im", "mpim"}:
             return
 
-        session_id = _session_id_for_dm(team_id=team_id, channel=channel)
+        session_id = (
+            _session_id(team_id=team_id, channel=channel, thread_ts=thread_ts_raw)
+            if thread_ts_raw else _session_id_for_dm(team_id=team_id, channel=channel)
+        )
         logger.info(
             "Slack DM message channel=%s user=%s text=%r",
             channel,
@@ -1548,6 +1608,7 @@ def _run_socket_mode(args) -> None:
         message_for_ispec = _format_message_for_ispec(text=raw_text, slack_user=cached)
         meta: dict[str, Any] = {
             "source": "slack",
+            "slack_inbox_id": context.get("slack_inbox_id"),
             "slack": {
                 "event": "dm",
                 "team_id": team_id,
@@ -1561,6 +1622,10 @@ def _run_socket_mode(args) -> None:
                 "user_real_name": cached.get("user_real_name"),
             },
         }
+        meta["slack_thread_context"] = inbox.thread_context(meta)
+        meta["slack_participants"] = _slack_participant_map(
+            client=client, user_cache=user_cache, meta=meta, text=raw_text,
+        )
         pending_reply_ts = _safe_slack_post_message(
             client=client,
             channel=channel,
@@ -1577,34 +1642,21 @@ def _run_socket_mode(args) -> None:
                 meta=meta,
                 timeout_seconds=cfg.timeout_seconds,
             )
-        except requests.HTTPError as exc:
-            body = ""
-            try:
-                body = exc.response.text if exc.response is not None else ""
-            except Exception:
-                body = ""
-            _send_or_update(
-                say=say,
-                client=client,
-                channel=channel,
-                thread_ts=reply_thread,
-                pending_ts=pending_reply_ts,
-                text=f"iSPEC API error: {exc}\n{body}".strip(),
-            )
-            return
         except Exception as exc:
+            logger.warning("iSPEC reply request failed error_type=%s", type(exc).__name__)
             _send_or_update(
                 say=say,
                 client=client,
                 channel=channel,
                 thread_ts=reply_thread,
                 pending_ts=pending_reply_ts,
-                text=f"iSPEC API call failed: {exc}",
+                text=inbox.failed_reply(context, exc),
             )
             return
 
+        inbox.backend_result(context, payload)
         compare = payload.get("compare") if isinstance(payload.get("compare"), dict) else None
-        message = str(payload.get("message") or "").strip()
+        message = chat_reply_text(payload)
         if compare is not None:
             pending_compare[pending_key] = {
                 "session_id": session_id,

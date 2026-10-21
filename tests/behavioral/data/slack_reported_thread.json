@@ -1,0 +1,13 @@
+{
+  "description": "Synthetic paraphrase of the oocyte/1131 reporting thread; no Slack sends or project writes.",
+  "messages": [
+    {"user": "UREVIEWER", "text": "Could we get an update on the last oocyte data?"},
+    {"user": "USTAFF", "text": "1131 new sets? They are uploaded and shared."},
+    {"user": "UREVIEWER", "text": "With the collaborator? I did not see the email."},
+    {"user": "USTAFF", "text": "I sent it Saturday; I can forward it."},
+    {"user": "UREVIEWER", "text": "Please do; I need to discuss it with them."},
+    {"user": "UANALYST", "text": "Did we also report BioID data? I see only prof."},
+    {"user": "USTAFF", "text": "BioID is there too; I left it out of the email."}
+  ],
+  "request": "make a note these were reported"
+}

@@ -254,5 +254,9 @@ def test_support_chat_self_review_skips_when_llm_returns_error(tmp_path, db_sess
                 user=None,
             )
 
-        assert response.message == "Assistant error: HTTPError: 400 Bad Request"
+        from ispec.assistant.reply_delivery import RETAINED_REPLY
+
+        assert response.message == RETAINED_REPLY
+        assert response.responseStatus == "unavailable"
+        assert response.retention.storage == "support_message"
         assert len(calls) == 1

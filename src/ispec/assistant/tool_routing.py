@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
@@ -254,6 +253,7 @@ def route_tool_groups_vllm(
     user_message: str,
     groups: list[ToolGroup],
     generate_reply_fn: Callable[..., AssistantReply],
+    context_messages: tuple[dict, ...] = (),
 ) -> tuple[dict[str, Any] | None, AssistantReply]:
     """Route a user request to a tool group using vLLM guided JSON output."""
 
@@ -265,6 +265,7 @@ def route_tool_groups_vllm(
     )
     router_messages = [
         {"role": "system", "content": prompt.text},
+        *context_messages,
         {"role": "user", "content": f'User request: "{user_message}"'},
     ]
     reply = generate_reply_fn(
