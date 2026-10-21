@@ -1,12 +1,14 @@
 # Agent Progress Summary (Local Dev Agent + Supervisor + Queue + Inference Broker)
 
-Last updated: 2026-03-06
+Last updated: 2026-10-01
 
 This document is a continuity anchor for ongoing work on iSPEC’s local agent runtime (supervisor + orchestrator + queued chat + telemetry commands). It is intentionally concise and code-referenced, so we can restart tomorrow without reloading a huge chat transcript.
 
 ## Where We Are (High Level)
 
-- The supervisor is the primary “runtime manager” process: it checks system health, owns the agent command queue, and is the single writer to the agent SQLite DB.
+- The supervisor manages scheduling and execution of the agent command queue.
+  Health checks are optional and disabled by default. API/CLI enqueue and child
+  sync processes also write the agent DB through their own short transactions.
 - Support chat can run in **queue mode** (API enqueues a command; supervisor executes it) with an inline fallback.
 - The orchestrator runs as a queued command (`orchestrator_tick_v1`) and schedules its own future ticks with backoff.
 - We added a **single-lane inference broker thread** inside the supervisor process so the main thread stays responsive while vLLM inference is in-flight.
@@ -20,7 +22,7 @@ This document is a continuity anchor for ongoing work on iSPEC’s local agent r
   - Relevant include: `src/ispec/api/main.py`
 - **Supervisor process**: long-running loop that:
   - owns agent-command scheduling/claiming/finalization
-  - owns agent DB writes (single-writer contract)
+  - owns its own main-thread bookkeeping, not all database writes across processes
   - performs health checks and periodic work
   - Relevant entry: `src/ispec/supervisor/loop.py:run_supervisor`
 
@@ -35,7 +37,11 @@ This document is a continuity anchor for ongoing work on iSPEC’s local agent r
   - Must not touch SQLite or shared state
   - Implementation: `src/ispec/supervisor/inference_broker.py`
 
-The design goal is “single writer to SQLite, single lane to the GPU,” while keeping the supervisor loop responsive to new queued commands and housekeeping.
+The inference thread does not write shared state. This is a per-process
+application convention, not a global writer-thread service: SQLite serializes
+write transactions from independent processes. See
+[relay deduplication](relay-deduplication.md) for atomic cross-process enqueue,
+and [legacy sync operations](legacy-sync-operations.md) for the CLI child worker.
 
 ## Agent Command Queue (AgentCommand)
 

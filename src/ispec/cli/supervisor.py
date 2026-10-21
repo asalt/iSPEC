@@ -12,6 +12,7 @@ import time
 from ispec.config.paths import resolve_supervisor_state_file
 from ispec.logging import get_logger
 from ispec.supervisor.loop import SupervisorConfig, _default_agent_id, run_supervisor
+from ispec.supervisor.runtime_status import observed_state, process_is_running
 from ispec.supervisor.smoke import (
     enqueue_orchestrator_tick,
     generate_smoke_session_id,
@@ -45,16 +46,7 @@ def _read_state_payload(*, logger) -> dict[str, object] | None:
 
 
 def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Process exists but we can't signal it; treat as running.
-        return True
-    return True
+    return process_is_running(pid)
 
 
 def register_subcommands(subparsers) -> None:
@@ -77,8 +69,8 @@ def register_subcommands(subparsers) -> None:
     run_parser.add_argument(
         "--interval-seconds",
         type=int,
-        default=30,
-        help="Seconds between steps (default: 30)",
+        default=300,
+        help="Seconds between optional health-check steps (default: 300; checks are off by default)",
     )
     run_parser.add_argument(
         "--timeout-seconds",
@@ -92,8 +84,14 @@ def register_subcommands(subparsers) -> None:
     status_parser.add_argument(
         "--json",
         action="store_true",
-        help="Print raw JSON state payload instead of a human summary.",
+        help="Print observed state, including recorded_status and process liveness.",
     )
+
+    worker_parser = subparsers.add_parser("sync-worker", help="Internal: execute one claimed inbound sync")
+    worker_parser.add_argument("--command-id", type=int, required=True)
+    worker_parser.add_argument("--run-id", required=True)
+    worker_parser.add_argument("--attempt", type=int, required=True)
+    worker_parser.add_argument("--worker-token", required=True)
 
     stop_parser = subparsers.add_parser("stop", help="Stop the supervisor process using its PID")
     stop_parser.add_argument(
@@ -152,16 +150,23 @@ def register_subcommands(subparsers) -> None:
 
 
 def dispatch(args) -> None:
-    if args.subcommand not in {"run", "smoke", "status", "stop"}:
+    if args.subcommand not in {"run", "smoke", "status", "stop", "sync-worker"}:
         raise SystemExit(f"Unknown supervisor subcommand: {args.subcommand}")
 
     logger = get_logger(__file__)
+
+    if args.subcommand == "sync-worker":
+        from ispec.supervisor.sync_worker import run_sync_worker
+
+        raise SystemExit(run_sync_worker(command_id=args.command_id, run_id=args.run_id,
+                                         attempt=args.attempt, worker_token=args.worker_token))
 
     if args.subcommand == "status":
         payload = _read_state_payload(logger=logger)
         if payload is None:
             logger.info("Supervisor is not running (no state file at %s).", _state_file_path())
             return
+        payload = observed_state(payload)
         if getattr(args, "json", False):
             sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
             return
@@ -178,7 +183,7 @@ def dispatch(args) -> None:
         started_at = payload.get("started_at")
         ended_at = payload.get("ended_at")
 
-        running = bool(pid_int is not None and _pid_is_running(pid_int))
+        running = payload["running"]
         logger.info(
             "Supervisor status=%s running=%s pid=%s run_id=%s agent_id=%s started_at=%s ended_at=%s",
             status,
@@ -205,7 +210,7 @@ def dispatch(args) -> None:
         if pid_int is None:
             logger.warning("Supervisor state file did not include a pid; cannot stop.")
             return
-        if not _pid_is_running(pid_int):
+        if not process_is_running(pid_int, payload.get("process_create_time")):
             logger.info("Supervisor process is already gone (pid=%s).", pid_int)
             return
 
@@ -247,7 +252,15 @@ def dispatch(args) -> None:
         interval_seconds=int(args.interval_seconds),
         timeout_seconds=float(args.timeout_seconds),
     )
-    run_id = run_supervisor(config, once=bool(args.once))
+    # SIGTERM should follow the same receipt/child cleanup path as Ctrl-C.
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt()
+
+    previous_handler = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        run_id = run_supervisor(config, once=bool(args.once))
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
     logger.info("Supervisor run_id=%s", run_id)
 
 

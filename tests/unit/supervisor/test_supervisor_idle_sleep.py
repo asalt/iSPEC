@@ -6,7 +6,37 @@ from ispec.agent.models import AgentCommand, AgentRun
 from ispec.supervisor.loop import _supervisor_dynamic_idle_sleep_seconds, utcnow
 
 
-def test_supervisor_dynamic_sleep_follows_orchestrator_idle_backoff(tmp_path, monkeypatch):
+def test_queue_poll_default_is_30_seconds(monkeypatch):
+    from ispec.supervisor.loop import _supervisor_command_poll_seconds
+
+    monkeypatch.delenv("ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS", raising=False)
+    assert _supervisor_command_poll_seconds(base_interval_seconds=300) == 30
+    monkeypatch.setenv("ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS", "45")
+    assert _supervisor_command_poll_seconds(base_interval_seconds=300) == 45
+
+
+def test_idle_wait_does_not_poll_twice_before_sleep(monkeypatch):
+    from ispec.supervisor import loop
+
+    monkeypatch.delenv("ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS", raising=False)
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(loop.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        loop.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds)
+    )
+    loop._supervisor_sleep_with_command_polling(
+        run_id="test",
+        sleep_seconds=30,
+        base_interval_seconds=300,
+        process_one_command=lambda: calls.append(clock[0]),
+    )
+    assert calls == [30.0]
+
+
+def test_supervisor_dynamic_sleep_follows_orchestrator_idle_backoff(
+    tmp_path, monkeypatch
+):
     agent_db_path = tmp_path / "agent.db"
     monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
     monkeypatch.setenv("ISPEC_SUPERVISOR_IDLE_MAX_SECONDS", "600")
@@ -138,7 +168,9 @@ def test_supervisor_dynamic_sleep_uses_base_when_checks_fail(tmp_path, monkeypat
     assert sleep_seconds == 10
 
 
-def test_supervisor_dynamic_sleep_backs_off_when_checks_keep_failing(tmp_path, monkeypatch):
+def test_supervisor_dynamic_sleep_backs_off_when_checks_keep_failing(
+    tmp_path, monkeypatch
+):
     agent_db_path = tmp_path / "agent.db"
     monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(agent_db_path))
     monkeypatch.setenv("ISPEC_SUPERVISOR_IDLE_MAX_SECONDS", "600")
@@ -164,7 +196,10 @@ def test_supervisor_dynamic_sleep_backs_off_when_checks_keep_failing(tmp_path, m
 
         sleep_seconds = _supervisor_dynamic_idle_sleep_seconds(
             run=run,
-            state_after={"checks": {"backend": {"ok": False}}, "check_failure_streak": 3},
+            state_after={
+                "checks": {"backend": {"ok": False}},
+                "check_failure_streak": 3,
+            },
             base_interval_seconds=10,
             now=now,
             db=db,

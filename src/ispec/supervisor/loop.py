@@ -91,6 +91,14 @@ from ispec.logging import get_logger
 from ispec.omics.connect import get_omics_session
 from ispec.schedule.connect import get_schedule_db_uri, get_schedule_session
 from ispec.supervisor.inference_broker import InferenceBroker, InferenceRequest
+from ispec.supervisor.sync_worker import (
+    SyncWorker,
+    launch_sync_worker,
+    reap_lost_sync_workers,
+    stop_worker,
+    worker_is_running,
+    worker_timeout_seconds,
+)
 from ispec.supervisor.sentinel import (
     build_sentinel_report,
     next_state_from_report,
@@ -1055,11 +1063,19 @@ def _claim_next_command(
     assert_main_thread("supervisor._claim_next_command")
     now = utcnow()
     with get_agent_session() as db:
+        reap_lost_sync_workers(db, agent_id=agent_id)
         query = (
             db.query(AgentCommand)
             .filter(AgentCommand.status == "queued")
             .filter(AgentCommand.available_at <= now)
         )
+        # A restarted dispatcher may encounter a still-running child from the
+        # previous run. Keep inbound sync serial without delaying relay work.
+        if db.query(AgentCommand.id).filter(
+            AgentCommand.command_type == COMMAND_LEGACY_SYNC_ALL,
+            AgentCommand.status == "running",
+        ).first() is not None:
+            query = query.filter(AgentCommand.command_type != COMMAND_LEGACY_SYNC_ALL)
         if exclude_command_types:
             query = query.filter(~AgentCommand.command_type.in_(sorted({str(x) for x in exclude_command_types if x})))
         cmd = query.order_by(AgentCommand.priority.desc(), AgentCommand.id.asc()).first()
@@ -1228,6 +1244,7 @@ def _recover_stale_running_commands(*, agent_id: str, run_id: str) -> dict[str, 
     running_total = 0
 
     with get_agent_session() as db:
+        reap_lost_sync_workers(db, agent_id=agent_id)
         running_rows = (
             db.query(AgentCommand)
             .filter(AgentCommand.status == "running")
@@ -1257,6 +1274,10 @@ def _recover_stale_running_commands(*, agent_id: str, run_id: str) -> dict[str, 
             claimed_agent_id = str(cmd.claimed_by_agent_id or "").strip()
             if claimed_agent_id and claimed_agent_id != agent_id:
                 skipped_other_agent += 1
+                continue
+
+            if worker_is_running(dict(cmd.result_json or {})):
+                skipped_recent_running_run += 1
                 continue
 
             last_activity = _as_utc_datetime(_command_last_activity_at(cmd))
@@ -6307,9 +6328,13 @@ def _run_legacy_sync_all(payload: dict[str, Any], *, command_id: int | None = No
             return
         with get_agent_session() as db:
             row = db.get(AgentCommand, command_id)
-            if row is not None:
-                row.result_json = {"sync_run": sync_run}
-                row.updated_at = utcnow()
+            if row is not None and row.status == "running":
+                previous = dict(row.result_json or {})
+                db.query(AgentCommand).filter(
+                    AgentCommand.id == command_id, AgentCommand.status == "running",
+                    AgentCommand.result_json == previous,
+                ).update({AgentCommand.result_json: {**previous, "sync_run": sync_run},
+                          AgentCommand.updated_at: utcnow()}, synchronize_session=False)
 
     try:
         from ispec.db.legacy_sync_all import sync_legacy_all
@@ -7239,6 +7264,13 @@ class _InflightInference:
     job_id: str
 
 
+@dataclass(frozen=True, kw_only=True)
+class _InflightSync:
+    cmd: ClaimedCommand
+    worker: SyncWorker
+    step_started: datetime
+
+
 class _SupervisorCommandProcessor:
     """Supervisor command processor with optional inference broker.
 
@@ -7258,6 +7290,7 @@ class _SupervisorCommandProcessor:
         self._run_id = run_id
         self._broker = broker
         self._inflight: _InflightInference | None = None
+        self._sync: _InflightSync | None = None
 
         heartbeat_seconds = float(_supervisor_heartbeat_seconds())
         now_mono = time.monotonic()
@@ -7269,11 +7302,18 @@ class _SupervisorCommandProcessor:
     def inflight(self) -> _InflightInference | None:
         return self._inflight
 
+    @property
+    def has_inflight_work(self) -> bool:
+        return self._inflight is not None or self._sync is not None
+
     def start(self) -> None:
         if self._broker is not None:
             self._broker.start()
 
     def stop(self) -> None:
+        if self._sync is not None:
+            stop_worker(self._sync.worker)
+            self._poll_sync_worker(interrupted=True)
         if self._broker is not None:
             self._broker.stop()
 
@@ -7282,9 +7322,65 @@ class _SupervisorCommandProcessor:
         if now_mono >= self._heartbeat_due_at:
             _touch_supervisor_run(run_id=self._run_id)
             self._heartbeat_due_at = now_mono + float(self._heartbeat_seconds)
-        if self._inflight is not None and now_mono >= self._command_touch_due_at:
-            _touch_command_updated_at(command_id=int(self._inflight.cmd.id))
+        if now_mono >= self._command_touch_due_at:
+            if self._inflight is not None:
+                _touch_command_updated_at(command_id=int(self._inflight.cmd.id))
+            if self._sync is not None:
+                _touch_command_updated_at(command_id=self._sync.cmd.id)
             self._command_touch_due_at = now_mono + min(float(self._heartbeat_seconds), 10.0)
+
+    def _start_sync_worker(self, cmd: ClaimedCommand) -> None:
+        started, monotonic = utcnow(), time.monotonic()
+        try:
+            worker = launch_sync_worker(command_id=cmd.id, run_id=self._run_id, attempt=cmd.attempts)
+        except Exception as exc:
+            with get_agent_session() as db:
+                row = db.get(AgentCommand, cmd.id)
+                result = dict(row.result_json or {}) if row is not None else {}
+            if "worker" in result:
+                result["worker"] = {**result["worker"], "state": "launch_failed"}
+            self._finalize_command(
+                cmd=cmd, execution=CommandExecution(ok=False, result={**result, "ok": False},
+                                                   error=f"sync_worker_launch_failed: {type(exc).__name__}"),
+                step_started=started, step_monotonic=monotonic,
+            )
+            logger.exception("Failed starting sync worker command_id=%s", cmd.id)
+            return
+        self._sync = _InflightSync(cmd=cmd, worker=worker, step_started=started)
+        logger.info("Sync worker started command_id=%s pid=%s log=%s", cmd.id, worker.process.pid, worker.log_path)
+
+    def _poll_sync_worker(self, *, interrupted: bool = False) -> bool:
+        inflight = self._sync
+        if inflight is None:
+            return False
+        worker = inflight.worker
+        timed_out = time.monotonic() - worker.started_monotonic >= worker_timeout_seconds()
+        if timed_out and worker.process.poll() is None:
+            stop_worker(worker)
+        code = worker.process.poll()
+        if code is None:
+            return False
+        self._sync = None
+        with get_agent_session() as db:
+            row = db.get(AgentCommand, worker.command_id)
+            if (row is None or row.claimed_by_run_id != self._run_id
+                    or row.attempts != worker.attempt or row.status not in {"running", "succeeded", "failed"}):
+                return True
+            result = dict(row.result_json or {})
+            if result.get("cancelled"):
+                return True
+            # A recorded outcome is stronger evidence than a later interpreter
+            # shutdown error. Keep process exit code alongside the sync result.
+            ok = row.status == "succeeded"
+            error = row.error
+            if row.status == "running":
+                error = ("sync_worker_interrupted" if interrupted else
+                         "sync_worker_timeout" if timed_out else f"sync_worker_exited:{code}")
+            result["worker"] = {**result.get("worker", {}), "state": "finished",
+                                "exit_code": code, "log_path": worker.log_path}
+        self._finalize_command(cmd=inflight.cmd, execution=CommandExecution(ok=ok, result=result, error=error),
+                               step_started=inflight.step_started, step_monotonic=worker.started_monotonic)
+        return True
 
     def _finalize_command(
         self,
@@ -7587,11 +7683,16 @@ class _SupervisorCommandProcessor:
         assert_main_thread("supervisor.processor.tick")
         self._maybe_heartbeat()
 
+        if self._poll_sync_worker():
+            return True
+
         if self._inflight is not None and self._broker is not None:
             if self._poll_inflight_result():
                 return True
 
-        exclude = _LLM_COMMAND_TYPES if (self._inflight is not None and self._broker is not None) else None
+        exclude = set(_LLM_COMMAND_TYPES) if (self._inflight is not None and self._broker is not None) else set()
+        if self._sync is not None:
+            exclude.add(COMMAND_LEGACY_SYNC_ALL)
         cmd = _claim_next_command(agent_id=self._agent_id, run_id=self._run_id, exclude_command_types=exclude)
         if cmd is None:
             return False
@@ -7607,14 +7708,16 @@ class _SupervisorCommandProcessor:
             payload_summary,
         )
 
-        if cmd.command_type in _LLM_COMMAND_TYPES:
+        if cmd.command_type == COMMAND_LEGACY_SYNC_ALL:
+            self._start_sync_worker(cmd)
+        elif cmd.command_type in _LLM_COMMAND_TYPES:
             if self._broker is not None:
                 self._start_claimed_llm(cmd)
             else:
                 self._handle_claimed_llm_sync(cmd)
             return True
-
-        self._handle_claimed_non_llm(cmd)
+        else:
+            self._handle_claimed_non_llm(cmd)
         return True
 
 
@@ -7702,7 +7805,7 @@ def _supervisor_command_poll_seconds(*, base_interval_seconds: int) -> float:
     """Polling interval for checking queued commands during long sleeps."""
 
     raw = (os.getenv("ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS") or "").strip()
-    default_value = 5.0
+    default_value = 30.0
     if not raw:
         return _clamp_float(float(default_value), min_value=0.1, max_value=max(0.1, float(base_interval_seconds)))
     try:
@@ -7721,11 +7824,11 @@ def _supervisor_heartbeat_seconds() -> float:
 
     raw = (os.getenv("ISPEC_SUPERVISOR_HEARTBEAT_SECONDS") or "").strip()
     if not raw:
-        return 15.0
+        return 30.0
     try:
         return _clamp_float(float(raw), min_value=1.0, max_value=300.0)
     except ValueError:
-        return 15.0
+        return 30.0
 
 
 def _touch_supervisor_run(*, run_id: str) -> None:
@@ -7764,15 +7867,7 @@ def _supervisor_sleep_with_command_polling(
     if total <= 0:
         return
 
-    # Fast path: if work showed up right before we were about to sleep, handle
-    # it immediately without waiting for the first poll tick.
-    if process_one_command():
-        return
-
     poll_seconds = float(_supervisor_command_poll_seconds(base_interval_seconds=int(base_interval_seconds)))
-    heartbeat_seconds = float(_supervisor_heartbeat_seconds())
-    heartbeat_due_at = time.monotonic() + heartbeat_seconds
-
     deadline = time.monotonic() + float(total)
     while True:
         remaining = float(deadline - time.monotonic())
@@ -7785,11 +7880,6 @@ def _supervisor_sleep_with_command_polling(
 
         if process_one_command():
             return
-
-        now_mono = time.monotonic()
-        if now_mono >= heartbeat_due_at:
-            _touch_supervisor_run(run_id=run_id)
-            heartbeat_due_at = now_mono + heartbeat_seconds
 
 
 def _supervisor_dynamic_idle_sleep_seconds(
@@ -7867,6 +7957,8 @@ def _supervisor_dynamic_idle_sleep_seconds(
 
 
 def _build_actions(config: SupervisorConfig) -> list[dict[str, Any]]:
+    if not _is_truthy(os.getenv("ISPEC_SUPERVISOR_HEALTH_CHECKS_ENABLED")):
+        return []
     return [
         {"id": "backend", "description": "Check iSPEC /status"},
         {"id": "frontend", "description": "Check UI root page"},
@@ -7907,148 +7999,153 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
 
     run_id = uuid.uuid4().hex
     started_at = utcnow()
-    pid_path = _write_supervisor_pid()
-    broker_enabled, broker_error = _inference_broker_enabled_status()
-    if broker_error:
-        logger.warning("Inference broker disabled: %s", broker_error)
-    broker: InferenceBroker | None = None
-    if broker_enabled:
-        broker = InferenceBroker()
-        broker.start()
-    inference_broker_info: dict[str, Any] = {
-        "enabled": bool(broker_enabled),
-        "error": broker_error,
-        "thread": (
-            {
-                "name": str(broker.thread.name),
-                "ident": int(broker.thread.ident) if broker.thread.ident is not None else None,
-            }
-            if broker is not None
-            else None
-        ),
-    }
-    _write_supervisor_state(
-        {
-            "schema_version": 1,
-            "kind": "supervisor",
-            "status": "running",
-            "run_id": run_id,
-            "agent_id": config.agent_id,
-            "pid": os.getpid(),
-            "thread_main": thread_main,
-            "inference_broker": inference_broker_info,
-            "started_at": started_at.isoformat(),
-            "backend_base_url": config.backend_base_url,
-            "frontend_url": config.frontend_url,
-            "interval_seconds": int(config.interval_seconds),
-            "timeout_seconds": float(config.timeout_seconds),
-        }
-    )
-    with get_agent_session() as db:
-        previous_orchestrator: dict[str, Any] | None = None
-        previous_scheduler: dict[str, Any] | None = None
-        try:
-            previous = (
-                db.query(AgentRun)
-                .filter(AgentRun.agent_id == config.agent_id)
-                .filter(AgentRun.kind == "supervisor")
-                .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
-                .first()
-            )
-            if previous is not None and isinstance(previous.summary_json, dict):
-                previous_state = previous.summary_json.get("orchestrator")
-                if isinstance(previous_state, dict) and previous_state:
-                    previous_orchestrator = dict(previous_state)
-                previous_sched = previous.summary_json.get("scheduler")
-                if isinstance(previous_sched, dict) and previous_sched:
-                    previous_scheduler = dict(previous_sched)
-        except Exception:
-            previous_orchestrator = None
-            previous_scheduler = None
-
-        summary_json: dict[str, Any] = {}
-        if previous_orchestrator:
-            summary_json["orchestrator"] = previous_orchestrator
-        if previous_scheduler:
-            summary_json["scheduler"] = previous_scheduler
-        run = AgentRun(
-            run_id=run_id,
-            agent_id=config.agent_id,
-            kind="supervisor",
-            status="running",
-            created_at=started_at,
-            updated_at=started_at,
-            config_json={
-                "pid": os.getpid(),
-                "thread_main": thread_main,
-                "inference_broker": inference_broker_info,
-                "backend_base_url": config.backend_base_url,
-                "frontend_url": config.frontend_url,
-                "interval_seconds": config.interval_seconds,
-                "timeout_seconds": config.timeout_seconds,
-            },
-            state_json={"checks": {}},
-            summary_json=summary_json,
-        )
-        db.add(run)
-        db.commit()
-        db.refresh(run)
-
-    actions = _build_actions(config)
-    funcs = _action_funcs(config)
-    processor = _SupervisorCommandProcessor(agent_id=config.agent_id, run_id=run_id, broker=broker)
-
-    logger.info("Supervisor run started (run_id=%s, agent_id=%s)", run_id, config.agent_id)
-    stale_recovery = _recover_stale_running_commands(agent_id=config.agent_id, run_id=run_id)
-    if int(stale_recovery.get("recovered") or 0) > 0:
-        logger.warning(
-            "Recovered stale running commands recovered=%s running_total=%s stale_seconds=%s",
-            stale_recovery.get("recovered"),
-            stale_recovery.get("running_total"),
-            stale_recovery.get("stale_seconds"),
-        )
-    orchestrator_min_tick = _orchestrator_tick_min_seconds()
-    orchestrator_max_tick = _orchestrator_tick_max_seconds()
-    seeded_id = _seed_orchestrator_tick(
-        delay_seconds=_orchestrator_initial_delay_seconds(
-            min_tick_seconds=orchestrator_min_tick,
-            max_tick_seconds=orchestrator_max_tick,
-        ),
-        agent_id=config.agent_id,
-        run_id=run_id,
-    )
-    if seeded_id is not None:
-        logger.info("Seeded orchestrator tick (command_id=%s)", seeded_id)
-
-    schedule_poll_seconds = _clamp_int(
-        _safe_int(os.getenv("ISPEC_SLACK_SCHEDULE_POLL_SECONDS")) or 30,
-        min_value=10,
-        max_value=3600,
-    )
-    last_schedule_poll_at: datetime | None = None
-    legacy_sync_poll_seconds = _clamp_int(
-        _safe_int(os.getenv("ISPEC_LEGACY_SYNC_POLL_SECONDS")) or 60,
-        min_value=10,
-        max_value=3600,
-    )
-    last_legacy_sync_poll_at: datetime | None = None
-    legacy_push_project_comments_poll_seconds = _clamp_int(
-        _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_POLL_SECONDS")) or 60,
-        min_value=10,
-        max_value=3600,
-    )
-    last_legacy_push_project_comments_poll_at: datetime | None = None
-    agent_log_archive_poll_seconds = _clamp_int(
-        _safe_int(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_POLL_SECONDS")) or 300,
-        min_value=30,
-        max_value=3600,
-    )
-    last_agent_log_archive_poll_at: datetime | None = None
-    once_command_started = False
-
     final_status = "stopped"
     final_error: str | None = None
+    pid_path: Path | None = None
+    broker: InferenceBroker | None = None
+    processor: _SupervisorCommandProcessor | None = None
+    inference_broker_info: dict[str, Any] = {"enabled": False}
+    # Cover startup too: a stop can arrive as soon as the PID/state is visible.
     try:
+        pid_path = _write_supervisor_pid()
+        broker_enabled, broker_error = _inference_broker_enabled_status()
+        if broker_error:
+            logger.warning("Inference broker disabled: %s", broker_error)
+        if broker_enabled:
+            broker = InferenceBroker()
+            broker.start()
+        inference_broker_info = {
+            "enabled": bool(broker_enabled),
+            "error": broker_error,
+            "thread": (
+                {
+                    "name": str(broker.thread.name),
+                    "ident": int(broker.thread.ident) if broker.thread.ident is not None else None,
+                }
+                if broker is not None
+                else None
+            ),
+        }
+        _write_supervisor_state(
+            {
+                "schema_version": 1,
+                "kind": "supervisor",
+                "status": "running",
+                "run_id": run_id,
+                "agent_id": config.agent_id,
+                "pid": os.getpid(),
+                "process_create_time": psutil.Process().create_time(),
+                "thread_main": thread_main,
+                "inference_broker": inference_broker_info,
+                "started_at": started_at.isoformat(),
+                "backend_base_url": config.backend_base_url,
+                "frontend_url": config.frontend_url,
+                "interval_seconds": int(config.interval_seconds),
+                "timeout_seconds": float(config.timeout_seconds),
+            }
+        )
+        with get_agent_session() as db:
+            previous_orchestrator: dict[str, Any] | None = None
+            previous_scheduler: dict[str, Any] | None = None
+            try:
+                previous = (
+                    db.query(AgentRun)
+                    .filter(AgentRun.agent_id == config.agent_id)
+                    .filter(AgentRun.kind == "supervisor")
+                    .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+                    .first()
+                )
+                if previous is not None and isinstance(previous.summary_json, dict):
+                    previous_state = previous.summary_json.get("orchestrator")
+                    if isinstance(previous_state, dict) and previous_state:
+                        previous_orchestrator = dict(previous_state)
+                    previous_sched = previous.summary_json.get("scheduler")
+                    if isinstance(previous_sched, dict) and previous_sched:
+                        previous_scheduler = dict(previous_sched)
+            except Exception:
+                previous_orchestrator = None
+                previous_scheduler = None
+
+            summary_json: dict[str, Any] = {}
+            if previous_orchestrator:
+                summary_json["orchestrator"] = previous_orchestrator
+            if previous_scheduler:
+                summary_json["scheduler"] = previous_scheduler
+            run = AgentRun(
+                run_id=run_id,
+                agent_id=config.agent_id,
+                kind="supervisor",
+                status="running",
+                created_at=started_at,
+                updated_at=started_at,
+                config_json={
+                    "pid": os.getpid(),
+                    "process_create_time": psutil.Process().create_time(),
+                    "thread_main": thread_main,
+                    "inference_broker": inference_broker_info,
+                    "backend_base_url": config.backend_base_url,
+                    "frontend_url": config.frontend_url,
+                    "interval_seconds": config.interval_seconds,
+                    "timeout_seconds": config.timeout_seconds,
+                },
+                state_json={"checks": {}},
+                summary_json=summary_json,
+            )
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+
+        actions = _build_actions(config)
+        funcs = _action_funcs(config)
+        processor = _SupervisorCommandProcessor(agent_id=config.agent_id, run_id=run_id, broker=broker)
+
+        logger.info("Supervisor run started (run_id=%s, agent_id=%s)", run_id, config.agent_id)
+        stale_recovery = _recover_stale_running_commands(agent_id=config.agent_id, run_id=run_id)
+        if int(stale_recovery.get("recovered") or 0) > 0:
+            logger.warning(
+                "Recovered stale running commands recovered=%s running_total=%s stale_seconds=%s",
+                stale_recovery.get("recovered"),
+                stale_recovery.get("running_total"),
+                stale_recovery.get("stale_seconds"),
+            )
+        orchestrator_min_tick = _orchestrator_tick_min_seconds()
+        orchestrator_max_tick = _orchestrator_tick_max_seconds()
+        seeded_id = _seed_orchestrator_tick(
+            delay_seconds=_orchestrator_initial_delay_seconds(
+                min_tick_seconds=orchestrator_min_tick,
+                max_tick_seconds=orchestrator_max_tick,
+            ),
+            agent_id=config.agent_id,
+            run_id=run_id,
+        )
+        if seeded_id is not None:
+            logger.info("Seeded orchestrator tick (command_id=%s)", seeded_id)
+
+        schedule_poll_seconds = _clamp_int(
+            _safe_int(os.getenv("ISPEC_SLACK_SCHEDULE_POLL_SECONDS")) or 30,
+            min_value=10,
+            max_value=3600,
+        )
+        last_schedule_poll_at: datetime | None = None
+        legacy_sync_poll_seconds = _clamp_int(
+            _safe_int(os.getenv("ISPEC_LEGACY_SYNC_POLL_SECONDS")) or 60,
+            min_value=10,
+            max_value=3600,
+        )
+        last_legacy_sync_poll_at: datetime | None = None
+        legacy_push_project_comments_poll_seconds = _clamp_int(
+            _safe_int(os.getenv("ISPEC_LEGACY_PUSH_PROJECT_COMMENTS_POLL_SECONDS")) or 60,
+            min_value=10,
+            max_value=3600,
+        )
+        last_legacy_push_project_comments_poll_at: datetime | None = None
+        agent_log_archive_poll_seconds = _clamp_int(
+            _safe_int(os.getenv("ISPEC_AGENT_LOG_ARCHIVE_POLL_SECONDS")) or 300,
+            min_value=30,
+            max_value=3600,
+        )
+        last_agent_log_archive_poll_at: datetime | None = None
+
         while True:
             assert_main_thread("supervisor.loop")
             now = utcnow()
@@ -8129,13 +8226,24 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
             did_command_work = processor.tick()
             if did_command_work:
                 if once:
-                    once_command_started = True
-                    if processor.inflight is None:
+                    if not processor.has_inflight_work:
                         break
                 continue
             if processor.inflight is not None and broker is not None:
                 # Keep the main loop responsive while inference is running.
                 time.sleep(0.05)
+                continue
+
+            if once and processor.has_inflight_work:
+                time.sleep(0.1)
+                continue
+
+            if not actions:
+                if once:
+                    break
+                # The next loop iteration polls once. Nested polling here
+                # would inspect the empty queue twice on every wakeup.
+                time.sleep(_supervisor_command_poll_seconds(base_interval_seconds=config.interval_seconds))
                 continue
 
             step_started = utcnow()
@@ -8258,7 +8366,10 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
         raise
     finally:
         try:
-            processor.stop()
+            if processor is not None:
+                processor.stop()
+            elif broker is not None:
+                broker.stop()
         except Exception:
             logger.exception("Failed stopping inference broker (run_id=%s)", run_id)
 
@@ -8266,12 +8377,13 @@ def run_supervisor(config: SupervisorConfig, *, once: bool = False) -> str:
             assert_main_thread("supervisor.shutdown")
             ended_at = utcnow()
             with get_agent_session() as db:
-                run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one()
-                run.status = final_status
-                run.ended_at = ended_at
-                run.updated_at = ended_at
-                if final_status != "stopped" and final_error:
-                    run.last_error = final_error
+                run = db.query(AgentRun).filter(AgentRun.run_id == run_id).one_or_none()
+                if run is not None:
+                    run.status = final_status
+                    run.ended_at = ended_at
+                    run.updated_at = ended_at
+                    if final_status != "stopped" and final_error:
+                        run.last_error = final_error
                 db.commit()
         except Exception:
             logger.exception("Failed to mark supervisor run stopped (run_id=%s)", run_id)

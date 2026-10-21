@@ -682,10 +682,13 @@ def snapshot(
                 thought_text = orchestrator_state.get("last_thought")
                 if isinstance(thought_text, str) and thought_text.strip():
                     orchestrator_thought = thought_text.strip()
+        from ispec.supervisor.runtime_status import observed_run_status
+
         latest_supervisor_run = {
             "run_id": getattr(run_row, "run_id", None),
             "agent_id": getattr(run_row, "agent_id", None),
-            "status": getattr(run_row, "status", None),
+            "status": observed_run_status(run_row.status, run_row.updated_at),
+            "recorded_status": run_row.status,
             "updated_at": (
                 getattr(run_row, "updated_at", None).isoformat()
                 if getattr(run_row, "updated_at", None)

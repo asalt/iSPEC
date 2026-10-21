@@ -66,8 +66,51 @@ the pagination regression tests model the legacy API's actual ordering/filtering
 Existing historical cursors alone do not prove full backfill coverage.
 A supervisor crash may leave a running receipt requiring existing queue recovery;
 this status view does not independently judge a job dead or run recovery.
-The existing sync executor remains synchronous; phase reporting does not add a
-parallel worker or eliminate time spent waiting on legacy HTTP requests.
+The dispatcher runs inbound aggregate sync in a dedicated CLI child process.
+The existing sync code remains sequential inside that child, but waiting on
+legacy HTTP no longer blocks the dispatcher's other queued commands. Direct
+CLI sync calls still run in the invoking process.
+
+## Quiet Worker and Sync Children
+
+Routine health probes are off by default (`ISPEC_SUPERVISOR_HEALTH_CHECKS_ENABLED=0`).
+An idle supervisor does not create health-check steps/events or call a model.
+It still checks configured schedules and the durable command queue. Queue polling
+defaults to 30 seconds (`ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS`), so new work may
+wait that long. The 30-second heartbeat is only a liveness timestamp. If probes
+are explicitly enabled, the CLI/Make default is one health step per 300 seconds.
+The optional model-driven orchestrator remains separately opt-in.
+
+For queued `legacy_sync_all` work, the dispatcher claims the existing receipt and
+launches `python -m ispec supervisor sync-worker` with the command ID, run ID,
+attempt, and a one-use launch token. This is an internal executor, not a second
+scheduler or an arbitrary-shell entry point. It rejects unclaimed, mismatched,
+and duplicate launches. Credentials and the import payload stay off argv; the
+child inherits the configured environment and reads its own claimed receipt.
+
+Each job has an append-only attempt log at
+`<ISPEC_LOG_DIR>/supervisor-jobs/sync-<command>-attempt-<attempt>.log` in addition
+to the daily sync JSONL. The receipt retains worker PID/start identity, log path,
+phase progress, final import outcome, and observed exit code. These per-job logs
+currently have no automatic pruning. A completed sync receipt remains authoritative
+even if interpreter shutdown subsequently fails; the exit code is separate evidence.
+
+Only one queued inbound sync runs at a time; other command types can proceed.
+The child records its own final receipt, including if its parent has exited.
+On restart, a still-live child is not retried. A verified dead child with an
+unfinished receipt is marked failed during queue inspection, preserving partial
+progress, rather than silently rerun. Normal supervisor shutdown terminates and
+reaps its child; default timeout is six hours
+(`ISPEC_SUPERVISOR_SYNC_TIMEOUT_SECONDS=21600`). Timeout enforcement belongs to
+the parent dispatcher; an orphan can finish but is not independently timed out.
+Committed pages survive interruption; inspect the receipt before retrying.
+
+`supervisor status` (including `--json`) derives liveness from the process and
+retains `recorded_status` separately. Operations marks a running record with an
+expired heartbeat as `stale`. Neither read fabricates an exit time or rewrites
+historical rows. SIGTERM follows normal shutdown cleanup. The queue is still a
+single dispatcher: other synchronous handlers, including legacy note writeback,
+can still delay dispatch and are not moved into children by this change.
 
 Direct aggregate CLI calls get JSONL events but no queued command receipt. Direct
 single-table CLI syncs retain their existing logging/cursors and are not included

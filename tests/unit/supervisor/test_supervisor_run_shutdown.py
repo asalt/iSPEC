@@ -1,7 +1,44 @@
 from __future__ import annotations
 
-from ispec.agent.models import AgentRun
+import json
+
+import pytest
+
+from ispec.agent.models import AgentEvent, AgentRun, AgentStep
 from ispec.supervisor.loop import SupervisorConfig, run_supervisor
+
+
+@pytest.mark.parametrize(
+    "startup_step",
+    ["_build_actions", "_recover_stale_running_commands", "_seed_orchestrator_tick"],
+)
+def test_interrupt_during_startup_still_finalizes(tmp_path, monkeypatch, startup_step):
+    from ispec.agent.connect import get_agent_session
+    from ispec.supervisor import loop
+
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(tmp_path / "agent.db"))
+    monkeypatch.setenv("ISPEC_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("ISPEC_SUPERVISOR_INFERENCE_BROKER_ENABLED", "0")
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(loop, startup_step, interrupt)
+    run_id = run_supervisor(
+        SupervisorConfig(
+            agent_id="test",
+            backend_base_url="http://unused",
+            frontend_url="http://unused",
+            interval_seconds=300,
+            timeout_seconds=0.1,
+        )
+    )
+    with get_agent_session() as db:
+        run = db.query(AgentRun).filter_by(run_id=run_id).one()
+        assert run.status == "stopped"
+        assert run.ended_at is not None
+    assert json.loads((tmp_path / "supervisor.json").read_text())["status"] == "stopped"
+    assert not (tmp_path / "supervisor.pid").exists()
 
 
 def test_supervisor_marks_run_stopped_on_keyboard_interrupt(tmp_path, monkeypatch):
@@ -12,8 +49,12 @@ def test_supervisor_marks_run_stopped_on_keyboard_interrupt(tmp_path, monkeypatc
 
     import ispec.supervisor.loop as supervisor_loop
 
-    monkeypatch.setattr(supervisor_loop, "_build_actions", lambda _config: [{"id": "noop"}])
-    monkeypatch.setattr(supervisor_loop, "_action_funcs", lambda _config: {"noop": lambda: {"ok": True}})
+    monkeypatch.setattr(
+        supervisor_loop, "_build_actions", lambda _config: [{"id": "noop"}]
+    )
+    monkeypatch.setattr(
+        supervisor_loop, "_action_funcs", lambda _config: {"noop": lambda: {"ok": True}}
+    )
 
     def _interrupt(_seconds: float) -> None:
         raise KeyboardInterrupt()
@@ -37,7 +78,11 @@ def test_supervisor_marks_run_stopped_on_keyboard_interrupt(tmp_path, monkeypatc
         assert row.status == "stopped"
         assert row.ended_at is not None
         assert row.updated_at is not None
-        thread_main = row.config_json.get("thread_main") if isinstance(row.config_json, dict) else None
+        thread_main = (
+            row.config_json.get("thread_main")
+            if isinstance(row.config_json, dict)
+            else None
+        )
         assert isinstance(thread_main, dict)
         assert thread_main.get("role") == "main"
         assert thread_main.get("owner") == "supervisor"
@@ -53,8 +98,12 @@ def test_supervisor_uses_dynamic_idle_sleep(tmp_path, monkeypatch):
 
     import ispec.supervisor.loop as supervisor_loop
 
-    monkeypatch.setattr(supervisor_loop, "_build_actions", lambda _config: [{"id": "noop"}])
-    monkeypatch.setattr(supervisor_loop, "_action_funcs", lambda _config: {"noop": lambda: {"ok": True}})
+    monkeypatch.setattr(
+        supervisor_loop, "_build_actions", lambda _config: [{"id": "noop"}]
+    )
+    monkeypatch.setattr(
+        supervisor_loop, "_action_funcs", lambda _config: {"noop": lambda: {"ok": True}}
+    )
     monkeypatch.setattr(
         supervisor_loop,
         "_supervisor_dynamic_idle_sleep_seconds",
@@ -67,7 +116,9 @@ def test_supervisor_uses_dynamic_idle_sleep(tmp_path, monkeypatch):
         sleeps.append(float(sleep_seconds))
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(supervisor_loop, "_supervisor_sleep_with_command_polling", _interrupt)
+    monkeypatch.setattr(
+        supervisor_loop, "_supervisor_sleep_with_command_polling", _interrupt
+    )
 
     config = SupervisorConfig(
         agent_id="test-agent",
@@ -79,3 +130,68 @@ def test_supervisor_uses_dynamic_idle_sleep(tmp_path, monkeypatch):
     run_id = run_supervisor(config, once=False)
     assert isinstance(run_id, str) and run_id
     assert sleeps and int(sleeps[0]) == 33
+
+
+def test_default_idle_worker_runs_no_probes_or_tick_records(tmp_path, monkeypatch):
+    from ispec.agent.connect import get_agent_session
+    from ispec.supervisor import loop
+
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(tmp_path / "agent.db"))
+    monkeypatch.setenv("ISPEC_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_ENABLED", "0")
+    monkeypatch.delenv("ISPEC_SUPERVISOR_HEALTH_CHECKS_ENABLED", raising=False)
+    monkeypatch.setattr(
+        loop,
+        "_action_funcs",
+        lambda _: {"backend": lambda: (_ for _ in ()).throw(AssertionError("probe"))},
+    )
+    config = SupervisorConfig(
+        agent_id="test",
+        backend_base_url="http://unused",
+        frontend_url="http://unused",
+        interval_seconds=300,
+        timeout_seconds=0.1,
+    )
+    assert loop._build_actions(config) == []
+    run_id = run_supervisor(config, once=True)
+    with get_agent_session() as db:
+        assert db.query(AgentStep).count() == 0
+        assert db.query(AgentEvent).count() == 0
+        assert db.query(AgentRun).filter_by(run_id=run_id).one().status == "stopped"
+    monkeypatch.setenv("ISPEC_SUPERVISOR_HEALTH_CHECKS_ENABLED", "1")
+    assert loop._build_actions(config)
+
+
+def test_idle_queue_is_polled_only_once_per_interval(tmp_path, monkeypatch):
+    from ispec.supervisor import loop
+
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(tmp_path / "agent.db"))
+    monkeypatch.setenv("ISPEC_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("ISPEC_ORCHESTRATOR_ENABLED", "0")
+    monkeypatch.setenv("ISPEC_SUPERVISOR_HEALTH_CHECKS_ENABLED", "0")
+    monkeypatch.setenv("ISPEC_SUPERVISOR_COMMAND_POLL_SECONDS", "30")
+    clock, polls = [0.0], []
+    tick = loop._SupervisorCommandProcessor.tick
+
+    def count_tick(self):
+        polls.append(clock[0])
+        return tick(self)
+
+    def sleep(seconds):
+        clock[0] += seconds
+        if clock[0] >= 60:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(loop._SupervisorCommandProcessor, "tick", count_tick)
+    monkeypatch.setattr(loop.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(loop.time, "sleep", sleep)
+    run_supervisor(
+        SupervisorConfig(
+            agent_id="test",
+            backend_base_url="http://unused",
+            frontend_url="http://unused",
+            interval_seconds=300,
+            timeout_seconds=0.1,
+        )
+    )
+    assert polls == [0.0, 30.0]
