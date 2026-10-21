@@ -100,6 +100,13 @@ def require_api_key(provided: str | None = Depends(_provided_api_key)) -> None:
         )
 
 
+def require_configured_api_key(provided: str | None = Depends(_provided_api_key)) -> None:
+    """Internal receipt/context access never becomes anonymous when auth is unset."""
+    if _expected_api_key() is None:
+        raise HTTPException(status_code=503, detail="Internal API key is not configured.")
+    require_api_key(provided)
+
+
 def _password_pepper_bytes() -> bytes:
     """Return a server-side pepper derived from an env var (optional).
 

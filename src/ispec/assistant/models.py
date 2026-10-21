@@ -63,6 +63,51 @@ class SupportMessage(AssistantBase):
     session: Mapped["SupportSession"] = relationship(back_populates="messages")
 
 
+class SlackInboxMessage(AssistantBase):
+    """Received Slack text, independently retained before reply generation."""
+
+    __tablename__ = "slack_inbox_message"
+    __table_args__ = (UniqueConstraint("team_id", "channel", "message_ts", "revision_ts"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[str] = mapped_column(Text)
+    channel: Mapped[str] = mapped_column(Text, index=True)
+    message_ts: Mapped[str] = mapped_column(Text)
+    revision_ts: Mapped[str] = mapped_column(Text, default="")
+    thread_ts: Mapped[str | None] = mapped_column(Text)
+    user_id: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[str | None] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(Text)
+    truncated: Mapped[bool] = mapped_column(default=False)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error_type: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    reviewed_by: Mapped[str | None] = mapped_column(Text)
+
+
+class SlackOutboundMessage(AssistantBase):
+    """Confirmed Slack sends, separate from generated-but-not-delivered replies."""
+
+    __tablename__ = "slack_outbound_message"
+    __table_args__ = (UniqueConstraint("team_id", "channel", "delivery_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    team_id: Mapped[str] = mapped_column(Text, index=True)
+    channel: Mapped[str] = mapped_column(Text, index=True)
+    delivery_key: Mapped[str] = mapped_column(Text)
+    message_ts: Mapped[str | None] = mapped_column(Text)
+    thread_ts: Mapped[str | None] = mapped_column(Text, index=True)
+    author_id: Mapped[str | None] = mapped_column(Text)
+    recipient_id: Mapped[str | None] = mapped_column(Text)
+    text: Mapped[str] = mapped_column(Text)
+    attachments: Mapped[list] = mapped_column(JSON, default=list)
+    source: Mapped[str] = mapped_column(Text)
+    sent_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class SupportMemory(AssistantBase):
     __tablename__ = "support_memory"
 

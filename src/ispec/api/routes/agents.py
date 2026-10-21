@@ -27,8 +27,21 @@ from ispec.assistant.slack_tmux_bridge import (
     find_artifact_receipt_for_thread,
     stable_json,
 )
+from ispec.assistant.connect import get_assistant_session_dep
+from ispec.assistant.slack_outbound import ConversationScope, OutboundReceipt, outbound_context, store_outbound
+from ispec.api.security import require_configured_api_key
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
+
+
+@router.post("/slack/outbound", dependencies=[Depends(require_configured_api_key)])
+def ingest_slack_outbound(receipt: OutboundReceipt, db: Session = Depends(get_assistant_session_dep)) -> dict:
+    return store_outbound(db, receipt)
+
+
+@router.post("/slack/outbound-context", dependencies=[Depends(require_configured_api_key)])
+def read_slack_outbound_context(scope: ConversationScope, db: Session = Depends(get_assistant_session_dep)) -> dict:
+    return {"messages": outbound_context(db, scope)}
 
 
 def utcnow() -> datetime:
