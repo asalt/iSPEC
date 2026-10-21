@@ -1,0 +1,8 @@
+{
+  "collectors": {
+    "windows-tims-ultra-0006": {
+      "token_env": "ISPEC_INSTRUMENT_TOKEN_BRUKER",
+      "instrument_ids": ["tims-ultra-0006"]
+    }
+  }
+}

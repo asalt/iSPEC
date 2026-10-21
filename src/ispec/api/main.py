@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from ispec.api.routes.auth import router as auth_router
 from ispec.api.routes.agents import router as agents_router
+from ispec.api.routes.instruments import router as instruments_router
 from ispec.api.routes.ops import router as ops_router
 from ispec.api.routes.project_files import router as project_files_router
 from ispec.api.routes.routes import router as crud_router
@@ -62,6 +63,9 @@ app.include_router(auth_router, prefix="/api", dependencies=[Depends(require_api
 
 # Agent telemetry endpoints (/api/agents/*).
 app.include_router(agents_router, prefix="/api", dependencies=[Depends(require_api_key)])
+
+# Collector credentials authorize ingestion only; status reads require staff login.
+app.include_router(instruments_router, prefix="/api")
 
 # Protected CRUD routes (both legacy root routes and /api/*).
 if legacy_root_routes:

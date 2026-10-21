@@ -1,0 +1,8 @@
+{
+  "collector_id": "windows-tims-ultra-0006",
+  "instrument_id": "tims-ultra-0006",
+  "root": "D:\\",
+  "max_depth": 1,
+  "max_entries": 2000,
+  "timeout_seconds": 8
+}

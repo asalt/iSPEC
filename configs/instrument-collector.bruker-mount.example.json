@@ -1,0 +1,8 @@
+{
+  "collector_id": "popos-bruker-share-preview",
+  "instrument_id": "tims-ultra-0006",
+  "root": "/home/alex/windows/tims-ultra-0006/dshare/58799_58810",
+  "max_depth": 0,
+  "max_entries": 500,
+  "timeout_seconds": 8
+}

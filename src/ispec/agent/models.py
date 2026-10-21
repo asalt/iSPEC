@@ -139,3 +139,17 @@ class RelayDedupKey(AgentBase):
     command_id: Mapped[int | None] = mapped_column(ForeignKey("agent_command.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+
+
+class InstrumentObservationRow(AgentBase):
+    """Immutable telemetry receipts; never command or notification requests."""
+
+    __tablename__ = "instrument_observation"
+
+    event_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    collector_id: Mapped[str] = mapped_column(Text, index=True)
+    instrument_id: Mapped[str] = mapped_column(Text, index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    payload_hash: Mapped[str] = mapped_column(Text)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
