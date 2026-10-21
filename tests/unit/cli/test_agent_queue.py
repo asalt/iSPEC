@@ -40,6 +40,24 @@ def test_agent_relay_pdf_parser_requires_destination_alias():
     assert args.to == "alex"
 
 
+def test_relay_cli_request_ids_duplicates_and_prune(tmp_path, capsys):
+    parser = argparse.ArgumentParser()
+    agent.register_subcommands(parser.add_subparsers(dest="subcommand", required=True))
+    path = str(tmp_path / "agent.db")
+    args = parser.parse_args([
+        "relay-enqueue", "--database", path, "--kind", "status_record",
+        "--body", "complete", "--request-id", "same", "--json",
+    ])
+    agent.dispatch(args)
+    original = json.loads(capsys.readouterr().out)
+    agent.dispatch(args)
+    duplicate = json.loads(capsys.readouterr().out)
+    assert original["command_id"] == duplicate["command_id"]
+    assert duplicate["deduplicated"] is True
+    agent.dispatch(parser.parse_args(["relay-prune", "--database", path, "--json"]))
+    assert json.loads(capsys.readouterr().out) == {"dry_run": True, "eligible": 0, "deleted": 0}
+
+
 def test_agent_queue_cancel_stale_dry_run_does_not_mutate(tmp_path, capsys):
     agent_db_path = tmp_path / "agent.db"
     old = datetime.now(UTC) - timedelta(days=3)

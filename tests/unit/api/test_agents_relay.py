@@ -53,3 +53,22 @@ def test_agents_relay_enqueue_rejects_unknown_kind(tmp_path, monkeypatch) -> Non
         with pytest.raises(HTTPException) as excinfo:
             enqueue_relay_request_endpoint(request, db=agent_db)
         assert excinfo.value.status_code == 400
+
+
+def test_agents_relay_duplicates_and_identity_conflict(tmp_path):
+    with get_agent_session(tmp_path / "agent.db") as db:
+        original = enqueue_relay_request_endpoint(
+            RelayEnqueueRequest(kind="status_record", body="done", request_id="one"), db=db
+        )
+        duplicate = enqueue_relay_request_endpoint(
+            RelayEnqueueRequest(kind="status_record", body="done", request_id="two"), db=db
+        )
+        assert duplicate.command_id == original.command_id
+        assert duplicate.deduplicated is True
+        assert duplicate.duplicate_match == "payload"
+        assert duplicate.submitted_request_id == "two"
+        with pytest.raises(HTTPException) as exc:
+            enqueue_relay_request_endpoint(
+                RelayEnqueueRequest(kind="status_record", body="different", request_id="one"), db=db
+            )
+        assert exc.value.status_code == 409

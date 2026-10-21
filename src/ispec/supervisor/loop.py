@@ -40,6 +40,7 @@ from ispec.agent.commands import (
 )
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun, AgentStep
 from ispec.agent.relay import dispatch_relay_request
+from ispec.agent.relay_store import uncertain_receipt
 from ispec.agent.policies.primitives.backoff import backoff_exponential_current
 from ispec.assistant.compaction import distill_conversation_memory
 from ispec.assistant.connect import get_assistant_db_uri, get_assistant_session
@@ -1289,6 +1290,26 @@ def _recover_stale_running_commands(*, agent_id: str, run_id: str) -> dict[str, 
                 "updated_at": cmd.updated_at.isoformat() if isinstance(cmd.updated_at, datetime) else None,
                 "error": _truncate_text(cmd.error, limit=240) or None,
             }
+
+            relay_request = (cmd.payload_json or {}).get("relay_request", {})
+            if (
+                cmd.command_type == COMMAND_LOCAL_RELAY_REQUEST
+                and relay_request.get("mode") == "send"
+            ):
+                # A crash after delivery but before local completion is not permission
+                # to repeat an external side effect. Retain any recorded outcome.
+                receipt = dict(cmd.result_json or {})
+                if not receipt.get("delivery_outcome"):
+                    receipt.update(uncertain_receipt(relay_request, error="relay_stale_delivery_unknown"))
+                receipt["stale_recovery"] = {
+                    "recovered_at": now.isoformat(), "previous": previous, "requeued": False,
+                }
+                cmd.result_json = receipt
+                cmd.status = "succeeded" if receipt.get("ok") else "failed"
+                cmd.error = None if receipt.get("ok") else str(receipt.get("error_type") or "relay_failed")
+                cmd.ended_at = cmd.updated_at = now
+                recovered += 1
+                continue
 
             cmd.status = "queued"
             cmd.available_at = now

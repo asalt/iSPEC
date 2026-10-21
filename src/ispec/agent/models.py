@@ -126,3 +126,16 @@ class AgentCommand(AgentBase):
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class RelayDedupKey(AgentBase):
+    """Small reservations, committed atomically with their queued command."""
+
+    __tablename__ = "relay_dedup_key"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(Text)
+    # NULL only while reserving a key inside the enqueue transaction.
+    command_id: Mapped[int | None] = mapped_column(ForeignKey("agent_command.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)

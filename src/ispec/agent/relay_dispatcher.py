@@ -27,7 +27,12 @@ from ispec.agent.relay_constants import (
 )
 from ispec.agent.relay_normalize import normalize_relay_request
 from ispec.agent.relay_slack import execute_slack_send, execute_slack_uploads
-from ispec.agent.relay_store import record_relay_receipt
+from ispec.agent.relay_store import (
+    begin_relay_delivery,
+    previous_relay_receipt,
+    record_relay_receipt,
+    uncertain_receipt,
+)
 from ispec.agent.relay_tmux import execute_tmux_send, validate_tmux_target
 
 
@@ -52,6 +57,10 @@ def dispatch_relay_request(
             "error_type": normalize_error or FAILURE_INVALID_REQUEST,
         }
         return _finish(command_id, {"request_id": None}, receipt)
+
+    previous = previous_relay_receipt(command_id)
+    if previous is not None:
+        return previous
 
     env = load_canonical_env()
     probe = relay_config_probe(
@@ -113,18 +122,19 @@ def dispatch_relay_request(
         if not relay_live_enabled(env):
             receipt.update(ok=False, delivery_outcome="failed", error_type=FAILURE_LIVE_SEND_DISABLED)
             return _finish(command_id, request, receipt)
-        if request.get("attachments"):
-            ok, result, error = execute_slack_uploads(
-                request=request,
-                env=env,
-                destination=destination,
-                post=slack_post,
-            )
-        else:
-            ok, result, error = execute_slack_send(request=request, env=env, destination=destination, post=slack_post)
+        previous = begin_relay_delivery(command_id, request)
+        if previous is not None:
+            return previous
+        try:
+            executor = execute_slack_uploads if request.get("attachments") else execute_slack_send
+            ok, result, error = executor(request=request, env=env, destination=destination, post=slack_post)
+        except Exception as exc:
+            receipt.update(uncertain_receipt(request, error="relay_delivery_exception"))
+            receipt["exception_type"] = type(exc).__name__
+            return _finish(command_id, request, receipt)
         receipt.update(result)
         receipt["ok"] = bool(ok)
-        receipt["delivery_outcome"] = "sent" if ok else "failed"
+        receipt["delivery_outcome"] = "sent" if ok else ("partial" if result.get("sent") else "failed")
         if error:
             receipt["error_type"] = error
         return _finish(command_id, request, receipt)
@@ -147,10 +157,21 @@ def dispatch_relay_request(
         if not relay_live_enabled(env):
             receipt.update(ok=False, delivery_outcome="failed", error_type=FAILURE_LIVE_SEND_DISABLED)
             return _finish(command_id, request, receipt)
-        ok, result, error = execute_tmux_send(request)
+        previous = begin_relay_delivery(command_id, request)
+        if previous is not None:
+            return previous
+        try:
+            ok, result, error = execute_tmux_send(request)
+        except Exception as exc:
+            receipt.update(uncertain_receipt(request, error="relay_delivery_exception"))
+            receipt["exception_type"] = type(exc).__name__
+            return _finish(command_id, request, receipt)
         receipt.update(result)
         receipt["ok"] = bool(ok)
-        receipt["delivery_outcome"] = "sent" if ok else "failed"
+        if ok:
+            receipt["delivery_outcome"] = "sent"
+        else:
+            receipt.update(uncertain_receipt(request, error=error or "tmux_delivery_failed"))
         if error:
             receipt["error_type"] = error
         return _finish(command_id, request, receipt)

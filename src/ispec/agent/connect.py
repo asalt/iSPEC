@@ -45,7 +45,11 @@ def get_agent_db_uri(file: str | Path | None = None) -> str:
 @lru_cache(maxsize=None)
 def _get_engine(db_uri: str) -> Engine:
     engine = sqlite_engine(db_uri)
-    AgentBase.metadata.create_all(bind=engine)
+    # Startup can race across the API, CLI and supervisor. Serialize the schema
+    # check/create sequence, including adding new tables to an existing DB.
+    with engine.begin() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        AgentBase.metadata.create_all(bind=connection)
     return engine
 
 

@@ -205,6 +205,7 @@ def register_subcommands(subparsers) -> None:
         help="Relay request kind.",
     )
     relay_parser.add_argument("--source", default="codex", help="Source id/kind label for provenance.")
+    relay_parser.add_argument("--request-id", default=None, help="Reuse this ID for retries of the same request.")
     relay_parser.add_argument("--to", "--target", dest="target", default=None, help="Destination alias or tmux target.")
     relay_parser.add_argument("--body", "--text", dest="body", default=None, help="Message body or status text.")
     relay_parser.add_argument("--attachment", action="append", default=[], help="Attachment path to stage; repeatable.")
@@ -228,6 +229,7 @@ def register_subcommands(subparsers) -> None:
     pdf_parser.add_argument("message", nargs="*", help="Optional message body; defaults to a short report-ready note.")
     pdf_parser.add_argument("--database", default=None, help="Agent DB path/URI (default: resolved env/default)")
     pdf_parser.add_argument("--to", required=True, help="Slack destination alias, e.g. alex.")
+    pdf_parser.add_argument("--request-id", default=None, help="Reuse this ID for retries of the same request.")
     pdf_parser.add_argument(
         "--send",
         action="store_true",
@@ -248,6 +250,12 @@ def register_subcommands(subparsers) -> None:
     pdf_parser.add_argument("--delay-seconds", type=int, default=0)
     pdf_parser.add_argument("--max-attempts", type=int, default=1)
     pdf_parser.add_argument("--json", action="store_true", help="Print JSON instead of a plain summary")
+
+    prune_parser = subparsers.add_parser("relay-prune", help="Prune expired relay dedup keys, not jobs or receipts; dry run by default")
+    prune_parser.add_argument("--database", default=None, help="Agent DB path/URI")
+    prune_parser.add_argument("--confirm", action="store_true", help="Delete eligible keys (default: preview only)")
+    prune_parser.add_argument("--limit", type=int, default=1000, help="Maximum keys per invocation")
+    prune_parser.add_argument("--json", action="store_true")
 
 
 def dispatch(args) -> None:
@@ -274,6 +282,9 @@ def dispatch(args) -> None:
         return
     if args.subcommand == "relay-pdf":
         _run_relay_pdf(args)
+        return
+    if args.subcommand == "relay-prune":
+        _run_relay_prune(args)
         return
     raise SystemExit(f"Unknown agent subcommand: {args.subcommand}")
 
@@ -375,6 +386,10 @@ def _print_relay_payload(payload: dict[str, Any], *, as_json: bool) -> None:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return
     print(f"ok={payload.get('ok')} command_id={payload.get('command_id')} status={payload.get('status')}")
+    if payload.get("error"):
+        print(f"error={payload['error']}")
+    if payload.get("deduplicated"):
+        print(f"deduplicated=True match={payload.get('duplicate_match')} submitted_request_id={payload.get('submitted_request_id')}")
     request = payload.get("relay_request")
     if isinstance(request, dict):
         print(
@@ -429,7 +444,18 @@ def _enqueue_relay_cli_payload(
             "command_id": int(row.id),
             "status": row.status,
             "relay_request": relay_request,
+            "deduplicated": bool(event_payload.get("deduplicated")),
+            "duplicate_match": event_payload.get("duplicate_match"),
+            "submitted_request_id": event_payload.get("submitted_request_id"),
         }
+
+
+def _run_relay_prune(args) -> None:
+    from ispec.agent.relay_dedup import prune_relay_keys
+
+    with get_agent_session(args.database) as db:
+        result = prune_relay_keys(db, now=datetime.now(UTC), confirm=args.confirm, limit=args.limit)
+    print(json.dumps(result, indent=2) if args.json else " ".join(f"{k}={v}" for k, v in result.items()))
 
 
 def _run_relay_probe(args) -> None:
@@ -467,6 +493,7 @@ def _run_relay_enqueue(args) -> None:
 
     request = {
         "kind": kind,
+        "request_id": getattr(args, "request_id", None),
         "source": source,
         "target": target,
         "body": getattr(args, "body", None),
@@ -524,6 +551,7 @@ def _run_relay_pdf(args) -> None:
         attachment["title"] = title
     request = {
         "kind": "slack_message",
+        "request_id": getattr(args, "request_id", None),
         "source": _source_from_cli_arg(getattr(args, "source", None)),
         "target": {"alias": str(getattr(args, "to", "") or "").strip()},
         "body": body,

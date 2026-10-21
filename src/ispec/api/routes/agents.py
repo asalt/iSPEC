@@ -133,6 +133,9 @@ class RelayEnqueueResponse(BaseModel):
     request_id: str
     status: str = "queued"
     relay_request: dict[str, Any]
+    deduplicated: bool = False
+    duplicate_match: str | None = None
+    submitted_request_id: str | None = None
 
 
 @router.post("/events", response_model=IngestResponse)
@@ -256,7 +259,8 @@ def enqueue_relay_request_endpoint(
             max_attempts=max_attempts,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        code = 409 if str(exc) == "relay_request_id_conflict" else 400
+        raise HTTPException(status_code=code, detail=str(exc)) from exc
 
     relay_request = event_payload.get("request") if isinstance(event_payload.get("request"), dict) else {}
     return RelayEnqueueResponse(
@@ -264,6 +268,9 @@ def enqueue_relay_request_endpoint(
         request_id=str(relay_request.get("request_id") or ""),
         status=str(row.status or "queued"),
         relay_request=relay_request,
+        deduplicated=bool(event_payload.get("deduplicated")),
+        duplicate_match=event_payload.get("duplicate_match"),
+        submitted_request_id=event_payload.get("submitted_request_id"),
     )
 
 

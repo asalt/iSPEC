@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -10,7 +10,7 @@ from ispec.agent.connect import get_agent_session
 from ispec.agent.models import AgentCommand, AgentEvent, AgentRun
 from ispec.agent.relay import EVENT_RELAY_RECEIPT
 from ispec.concurrency.thread_context import set_main_thread
-from ispec.supervisor.loop import _enqueue_command, _process_one_command
+from ispec.supervisor.loop import _enqueue_command, _process_one_command, _recover_stale_running_commands
 
 
 @pytest.fixture(autouse=True)
@@ -82,3 +82,30 @@ def test_supervisor_processes_relay_request_as_stage_only_receipt(tmp_path, monk
         payload = json.loads(receipt.payload_json)
         assert payload["receipt"]["delivery_outcome"] == "staged"
         assert payload["receipt"]["metadata"]["next_action"] == "gpGrouper comparison"
+
+
+@pytest.mark.parametrize("receipt", [
+    {}, {"ok": True, "sent": True, "delivery_outcome": "sent", "slack": {"ts": "123"}},
+    {"ok": False, "sent": None, "delivery_outcome": "unknown", "error_type": "timeout"},
+])
+def test_stale_send_never_requeues_and_preserves_receipt(tmp_path, monkeypatch, receipt):
+    monkeypatch.setenv("ISPEC_AGENT_DB_PATH", str(tmp_path / "agent.db"))
+    old = datetime.now(UTC) - timedelta(days=1)
+    with get_agent_session() as db:
+        cmd = AgentCommand(
+            command_type=COMMAND_LOCAL_RELAY_REQUEST, status="running", created_at=old,
+            updated_at=old, claimed_by_agent_id="agent", claimed_by_run_id="dead-run",
+            payload_json={"relay_request": {"mode": "send", "request_id": "old"}},
+            result_json=receipt,
+        )
+        db.add(cmd)
+        db.commit()
+        command_id = cmd.id
+    _recover_stale_running_commands(agent_id="agent", run_id="new-run")
+    with get_agent_session() as db:
+        cmd = db.get(AgentCommand, command_id)
+        assert cmd.status == ("succeeded" if receipt.get("ok") else "failed")
+        assert cmd.result_json["delivery_outcome"] == receipt.get("delivery_outcome", "unknown")
+        assert cmd.result_json["stale_recovery"]["requeued"] is False
+        if receipt.get("slack"):
+            assert cmd.result_json["slack"] == receipt["slack"]
