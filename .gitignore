@@ -27,3 +27,9 @@ experiments_dump/
 logs/
 src/repo.txt
 tests/behavioral/local/
+# Curated synthetic cases only; other data remains local unless reviewed.
+!tests/behavioral/data/
+tests/behavioral/data/*
+!tests/behavioral/data/response_phrase_cases.json
+!tests/behavioral/data/project_comment_approval_cases.json
+!tests/behavioral/data/slack_reported_thread.json

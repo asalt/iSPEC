@@ -60,7 +60,30 @@ python scripts/extract_behavioral_scenarios.py --session-pk 244 --tag project-no
 The checked-in behavioral smoke set should stay small and sanitized. Promote a
 local extracted scenario only after manually curating it into a stable fixture.
 
+## Optional reply-phrase trial
+
+[`data/response_phrase_cases.json`](./data/response_phrase_cases.json) contains
+eight synthetic review scenarios with context and flexible review criteria.
+The experimental corpus is `src/ispec/prompts/experimental.response.phrases.md`;
+it is not included in live prompts. The initial raw-model comparison exposed
+unsupported success/reminder claims, so it remains an evaluation artifact.
+See [`slack-project-note-monitoring.md`](../../docs/slack-project-note-monitoring.md)
+for findings and limitations. Prompt wiring tests are not model-accuracy tests;
+repeat with production-shaped context before claiming controller behavior.
+
 ## Benchmark runner
+
+For a real-model queue/context replay without live writes or Slack sends:
+
+```bash
+ISPEC_RUN_VLLM_TESTS=1 pytest tests/behavioral/test_slack_thread_queue_vllm_live.py --run-behavioral -q -s
+```
+
+This calls the supervisor's queued-turn entrypoint against temporary databases;
+tools are intercepted, and only inference at localhost:8000 is permitted. It
+prints replies, proposed tool arguments, context inclusion and timing for review.
+Passing assertions establish context/target grounding, not complete note quality
+or permission to save. The running supervisor/model are not restarted by this test.
 
 Use the benchmark runner when we want timing, tool-loop counts, and scenario
 comparison against the live local support stack without turning pytest into a
