@@ -13,6 +13,11 @@ Use this lane for:
 
 These tests are skipped by default.
 
+The [October 25 OLMo follow-up](../../docs/olmo-vllm-evaluation-2026-10-25.md)
+adds a separate curated holdout directory and an opt-in real-controller fixture
+test. Its experimental Think template is never loaded by ordinary application
+startup. Model failures are distinct from deterministic test-suite failures.
+
 Run them with:
 
 ```bash
@@ -111,6 +116,73 @@ orchestrator to be disabled unless explicitly enabled. Timing buckets default to
 90 seconds for `slow` turns and 180 seconds for `problematic` turns; override
 them with `--slow-threshold-seconds` and `--problematic-threshold-seconds` when
 calibrating a particular local machine.
+
+## Offline model comparison
+
+`scripts/eval_model_matrix.py` prepares the existing 20 gated approval cases,
+one no-pending-action control (no model call), ten synthetic note cases, and five
+context-grounding probes. New inputs live in `data/model_note_cases.json` and
+`data/model_grounding_cases.json`. No Slack history is fetched, no tools are
+exposed, and no application data is written.
+
+From the backend root, with an already-running local inference endpoint:
+
+```bash
+.venv/bin/python scripts/eval_model_matrix.py prepare tests/behavioral/local/my-trial
+.venv/bin/python scripts/eval_model_matrix.py run tests/behavioral/local/my-trial/requests.json \
+  --provider ollama --model gpt-oss:20b --think low --url http://127.0.0.1:11434 \
+  --output tests/behavioral/local/my-trial/results.json
+.venv/bin/python scripts/eval_model_matrix.py score tests/behavioral/local/my-trial/manifest.json \
+  tests/behavioral/local/my-trial/results.json --output tests/behavioral/local/my-trial/scores.json
+```
+
+Only loopback inference is permitted; an explicit temporary SSH forward can
+reach a trusted host. The runner does not start services, load workspace auth,
+download weights, or dispatch tool calls. An existing inference server may load
+the selected cached model into GPU memory. Expectations are kept in a separate
+manifest and input fingerprints must agree when scoring. Rendering records prompt
+versions in the trial directory's `prompts.db`, not the live registry. Raw results
+are checkpointed after each case and remain ignored by Git.
+
+The same `requests.json` can be passed to `eval_cached_transformers_chat.py` in
+an existing CUDA-compatible environment, using `--model-path` for cached weights
+and `--output` for a new result file. This tests content, not vLLM tool parsing.
+The default per-case budgets are 160 approval, 512 note, and 256 grounding tokens;
+`run --max-output-tokens 1024` creates a separate reasoning-budget diagnostic.
+Temperature is zero, JSON is prompt-only for cross-runtime comparison, and no
+automatic retries replace failed trials.
+Reasoning is unset by default: pass `--think low` for GPT-OSS, and omit it for
+non-reasoning models such as Tulu or OLMo Instruct. Reasoning settings are recorded
+in the runtime metadata rather than imposed across unrelated model families.
+
+`prepare --note-prompt compact --tasks note grounding` selects an experimental
+compact note prompt. This is not activated in the bot. The initial October 23
+grounding probe was ambiguous about what counted as a write and was revised;
+preserved request fingerprints identify that difference. Never combine unlike
+inputs into a single model ranking. See
+[`model-comparison-2026-10-23.md`](../../docs/model-comparison-2026-10-23.md).
+The OLMo Instruct Q4/FP16 and Tulu Ollama Q4 follow-up, including native tool and
+actual classifier-path failures, is in
+[`model-runtime-comparison-2026-10-23.md`](../../docs/model-runtime-comparison-2026-10-23.md).
+
+Scores separate exact label agreement, JSON validity, false approvals at 0.75,
+and the current six-second approval budget. Note fragment checks are deliberately
+small regression signals, not semantic judges; manual review remains necessary.
+The no-pending control checks evaluator gating, not model accuracy. Treat prompt
+revision results as exploratory, then validate on newly held-out cases and the
+real controller before any deployment decision.
+
+## Isolated Instruct interface refinement
+
+`scripts/run_instruct_refinement.py` runs native tool probes, actual `support.chat`
+turns with real temporary fixture writes, and source-grounded note trials. It uses
+a clean child environment, never loads credential/env files, allows only loopback
+inference and never starts a service. Output directories must be new. The frozen
+corpus has three development and sixteen held-out cases; two separately reported
+real-schema lookup diagnostics were added afterward. No prompt retuning used the
+held-out answers. See the [refinement report](../../docs/instruct-refinement-2026-10-25.md)
+for exact commands, failures, runtime and cleanup. These live tests are opt-in,
+and expected model failures remain failures rather than being marked xfail.
 
 ## Reviewed private-snapshot pipeline
 

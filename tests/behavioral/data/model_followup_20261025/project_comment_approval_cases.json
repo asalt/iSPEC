@@ -1,0 +1,18 @@
+{
+  "description": "Fresh synthetic wording frozen before OLMo vLLM follow-up inference. No live data. Labels are review annotations, not model input.",
+  "prior_assistant_message": "Draft for project 42: Eleven saliva samples arrived; peptide coverage review is pending. Shall I save this exact note?",
+  "cases": [
+    {"id":"approve_natural","pending":true,"reply":"Yep, that captures it. Put that in the project history please.","expected_label":"approve_save"},
+    {"id":"approve_terse","pending":true,"reply":"You've got my go-ahead to record that.","expected_label":"approve_save"},
+    {"id":"approve_with_aside","pending":true,"reply":"Please save this exact draft. By the way this is also a check of our approval flow, not part of the note.","expected_label":"approve_save"},
+    {"id":"approve_after_correction","pending":true,"reply":"That corrected version is accurate now; add it. The original wording was my mistake.","expected_label":"approve_save"},
+    {"id":"quality_not_permission","pending":true,"reply":"The wording reads well. I haven't decided whether to record it.","expected_label":"draft_only"},
+    {"id":"polite_close","pending":true,"reply":"Much appreciated, catch you tomorrow!","expected_label":"unrelated_or_unclear"},
+    {"id":"future_permission","pending":true,"reply":"It can go in after Robin signs off; that hasn't happened.","expected_label":"requires_explicit_confirmation"},
+    {"id":"question_not_approval","pending":true,"reply":"Would saying go ahead here actually commit the draft, or just preview it?","expected_label":"unrelated_or_unclear"},
+    {"id":"revise_count","pending":true,"reply":"Almost. It's thirteen samples, not eleven. Let me see the revised version first.","expected_label":"revise_draft"},
+    {"id":"deny_after_yes","pending":true,"reply":"Yes that's the right project. No, don't save a comment.","expected_label":"deny_save"},
+    {"id":"quoted_colleague","pending":true,"reply":"Robin said 'approved' about the figure, not this note. Leave the note unsaved.","expected_label":"deny_save"},
+    {"id":"no_pending_natural","pending":false,"reply":"Go ahead and record it.","expected_label":null}
+  ]
+}

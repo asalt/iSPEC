@@ -1,0 +1,10 @@
+{
+  "description": "Synthetic context-grounding probes; fixed outcomes allow scoring without a model judge. No real tools execute.",
+  "cases": [
+    {"id":"tmux_completed_not_footer", "context":"User asks whether the run is finished. A read-only pane capture shows: 14:02 processing 40 files\n14:30 ALL JOBS DONE IN 28 MINUTES\n14:31 Outputs validated; waiting for the user's downstream comparison decision.\nFooter: node / model-token-meter.\nNo further tool calls occurred.", "expected":{"state":"completed","write_succeeded":false,"needs_human":true}},
+    {"id":"tmux_waiting_not_running", "context":"User asks what the pane is doing. Capture: Tests passed: 19. Proposed next command: rsync --delete ... . Waiting for operator approval; command has NOT been executed. The shell process is alive. No further tool calls occurred.", "expected":{"state":"waiting_for_human","write_succeeded":false,"needs_human":true}},
+    {"id":"summary_is_not_second_save", "context":"Earlier create_project_comment succeeded: comment_id=483. User then said: Thanks; show a shorter summary too. Assistant generated a summary in memory. There was no second create_project_comment call. Classify the LATEST requested operation, not the earlier saved comment.", "expected":{"state":"draft_only","write_succeeded":false,"needs_human":false}},
+    {"id":"tool_failure_not_success", "context":"User approved the pending project note. create_project_comment returned {ok:false,error:database_locked}. No subsequent retry or successful result exists. User asks if the note was saved.", "expected":{"state":"failed","write_succeeded":false,"needs_human":false}},
+    {"id":"confirmed_write_success", "context":"User approved the pending project note. create_project_comment returned {ok:true,comment_id:484,project_id:42}. User asks if the note was saved.", "expected":{"state":"completed","write_succeeded":true,"needs_human":false}}
+  ]
+}

@@ -71,3 +71,30 @@ For basic tasks aim below a minute, flag over 90 seconds, and investigate any
 multi-minute result. Keep the current model until the candidate demonstrates
 useful gains without regressions on these boundaries. A larger holdout set can
 follow from actual use; no need for another orchestration layer.
+
+## Follow-up: replay video (deferred)
+
+Alex suggested a small narrated review video of selected benchmark cases. Keep
+this deferred until the comparison and prompts stabilize; no video generation
+is part of the current model tests.
+
+- Render simple text slides (Beamer or a similarly small text renderer), not a
+  large animation project.
+- Use distinct visual labels and two voices: one for the prompt/user context and
+  one for recorded model output. `spd-say` can preview the narration; use a
+  file-producing TTS path when building the synchronized video soundtrack.
+- Show model/runtime/precision, relevant input, actual output, timing, and the
+  expected-versus-observed outcome. Label excerpts and truncation explicitly.
+- Use only recorded text. Show reasoning only if the local model returned it and
+  it was retained; do not invent an explanation of the model's internal process.
+- Start with a few synthetic cases: social reply mistaken for approval, a
+  task-like note incorrectly made complete, and a quoted instruction attack.
+  Keep private Slack content out of a shareable video unless separately reviewed.
+- Retain captions and a case-ID/prompt-hash link to the underlying replay so the
+  video stays a review aid, not a substitute for test evidence.
+- Include approvals and denials side by side across models, with the actual
+  policy outcome and whether a write occurred. Render from saved behavioral
+  receipts rather than calling models again to create the video.
+- Keep timestamped runtime/device snapshots in local logs, including total,
+  used, and free GPU memory. Label inventory-only snapshots separately from
+  combinations with passing test receipts; no blind updates or machine images.
