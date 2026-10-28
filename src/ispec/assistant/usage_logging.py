@@ -78,6 +78,19 @@ def record_inference_usage_event(
     usage = _clean_usage(meta_dict.get("usage"))
     if usage is not None:
         event["usage"] = usage
+    runtime = _clean_usage(meta_dict.get("runtime"))
+    if runtime is not None:
+        event["runtime"] = runtime
+    preamble = meta_dict.get("tool_preamble")
+    if isinstance(preamble, dict):
+        event["tool_preamble"] = {
+            key: _clean_scalar(preamble[key])
+            for key in ("prompt_family", "prompt_version_num", "prompt_version_id",
+                        "prompt_sha256", "prompt_source_path")
+            if key in preamble
+        }
+    if "finish_reason" in meta_dict:
+        event["finish_reason"] = _clean_scalar(meta_dict["finish_reason"])
     fallback = meta_dict.get("fallback")
     if isinstance(fallback, dict) and fallback:
         event["fallback"] = {

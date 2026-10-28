@@ -49,6 +49,7 @@ from ispec.assistant.reply_delivery import RETAINED_REPLY, ReplyRetention
 from ispec.assistant.reply_interpretation import interpret_reply_for_project_comment_save
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
+from ispec.assistant.runtime_settings import vllm_strict_protocol
 from ispec.assistant.response_contracts import (
     response_contracts_mode,
     response_contract_names,
@@ -1531,6 +1532,7 @@ def chat(
     history_limit = _history_limit()
     max_tokens = _max_prompt_tokens()
     assistant_provider = _assistant_provider()
+    structured_model = assistant_provider in {"vllm", "ollama"}
 
     slack_thread_context = SlackThreadContext.from_meta(payload.meta)
     slack_thread_prompt = render_thread_context(slack_thread_context, max_tokens=min(2400, max_tokens // 2))
@@ -1583,7 +1585,7 @@ def chat(
     )
     confirmation_reply = reply_interpretation.is_confirmation_reply
     awaiting_reply_state = reply_interpretation.awaiting_state_dict()
-    if assistant_provider == "vllm" and turn_decision_mode != "off":
+    if structured_model and turn_decision_mode != "off":
         turn_decision_result = run_turn_decision_pipeline(
             generate_reply_fn=generate_reply,
             mode=turn_decision_mode,
@@ -1748,7 +1750,7 @@ def chat(
         and tools_enabled
         and isinstance(tool_schemas, list)
         and tool_schemas
-        and assistant_provider == "vllm"
+        and structured_model
         and not confirmation_reply
         and not skip_tool_router_for_reply_interpretation
     ):
@@ -1892,7 +1894,7 @@ def chat(
         and tools_enabled
         and isinstance(tool_schemas, list)
         and tool_schemas
-        and assistant_provider == "vllm"
+        and structured_model
         and (confirmation_reply or skip_tool_router_for_reply_interpretation)
     ):
         tool_router = {
@@ -2080,7 +2082,7 @@ def chat(
     elif (
         tool_protocol == "openai"
         and tools_enabled
-        and assistant_provider == "vllm"
+        and structured_model
         and _project_comment_intent_hints_enabled()
         and "create_project_comment" in openai_tool_names
         and (confirmation_reply or _PROJECT_COMMENT_INTENT_RE.search(payload.message or ""))
@@ -2393,6 +2395,9 @@ def chat(
             trace_step["provider_meta"] = {
                 "elapsed_ms": reply.meta.get("elapsed_ms"),
                 "usage": reply.meta.get("usage"),
+                "runtime": reply.meta.get("runtime"),
+                "tool_preamble": reply.meta.get("tool_preamble"),
+                "finish_reason": reply.meta.get("finish_reason"),
                 "fallback": reply.meta.get("fallback"),
                 "tool_call_dialect": reply.meta.get("tool_call_dialect"),
                 "tool_parser_fallback_used": reply.meta.get("tool_parser_fallback_used"),
@@ -2413,6 +2418,11 @@ def chat(
             if tool_call_names:
                 trace_step["reply_tool_calls"] = tool_call_names
         llm_trace.append(trace_step)
+
+        native_tools_only = reply.provider == "vllm" and vllm_strict_protocol()
+        if native_tools_only and not reply.ok:
+            trace_step["action"] = "model_protocol_error"
+            break
 
         if reply.tool_calls:
             trace_step["action"] = "openai_tool_calls"
@@ -2510,9 +2520,11 @@ def chat(
                 trace_step["executed_tools"] = executed_openai_tools
             continue
 
-        tool_call = parse_tool_call(reply.content)
+        tool_call = None if native_tools_only else parse_tool_call(reply.content)
         if tool_call is None:
-            suggested_tool_name = _suggested_tool_from_text(reply.content, candidates=openai_no_arg_tool_names)
+            suggested_tool_name = None if native_tools_only else _suggested_tool_from_text(
+                reply.content, candidates=openai_no_arg_tool_names
+            )
             executed_tools = {
                 str(call.get("name") or "").strip()
                 for call in tool_calls

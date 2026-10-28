@@ -25,9 +25,10 @@ from ispec.schedule.connect import get_schedule_session
     ("approve_save", float("nan"), False), ("approve_save", float("inf"), False),
     ("approve_save", True, False), ("approve_save", 1.01, False),
 ])
-def test_live_classifier_owns_pending_approval(tmp_path, db_session, monkeypatch, label, confidence, expected):
+@pytest.mark.parametrize("provider", ["stub", "ollama"])
+def test_live_classifier_owns_pending_approval(tmp_path, db_session, monkeypatch, label, confidence, expected, provider):
     for key, value in {
-        "PROVIDER": "stub", "PROJECT_COMMENT_APPROVAL_EVAL_MODE": "own",
+        "PROVIDER": provider, "PROJECT_COMMENT_APPROVAL_EVAL_MODE": "own",
         "PROJECT_COMMENT_APPROVAL_APPROVE_THRESHOLD": "0.75", "TURN_DECISION_MODE": "off",
         "TOOL_PROTOCOL": "openai", "MAX_TOOL_CALLS": "3", "HISTORY_LIMIT": "10",
         "MAX_PROMPT_TOKENS": "4000", "SUMMARY_MAX_CHARS": "0",

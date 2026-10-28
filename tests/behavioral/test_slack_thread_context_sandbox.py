@@ -18,7 +18,8 @@ pytestmark = pytest.mark.behavioral
 
 
 @pytest.mark.parametrize("request_text", [None, "thanks"])
-def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tmp_path, behavioral_datastore, monkeypatch, request_text):
+@pytest.mark.parametrize("provider", ["vllm", "ollama"])
+def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tmp_path, behavioral_datastore, monkeypatch, request_text, provider):
     for key, value in behavioral_datastore.env_overrides().items():
         monkeypatch.setenv(key, value)
     def forbidden(*a, **kw):
@@ -26,7 +27,7 @@ def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tm
     monkeypatch.setattr(requests.sessions.Session, "request", forbidden)
     monkeypatch.setattr(support, "run_tool", forbidden)
     for name, value in {
-        "PROVIDER": "vllm", "CLASSIFIER_PROVIDER": "inherit", "TOOL_PROTOCOL": "openai",
+        "PROVIDER": provider, "CLASSIFIER_PROVIDER": "inherit", "TOOL_PROTOCOL": "openai",
         "TURN_DECISION_MODE": "shadow", "MAX_TOOL_CALLS": "2", "MAX_PROMPT_TOKENS": "4000",
         "SUMMARY_MAX_CHARS": "0", "SELF_REVIEW": "0", "SELF_REVIEW_DECIDER": "0",
         "COMPACTION_ENABLED": "0", "CHAT_QUEUE_ENABLED": "0", "PROJECT_COMMENT_INTENT_HINTS": "0",

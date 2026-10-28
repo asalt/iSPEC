@@ -31,7 +31,8 @@ def test_support_chat_passes_and_persists_prompt_observability(tmp_path, db_sess
             content="FINAL:\nPrompt-aware answer.",
             provider="test",
             model="test-model",
-            meta=None,
+            meta={"runtime": {"profile": "synthetic-eval", "max_output_tokens": 1024},
+                  "usage": {"prompt_tokens": 30, "completion_tokens": 5}, "finish_reason": "stop"},
         )
 
     monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
@@ -91,6 +92,9 @@ def test_support_chat_passes_and_persists_prompt_observability(tmp_path, db_sess
         assert len(str(meta["prompt_sha256"] or "")) == 64
         assert meta["llm_trace"][0]["prompt_family"] == "assistant.answer.system"
         assert meta["llm_trace"][0]["prompt_version_num"] == 1
+        assert meta["llm_trace"][0]["provider_meta"]["runtime"]["profile"] == "synthetic-eval"
+        assert meta["llm_trace"][0]["provider_meta"]["finish_reason"] == "stop"
+        assert meta["llm_trace"][0]["provider_meta"]["usage"]["prompt_tokens"] == 30
 
 
 def test_base_system_prompt_preserves_project_note_status_and_correction_boundary():

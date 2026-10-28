@@ -12,8 +12,13 @@ import requests
 
 from ispec.assistant.tools import TOOL_CALL_PREFIX, TOOL_RESULT_PREFIX, tool_prompt
 from ispec.assistant.usage_logging import record_inference_usage_event
+from ispec.assistant import ollama_protocol, vllm_protocol
+from ispec.assistant.runtime_settings import (
+    max_output_tokens, runtime_metadata, vllm_strict_protocol, vllm_tool_parser, vllm_tool_preamble_family,
+)
 from ispec.logging import get_logger
 from ispec.prompt import PromptSource, PromptVersionInfo, RenderedPrompt, load_bound_prompt, prompt_binding, prompt_observability_context
+from ispec.prompt.loader import render_prompt
 
 
 logger = get_logger(__name__)
@@ -255,10 +260,21 @@ def _planner_tool_use_block(*, tool_names: set[str] | None = None) -> str:
     return "\n".join(tool_use_lines)
 
 
+@prompt_binding("assistant.tools.native_protocol")
+def _native_tool_protocol() -> str:
+    return load_bound_prompt(_native_tool_protocol).text
+
+
 def _planner_tool_protocol_block(*, tools_available: bool, provider: str | None = None) -> str:
     normalized_provider = str(provider or _assistant_provider()).strip().lower()
     if tools_available:
+        if normalized_provider == "ollama" or (normalized_provider == "vllm" and vllm_tool_parser() != "llama3_json"):
+            return _native_tool_protocol()
         if normalized_provider == "vllm":
+            fallback = "" if vllm_strict_protocol() else (
+                f"- If raw JSON tool calls are not supported, fallback to one line starting with {TOOL_CALL_PREFIX}:\n"
+                f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
+            )
             return (
                 "Tool calling protocol:\n"
                 "- The active local parser expects parser-native JSON tool calls.\n"
@@ -268,8 +284,7 @@ def _planner_tool_protocol_block(*, tools_available: bool, provider: str | None 
                 '- Use top-level "name" and "arguments" keys. Do not wrap calls inside '
                 '"tool_calls", "type":"function", or another envelope.\n'
                 "- When calling tools, do not include PLAN/FINAL or any extra prose.\n"
-                f"- If raw JSON tool calls are not supported, fallback to one line starting with {TOOL_CALL_PREFIX}:\n"
-                f'  {TOOL_CALL_PREFIX} {{"name":"<tool>","arguments":{{...}}}}\n'
+                f"{fallback}"
                 f"- Tool results may arrive as a {TOOL_RESULT_PREFIX} system message or a role=tool message; treat them as authoritative."
             )
         return (
@@ -508,7 +523,11 @@ def generate_reply(
         )
         observability_context = prompt_observability_context(stage_prompt, extra=observability_context)
     if provider == "ollama":
-        return _generate_ollama_reply(messages=messages, tools=tools, observability_context=observability_context)
+        return _generate_ollama_reply(
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            extra_body=vllm_extra_body, timeout_seconds=timeout_seconds,
+            observability_context=observability_context,
+        )
     if provider == "vllm":
         return _generate_vllm_reply(
             messages=messages,
@@ -574,6 +593,9 @@ def _build_messages(
                 extra["tool_call_id"] = item.get("tool_call_id")
             if "tool_calls" in item:
                 extra["tool_calls"] = item.get("tool_calls")
+            for key in ("name", "tool_name"):
+                if key in item:
+                    extra[key] = item[key]
 
             if not content_stripped and not extra:
                 continue
@@ -595,34 +617,66 @@ def _build_messages(
     return messages
 
 
-def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, observability_context: dict[str, Any] | None = None) -> AssistantReply:
+def _generate_ollama_reply(
+    *, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+    tool_choice: str | dict[str, Any] | None = None,
+    extra_body: dict[str, Any] | None = None,
+    timeout_seconds: float | None = None,
+    observability_context: dict[str, Any] | None = None,
+) -> AssistantReply:
     url = f"{_ollama_url()}/api/chat"
     model = _ollama_model()
-    timeout = _ollama_timeout_seconds()
-
-    allowed_roles = {"system", "user", "assistant"}
-    normalized_messages: list[dict[str, Any]] = []
-    for item in messages:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "user")
-        if role not in allowed_roles:
-            role = "system"
-        normalized_messages.append({"role": role, "content": str(item.get("content", "") or "")})
-
-    payload = {"model": model, "messages": normalized_messages, "stream": False}
-    temperature = _assistant_temperature()
-    if temperature is not None:
-        payload["options"] = {"temperature": temperature}
+    timeout = timeout_seconds if timeout_seconds is not None else _ollama_timeout_seconds()
     started = time.monotonic()
     try:
+        available_tools = ollama_protocol.selected_tools(tools, tool_choice)
+        options, fields, choice_format = ollama_protocol.request_options(extra_body)
+        output_limit = max_output_tokens()
+        if output_limit is not None:
+            options.setdefault("num_predict", output_limit)
+        temperature = _assistant_temperature()
+        if temperature is not None:
+            options.setdefault("temperature", temperature)
+        for key, target in (("ISPEC_OLLAMA_NUM_CTX", "num_ctx"),
+                            ("ISPEC_OLLAMA_NUM_PREDICT", "num_predict")):
+            if os.getenv(key):
+                value = int(os.environ[key])
+                if value <= 0:
+                    raise ValueError(f"{key} must be positive")
+                options.setdefault(target, value)
+        payload = {"model": model, "messages": ollama_protocol.native_messages(messages),
+                   "stream": False, **fields}
+        if options:
+            payload["options"] = options
+        if available_tools:
+            payload["tools"] = available_tools
+        think = (os.getenv("ISPEC_OLLAMA_THINK") or "").strip()
+        if think:
+            payload["think"] = {"true": True, "false": False}.get(think, think)
         response = requests.post(url, json=payload, timeout=timeout)
         response.raise_for_status()
         data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("message"), dict):
+            raise ValueError("Invalid Ollama response envelope")
+        if data.get("done_reason") == "length":
+            raise ValueError("Ollama output exhausted its token budget")
+        message_obj = data["message"]
+        content = str(message_obj.get("content") or "")
+        tool_calls = ollama_protocol.response_tools(message_obj.get("tool_calls"), available_tools, tool_choice)
+        if choice_format:
+            content = json.loads(content)
+            if content not in payload["format"]["enum"]:
+                raise ValueError("Ollama returned an invalid constrained choice")
+        elif fields.get("format"):
+            # Caller-specific validators still check the full decision schema.
+            json.loads(content)
+        if not content.strip() and not tool_calls:
+            raise ValueError("Ollama returned no final answer or tool call")
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         logger.warning("Ollama request failed (%s): %s", url, error)
-        meta = {"url": url, "error": repr(exc)}
+        meta = {"url": url, "error": repr(exc), "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "runtime": runtime_metadata("ollama")}
         record_inference_usage_event(
             provider="ollama",
             model=model,
@@ -641,16 +695,17 @@ def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[s
         )
     elapsed_ms = int((time.monotonic() - started) * 1000)
 
-    content = ""
-    tool_calls = None
-    if isinstance(data, dict):
-        message_obj = data.get("message") or {}
-        if isinstance(message_obj, dict):
-            content = str(message_obj.get("content") or "")
-    if not content and not tool_calls:
-        content = json.dumps(data)[:4000]
-
-    meta = {"url": url, "elapsed_ms": elapsed_ms}
+    usage = {"prompt_tokens": int(data.get("prompt_eval_count") or 0),
+             "completion_tokens": int(data.get("eval_count") or 0)}
+    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    meta = {"url": url, "elapsed_ms": elapsed_ms, "usage": usage,
+            "runtime": {**runtime_metadata("ollama"), "max_output_tokens": options.get("num_predict"),
+                        "context_limit": options.get("num_ctx")},
+            "finish_reason": data.get("done_reason"),
+            "tool_call_dialect": "ollama_native",
+            "durations_ns": {key: data[key] for key in (
+                "total_duration", "load_duration", "prompt_eval_duration", "eval_duration"
+            ) if key in data}}
     record_inference_usage_event(
         provider="ollama",
         model=model,
@@ -663,7 +718,7 @@ def _generate_ollama_reply(*, messages: list[dict[str, Any]], tools: list[dict[s
         provider="ollama",
         model=model,
         meta=meta,
-        tool_calls=None,
+        tool_calls=tool_calls,
     )
 
 
@@ -832,7 +887,7 @@ def _generate_vllm_reply(
         model = _vllm_model()
         error = f"{type(exc).__name__}: {exc}"
         logger.warning("vLLM model resolution failed (%s): %s", base_url, error)
-        meta = {"url": base_url, "error": repr(exc)}
+        meta = {"url": base_url, "error": repr(exc), "runtime": runtime_metadata("vllm")}
         record_inference_usage_event(
             provider="vllm",
             model=model,
@@ -867,13 +922,28 @@ def _generate_vllm_reply(
     started = time.monotonic()
     fallback: dict[str, Any] = {}
     rejections: list[dict[str, Any]] = []
+    strict_protocol = vllm_strict_protocol()
+    validated_reply = None
+    tool_preamble_meta = None
+    data = None
     try:
+        family = vllm_tool_preamble_family()
+        if family and tools and tool_choice != "none":
+            preamble = render_prompt(family)
+            prepared_messages = vllm_protocol.with_system_preamble(messages, preamble.text)
+            payload_base["messages"] = prepared_messages
+            payload["messages"] = prepared_messages
+            tool_preamble_meta = preamble.observability_fields()
+        output_limit = max_output_tokens()
+        if output_limit is not None:
+            payload_base.setdefault("max_tokens", output_limit)
+            payload.setdefault("max_tokens", output_limit)
         response = None
         data = None
         candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = [("full", payload, {})]
-        if cleaned_extra_body:
+        if cleaned_extra_body and not strict_protocol:
             candidates.append(("drop_extra_fields", payload_base, {"dropped_extra_fields": True}))
-        if tools is not None:
+        if tools is not None and not strict_protocol:
             payload_no_tools = dict(payload_base)
             payload_no_tools.pop("tools", None)
             payload_no_tools.pop("tool_choice", None)
@@ -918,6 +988,8 @@ def _generate_vllm_reply(
 
         if last_exc is not None or data is None:
             raise last_exc or RuntimeError("No response data from vLLM.")
+        if strict_protocol:
+            validated_reply = vllm_protocol.structured_reply(data, tools=tools, tool_choice=tool_choice)
     except requests.exceptions.HTTPError as exc:
         response_obj = getattr(exc, "response", None)
         status_code = getattr(response_obj, "status_code", None)
@@ -929,9 +1001,13 @@ def _generate_vllm_reply(
                 response_text = ""
 
         error = f"{type(exc).__name__}: {exc}"
-        meta: dict[str, Any] = {"url": url, "error": repr(exc)}
+        meta: dict[str, Any] = {"url": url, "error": repr(exc),
+                                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                                "runtime": {**runtime_metadata("vllm"), "max_output_tokens": payload.get("max_tokens")}}
         if status_code is not None:
             meta["status_code"] = status_code
+        if tool_preamble_meta:
+            meta["tool_preamble"] = tool_preamble_meta
         response_text = _truncate_text(response_text)
         if response_text:
             meta["response_text"] = response_text
@@ -963,7 +1039,17 @@ def _generate_vllm_reply(
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         logger.warning("vLLM request failed (%s): %s", url, error)
-        meta = {"url": url, "error": repr(exc)}
+        meta = {"url": url, "error": repr(exc),
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "runtime": {**runtime_metadata("vllm"), "max_output_tokens": payload.get("max_tokens")}}
+        if isinstance(data, dict):
+            if isinstance(data.get("usage"), dict):
+                meta["usage"] = data["usage"]
+            choices = data.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                meta["finish_reason"] = choices[0].get("finish_reason")
+        if tool_preamble_meta:
+            meta["tool_preamble"] = tool_preamble_meta
         record_inference_usage_event(
             provider="vllm",
             model=model,
@@ -988,6 +1074,7 @@ def _generate_vllm_reply(
     tool_calls: list[dict[str, Any]] | None = None
     tool_parser_fallback_used = False
     tool_parser_fallback_shape: str | None = None
+    finish_reason: str | None = None
     if isinstance(data, dict):
         usage_obj = data.get("usage")
         if isinstance(usage_obj, dict):
@@ -1005,21 +1092,30 @@ def _generate_vllm_reply(
                         tool_calls = [tc for tc in tool_calls_obj if isinstance(tc, dict)]
                 if not content and "text" in choice0:
                     content = str(choice0.get("text") or "")
-    if tools is not None and not tool_calls:
+    if validated_reply is not None:
+        content, tool_calls, finish_reason = validated_reply
+    if tools is not None and not tool_calls and not strict_protocol:
         salvaged_tool_calls, salvage_shape = _salvage_vllm_tool_calls_from_content(content)
         if salvaged_tool_calls:
             tool_calls = salvaged_tool_calls
             tool_parser_fallback_used = True
             tool_parser_fallback_shape = salvage_shape
             content = ""
-    if not content and not tool_calls:
+    if not content and not tool_calls and not strict_protocol:
         content = json.dumps(data)[:4000]
 
-    meta: dict[str, Any] = {"url": url, "elapsed_ms": elapsed_ms}
+    meta: dict[str, Any] = {"url": url, "elapsed_ms": elapsed_ms,
+                            "runtime": {**runtime_metadata("vllm"), "max_output_tokens": payload.get("max_tokens")}}
+    if finish_reason:
+        meta["finish_reason"] = finish_reason
+    if tool_preamble_meta:
+        meta["tool_preamble"] = tool_preamble_meta
     if usage is not None:
         meta["usage"] = usage
     if tools is not None:
-        meta["tool_call_dialect"] = "parser_native_name_arguments"
+        meta["tool_call_dialect"] = "openai_tool_calls" if strict_protocol else (
+            "parser_native_name_arguments" if vllm_tool_parser() == "llama3_json" else vllm_tool_parser()
+        )
     if tool_parser_fallback_used:
         meta["tool_parser_fallback_used"] = True
         meta["tool_parser_fallback_shape"] = tool_parser_fallback_shape

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 
 import pytest
 import requests
@@ -82,4 +83,61 @@ def test_generate_reply_ollama_smoke(monkeypatch):
     assert "Assistant error:" not in reply.content
     clean = reply.content.strip().strip('"').strip("'").strip()
     assert re.fullmatch(r"(?i)ok[.!]?", clean) is not None
+
+
+def test_native_tool_roundtrip_without_live_tools(monkeypatch, record_property):
+    url, model = _ollama_url(), _ollama_model()
+    _skip_if_ollama_unreachable(url)
+    _skip_if_model_missing(url, model)
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "ollama")
+    monkeypatch.setenv("ISPEC_OLLAMA_MODEL", model)
+    tool = {"type": "function", "function": {"name": "lookup_fixture_project",
+        "description": "Read the synthetic project's sample count.", "parameters": {
+            "type": "object", "properties": {"project_id": {"type": "integer"}},
+            "required": ["project_id"],
+        }}}
+    messages = [{"role": "system", "content": "Use the lookup tool; do not guess. This is a read-only test."},
+                {"role": "user", "content": "How many samples were received for project 42?"}]
+    first = service.generate_reply(messages=messages, tools=[tool], tool_choice="required", timeout_seconds=120)
+    assert first.ok, first.error
+    assert len(first.tool_calls or []) == 1
+    call = first.tool_calls[0]
+    assert call["function"]["name"] == "lookup_fixture_project"
+    assert json.loads(call["function"]["arguments"]) == {"project_id": 42}
+    messages.extend([
+        {"role": "assistant", "content": first.content, "tool_calls": first.tool_calls},
+        {"role": "tool", "tool_call_id": call["id"], "content": '{"project_id":42,"sample_count":7}'},
+    ])
+    second = service.generate_reply(messages=messages, tools=[tool], tool_choice="none", timeout_seconds=120)
+    assert second.ok, second.error
+    assert not second.tool_calls
+    assert re.search(r"\b(7|seven)\b", second.content, re.I), second.content
+    record_property("lookup_ms", first.meta["elapsed_ms"])
+    record_property("answer_ms", second.meta["elapsed_ms"])
+    print("\nOLLAMA_ROUNDTRIP " + json.dumps({"model": model, "lookup_ms": first.meta["elapsed_ms"],
+        "answer_ms": second.meta["elapsed_ms"], "answer": second.content}))
+
+
+def test_bounded_approval_json_without_authorizing_any_write(monkeypatch, record_property):
+    url, model = _ollama_url(), _ollama_model()
+    _skip_if_ollama_unreachable(url)
+    _skip_if_model_missing(url, model)
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "ollama")
+    monkeypatch.setenv("ISPEC_OLLAMA_MODEL", model)
+    schema = {"type": "object", "properties": {
+        "label": {"type": "string", "enum": ["approve_save", "deny_save", "unclear"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    }, "required": ["label", "confidence"], "additionalProperties": False}
+    reply = service.generate_reply(messages=[
+        {"role": "system", "content": "Classify the latest reply to a pending project-note draft. Return JSON only. Do not execute or claim any write."},
+        {"role": "user", "content": 'Pending ask: "Received seven samples. Save this note?" Latest reply: "No, do not save it."'},
+    ], vllm_extra_body={"structured_outputs": {"json": schema}, "max_tokens": 300, "temperature": 0},
+        timeout_seconds=120)
+    assert reply.ok, reply.error
+    result = json.loads(reply.content)
+    assert result["label"] == "deny_save"
+    assert 0 <= result["confidence"] <= 1
+    assert not reply.tool_calls
+    record_property("classifier_ms", reply.meta["elapsed_ms"])
+    print("\nOLLAMA_CLASSIFIER " + json.dumps({"model": model, "elapsed_ms": reply.meta["elapsed_ms"], "result": result}))
 

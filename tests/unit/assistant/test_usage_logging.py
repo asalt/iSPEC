@@ -27,7 +27,9 @@ def test_record_inference_usage_event_writes_jsonl(tmp_path, monkeypatch):
     record_inference_usage_event(
         provider='vllm',
         model='test-model',
-        meta={'elapsed_ms': 12, 'usage': {'total_tokens': 5}},
+        meta={'elapsed_ms': 12, 'usage': {'total_tokens': 5},
+              'runtime': {'profile': 'olmo7b-think-vllm', 'tool_parser': 'olmo3', 'max_output_tokens': 2048},
+              'finish_reason': 'stop'},
         ok=True,
         observability_context={'surface': 'support_chat', 'session_id': 's1'},
     )
@@ -37,6 +39,9 @@ def test_record_inference_usage_event_writes_jsonl(tmp_path, monkeypatch):
     payload = json.loads(files[0].read_text(encoding='utf-8').strip())
     assert payload['surface'] == 'support_chat'
     assert payload['usage']['total_tokens'] == 5
+    assert payload['runtime']['profile'] == 'olmo7b-think-vllm'
+    assert payload['runtime']['max_output_tokens'] == 2048
+    assert payload['finish_reason'] == 'stop'
     assert 'content' not in payload
 
 
@@ -70,6 +75,20 @@ def test_generate_reply_records_usage_event(tmp_path, monkeypatch):
     assert payload['surface'] == 'support_chat'
     assert payload['session_id'] == 'abc'
     assert payload['provider'] == 'vllm'
+
+
+def test_usage_keeps_preamble_identity_without_prompt_text(tmp_path, monkeypatch):
+    monkeypatch.setenv('ISPEC_LOG_DIR', str(tmp_path))
+    monkeypatch.setenv('ISPEC_INFERENCE_USAGE_LOG_ENABLED', '1')
+    record_inference_usage_event(provider='vllm', model='candidate', ok=False,
+        error='unavailable tool', meta={'tool_preamble': {
+            'prompt_family': 'assistant.tools.olmo3_preamble',
+            'prompt_sha256': 'fixture-hash', 'text': 'Do not log prompt bodies here'}})
+    path, = (tmp_path / 'inference-usage').glob('usage-*.jsonl')
+    event = json.loads(path.read_text())
+    assert event['tool_preamble'] == {
+        'prompt_family': 'assistant.tools.olmo3_preamble', 'prompt_sha256': 'fixture-hash'}
+    assert event['ok'] is False
 
 
 def test_generate_classifier_reply_records_usage_event(tmp_path, monkeypatch):
