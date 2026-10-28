@@ -72,6 +72,24 @@ def test_claims_are_atomic_bounded_and_not_durable(monkeypatch):
     assert len(claims._seen) == 2
 
 
+@pytest.mark.parametrize("route", ["message", "app_mention"])
+def test_receiver_allowlist_blocks_unapproved_senders_without_replies(receiver, monkeypatch, route):
+    monkeypatch.setenv("ISPEC_SLACK_ALLOWED_USER_IDS", "UALLOWED")
+    monkeypatch.setattr(slack, "_post_ispec_chat", lambda **kw: pytest.fail("Unapproved API call"))
+    receiver.dispatch(name=route)
+    assert not receiver.posts and not receiver.updates and not receiver.says
+
+
+def test_receiver_allowlist_is_explicit_and_exact(monkeypatch):
+    monkeypatch.delenv("ISPEC_SLACK_ALLOWED_USER_IDS", raising=False)
+    assert slack._reply_user_allowed({"user": "UTEST"})
+    monkeypatch.setenv("ISPEC_SLACK_ALLOWED_USER_IDS", "UALLOWED, USECOND")
+    assert slack._reply_user_allowed({"user": "UALLOWED"})
+    assert slack._reply_user_allowed({"user": "USECOND"})
+    assert not slack._reply_user_allowed({"user": "UALLOWED-extra"})
+    assert not slack._reply_user_allowed({})
+
+
 @pytest.fixture
 def receiver(monkeypatch, tmp_path):
     # Keep the real response type importable when replacing the Bolt app below.

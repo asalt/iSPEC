@@ -1128,6 +1128,15 @@ def _ack_ignored_slack_event(*, event_name: str, event: dict[str, Any] | None, a
         pass
 
 
+def _reply_user_allowed(event: dict[str, Any]) -> bool:
+    """Optional receiver allowlist; empty preserves existing deployment behavior."""
+    raw = os.getenv("ISPEC_SLACK_ALLOWED_USER_IDS", "").strip()
+    if not raw:
+        return True
+    allowed = {value.strip() for value in raw.split(",") if value.strip()}
+    return str(event.get("user") or "") in allowed
+
+
 def _run_socket_mode(args) -> None:
     try:
         from slack_bolt import App
@@ -1275,6 +1284,8 @@ def _run_socket_mode(args) -> None:
             ack()
         except Exception:
             pass
+        if not _reply_user_allowed(event):
+            return
         if event.get("bot_id") or event.get("subtype") == "bot_message":
             return
 
@@ -1474,6 +1485,8 @@ def _run_socket_mode(args) -> None:
             ack()
         except Exception:
             pass
+        if not _reply_user_allowed(event):
+            return
         if event.get("bot_id") or event.get("subtype"):
             return
 

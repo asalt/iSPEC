@@ -20,6 +20,7 @@ from ispec.agent.archive import get_agent_archive_session_if_available
 from ispec.agent.connect import get_agent_session
 from ispec.authz import get_project_for_user, scope_project_query, uses_explicit_project_access
 from ispec.backup import load_backup_status
+from ispec.prompt import load_bound_prompt, prompt_binding
 from ispec.assistant.context import person_summary, project_summary
 from ispec.assistant.models import (
     SupportMemory,
@@ -156,6 +157,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
 
 _WRITE_TOOL_NAMES: set[str] = {
     "create_project_comment",
+    "assistant_enqueue_dev_restart_services",
     "assistant_enqueue_slack_message",
     "assistant_enqueue_staff_slack_message",
     "assistant_upsert_scheduled_job",
@@ -167,6 +169,16 @@ _WRITE_TOOL_NAMES: set[str] = {
 
 def tool_writes_data(name: str | None) -> bool:
     return str(name or "").strip() in _WRITE_TOOL_NAMES
+
+
+def assistant_read_only() -> bool:
+    """An explicit read-only deployment blocks writes even for privileged users."""
+    return os.getenv("ISPEC_ASSISTANT_READ_ONLY", "0").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+@prompt_binding("assistant.tools.read_only")
+def _read_only_tools_context() -> str:
+    return load_bound_prompt(_read_only_tools_context).text
 
 
 def _normalize_request_text(value: str | None) -> str:
@@ -1783,10 +1795,13 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
 
     lines = [
         "Available tools:",
+        _read_only_tools_context().strip() if assistant_read_only() else
         "- (Most tools are read-only; create_project_comment plus internal enqueue/schedule/tmux-relay tools perform writes.)",
     ]
 
     def add(tool_name: str, line: str) -> None:
+        if assistant_read_only() and tool_writes_data(tool_name):
+            return
         if allowed is not None and tool_name not in allowed:
             return
         if tool_name.startswith("repo_") and not repo_enabled:
@@ -2196,7 +2211,9 @@ def _assistant_list_tools_payload(
         scope_err = _scope_error(scope, user)
 
         unavailable_reason: str | None = None
-        if _tool_requires_code_access(tool_name) and not code_tools_enabled:
+        if assistant_read_only() and tool_writes_data(tool_name):
+            unavailable_reason = "Assistant writes are disabled in read-only mode."
+        elif _tool_requires_code_access(tool_name) and not code_tools_enabled:
             unavailable_reason = code_tools_reason or "Code tools are unavailable."
         elif tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
             unavailable_reason = (
@@ -3003,6 +3020,8 @@ def run_tool(
     support_turn_id: str | None = None,
     support_session_id: str | None = None,
 ) -> dict[str, Any]:
+    if assistant_read_only() and tool_writes_data(name):
+        return {"ok": False, "tool": name, "error": "Assistant writes are disabled in read-only mode."}
     # the large try block is not great - but these if statements for
     # resolving tool call results is probably fine
     # also not great to define closure inside as that makes it more difficult to test
@@ -7540,6 +7559,8 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
     tmux_tools_enabled, _ = _tmux_tools_status()
     code_tools_enabled, _ = _code_tool_access_status(user)
     for name, spec in _OPENAI_TOOL_SPECS.items():
+        if assistant_read_only() and tool_writes_data(name):
+            continue
         if _tool_requires_code_access(name) and not code_tools_enabled:
             continue
         if name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:

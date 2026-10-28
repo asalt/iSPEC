@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+import os
 from typing import Any, Callable, Literal
 
 from sqlalchemy.orm import Session
@@ -162,6 +163,10 @@ def enqueue_post_send_prepare_command(
     current_command_id: int | None = None,
 ) -> ControllerPostSendEnqueueResult:
     normalized_thread_key = str(thread_key or "").strip()
+    if os.getenv("ISPEC_ASSISTANT_POST_SEND_PREPARE_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return ControllerPostSendEnqueueResult(
+            action="none", enqueued=False, thread_key=normalized_thread_key, reason="disabled",
+        )
     if not normalized_thread_key:
         return ControllerPostSendEnqueueResult(
             action="none",
