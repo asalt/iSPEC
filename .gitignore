@@ -17,6 +17,11 @@ data/testdata/raw/
 *.swo
 *.swn
 *.db-journal
+*.db-shm
+*.db-wal
+/ispec-observer.zip
+# Independent checkout; pinned by the wrapper configs/observer-source.json.
+/packages/ispec-observer/
 *.xlsx
 *.sqlite
 *.db
