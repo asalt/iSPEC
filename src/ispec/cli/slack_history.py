@@ -6,16 +6,23 @@ Run with ``python -m ispec.cli.slack_history --help``. No assistant is invoked.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 import json
+import os
+from pathlib import Path
 import re
 import sys
+import tempfile
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
 from ispec.cli import slack
 from ispec.slack_delivery import log_delivery
 from ispec.cli.env import extract_env_files, load_env_files
+from ispec.config.paths import resolve_config_dir
 
 
 class SlackReadError(Exception):
@@ -58,6 +65,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--env-file", action="append", help="Existing iSPEC KEY=value credentials file; repeatable.")
     p.add_argument("--channel", required=True, help="Exact Slack channel ID (no aliases or auto-join).")
     p.add_argument("--thread-ts", help="Exact parent timestamp; selects a thread read or reply target.")
+    p.add_argument("--date", help="Read channel history for one YYYY-MM-DD; never sends or imports receipts.")
+    p.add_argument("--timezone", help="IANA timezone for --date; remember for later reads (initial default America/Chicago).")
     p.add_argument("--limit", type=int, default=10, help="Messages per page, 1–100 (default 10).")
     p.add_argument("--max-pages", type=int, default=1, help="Bounded cursor pagination, 1–100 (default 1).")
     p.add_argument("--cursor", default="", help="Continue a previous read from next_cursor.")
@@ -72,6 +81,62 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def timezone_settings_path() -> Path:
+    return Path(resolve_config_dir().value) / "slack-history.json"
+
+
+def saved_timezone() -> str:
+    try:
+        value = json.loads(timezone_settings_path().read_text(encoding="utf-8"))["timezone"]
+        if not isinstance(value, str):
+            raise ValueError("Invalid timezone setting")
+        ZoneInfo(value)
+        return value
+    except FileNotFoundError:
+        return "America/Chicago"
+    except (OSError, ValueError, KeyError, TypeError, ZoneInfoNotFoundError):
+        raise SlackReadError("Cannot read saved Slack history timezone; specify --timezone to replace it.") from None
+
+
+def save_timezone(value: str) -> None:
+    path = timezone_settings_path()
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # One local preference, atomically replaced; no credentials or messages.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".slack-history-", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump({"timezone": value}, handle)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except OSError:
+        raise SlackReadError("Cannot save Slack history timezone; no Slack request was made.") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def date_window(day: str, timezone: str) -> tuple[int, int]:
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            raise ValueError("Invalid date")
+        start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=ZoneInfo(timezone))
+        return int(start.timestamp()), int((start + timedelta(days=1)).timestamp())
+    except (ValueError, ZoneInfoNotFoundError):
+        raise SlackReadError("Use a valid --date YYYY-MM-DD and IANA --timezone.") from None
+
+
+def in_date_window(row: dict, bounds: tuple[int, int]) -> bool:
+    try:
+        timestamp = Decimal(str(row.get("ts", "")))
+        return timestamp.is_finite() and bounds[0] <= timestamp < bounds[1]
+    except InvalidOperation:
+        return False
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     if not re.fullmatch(r"[CGD][A-Z0-9]+", args.channel):
         raise SlackReadError("--channel must be an explicit Slack channel ID.")
@@ -83,6 +148,17 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         raise SlackReadError("--timeout-seconds must be greater than 0 and at most 120.")
     text = sys.stdin.read() if args.stdin else args.text
     posting = args.send or args.dry_run
+    timezone = args.timezone
+    if timezone is not None:
+        try:
+            ZoneInfo(timezone)
+        except (ValueError, ZoneInfoNotFoundError):
+            raise SlackReadError("Use a valid IANA --timezone.") from None
+    if args.date and timezone is None:
+        timezone = saved_timezone()
+    bounds = date_window(args.date, timezone) if args.date else None
+    if bounds and (posting or args.record_outbound or args.thread_ts or text is not None):
+        raise SlackReadError("--date is a read-only channel scan; fetch chosen threads separately.")
     if args.record_outbound and (posting or text is not None or not args.thread_ts or args.cursor):
         raise SlackReadError("--record-outbound requires one exact --thread-ts and cannot send or paginate.")
     if text is not None and not posting:
@@ -95,6 +171,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                "unfurl_links": "false", "unfurl_media": "false"}
     if args.dry_run:
         return {"ok": True, "dry_run": True, "identity_verified": False, "payload": payload}
+    if args.timezone is not None and not posting and not args.record_outbound:
+        save_timezone(timezone)
     token = slack._cli_slack_bot_token()
     if not token:
         raise SlackReadError("No bot token configured. Use existing iSPEC --env-file settings or inherited bot environment.")
@@ -147,13 +225,15 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     messages: list[dict[str, Any]] = []
     for page in range(args.max_pages):
         query: dict[str, Any] = {"channel": args.channel, "limit": args.limit}
+        if bounds:
+            query.update(oldest=str(bounds[0]), latest=str(bounds[1]), inclusive="true")
         if args.thread_ts:
             query["ts"] = args.thread_ts
         if cursor:
             query["cursor"] = cursor
         result = _call(token, endpoint, query, args.timeout_seconds)
         messages.extend({k: row.get(k) for k in ("ts", "thread_ts", "user", "text", "reply_count")}
-                        for row in result.get("messages", []))
+                        for row in result.get("messages", []) if not bounds or in_date_window(row, bounds))
         cursor = str((result.get("response_metadata") or {}).get("next_cursor") or "").strip()
         has_more = bool(cursor or result.get("has_more"))
         if not cursor:
@@ -163,6 +243,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         seen.add(cursor)
     output = {**base, "thread_ts": args.thread_ts, "messages": messages,
               "pages": page + 1, "has_more": has_more, "next_cursor": cursor}
+    if bounds:
+        output["date_window"] = {"date": args.date, "timezone": timezone,
+                                 "oldest_inclusive": bounds[0], "latest_exclusive": bounds[1]}
+        output["coverage"] = "Channel history only; not a complete scan of replies to older threads. Read selected threads separately."
     if has_more and not cursor:
         output["warning"] = "Slack reports more results but supplied no cursor; result is incomplete."
     return output

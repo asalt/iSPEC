@@ -6,6 +6,12 @@ import requests
 from ispec.cli import slack_history as cli
 
 
+@pytest.fixture(autouse=True)
+def local_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("ISPEC_CONFIG_DIR", str(tmp_path / "config"))
+    return tmp_path / "config/slack-history.json"
+
+
 @pytest.fixture
 def provider(monkeypatch, tmp_path):
     calls = []
@@ -40,6 +46,111 @@ def test_default_read_and_redaction(provider, capsys):
     assert code == 0 and result["source"] == "live_slack"
     assert result["messages"][0]["text"] == "[REDACTED]"
     assert [x[0] for x in calls] == ["auth.test", "conversations.info", "conversations.history"]
+
+
+def test_date_scan_bounds_and_read_only(provider, capsys):
+    calls, responses = provider
+    start, end = cli.date_window("2026-10-21", "America/Chicago")
+    responses.append({"ok": True, "messages": [
+        {"ts": str(start - 1)}, {"ts": str(start)},
+        {"ts": str(end - 1)}, {"ts": str(end)}, {"ts": "NaN"},
+    ]})
+    code, result = run(capsys, "--date", "2026-10-21")
+    assert code == 0 and len(result["messages"]) == 2
+    assert "older threads" in result["coverage"]
+    assert calls[-1][1]["oldest"] == str(start)
+    assert calls[-1][1]["latest"] == str(end)
+    assert all(endpoint != "chat.postMessage" for endpoint, _ in calls)
+
+
+@pytest.mark.parametrize("day,hours", [("2026-03-08", 23), ("2026-11-01", 25)])
+def test_date_scan_handles_daylight_saving(day, hours):
+    start, end = cli.date_window(day, "America/Chicago")
+    assert end - start == hours * 3600
+
+
+def test_timezone_remembered_across_calls_and_working_directories(provider, capsys, local_settings, monkeypatch, tmp_path):
+    calls, responses = provider
+    responses.extend([{"ok": True, "messages": []}] * 3)
+    assert run(capsys, "--date", "2026-10-21", "--timezone", "Asia/Tokyo")[0] == 0
+    assert json.loads(local_settings.read_text()) == {"timezone": "Asia/Tokyo"}
+    assert local_settings.stat().st_mode & 0o077 == 0
+    monkeypatch.chdir(tmp_path)
+    code, result = run(capsys, "--date", "2026-10-22")
+    assert code == 0 and result["date_window"]["timezone"] == "Asia/Tokyo"
+    assert calls[-1][1]["oldest"] == str(cli.date_window("2026-10-22", "Asia/Tokyo")[0])
+    assert run(capsys, "--date", "2026-10-22", "--timezone", "UTC")[0] == 0
+    assert cli.saved_timezone() == "UTC"
+
+
+@pytest.mark.parametrize("args", [
+    ["--date", "2026-10-21", "--timezone", "invalid/timezone"],
+    ["--date", "2026-02-30", "--timezone", "UTC"],
+    ["--date", "2026-10-21", "--timezone", "UTC", "--send", "--thread-ts", "1.1", "--text", "no"],
+])
+def test_invalid_command_preserves_saved_timezone(provider, capsys, args):
+    cli.save_timezone("America/Chicago")
+    assert run(capsys, *args)[0] == 1
+    assert cli.saved_timezone() == "America/Chicago"
+    assert provider[0] == []
+
+
+def test_date_default_does_not_create_settings(provider, capsys, local_settings):
+    provider[1].append({"ok": True, "messages": []})
+    _, result = run(capsys, "--date", "2026-10-21")
+    assert result["date_window"]["timezone"] == "America/Chicago"
+    assert not local_settings.exists()
+
+
+@pytest.mark.parametrize("contents", ["invalid json", "[]", '{"timezone": "bad/zone"}'])
+def test_corrupt_preferences_require_explicit_timezone(provider, capsys, local_settings, contents):
+    local_settings.parent.mkdir()
+    local_settings.write_text(contents)
+    code, result = run(capsys, "--date", "2026-10-21")
+    assert code == 1 and "specify --timezone" in result["error"]
+    assert provider[0] == []
+    provider[1].append({"ok": True, "messages": []})
+    assert run(capsys, "--date", "2026-10-21", "--timezone", "UTC")[0] == 0
+    assert cli.saved_timezone() == "UTC"
+
+
+def test_settings_write_failure_happens_before_provider(provider, capsys, monkeypatch):
+    monkeypatch.setattr(cli.tempfile, "NamedTemporaryFile", lambda **kw: (_ for _ in ()).throw(PermissionError()))
+    code, result = run(capsys, "--date", "2026-10-21", "--timezone", "UTC")
+    assert code == 1 and "no Slack request" in result["error"]
+    assert provider[0] == []
+
+
+def test_timezone_selection_survives_provider_failure(provider, capsys):
+    provider[1].append(requests.Timeout("synthetic outage"))
+    code, _ = run(capsys, "--date", "2026-10-21", "--timezone", "UTC")
+    assert code == 1
+    assert cli.saved_timezone() == "UTC"
+
+
+def test_failed_atomic_replace_preserves_previous_setting(provider, capsys, monkeypatch, local_settings):
+    cli.save_timezone("America/Chicago")
+    monkeypatch.setattr(cli.Path, "replace", lambda *a: (_ for _ in ()).throw(PermissionError()))
+    code, _ = run(capsys, "--date", "2026-10-21", "--timezone", "UTC")
+    assert code == 1 and cli.saved_timezone() == "America/Chicago"
+    assert not list(local_settings.parent.glob(".slack-history-*"))
+    assert provider[0] == []
+
+
+def test_send_dry_run_does_not_save_timezone(provider, capsys, local_settings):
+    assert run(capsys, "--dry-run", "--thread-ts", "1.1", "--text", "hello", "--timezone", "UTC")[0] == 0
+    assert not local_settings.exists()
+
+
+@pytest.mark.parametrize("args", [
+    ["--date", "2026-02-30"], ["--date", "2026-10-21", "--timezone", "not/a/timezone"],
+    ["--date", "2026-10-21", "--thread-ts", "1.1", "--send", "--text", "no"],
+    ["--date", "2026-10-21", "--thread-ts", "1.1", "--record-outbound"],
+])
+def test_invalid_date_or_date_send_calls_no_provider(provider, capsys, args):
+    calls, _ = provider
+    code, _ = run(capsys, *args)
+    assert code == 1 and calls == []
 
 
 def test_thread_pagination_and_bound(provider, capsys):

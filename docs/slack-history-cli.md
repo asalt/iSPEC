@@ -11,6 +11,11 @@ Run from `/home/alex/tools/ispec-full/iSPEC`:
 .venv/bin/python -m ispec.cli.slack_history --env-file ../.env.slack \
   --channel GC420B63V --thread-ts 1791213934.178879
 
+# Inspect a calendar day without posting or importing messages.
+.venv/bin/python -m ispec.cli.slack_history --env-file ../.env.slack \
+  --channel GC420B63V --date 2026-10-21 --timezone America/Chicago \
+  --limit 100 --max-pages 5
+
 # Preview exact reply text from stdin, without network access.
 printf '%s' 'Your approved reply' | .venv/bin/python -m ispec.cli.slack_history \
   --channel GC420B63V --thread-ts 1791213934.178879 --stdin --dry-run
@@ -63,6 +68,21 @@ and/or `--limit` (each bounded 1–100), or resume using the returned
 `next_cursor` with `--cursor`. `has_more` signals incomplete history.
 The helper stops if Slack repeats a cursor. Thread timestamps must be copied
 exactly as strings, never rounded numbers.
+
+`--date` selects local midnight through the next midnight in the selected IANA
+timezone, including daylight-saving transitions. An explicitly supplied
+`--timezone` on a valid read becomes the default for later reads, even from a
+different working directory. It is stored in `~/.ispec/slack-history.json`
+(or `$ISPEC_CONFIG_DIR/slack-history.json`); only the timezone is saved, not
+messages or credentials. The initial default is `America/Chicago`. Pass another
+`--timezone` to change it. Invalid arguments and send/dry-run operations do not
+update this preference. A valid read saves the setting before network access,
+so a later Slack outage does not lose the selection. Unreadable/invalid saved
+settings require an explicit timezone rather than silently selecting another day.
+
+A date scan covers channel history, **not all replies posted that day on older
+threads**. Fetch selected threads separately with `--thread-ts`. Date mode cannot
+send or import receipts, and does not generate project-note proposals itself.
 
 Tests:
 ```bash
