@@ -58,8 +58,9 @@ def status():
     return {"ok": True}
 
 
-# Auth endpoints live under /api/auth.
-app.include_router(auth_router, prefix="/api", dependencies=[Depends(require_api_key)])
+# Browser login/session endpoints do not require a shared service credential.
+# First-admin bootstrap has its own explicit key dependency.
+app.include_router(auth_router, prefix="/api")
 
 # Agent telemetry endpoints (/api/agents/*).
 app.include_router(agents_router, prefix="/api", dependencies=[Depends(require_api_key)])

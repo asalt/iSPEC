@@ -14,6 +14,8 @@ from ispec.api.security import (
     delete_session,
     hash_password,
     require_admin,
+    require_browser_origin,
+    require_configured_api_key,
     require_staff,
     require_user,
     session_cookie_name,
@@ -32,7 +34,7 @@ from ispec.db.models import (
 )
 
 
-router = APIRouter(prefix="/auth", tags=["Auth"])
+router = APIRouter(prefix="/auth", tags=["Auth"], dependencies=[Depends(require_browser_origin)])
 
 
 class UserOut(BaseModel):
@@ -158,7 +160,8 @@ def _require_person(db: Session, person_id: int | None) -> Person | None:
     return person
 
 
-@router.post("/bootstrap", response_model=UserOut, status_code=201)
+@router.post("/bootstrap", response_model=UserOut, status_code=201,
+             dependencies=[Depends(require_configured_api_key)])
 def bootstrap(
     payload: BootstrapRequest,
     response: Response,

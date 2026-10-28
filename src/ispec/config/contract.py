@@ -251,7 +251,7 @@ def default_contract() -> tuple[VarSpec, ...]:
             key="ISPEC_API_KEY",
             kind="string",
             group="Security",
-            description="Shared API key required for non-local binds and recommended for all deployments.",
+            description="Internal service/bootstrap API key; never inject into browser requests or frontend builds.",
             required_in=frozenset({"prod"}),
             recommended_in=frozenset({"dev"}),
             secret=True,

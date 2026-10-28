@@ -1,13 +1,14 @@
 """API security helpers for the FastAPI service.
 
-This module provides two layers of protection:
+This module provides distinct browser and internal-service authentication:
 
-1) Optional API key (env: ``ISPEC_API_KEY``)
+1) Internal API key (env: ``ISPEC_API_KEY``)
    - Accepted via ``X-API-Key`` header or ``Authorization: Bearer <key>``.
 
-2) Optional cookie-backed user sessions (env: ``ISPEC_REQUIRE_LOGIN=1``)
+2) Cookie-backed user sessions (required with ``ISPEC_REQUIRE_LOGIN=1``)
    - Login issues an HttpOnly cookie containing a random session token.
    - The token is stored *hashed* in the database.
+   - Browser sessions do not also need the internal API key.
 
 Notes on password storage:
 - Do **not** store raw passwords or fast hashes (e.g. plain SHA256).
@@ -23,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import os
 import secrets
+from urllib.parse import urlsplit
 
 from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
@@ -101,7 +103,7 @@ def require_api_key(provided: str | None = Depends(_provided_api_key)) -> None:
 
 
 def require_configured_api_key(provided: str | None = Depends(_provided_api_key)) -> None:
-    """Internal receipt/context access never becomes anonymous when auth is unset."""
+    """Internal access/bootstrap never becomes anonymous when auth is unset."""
     if _expected_api_key() is None:
         raise HTTPException(status_code=503, detail="Internal API key is not configured.")
     require_api_key(provided)
@@ -299,12 +301,48 @@ def require_user(
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated.")
 
+    require_browser_origin(request)
+
     if getattr(user, "must_change_password", False):
         path = (request.url.path or "").rstrip("/")
         if path not in _PASSWORD_CHANGE_ALLOWED_PATHS:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Password change required.")
 
     return user
+
+
+def require_browser_origin(request: Request) -> None:
+    """Reject cross-origin browser mutations, including login/logout CSRF.
+
+    Same-origin proxies must preserve Host and the externally visible scheme.
+    Non-browser clients without Origin/Fetch Metadata still need normal auth.
+    """
+    if request.method in {"GET", "HEAD", "OPTIONS"}:
+        return
+    origin = request.headers.get("origin")
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        raise HTTPException(status_code=403, detail="Cross-origin request denied.")
+    if origin is None:
+        return
+    try:
+        supplied = urlsplit(origin)
+        target = urlsplit(str(request.url))
+
+        def origin_key(url):
+            port = url.port if url.port is not None else {"http": 80, "https": 443}.get(url.scheme)
+            return url.scheme, url.hostname, port
+
+        valid = (
+            supplied.scheme in {"http", "https"}
+            and supplied.hostname is not None
+            and supplied.username is None and supplied.password is None
+            and not supplied.path and not supplied.query and not supplied.fragment
+            and origin_key(supplied) == origin_key(target)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise HTTPException(status_code=403, detail="Cross-origin request denied.")
 
 
 def require_admin(user: AuthUser = Depends(require_user)) -> AuthUser:
@@ -346,6 +384,17 @@ def _require_login() -> bool:
     return _is_truthy(os.getenv("ISPEC_REQUIRE_LOGIN"))
 
 
+def _authenticated_browser_user(request: Request, db: Session) -> AuthUser | None:
+    user = get_current_user(request, db)
+    if user is None and _session_cookie_name() in request.cookies:
+        # An expired/disabled browser identity must not fall back to service scope.
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    if user is not None:
+        user = require_user(request, user)
+        request.state.user = user
+    return user
+
+
 def require_access(
     request: Request,
     db: Session = Depends(get_session_dep),
@@ -354,37 +403,21 @@ def require_access(
     """Dependency guarding protected API routes.
 
     Rules:
-    - If ``ISPEC_API_KEY`` is set, the request must supply that key.
-    - If ``ISPEC_REQUIRE_LOGIN`` is truthy, the request must also carry a valid
-      session cookie (created via ``/api/auth/login``).
-    - When logged in as a ``viewer``, write methods are rejected.
+    - A valid browser session is sufficient, with its existing role/project scope.
+    - Without a session, retain the key-gated development mode only when login
+      is disabled. A service key cannot bypass required CRUD login.
+    - Client/viewer accounts cannot write core records.
     """
 
-    expected = _expected_api_key()
-    if expected is not None and (
-        provided_api_key is None or not secrets.compare_digest(provided_api_key, expected)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid API key.",
-        )
-
-    if not _require_login():
+    user = _authenticated_browser_user(request, db)
+    if user is None:
+        require_api_key(provided_api_key)
+        if _require_login():
+            raise HTTPException(status_code=401, detail="Not authenticated.")
         request.state.user = None
         return None
 
-    user = get_current_user(request, db)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated."
-        )
-
-    request.state.user = user
-
-    if getattr(user, "must_change_password", False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Password change required.")
-
-    if request.method in {"POST", "PUT", "DELETE"} and user.role in {UserRole.viewer, UserRole.client}:
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and user.role in {UserRole.viewer, UserRole.client}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Read-only account.")
 
     return user
@@ -401,48 +434,23 @@ def require_assistant_access(
     requests (assistant chat and feedback still write, but not to core tables).
     """
 
-    expected = _expected_api_key()
-    api_key_ok = expected is None
-    if expected is not None:
-        api_key_ok = bool(
-            provided_api_key is not None and secrets.compare_digest(provided_api_key, expected)
-        )
-        if not api_key_ok:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Missing or invalid API key.",
-            )
+    user = _authenticated_browser_user(request, db)
+    if user is not None:
+        return user
 
+    require_api_key(provided_api_key)
     if not _require_login():
         request.state.user = None
         return None
 
-    # Prefer a cookie-backed user session when present.
-    user = get_current_user(request, db)
-    if user is None:
-        # In some environments (bots, local agents), we want API-key authenticated
-        # calls to assistant endpoints without requiring a cookie-backed session.
-        if (
-            api_key_ok
-            and expected is not None
-            and _is_truthy(os.getenv("ISPEC_ASSISTANT_ALLOW_API_KEY_ONLY"))
-        ):
-            user = _ApiKeyServiceUser(
-                can_write_project_comments=_is_truthy(
-                    os.getenv("ISPEC_ASSISTANT_ALLOW_API_KEY_WRITE_PROJECT_COMMENTS")
-                )
+    # Explicit service-only access remains available to Slack/local agents.
+    if _expected_api_key() is not None and _is_truthy(os.getenv("ISPEC_ASSISTANT_ALLOW_API_KEY_ONLY")):
+        user = _ApiKeyServiceUser(
+            can_write_project_comments=_is_truthy(
+                os.getenv("ISPEC_ASSISTANT_ALLOW_API_KEY_WRITE_PROJECT_COMMENTS")
             )
-            request.state.user = user
-            return user
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated.",
         )
+        request.state.user = user
+        return user
 
-    request.state.user = user
-
-    if getattr(user, "must_change_password", False):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Password change required.")
-
-    return user
+    raise HTTPException(status_code=401, detail="Not authenticated.")

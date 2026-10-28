@@ -10,6 +10,7 @@ from ispec.api.security import (
     require_user,
     require_access,
     require_assistant_access,
+    require_browser_origin,
     session_cookie_name,
     verify_password,
 )
@@ -211,3 +212,42 @@ def test_require_assistant_access_requires_login_when_disabled(db_session, monke
     with pytest.raises(HTTPException) as exc:
         require_assistant_access(request, db_session, provided_api_key="secret")
     assert exc.value.status_code == 401
+
+
+@pytest.mark.parametrize("guard", [require_access, require_assistant_access])
+def test_sessionless_dev_access_keeps_service_key_enforcement(db_session, monkeypatch, guard):
+    monkeypatch.setenv("ISPEC_REQUIRE_LOGIN", "0")
+    monkeypatch.setenv("ISPEC_API_KEY", "test-service-key")
+    request = _make_request(method="POST")
+    with pytest.raises(HTTPException) as exc:
+        guard(request, db_session, provided_api_key=None)
+    assert exc.value.status_code == 401
+    assert guard(request, db_session, provided_api_key="test-service-key") is None
+
+    monkeypatch.delenv("ISPEC_API_KEY")
+    monkeypatch.setenv("ISPEC_API_REQUIRE_KEY", "1")
+    with pytest.raises(HTTPException) as exc:
+        guard(request, db_session, provided_api_key=None)
+    assert exc.value.status_code == 503
+    monkeypatch.setenv("ISPEC_API_REQUIRE_KEY", "0")
+    assert guard(request, db_session, provided_api_key=None) is None
+
+
+@pytest.mark.parametrize("origin,allowed", [
+    (None, True), ("http://testserver", True), ("http://testserver:80", True),
+    ("https://testserver", False), ("http://testserver:81", False),
+    ("http://testserver:0", False), ("http://testserver:invalid", False),
+    ("http://testserver/", False), ("http://user@testserver", False),
+    ("http://testserver?foo=1", False), ("http://testserver#foo", False),
+    ("null", False), ("http://[broken", False),
+])
+def test_browser_mutations_require_same_origin_when_supplied(origin, allowed):
+    request = _make_request(method="POST")
+    if origin is not None:
+        request.scope["headers"].append((b"origin", origin.encode("ascii")))
+    if allowed:
+        assert require_browser_origin(request) is None
+    else:
+        with pytest.raises(HTTPException) as exc:
+            require_browser_origin(request)
+        assert exc.value.status_code == 403
