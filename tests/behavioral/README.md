@@ -119,3 +119,7 @@ optionally request a model rewrite, review privacy and preserved meaning, and
 explicitly export a fixture. None of these steps add or commit files to Git.
 See [the workflow](../../docs/behavioral-corpus-workflow.md). The existing session
 extractor remains unchanged; its raw outputs are private, not automatically anonymized.
+
+For narrated saved-evidence reviews, captions and an optional quiet musical outro,
+see [behavioral review videos](../../docs/behavioral-review-videos.md). Rendering
+does not run inference, turn failures into passes, or publish the result.
