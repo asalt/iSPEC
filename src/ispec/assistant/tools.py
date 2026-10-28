@@ -2251,6 +2251,8 @@ def _assistant_list_tools_payload(
         elif tool_name in _WRITE_TOOL_NAMES:
             if user is None:
                 unavailable_reason = "Authentication required for write tools."
+            elif tool_name == "create_project_comment" and getattr(user, "can_write_project_comments", True) is not True:
+                unavailable_reason = "Project-comment writes are disabled for this service identity."
             elif uses_explicit_project_access(user) and tool_name != "create_project_comment":
                 unavailable_reason = "Write access required."
 
@@ -3648,6 +3650,10 @@ def run_tool(
         if name == "create_project_comment":
             if user is None:
                 return {"ok": False, "tool": name, "error": "Not authenticated."}
+            # Synthetic service identities carry an explicit grant; ordinary users
+            # retain the project-access and confirmation checks below.
+            if getattr(user, "can_write_project_comments", True) is not True:
+                return {"ok": False, "tool": name, "error": "Project-comment writes are disabled for this service identity."}
 
             is_scoped_user = uses_explicit_project_access(user)
 
@@ -7584,6 +7590,8 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
             continue
         if name in _WRITE_TOOL_NAMES:
             if user is None:
+                continue
+            if name == "create_project_comment" and getattr(user, "can_write_project_comments", True) is not True:
                 continue
             if uses_explicit_project_access(user) and name != "create_project_comment":
                 continue

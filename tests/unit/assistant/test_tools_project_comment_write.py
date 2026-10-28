@@ -76,6 +76,41 @@ def test_create_project_comment_allows_service_viewer_write(db_session):
     assert payload["ok"] is True
 
 
+@pytest.mark.parametrize("grant", [False, None, 0, "true"])
+def test_service_write_grant_is_enforced_before_authorization(db_session, monkeypatch, grant):
+    monkeypatch.setenv("ISPEC_ASSISTANT_READ_ONLY", "0")
+    from ispec.api.security import _ApiKeyServiceUser
+
+    user = _ApiKeyServiceUser(can_write_project_comments=grant)
+    names = {tool["function"]["name"] for tool in openai_tools_for_user(user)}
+    assert "create_project_comment" not in names
+    payload = run_tool(
+        name="create_project_comment",
+        args={"project_id": 12, "comment": "Must not save", "confirm": True},
+        core_db=db_session, user=user, user_message="save it",
+        project_comment_save_authorized=True, project_comment_authorization=object(),
+    )
+    assert payload["ok"] is False
+    assert "service identity" in payload["error"]
+    assert db_session.query(ProjectComment).count() == 0
+    assert db_session.query(Person).count() == 0
+
+
+def test_service_grant_does_not_bypass_confirmation_or_read_only(db_session, monkeypatch):
+    from ispec.api.security import _ApiKeyServiceUser
+
+    user = _ApiKeyServiceUser(can_write_project_comments=True)
+    monkeypatch.setenv("ISPEC_ASSISTANT_READ_ONLY", "0")
+    payload = run_tool(name="create_project_comment", args={"project_id": 12, "comment": "Note"},
+                       core_db=db_session, user=user, user_message="save it")
+    assert "confirm=true" in payload["error"]
+    monkeypatch.setenv("ISPEC_ASSISTANT_READ_ONLY", "1")
+    payload = run_tool(name="create_project_comment", args={"project_id": 12, "comment": "Note", "confirm": True},
+                       core_db=db_session, user=user, user_message="save it")
+    assert "read-only" in payload["error"]
+    assert db_session.query(ProjectComment).count() == 0
+
+
 @pytest.mark.parametrize("role", [UserRole.client, UserRole.viewer])
 def test_create_project_comment_requires_explicit_project_access(db_session, role):
     allowed = Project(id=10, prj_AddedBy="test", prj_ProjectTitle="Allowed Project")
