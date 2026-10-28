@@ -111,3 +111,11 @@ orchestrator to be disabled unless explicitly enabled. Timing buckets default to
 90 seconds for `slow` turns and 180 seconds for `problematic` turns; override
 them with `--slow-threshold-seconds` and `--problematic-threshold-seconds` when
 calibrating a particular local machine.
+
+## Reviewed private-snapshot pipeline
+
+Use `scripts/prepare_behavioral_case.py` to stage selected assistant/Slack snapshots,
+optionally request a model rewrite, review privacy and preserved meaning, and
+explicitly export a fixture. None of these steps add or commit files to Git.
+See [the workflow](../../docs/behavioral-corpus-workflow.md). The existing session
+extractor remains unchanged; its raw outputs are private, not automatically anonymized.
