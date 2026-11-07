@@ -75,6 +75,9 @@ def test_generate_reply_records_usage_event(tmp_path, monkeypatch):
     assert payload['surface'] == 'support_chat'
     assert payload['session_id'] == 'abc'
     assert payload['provider'] == 'vllm'
+    assert [node['family'] for node in payload['prompt_composition']['nodes']] == [
+        'assistant.answer.system', 'assistant.base.system']
+    assert 'rendered_sha256' not in payload
 
 
 def test_usage_keeps_preamble_identity_without_prompt_text(tmp_path, monkeypatch):
@@ -88,6 +91,22 @@ def test_usage_keeps_preamble_identity_without_prompt_text(tmp_path, monkeypatch
     event = json.loads(path.read_text())
     assert event['tool_preamble'] == {
         'prompt_family': 'assistant.tools.olmo3_preamble', 'prompt_sha256': 'fixture-hash'}
+    assert event['ok'] is False
+
+
+def test_failed_call_keeps_composition_but_not_prompt_values(tmp_path, monkeypatch):
+    monkeypatch.setenv('ISPEC_LOG_DIR', str(tmp_path))
+    monkeypatch.setenv('ISPEC_INFERENCE_USAGE_LOG_ENABLED', '1')
+    monkeypatch.setenv('ISPEC_PROMPTS_DB_PATH', str(tmp_path / 'unused.db'))
+    prompt = service._render_system_prompt_answer()
+    context = prompt.observability_fields()
+    context['prompt_composition']['nodes'][0]['text'] = 'PRIVATE CONTENT'
+    record_inference_usage_event(provider='vllm', model='test', ok=False,
+        error='timeout', meta={}, observability_context=context)
+    path, = (tmp_path / 'inference-usage').glob('usage-*.jsonl')
+    event = json.loads(path.read_text())
+    assert event['prompt_composition']['nodes'][1]['family'] == 'assistant.base.system'
+    assert 'PRIVATE CONTENT' not in path.read_text()
     assert event['ok'] is False
 
 

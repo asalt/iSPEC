@@ -2374,6 +2374,7 @@ def chat(
             "prompt_family": system_prompt_observability.get("prompt_family"),
             "prompt_version_num": system_prompt_observability.get("prompt_version_num"),
             "prompt_binding": system_prompt_observability.get("prompt_binding"),
+            "prompt_composition": system_prompt_observability.get("prompt_composition"),
         }
         final_prompt_observability = dict(system_prompt_observability)
         final_prompt_stage = "planner" if tools_enabled else "answer"

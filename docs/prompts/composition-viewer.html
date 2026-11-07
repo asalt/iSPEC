@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; img-src 'none'; base-uri 'none'; form-action 'none'">
+<title>iSPEC / Prompt paths</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f4f2ea; --fg:#20322d; --line:#b8c3ba; --muted:#53655c; --accent:#17674e; --panel:#fffef9; }
+  @media(prefers-color-scheme:dark) { :root { --bg:#15211e; --fg:#e3ece5; --line:#506159; --muted:#a5b9ac; --accent:#80d1ac; --panel:#1e3029; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:clamp(16px,4vw,48px); background:var(--bg); color:var(--fg); font:16px/1.5 Georgia,serif; }
+  header { border-bottom:1px solid var(--line); padding-bottom:20px; }
+  h1 { font-size:clamp(30px,5vw,48px); margin:0; font-weight:normal; }
+  h2 { font-size:21px; font-weight:normal; }
+  .eyebrow, button, select, label, .meta { font-family:"DejaVu Sans",sans-serif; }
+  .eyebrow { letter-spacing:.12em; font-size:12px; text-transform:uppercase; color:var(--muted); }
+  .layout { display:grid; grid-template-columns:minmax(0,2fr) minmax(250px,1fr); gap:36px; }
+  .controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:24px 0; }
+  select, button { font-size:14px; color:var(--fg); background:var(--panel); padding:10px 14px; border:1px solid var(--line); border-radius:6px; max-width:100%; }
+  select { flex:1; min-width:180px; }
+  button { cursor:pointer; }
+  button:disabled { cursor:default; opacity:.45; }
+  button:focus-visible, select:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
+  .tree, .tree ul { list-style:none; padding:0; margin:0; }
+  .tree ul { margin-left:20px; padding-left:18px; border-left:1px solid var(--line); }
+  .tree ul ul ul ul { margin-left:0; padding-left:0; border-left:0; }
+  .tree li { position:relative; margin:14px 0; min-width:0; }
+  .tree ul > li:before { content:""; position:absolute; width:18px; left:-18px; top:24px; border-top:1px solid var(--line); }
+  .tree ul ul ul ul > li:before { display:none; }
+  .node { text-align:left; display:block; width:100%; overflow-wrap:anywhere; }
+  .node[aria-pressed=true] { border-color:var(--accent); box-shadow:inset 4px 0 var(--accent); }
+  .node .slot { color:var(--muted); display:block; font-size:12px; }
+  .node .family { display:block; }
+  .node .variant { color:var(--accent); display:block; font-size:13px; }
+  .detail { align-self:start; border-top:2px solid var(--accent); min-width:0; }
+  pre { font:13px/1.6 "DejaVu Sans Mono",monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .meta { color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+  footer { margin-top:30px; border-top:1px solid var(--line); padding-top:14px; color:var(--muted); }
+  @media(max-width:700px) { .layout { grid-template-columns:1fr; gap:20px; } .controls select { flex-basis:100%; } }
+</style>
+<header>
+  <div class="eyebrow">iSPEC / code review / read-only</div>
+  <h1>Prompt paths</h1>
+  <div class="meta">Template components selected for each recorded call. Not a full prompt transcript or authorization graph.</div>
+</header>
+<nav class="controls" aria-label="Recorded inference calls">
+  <button id="previous" type="button">Previous call</button>
+  <label for="call">Call</label><select id="call"></select>
+  <button id="next" type="button">Next call</button>
+</nav>
+<p id="status" class="meta" aria-live="polite"></p>
+<main class="layout">
+  <section aria-label="Prompt composition graph"><ul id="tree" class="tree"></ul></section>
+  <section class="detail"><h2>Selected component</h2><pre id="detail"></pre></section>
+</main>
+<footer>Source hashes identify template bodies, not rendered requests. Variant IDs describe offered input, not words the model necessarily used. Missing versions mean unindexed sources. Raw slot values and conversation text are omitted.</footer>
+<script>
+(() => {
+  const data = /* COMPOSITION_DATA */ {};
+  const calls = data.calls || [];
+  const select = document.getElementById('call');
+  const tree = document.getElementById('tree');
+  const detail = document.getElementById('detail');
+  const status = document.getElementById('status');
+  const previous = document.getElementById('previous');
+  const next = document.getElementById('next');
+  calls.forEach((call, index) => {
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = `${index + 1}. ${call.ts_utc || 'Time unknown'} / ${call.stage || 'Stage unknown'}`;
+    select.append(option);
+  });
+  function render() {
+    tree.replaceChildren();
+    detail.textContent = '';
+    const index = Number(select.value || 0), call = calls[index];
+    previous.disabled = !call || index === 0;
+    next.disabled = !call || index === calls.length - 1;
+    select.disabled = !call;
+    if (!call) {
+      status.textContent = `No component-aware calls in this input. ${data.skipped || 0} rows skipped.`;
+      return;
+    }
+    const graph = call.prompt_composition;
+    status.textContent = `${call.surface === 'synthetic_composition_demo' ? 'SYNTHETIC / STUBBED CALLS | ' : ''}Session: ${call.session_id ?? 'unrecorded'} | Model: ${call.model ?? 'unrecorded'} | Call ${call.ok === true ? 'succeeded' : call.ok === false ? 'failed' : 'status unknown'} | ${graph.truncated ? 'Partial graph' : 'Recorded components'} | ${data.skipped || 0} rows skipped`;
+    const lists = new Map();
+    graph.nodes.forEach(node => {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      button.className = 'node'; button.type = 'button'; button.setAttribute('aria-pressed', 'false');
+      const fields = [
+        ['slot', node.parent === null ? 'Root template' : `${node.slot} / occurrence ${node.occurrence + 1}`],
+        ['family', node.family],
+        ['slot', `${node.version_num === null ? 'Unindexed' : 'v' + node.version_num} / ${node.source_sha256.slice(0,12)}`]
+      ];
+      if (node.variant_id !== null) fields.push(['variant', `Offered variant: ${node.variant_id}`]);
+      fields.forEach(([style, text]) => { const span = document.createElement('span'); span.className = style; span.textContent = text; button.append(span); });
+      button.addEventListener('click', () => {
+        tree.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b === button)));
+        detail.textContent = JSON.stringify(node, null, 2);
+      });
+      item.append(button);
+      const children = document.createElement('ul'); item.append(children); lists.set(node.id, children);
+      (node.parent === null ? tree : lists.get(node.parent)).append(item);
+    });
+    tree.querySelector('button').click();
+  }
+  select.addEventListener('change', render);
+  previous.addEventListener('click', () => { select.value = String(Number(select.value) - 1); render(); });
+  next.addEventListener('click', () => { select.value = String(Number(select.value) + 1); render(); });
+  render();
+})();
+</script>
+</html>

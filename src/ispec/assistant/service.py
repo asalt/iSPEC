@@ -123,6 +123,7 @@ def _overlay_rendered_prompt(
     *,
     text: str,
     source_path: str | None = None,
+    preserve_components: bool = False,
 ) -> RenderedPrompt:
     normalized = (text or "").strip()
     source = PromptSource(
@@ -133,14 +134,25 @@ def _overlay_rendered_prompt(
         body=normalized,
         body_sha256=_prompt_text_sha256(normalized),
     )
-    return RenderedPrompt(text=normalized, source=source, binding=prompt.binding, version=PromptVersionInfo())
+    return RenderedPrompt(
+        text=normalized,
+        source=source,
+        binding=prompt.binding,
+        version=PromptVersionInfo(),
+        components=prompt.components if preserve_components else (),
+        value_slots=(*prompt.value_slots, "runtime_extra") if preserve_components else (),
+    )
 
 
 def _apply_prompt_extras(prompt: RenderedPrompt) -> RenderedPrompt:
     extras = _prompt_extras()
     if not extras:
         return prompt
-    return _overlay_rendered_prompt(prompt, text=prompt.text.rstrip() + "\n\n" + extras)
+    return _overlay_rendered_prompt(
+        prompt,
+        text=prompt.text.rstrip() + "\n\n" + extras,
+        preserve_components=True,
+    )
 
 
 def _legacy_answer_prompt_override() -> tuple[str | None, str | None]:
@@ -320,7 +332,7 @@ def _render_system_prompt_answer(*, response_format: ResponseFormat = "single") 
     prompt = load_bound_prompt(
         _system_prompt_answer,
         values={
-            "base_prompt": _render_base_system_prompt().text,
+            "base_prompt": _render_base_system_prompt(),
             "response_format_block": _final_template(response_format=response_format).rstrip(),
         },
     )
@@ -353,7 +365,7 @@ def _render_system_prompt_planner(
     prompt = load_bound_prompt(
         _system_prompt_planner,
         values={
-            "base_prompt": _render_base_system_prompt().text,
+            "base_prompt": _render_base_system_prompt(),
             "tool_use_block": _planner_tool_use_block(tool_names=tool_names),
             "tool_protocol_block": _planner_tool_protocol_block(
                 tools_available=tools_available,
@@ -374,7 +386,7 @@ def _system_prompt_review() -> str:
 def _render_system_prompt_review() -> RenderedPrompt:
     prompt = load_bound_prompt(
         _system_prompt_review,
-        values={"base_prompt": _render_base_system_prompt().text},
+        values={"base_prompt": _render_base_system_prompt()},
     )
     return _apply_prompt_extras(prompt)
 
@@ -387,7 +399,7 @@ def _system_prompt_review_decider() -> str:
 def _render_system_prompt_review_decider() -> RenderedPrompt:
     prompt = load_bound_prompt(
         _system_prompt_review_decider,
-        values={"base_prompt": _render_base_system_prompt().text},
+        values={"base_prompt": _render_base_system_prompt()},
     )
     return _apply_prompt_extras(prompt)
 

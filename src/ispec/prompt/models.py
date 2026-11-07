@@ -38,14 +38,26 @@ class PromptVersionInfo:
     version_num: int | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
+class PromptComponent:
+    slot: str
+    occurrence: int
+    prompt: RenderedPrompt
+
+
+@dataclass(frozen=True, kw_only=True)
 class RenderedPrompt:
     text: str
     source: PromptSource
     binding: PromptBindingMeta | None = None
     version: PromptVersionInfo = PromptVersionInfo()
+    components: tuple[PromptComponent, ...] = ()
+    value_slots: tuple[str, ...] = ()
+    variant_id: str | None = None
 
     def observability_fields(self) -> dict[str, Any]:
+        from .composition import prompt_composition
+
         payload: dict[str, Any] = {
             "prompt_family": self.source.family,
             "prompt_sha256": self.source.body_sha256,
@@ -57,4 +69,5 @@ class RenderedPrompt:
             payload["prompt_version_num"] = int(self.version.version_num)
         if self.version.version_id is not None:
             payload["prompt_version_id"] = int(self.version.version_id)
+        payload["prompt_composition"] = prompt_composition(self)
         return payload

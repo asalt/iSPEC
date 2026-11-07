@@ -8,6 +8,7 @@ from typing import Any
 
 from ispec.config.paths import resolve_log_dir
 from ispec.logging import get_logger
+from ispec.prompt.composition import clean_prompt_composition
 
 
 logger = get_logger(__name__)
@@ -103,6 +104,12 @@ def record_inference_usage_event(
             event[key] = _clean_scalar(meta_dict.get(key))
 
     context = observability_context if isinstance(observability_context, dict) else {}
+    if "prompt_composition" in context:
+        composition = clean_prompt_composition(context["prompt_composition"])
+        if composition is not None:
+            event["prompt_composition"] = composition
+        else:
+            event["prompt_composition_unavailable"] = True
     for key in (
         "surface",
         "session_id",

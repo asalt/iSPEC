@@ -95,6 +95,8 @@ def test_support_chat_passes_and_persists_prompt_observability(tmp_path, db_sess
         assert meta["llm_trace"][0]["provider_meta"]["runtime"]["profile"] == "synthetic-eval"
         assert meta["llm_trace"][0]["provider_meta"]["finish_reason"] == "stop"
         assert meta["llm_trace"][0]["provider_meta"]["usage"]["prompt_tokens"] == 30
+        assert meta["prompt_composition"]["nodes"][1]["family"] == "assistant.base.system"
+        assert meta["llm_trace"][0]["prompt_composition"] == meta["prompt_composition"]
 
 
 def test_base_system_prompt_preserves_project_note_status_and_correction_boundary():
