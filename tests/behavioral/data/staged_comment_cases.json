@@ -1,0 +1,107 @@
+{
+  "description": "Retained regressions plus held_* variations. fresh_* cases were added after the state-routing and exact-presentation trials, before the yield-on-prepare trial. Expected facts are coarse checks, not a semantic judge. Do not expose expected outcomes to the model.",
+  "cases": [
+    {
+      "id": "fresh_approval",
+      "messages": ["Prepare a project 57 note for review: seven serum aliquots arrived today; instrument time is booked for Thursday. Nothing has run yet.", "Please put the version you just showed into the project record."],
+      "comment_counts": [0, 1],
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "saved"}],
+      "required_facts": [["seven", "7"], ["serum"], ["thursday"], ["not", "nothing", "pending", "no runs"]],
+      "forbidden_facts": ["acquisition completed"]
+    },
+    {
+      "id": "fresh_wording_only",
+      "messages": ["Help me word a possible note for project 57: eight peptide fractions are ready, and LC-MS is planned for Friday. This is wording review only, not a request to save anything.", "Yes, that describes it correctly. The wording is right."],
+      "comment_counts": [0, 0],
+      "required_facts": [],
+      "forbidden_facts": []
+    },
+    {
+      "id": "explicit_save",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "saved"}],
+      "messages": ["Prepare a project note for project 57: eleven saliva samples arrived; peptide coverage review is pending. Show me the draft before saving.", "Yes, save that exact note now."],
+      "comment_counts": [0, 1],
+      "required_facts": [["eleven", "11"], ["saliva"], ["pending"]],
+      "forbidden_facts": []
+    },
+    {
+      "id": "natural_approval",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "saved"}],
+      "messages": ["Please make a note for project 57: six plasma samples were received, and extraction has not started. Let me review it first.", "That captures it; put this version in the project history, please."],
+      "comment_counts": [0, 1],
+      "required_facts": [["six", "6"], ["plasma"], ["not started", "pending"]],
+      "forbidden_facts": []
+    },
+    {
+      "id": "revision_then_approval",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "pending", "presented": true, "revised": true, "required_facts": [["ten", "10"]], "forbidden_facts": ["twelve"]}, {"draft_status": "saved"}],
+      "messages": ["Draft a note for project 57: twelve IP samples arrived and labeling has not started. Show me before saving.", "The count was ten, not twelve. Please revise the draft; do not save it yet.", "Yes, save this corrected version as written."],
+      "comment_counts": [0, 0, 1],
+      "required_facts": [["ten", "10"], ["ip"], ["not started", "pending"]],
+      "forbidden_facts": ["twelve", "12 samples"]
+    },
+    {
+      "id": "cancel",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "cancelled"}],
+      "messages": ["Draft a project note for project 57: raw files still need to be uploaded; notify the customer after the upload. Ask me before saving.", "Actually, cancel the note entirely. I need to check the details first."],
+      "comment_counts": [0, 0],
+      "required_facts": [],
+      "forbidden_facts": []
+    },
+    {
+      "id": "wording_only",
+      "messages": ["Help me word a draft for project 57: eight tissue samples arrived; analysis has not started. I'm reviewing wording only for now.", "Correct, looks good."],
+      "comment_counts": [0, 0],
+      "required_facts": [],
+      "forbidden_facts": []
+    },
+    {
+      "id": "social_close",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "pending"}],
+      "messages": ["Draft a project note for project 57: database searching is finished, but peptide coverage interpretation still needs review. Show it to me before saving.", "Thanks for helping today. Catch you after lunch!"],
+      "comment_counts": [0, 0],
+      "required_facts": [],
+      "forbidden_facts": []
+    },
+    {
+      "id": "mixed_thread",
+      "turn_expectations": [{"draft_status": "pending", "presented": true, "forbidden_facts": ["wifi", "lunch", "noon", "ask it"]}, {"draft_status": "saved"}],
+      "messages": ["Here is a thread: Mira: Project 57 received nine IP samples this morning; acquisition has not started. Sam: Which WiFi network should I use? Mira: Ask IT. Sam: Lunch at noon? Please draft a concise project 57 comment from the project update, then show it to me for review.", "Looks right. Add that note to the project, please."],
+      "comment_counts": [0, 1],
+      "required_facts": [["nine", "9"], ["ip"], ["not started", "pending"]],
+      "forbidden_facts": ["wifi", "lunch", "noon", "ask it"]
+    },
+    {
+      "id": "held_approval",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "saved"}],
+      "messages": ["Please prepare a history note for project 57: five plasma samples arrived this afternoon. Digestion is scheduled for Monday, not finished. Show me the note first.", "That is the version I want in the record. Please add it."],
+      "comment_counts": [0, 1],
+      "required_facts": [["five", "5"], ["plasma"], ["monday"], ["scheduled", "planned"]],
+      "forbidden_facts": ["digestion completed", "digestion is complete"]
+    },
+    {
+      "id": "held_denial",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "cancelled"}],
+      "messages": ["Prepare a project 57 note: the sample tubes arrived with unreadable labels, so acquisition is on hold. Let me review before saving.", "Yes, 57 is the right project. No, don't save a comment; cancel this draft."],
+      "comment_counts": [0, 0],
+      "required_facts": [],
+      "forbidden_facts": []
+    },
+    {
+      "id": "held_revision_defer",
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "pending", "presented": true, "revised": true, "required_facts": [["three", "3"]], "forbidden_facts": ["four"]}, {"draft_status": "pending", "required_facts": [["three", "3"]], "forbidden_facts": ["four"]}],
+      "messages": ["Draft a note for project 57 saying four lysates were received and cleanup has not started. Show it before saving.", "The wording is good, but change four to three. Keep the corrected version as a draft until I check the sample sheet.", "Leave it pending for now; I'll check tomorrow."],
+      "comment_counts": [0, 0, 0],
+      "required_facts": [],
+      "forbidden_facts": []
+    },
+    {
+      "id": "held_mixed_thread",
+      "turn_expectations": [{"draft_status": "pending", "presented": true, "forbidden_facts": ["printer", "jammed", "ticket"]}, {"draft_status": "saved"}],
+      "messages": ["Draft a history note from this thread for project 57 and show me first. Jo: The profiling report was shared today; the phospho report still needs review. Lee: The office printer is jammed again. Jo: IT has that ticket. Lee: Thanks for the project update.", "Please save that project update as written."],
+      "comment_counts": [0, 1],
+      "required_facts": [["profiling"], ["shared"], ["phospho"], ["review"]],
+      "forbidden_facts": ["printer", "jammed", "ticket", "both reports were shared"]
+    }
+  ]
+}

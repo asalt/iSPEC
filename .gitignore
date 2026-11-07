@@ -38,6 +38,12 @@ tests/behavioral/data/*
 !tests/behavioral/data/response_phrase_cases.json
 !tests/behavioral/data/project_comment_approval_cases.json
 !tests/behavioral/data/slack_reported_thread.json
+!tests/behavioral/data/staged_comment_cases.json
+!tests/behavioral/data/staged_comment_review_notes.json
+!tests/behavioral/data/staged_boundary_scope.txt
+!tests/behavioral/data/staged_boundary_minimal.txt
+!tests/behavioral/data/staged_promotion_20261107.json
+!tests/behavioral/data/staged_save_offer_fresh_20261107.json
 !tests/behavioral/data/model_note_cases.json
 !tests/behavioral/data/model_grounding_cases.json
 !tests/behavioral/data/model_followup_20261025/

@@ -1,0 +1,13 @@
+{
+  "purpose": "Unseen structural-save-offer gate cases; frozen before inference",
+  "cases": [
+    {"id":"F01_natural_record","category":"fresh approval","messages":["Draft a project 57 history note: nine kidney specimens arrived Wednesday; cleanup is pending. Offer the exact draft for my approval before saving.","That version is ready for the record; please add it."],"comment_counts":[0,1]},
+    {"id":"F02_explicit_record","category":"fresh approval","messages":["Prepare a project 57 history comment: the revised FASTA is ready and the rerun is queued. Show it and ask me to approve saving.","Yes, save the note you just offered, unchanged."],"comment_counts":[0,1]},
+    {"id":"F03_save_without_offer","category":"fresh explicit save after wording review","messages":["Help with wording only for project 57: two CSF aliquots arrived; centrifugation is pending. I do not want a save offer yet.","Now I want to save this exact draft.","Yes, save that exact note."],"comment_counts":[0,0,1]},
+    {"id":"F04_wording_agree","category":"fresh wording-only agreement","messages":["Edit wording only for a possible project 57 note: twelve fractions were pooled and injection is pending. We are not making a history entry.","That reads exactly how I wanted."],"comment_counts":[0,0]},
+    {"id":"F05_cancel_offer","category":"fresh cancellation","messages":["Prepare a project 57 history note: the sample delivery is delayed until next week. Show it and offer to save for my confirmation.","Scratch this entirely; cancel the draft instead."],"comment_counts":[0,0],"cancelled":true},
+    {"id":"F06_condition_inventory","category":"fresh conditional approval","messages":["Draft a project 57 note: twenty extracts are ready, but the inventory is awaiting verification. Offer it for approval.","This may be saved only after I return with confirmation from the lab; I haven't checked yet."],"comment_counts":[0,0]},
+    {"id":"F07_revision_count","category":"fresh revision","messages":["Draft a project 57 note: seven serum tubes arrived; thawing is pending. Offer it for approval before saving.","Replace seven with six and show me the new draft; don't save it."],"comment_counts":[0,0],"revised_turns":[1]},
+    {"id":"F08_social_offer","category":"fresh social reply","messages":["Draft a project 57 update: the peptide standard arrived and calibration is pending. Offer it for review before recording anything.","Appreciate you helping me with the wording."],"comment_counts":[0,0]}
+  ]
+}
