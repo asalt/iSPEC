@@ -46,4 +46,5 @@ tests/behavioral/data/model_followup_20261025/*
 !tests/behavioral/data/model_followup_20261025/model_note_cases.json
 !tests/behavioral/data/model_followup_20261025/model_grounding_cases.json
 !tests/behavioral/data/model_followup_20261025/olmo_think_tools.jinja
+!tests/behavioral/data/model_followup_20261025/olmo_instruct_tools_defined.jinja
 !tests/behavioral/data/model_followup_20261025/instruct_refinement_cases.json

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Staged comment postmortems</title>
+<style>$style</style>
+</head>
+<body id="top">
+<a class="skip" href="#case-index">Skip to cases</a>
+<div class="layout">
+<nav aria-label="Report sections">
+  <p class="eyebrow">iSPEC / review notebook</p>
+  <a href="#top">Overview</a>
+  <a href="#batches">Batches</a>
+  <a href="#case-index">Case index</a>
+  <a href="#evidence">Detailed evidence</a>
+  <a href="#tool-results">Tool-result roles</a>
+  <a href="#footnotes">Reading notes</a>
+  <p class="nav-note">Saved conversations.<br>No live inference.</p>
+</nav>
+<main>
+<header>
+  <p class="eyebrow">Model behavior / staged project notes</p>
+  <h1>Staged comment<br>postmortems</h1>
+  <p class="lede">Find a result. Read the exchange. Follow the evidence.</p>
+  <div class="totals" aria-label="Recorded test totals">
+    <div><strong>$total</strong><span>cases</span></div>
+    <div class="pass"><strong>$passed</strong><span>pytest passed</span></div>
+    <div class="fail"><strong>$failed</strong><span>pytest failed</span></div>
+    <div><strong>$errors / $skipped / $unknown</strong><span>error / skipped / unknown</span></div>
+  </div>
+  <p class="caption">Recorded assertions, not overall model quality. <a href="#footnotes">How to read these results</a></p>
+</header>
+<section id="batches">
+  <h2>01 / Batches</h2>
+  <p>Latest supplied batch first. Select a card to narrow the case index.</p>
+  <div class="batch-grid">$batches</div>
+</section>
+<section id="case-index">
+  <h2>02 / Case index</h2>
+  <form id="filters" hidden>
+    <label class="search">Search cases or findings<input id="search" type="search" placeholder="wording_only, guard, revision..."></label>
+    <label>Batch<select id="batch"><option value="">All batches</option>$batch_options</select></label>
+    <label>Model<select id="model"><option value="">All models</option>$model_options</select></label>
+    <label>Pytest result<select id="result"><option value="">All results</option><option value="fail">Failed</option><option value="pass">Passed</option><option value="error">Error</option><option value="skipped">Skipped</option><option value="unknown">Unknown</option></select></label>
+    <label class="check"><input id="attention" type="checkbox">With findings or signals</label>
+    <div class="quick-filters">
+      <button type="button" id="failures">Failures ($failed)</button>
+      <button type="button" id="flagged">Passed with flags ($flagged_passes)</button>
+      <button type="reset">Clear filters</button>
+    </div>
+  </form>
+  <p id="showing" role="status" aria-live="polite">Showing $total of $total cases</p>
+  <div class="table-wrap" tabindex="0" role="region" aria-label="Case results, scroll horizontally if needed">
+    <table><thead><tr><th scope="col">Case</th><th scope="col">Batch</th><th scope="col">Model</th><th scope="col">Pytest</th><th scope="col">Comment counts</th><th scope="col">Behavioral review</th></tr></thead><tbody id="case-rows">$rows</tbody></table>
+  </div>
+  <p id="no-results" hidden>No matching cases. Clear or change the filters.</p>
+  <p class="caption">Open a case for the assertion, conversation, tool results and raw model responses.</p>
+</section>
+<section id="evidence"><h2>03 / Detailed evidence</h2>$panels</section>
+<section id="tool-results">
+  <h2>04 / One result, an appropriate role</h2>
+  <p>A tool result is server-provided evidence, not a user instruction or an assistant's claim.
+  The chat template decides how API messages become model-visible text.</p>
+  <div class="exchange">
+    <div><h3>Tulu: labeled system message</h3>
+      <p>The cached Tulu template renders <code>system</code>, <code>user</code> and <code>assistant</code> text,
+      but omits native <code>tool</code> messages. iSPEC's system <code>TOOL_RESULT</code> copy keeps the result visible.</p>
+      <pre>&lt;|system|&gt;
+TOOL_RESULT ... actual server result ...</pre>
+    </div>
+    <div><h3>OLMo: environment message</h3>
+      <p>The evaluated OLMo template renders API <code>role=tool</code> as <code>environment</code>.
+      Assistant messages carry the model's previous replies and tool calls.</p>
+      <pre>&lt;|im_start|&gt;environment
+... actual server result ...&lt;|im_end|&gt;</pre>
+    </div>
+  </div>
+  <p>The current compatibility path sends both API representations; Tulu sees the system copy,
+  while this OLMo template sees both. That is one logical result, not two executions.
+  This viewer does not change that routing. A system label does not grant permission or turn quoted content into policy.</p>
+  <p class="caption">Verified for the cached Tulu and local OLMo evaluation templates, not every model/runtime.
+  Think's adapted template was inspected; no new Think inference was run.</p>
+</section>
+<footer id="footnotes">
+  <h2>Reading notes</h2>
+  <ol>
+    <li>Pass/fail comes from the nearest matching <code>results.xml</code>. Missing or ambiguous results are unknown. Matching comment counts alone are not a pass.</li>
+    <li>Behavioral findings are separate review annotations. Automatic signals are leads, not semantic verdicts; the response guard can itself be wrong. Unreviewed does not mean correct.</li>
+    <li>A blocked save is still an attempted save. A delivered correction does not erase a raw false claim. A fixture write does not prove approval or note quality.</li>
+    <li>These are saved synthetic trials, not new inference or production writes. Repeated cases and changed prompt bundles do not establish causal improvements or deployment readiness.</li>
+    <li>API request JSON precedes chat-template rendering. Detailed captures can contain private context in other runs; review before sharing.</li>
+  </ol>
+  <a href="#top">Back to overview</a>
+</footer>
+</main>
+</div>
+<script>$script</script>
+</body>
+</html>
