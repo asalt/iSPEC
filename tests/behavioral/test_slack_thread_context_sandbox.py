@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -19,7 +20,8 @@ pytestmark = pytest.mark.behavioral
 
 @pytest.mark.parametrize("request_text", [None, "thanks"])
 @pytest.mark.parametrize("provider", ["vllm", "ollama"])
-def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tmp_path, behavioral_datastore, monkeypatch, request_text, provider):
+@pytest.mark.parametrize("context_source", ["local", "api"])
+def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tmp_path, behavioral_datastore, monkeypatch, request_text, provider, context_source):
     for key, value in behavioral_datastore.env_overrides().items():
         monkeypatch.setenv(key, value)
     def forbidden(*a, **kw):
@@ -38,17 +40,24 @@ def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tm
     fixture = json.loads((Path(__file__).parent / "data/slack_reported_thread.json").read_text())
     latest = request_text or fixture["request"]
     inbox = SlackInbox(file=tmp_path / "assistant.db", channels=frozenset({("T1", "C1")}))
+    thread_rows = []
     for index, row in enumerate(fixture["messages"], start=1):
-        inbox.receive({"team_id": "T1", "event": {
+        event = {
             "type": "message", "channel": "C1", "user": row["user"], "text": row["text"],
             "ts": f"{index}.0", "thread_ts": "1.0" if index > 1 else None,
-        }}, {"bot_user_id": "UBOT"})
+        }
+        thread_rows.append(event)
+        if context_source == "local":
+            inbox.receive({"team_id": "T1", "event": event}, {"bot_user_id": "UBOT"})
     if request_text:
         # Other people's old save words are reference, not the latest user's approval.
-        inbox.receive({"team_id": "T1", "event": {
+        event = {
             "type": "message", "channel": "C1", "user": "UOTHER", "text": "yes confirm save it",
             "ts": "8.0", "thread_ts": "1.0",
-        }}, {"bot_user_id": "UBOT"})
+        }
+        thread_rows.append(event)
+        if context_source == "local":
+            inbox.receive({"team_id": "T1", "event": event}, {"bot_user_id": "UBOT"})
     current = inbox.receive({"team_id": "T1", "event": {
         "type": "app_mention", "channel": "C1", "user": "USTAFF", "text": latest,
         "ts": "10.0", "thread_ts": "1.0",
@@ -56,7 +65,11 @@ def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tm
     meta = {"source": "slack", "slack_inbox_id": current, "slack": {
         "team_id": "T1", "channel": "C1", "thread_ts": "1.0", "message_ts": "10.0", "user_id": "USTAFF",
     }}
-    meta["slack_thread_context"] = inbox.thread_context(meta)
+    client = SimpleNamespace(conversations_replies=lambda **kw: {"ok": True, "messages": thread_rows}) if context_source == "api" else None
+    meta["slack_thread_context"] = inbox.thread_context(meta, client=client)
+    if context_source == "api":
+        assert len(inbox.records()) == 1
+        assert meta["slack_thread_context"]["source"] == "slack_api"
     calls = []
     def generate(**kw):
         calls.append(kw)

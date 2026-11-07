@@ -17,8 +17,9 @@ outbound destination permissions and staff/project authorization.
 Slack must already deliver the appropriate events to the bot. A configured ID
 does not subscribe the app, add scopes, establish membership, or backfill missed
 messages. Private channels need the corresponding existing event subscription.
-No periodic history fetch is introduced; an explicitly requested bounded history
-read remains a separate tool. Restart only the existing receiver after changing
+No periodic history fetch is introduced. Authorized threaded requests make one
+bounded read of that thread as described below; broader history reads remain
+explicit tools. Restart only the existing receiver after changing
 its configuration. Do not start a second receiver or the entire dev stack.
 
 Stored text is capped at 40,000 characters with an explicit truncation flag.
@@ -53,18 +54,28 @@ type and leave incomplete evidence; they do not erase the original message.
 
 ### Same-thread reply context
 
-For a threaded DM or channel mention, the receiver now attaches the earlier
-human messages already retained for that exact workspace/channel/thread. The
-current receipt bounds the snapshot: later messages, later edits, and records
-received after it are excluded. The newest eligible revision of each message is
-used. Unthreaded DMs retain the existing session-history behavior.
+For an authorized threaded DM or channel mention, the receiver verifies the
+current durable receipt, reads locally retained context, closes the DB session,
+then calls `conversations.replies` for that exact channel/thread. A mention is a
+response trigger, not a requirement on earlier messages: context may include
+other participants and bot replies, including a root missed by passive capture.
+Unthreaded DMs retain the existing session-history behavior.
 
-This is a bounded local transcript, **not a claim to have fetched the full Slack
-thread**. It keeps the root and recent replies, up to 24 messages, 2,000 characters
-per message and an 8,000-character envelope. Missing roots and truncation are
-explicit. Capture gaps, deletes, file contents, and messages from before capture
-started are not recovered. Confirmed bot sends still use the separate outbound
-receipt context. No additional Slack API call or model inference pass is added.
+Retrieval is one page (up to 100 messages), with a five-second SDK timeout and
+automatic retries disabled. It is bounded by the current request timestamp;
+future messages/edits and foreign-thread rows are excluded. No pagination, bulk
+import, new work items, Slack sends, or additional model pass is introduced.
+Fetched context is retained in the normal support request metadata, not inserted
+as new inbox events. It keeps the root and bounded replies, up to 24 messages,
+2,000 characters per message and an 8,000-character envelope.
+
+A complete API snapshot replaces local history; a partial snapshot can retain
+local evidence with its origin identified. On failure the local context remains
+available, with an explicit sanitized error category. `source`, `coverage`,
+`fetch_status`, `fetch_error`, and `fetched_at` distinguish retrieval from local
+capture. Missing roots, pagination and truncation are explicit, never described
+as complete history. File bytes and text no longer available to Slack are not
+recovered. A quoted bot reply is evidence, not proof of a successful write.
 
 `meta.slack_thread_context` holds the snapshot. The backend validates its scope
 against `meta.slack` and quotes it in the existing turn-decision, tool-router and
@@ -73,7 +84,7 @@ it as an assistant confirmation, or fetches database contents on the basis of
 caller-supplied metadata. Existing write/authorization checks remain separate.
 The recent support exchange (especially a pending draft) gets budget priority,
 then thread context, then older support history. `context.slack_thread_context`
-and each `llm_trace[].slack_thread_context` record included inbox IDs, count,
+and each `llm_trace[].slack_thread_context` record retrieval coverage, inbox IDs, count,
 parent presence, truncation and budget omission. The latter records actual
 per-round inclusion, not just availability to the earlier router.
 
@@ -91,6 +102,14 @@ ISPEC_RUN_VLLM_TESTS=1 .venv/bin/python -m pytest \
 Receiver and backend processes need the updated source loaded; no supervisor,
 new subscriptions, model change or permission change is required. This is
 context repair, not the separate autonomous note-proposal workflow.
+
+The October 29 production failure was a root missing from the local inbox,
+not a Slack scope denial: a read-only API query recovered it. The targeted fetch
+has mocked receiver/integration/behavioral coverage, including duplicate events,
+unapproved senders, API failure, and old quoted approvals not authorizing writes.
+Live-model validation remains separate: having context in a trace does not prove
+the model used it correctly. Deployment requires reviewing that preflight and
+reloading both API and receiver; a source change alone is not activation.
 
 October 19 verification: a read-only lookup of the reported 1131 thread recovered
 all seven prior human messages, including the project number and BioID discussion,

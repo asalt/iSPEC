@@ -15,6 +15,7 @@ from ispec.assistant.models import SlackInboxMessage, utcnow
 from ispec.assistant.reply_delivery import RETAINED_REPLY, failed_request_reply
 from ispec.assistant.slack_outbound import ConversationScope
 from ispec.assistant.slack_thread_context import SlackThreadContext, read_thread_context
+from ispec.assistant.slack_thread_fetch import fetch_thread_context
 from ispec.logging import get_logger
 
 logger = get_logger(__name__)
@@ -112,7 +113,7 @@ class SlackInbox:
             context["slack_inbox_id"] = row_id
         return next()
 
-    def thread_context(self, meta):
+    def thread_context(self, meta, *, client=None):
         try:
             scope = ConversationScope.model_validate(meta["slack"])
         except ValueError:
@@ -125,6 +126,9 @@ class SlackInbox:
         except Exception as exc:
             logger.warning("Slack thread context unavailable error_type=%s", type(exc).__name__)
             context = SlackThreadContext(scope=scope, status="unavailable")
+        # Network I/O happens after the local database session has closed.
+        if client is not None:
+            context = fetch_thread_context(context, client=client)
         return context.model_dump(mode="json")
 
     def claim(self, context, *, fallback, team_id, event, route) -> bool:

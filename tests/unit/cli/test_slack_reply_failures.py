@@ -78,6 +78,7 @@ def test_receiver_allowlist_blocks_unapproved_senders_without_replies(receiver, 
     monkeypatch.setattr(slack, "_post_ispec_chat", lambda **kw: pytest.fail("Unapproved API call"))
     receiver.dispatch(name=route)
     assert not receiver.posts and not receiver.updates and not receiver.says
+    assert not receiver.reads
 
 
 def test_receiver_allowlist_is_explicit_and_exact(monkeypatch):
@@ -100,7 +101,16 @@ def receiver(monkeypatch, tmp_path):
     config = tmp_path / "inbox.json"
     config.write_text(json.dumps({"channels": [{"team_id": "T", "channel_id": "CTEST"}]}))
     monkeypatch.setenv("ISPEC_SLACK_INBOX_CONFIG", str(config))
-    posts, updates, says = [], [], []
+    posts, updates, says, reads = [], [], [], []
+    thread_client = SimpleNamespace(result={"ok": True, "messages": [], "has_more": True})
+    def replies(**kw):
+        reads.append(kw)
+        return thread_client.result
+    thread_client.conversations_replies = replies
+    def reader(**kwargs):
+        assert kwargs["timeout"] == 5 and kwargs["retry_handlers"] == []
+        return thread_client
+    monkeypatch.setattr("slack_sdk.web.WebClient", reader)
     client = SimpleNamespace(
         auth_test=lambda: {"team": "test", "team_id": "T", "user_id": "UBOT"},
         users_info=lambda **kw: {"user": {"name": "test"}},
@@ -161,6 +171,7 @@ def receiver(monkeypatch, tmp_path):
     return SimpleNamespace(
         dispatch=dispatch, handlers=handlers, posts=posts, updates=updates, says=says,
         inbox=slack.SlackInbox(file=tmp_path / "assistant.db"),
+        reads=reads, thread_client=thread_client,
     )
 
 
@@ -264,6 +275,25 @@ def test_context_lookup_failure_does_not_prevent_normal_reply(monkeypatch):
                                    meta={"slack": {"channel": "D1"}}, timeout_seconds=60)
     assert result["message"] == "OK" and len(calls) == 2
     assert calls[-1][1]["json"]["meta"]["slack_outbound_context_status"] == "unavailable"
+
+
+def test_mentioned_reply_fetches_unmentioned_parent_without_passive_capture(receiver, monkeypatch):
+    # The parent was never delivered while this receiver was running.
+    receiver.thread_client.result = {"ok": True, "messages": [
+        {"ts": "1.0", "user": "UOTHER", "text": "<@URECIPIENT> 42 ready for data analysis"},
+    ]}
+    calls = []
+    monkeypatch.setattr(slack, "_post_ispec_chat", lambda **kw: calls.append(kw) or {"message": "draft"})
+    receiver.dispatch(name="app_mention", channel="CUNCAPTURED", channel_type="channel",
+                      thread_ts="1.0", ts="2.0", text="<@UBOT> make a project note about this pls")
+    assert len(receiver.reads) == 1 and len(calls) == 1
+    meta = calls[0]["meta"]
+    assert meta["slack_thread_context"]["messages"][0]["user_id"] == "UOTHER"
+    assert "42 ready for data analysis" in meta["slack_thread_context"]["messages"][0]["text"]
+    assert "42" not in calls[0]["message"]  # Reference stays separate from current instruction.
+    receiver.dispatch(name="app_mention", channel="CUNCAPTURED", channel_type="channel",
+                      thread_ts="1.0", ts="2.0", text="<@UBOT> make a project note about this pls")
+    assert len(receiver.reads) == 1  # Redelivery cannot repeat the fetch or response.
 
 
 def test_provider_unavailable_with_receipt_and_channel_mention(receiver, monkeypatch):

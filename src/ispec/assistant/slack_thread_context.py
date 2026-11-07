@@ -1,4 +1,4 @@
-"""Bounded, locally retained Slack thread evidence, never write authorization."""
+"""Bounded Slack thread evidence from local capture or scoped API retrieval."""
 
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -21,7 +21,8 @@ MAX_CHARS = 8000
 
 class ThreadMessage(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    inbox_id: int
+    inbox_id: int | None = None
+    source: Literal["local_slack_inbox", "slack_api"] = "local_slack_inbox"
     user_id: str = Field(max_length=80)
     message_ts: str = Field(pattern=r"^[0-9]+\.[0-9]+$", max_length=80)
     revision_ts: str = Field(default="", max_length=80)
@@ -36,6 +37,11 @@ class SlackThreadContext(BaseModel):
     messages: tuple[ThreadMessage, ...] = Field(default=(), max_length=MAX_MESSAGES)
     participants: tuple[SlackParticipant, ...] = Field(default=(), max_length=MAX_PARTICIPANTS)
     truncated: bool = False
+    source: Literal["local_slack_inbox", "slack_api", "slack_api_with_local"] = "local_slack_inbox"
+    coverage: Literal["locally_retained_only", "thread_snapshot", "partial_thread_snapshot"] = "locally_retained_only"
+    fetch_status: Literal["not_requested", "loaded", "failed"] = "not_requested"
+    fetch_error: str | None = Field(default=None, max_length=64)
+    fetched_at: str | None = Field(default=None, max_length=80)
 
     @classmethod
     def from_meta(cls, meta: dict | None):
@@ -104,17 +110,22 @@ def read_thread_context(db: Session, *, scope: ConversationScope, inbox_id: int)
         truncated=item.truncated or len(item.text) > 2000,
     ) for item in sorted(rows, key=lambda item: Decimal(item.message_ts)))
     context = SlackThreadContext(scope=scope, messages=messages, truncated=truncated)
-    # Bound transport/storage too, not just the final model prompt.
-    while len(context.model_dump_json()) > MAX_CHARS and messages:
-        messages = _drop_oldest_reply(messages, scope.thread_ts)
-        context = SlackThreadContext(scope=scope, messages=messages, truncated=True)
-    return context
+    return bound_thread_context(context)
 
 
 def _drop_oldest_reply(messages, parent_ts):
     # Retain the root plus the latest replies when an entire thread cannot fit.
     index = 1 if len(messages) > 1 and messages[0].message_ts == parent_ts else 0
     return messages[:index] + messages[index + 1:]
+
+
+def bound_thread_context(context: SlackThreadContext) -> SlackThreadContext:
+    """Keep the root and bounded tail; mark omissions in the serialized evidence."""
+    rows = tuple(sorted(context.messages, key=lambda row: Decimal(row.message_ts)))
+    while len(context.model_copy(update={"messages": rows}).model_dump_json()) > MAX_CHARS and rows:
+        rows = _drop_oldest_reply(rows, context.scope.thread_ts)
+    return context.model_copy(update={"messages": rows,
+                                      "truncated": context.truncated or len(rows) < len(context.messages)})
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -132,19 +143,29 @@ def render_thread_context(context: SlackThreadContext | None, *, max_tokens: int
     while True:
         metadata = {
             "status": context.status,
-            "source": "local_slack_inbox",
-            "coverage": "locally_retained_only",
+            "source": context.source,
+            "coverage": context.coverage,
+            "fetch_status": context.fetch_status,
+            "fetch_error": context.fetch_error,
+            "fetched_at": context.fetched_at,
             "message_count": len(rows),
             "participant_count": len(context.participants),
-            "inbox_ids": [row.inbox_id for row in rows],
+            "inbox_ids": [row.inbox_id for row in rows if row.inbox_id is not None],
             "parent_present": any(row.message_ts == context.scope.thread_ts for row in rows),
             "truncated": context.truncated or len(rows) < len(context.messages) or any(row.truncated for row in rows),
         }
-        content = guidance + "\n" + json.dumps({
-            **metadata, "scope": context.scope.model_dump(),
-            "messages": [row.model_dump() for row in rows],
-            "participants": [person.model_dump() for person in context.participants],
-        }, ensure_ascii=True)
+        # Receipt IDs and transport bookkeeping stay in metadata, not model prose.
+        coverage = {key: metadata[key] for key in (
+            "coverage", "fetch_status", "parent_present", "truncated",
+        )}
+        quoted = "\n".join(json.dumps({
+            "author_user_id": row.user_id, "message_ts": row.message_ts, "text": row.text,
+        }, ensure_ascii=True) for row in rows)
+        content = (guidance + "\nCoverage: " + json.dumps(coverage)
+                   + "\nQuoted thread:\n" + quoted
+                   + "\nParticipants: " + json.dumps(
+                       [person.model_dump(exclude_defaults=True) for person in context.participants],
+                       ensure_ascii=True))
         message = {"role": "user", "content": content}
         if len(content) <= MAX_CHARS and estimate_tokens_for_messages([message]) <= max_tokens:
             return ThreadContextPrompt(messages=(message,), metadata={**metadata, "included": True})

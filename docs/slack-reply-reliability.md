@@ -11,8 +11,10 @@ Unthreaded DMs use the daily `slack:TEAM:CHANNEL:dm24:DATE` bucket; threaded DMs
 use their thread session. Parent and message timestamps are included in request
 metadata, and output targets the same Slack thread. Bounded locally retained
 outgoing context is described in [outbound context](slack-outbound-context.md);
-arbitrary Slack history is not automatically imported. Reading that needs the
-existing explicit history/reply tools. Normal replies do not notify Alex, dot, or another
+arbitrary Slack history is not automatically imported. Authorized threaded turns
+also make a bounded read of the exact thread, with explicit local fallback on
+failure; see [thread context](slack-inbox.md#same-thread-reply-context). Broader
+history reads use the existing explicit tools. Normal replies do not notify Alex, dot, or another
 agent automatically. Artifact review matching stores a review event; it is not
 proof that a human or originating agent has seen it.
 

@@ -1168,6 +1168,10 @@ def _run_socket_mode(args) -> None:
     logger.info("Slack durable inbox ready passive_channels=%s", len(inbox.channels))
 
     app = App(token=cfg.bot_token)
+    from slack_sdk.web import WebClient
+    from ispec.assistant.slack_thread_fetch import TIMEOUT_SECONDS
+
+    thread_client = WebClient(token=cfg.bot_token, timeout=TIMEOUT_SECONDS, retry_handlers=[])
     app.middleware(inbox.middleware)
 
     api_key_fingerprint = ""
@@ -1338,7 +1342,7 @@ def _run_socket_mode(args) -> None:
             },
         }
 
-        meta["slack_thread_context"] = inbox.thread_context(meta)
+        meta["slack_thread_context"] = inbox.thread_context(meta, client=thread_client)
         meta["slack_participants"] = _slack_participant_map(
             client=client, user_cache=user_cache, meta=meta, text=text,
         )
@@ -1635,7 +1639,7 @@ def _run_socket_mode(args) -> None:
                 "user_real_name": cached.get("user_real_name"),
             },
         }
-        meta["slack_thread_context"] = inbox.thread_context(meta)
+        meta["slack_thread_context"] = inbox.thread_context(meta, client=thread_client)
         meta["slack_participants"] = _slack_participant_map(
             client=client, user_cache=user_cache, meta=meta, text=raw_text,
         )
