@@ -20,7 +20,6 @@ from ispec.api.security import require_access, require_assistant_access
 from ispec.agent.connect import get_agent_session_dep
 from ispec.agent.commands import COMMAND_COMPACT_SESSION_MEMORY, COMMAND_ORCHESTRATOR_TICK, COMMAND_SUPPORT_CHAT_TURN
 from ispec.agent.models import AgentCommand, AgentRun
-from ispec.assistant.comment_intent import decide_project_comment_intent_vllm
 from ispec.assistant.classifier_service import generate_classifier_reply
 from ispec.assistant.context import build_ispec_context, extract_project_ids
 from ispec.assistant.compaction import normalize_conversation_memory
@@ -35,18 +34,12 @@ from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
 from ispec.assistant.project_comment_approval import (
     ProjectCommentApprovalSettings,
-    ProjectCommentAuthorization,
-    build_project_comment_gate,
-    decide_project_comment_policy,
-    detect_project_comment_trigger,
-    empty_project_comment_classifier,
-    forced_tool_choice_name as _forced_tool_choice_name,
-    project_comment_force_tool_choice_requested as _project_comment_force_tool_choice_requested,
     project_comment_write_outcome as _project_comment_write_outcome,
-    run_project_comment_approval_classifier,
+)
+from ispec.assistant.project_comment_workflow import (
+    COMMENT_WORKFLOW_TOOLS, ProjectCommentWorkflow, comment_workflow_tools,
 )
 from ispec.assistant.reply_delivery import RETAINED_REPLY, ReplyRetention
-from ispec.assistant.reply_interpretation import interpret_reply_for_project_comment_save
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
 from ispec.assistant.runtime_settings import vllm_strict_protocol
@@ -60,7 +53,6 @@ from ispec.assistant.service import (
     generate_reply,
 )
 from ispec.assistant.support_policies import (
-    comment_intent_messages_for_write_mode,
     hinted_support_tool_groups,
     select_support_tool_policy,
 )
@@ -81,7 +73,6 @@ from ispec.assistant.tools import (
     openai_tools_for_user,
     openai_tool_names_all,
     parse_tool_call,
-    project_comment_save_requested,
     run_tool,
     tool_writes_data,
 )
@@ -105,10 +96,6 @@ _PROJECT_ROUTE_RE = re.compile(r"/project/(\d+)", re.IGNORECASE)
 _EXPERIMENT_ROUTE_RE = re.compile(r"/experiment/(\d+)", re.IGNORECASE)
 _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
 _CONTEXT_SCHEMA_VERSION = 1
-_PROJECT_COMMENT_INTENT_RE = re.compile(
-    r"\b(comment|note|history|save|draft|rewrite|edit|word|wording|log|record|add|commit)\b",
-    re.IGNORECASE,
-)
 _WRITE_SUCCESS_VERB_RE = re.compile(
     r"\b(saved|added|logged|recorded|created|written|updated|committed)\b",
     re.IGNORECASE,
@@ -586,13 +573,6 @@ def _chat_queue_enabled() -> bool:
     return _state_dir_is_dev()
 
 
-def _project_comment_intent_hints_enabled() -> bool:
-    parsed = _env_tristate_bool("ISPEC_ASSISTANT_PROJECT_COMMENT_INTENT_HINTS")
-    if parsed is not None:
-        return bool(parsed)
-    return False
-
-
 def _chat_queue_wait_seconds() -> float:
     raw = (os.getenv("ISPEC_ASSISTANT_CHAT_QUEUE_WAIT_SECONDS") or "").strip()
     if not raw:
@@ -713,40 +693,6 @@ def _remove_write_tools_from_openai_schemas(
 ) -> tuple[list[dict[str, Any]] | None, list[str]]:
     names = {name for name in _openai_tool_names(tools) if tool_writes_data(name)}
     return _remove_tool_names_from_openai_schemas(tools, names=names)
-
-
-def _project_comment_write_tool_allowed(
-    *,
-    explicit_save_requested: bool,
-    confirmation_reply: bool,
-    awaiting_state: dict[str, Any] | None,
-    reply_interpretation_action: str | None,
-    trigger_allows_write_tool: bool = False,
-) -> tuple[bool, str]:
-    action = str(reply_interpretation_action or "").strip()
-    if action == "approve_save":
-        return True, "reply_interpretation_approve"
-    if action == "clarify" and explicit_save_requested:
-        return True, "explicit_save_request"
-    if action:
-        return False, f"reply_interpretation:{action}"
-    if explicit_save_requested and (not confirmation_reply or isinstance(awaiting_state, dict)):
-        return True, "explicit_save_request"
-    if trigger_allows_write_tool and not confirmation_reply:
-        return True, "project_comment_trigger"
-    if confirmation_reply and not isinstance(awaiting_state, dict):
-        return False, "confirmation_without_pending_save"
-    return False, "no_explicit_save_request"
-
-
-def _project_comment_write_policy_message(*, project_id: int | None) -> dict[str, str]:
-    text = (
-        "Do not save or log to project history in this turn unless the user explicitly asks you to save. "
-        "You may still help draft or revise the note in normal language."
-    )
-    if isinstance(project_id, int) and project_id > 0:
-        text += f" The current draft context is project {project_id}."
-    return {"role": "system", "content": text}
 
 
 def _write_block_reason_for_tool_payload(tool_name: str | None, tool_payload: dict[str, Any] | None) -> str | None:
@@ -1482,12 +1428,12 @@ def chat(
 
     referenced_projects = extract_project_ids(payload.message)
     focused_project_id: int | None = None
-    if referenced_projects:
+    if len(referenced_projects) == 1:
         focused_project_id = referenced_projects[0]
         if state.get("current_project_id") != focused_project_id:
             state["current_project_id"] = focused_project_id
             state_changed = True
-    else:
+    elif not referenced_projects:
         candidate = state.get("current_project_id")
         if isinstance(candidate, int) and candidate >= 0:
             focused_project_id = candidate
@@ -1576,15 +1522,7 @@ def chat(
         if last_assistant_turn_row is not None
         else ""
     )
-    reply_interpretation = interpret_reply_for_project_comment_save(
-        tool_protocol=tool_protocol,
-        available_tool_names=available_openai_tool_names_full,
-        focused_project_id=focused_project_id,
-        last_assistant_message=last_assistant_text_for_turn_decision,
-        user_message=payload.message,
-    )
-    confirmation_reply = reply_interpretation.is_confirmation_reply
-    awaiting_reply_state = reply_interpretation.awaiting_state_dict()
+    awaiting_reply_state = None
     if structured_model and turn_decision_mode != "off":
         turn_decision_result = run_turn_decision_pipeline(
             generate_reply_fn=generate_reply,
@@ -1598,7 +1536,7 @@ def chat(
             response_modes=["single", "compare"] if compare_mode_enabled else ["single"],
             contract_caps=list(response_contract_names()),
             extra_context={
-                "confirmation_reply": confirmation_reply,
+                "confirmation_reply": False,
                 "tool_protocol": tool_protocol,
                 "tools_enabled": bool(tools_enabled),
                 "requested_tool_names": requested_tool_names_known,
@@ -1611,136 +1549,28 @@ def chat(
         turn_decision_runtime_applied = bool(
             turn_decision_result.ok and turn_decision_mode == "own" and turn_decision_result.decision is not None
         )
-    reply_interpretation = reply_interpretation.with_turn_decision(
-        turn_decision_result=turn_decision_result,
-        turn_decision_runtime_applied=turn_decision_runtime_applied,
-        available_tool_names=available_openai_tool_names_full,
-        focused_project_id=focused_project_id,
-    )
-    awaiting_reply_state = reply_interpretation.awaiting_state_dict()
-    reply_interpretation_policy_messages = list(reply_interpretation.policy_messages)
-    skip_tool_router_for_reply_interpretation = bool(reply_interpretation.applied)
-    explicit_project_comment_save_request = project_comment_save_requested(payload.message)
     controller_thread_key = support_post_send_thread_key(session.session_id)
-    project_comment_approval_settings = ProjectCommentApprovalSettings.from_env(
-        assistant_provider=assistant_provider,
-        state_dir_is_dev=_state_dir_is_dev(),
-    )
-    project_comment_trigger = detect_project_comment_trigger(
-        message=payload.message,
-        legacy_confirmation_kind=reply_interpretation.kind,
-        legacy_save_requested=explicit_project_comment_save_request,
-    )
-    project_comment_approval_lexical_features = project_comment_trigger.to_lexical_features()
-    project_comment_approval_state_gate_obj = build_project_comment_gate(
-        settings=project_comment_approval_settings,
-        trigger=project_comment_trigger,
-        tool_protocol=tool_protocol,
-        available_tool_names=available_openai_tool_names_full,
-        focused_project_id=focused_project_id,
-        session_id=session.session_id,
-        thread_key=controller_thread_key,
-        current_turn_id=str(user_message.id),
-        prior_assistant_message_id=(
-            int(last_assistant_turn_row.id) if last_assistant_turn_row is not None else None
+    slack_actor = (payload.meta or {}).get("slack")
+    project_comment_workflow = ProjectCommentWorkflow(
+        core_db=core_db, assistant_db=assistant_db, user=user,
+        session_id=session.session_id, turn_id=int(user_message.id), user_message=payload.message,
+        settings=ProjectCommentApprovalSettings.from_env(
+            assistant_provider=assistant_provider, state_dir_is_dev=_state_dir_is_dev(),
         ),
-        prior_assistant_message=last_assistant_text_for_turn_decision,
-        user_message=payload.message,
-        awaiting_reply_state=awaiting_reply_state,
+        generate_reply_fn=generate_reply, generate_classifier_reply_fn=generate_classifier_reply,
+        source_actor=str(slack_actor.get("user_id") or "") if isinstance(slack_actor, dict) else "",
     )
-    project_comment_approval_classifier_obj = empty_project_comment_classifier(
-        settings=project_comment_approval_settings
+    tool_schemas = comment_workflow_tools(tools=tool_schemas or []) if tool_protocol == "openai" else tool_schemas
+    comment_tool_schemas = [
+        spec for spec in tool_schemas or [] if spec["function"]["name"] in COMMENT_WORKFLOW_TOOLS
+    ]
+    project_comment_write_tool_exposed = any(
+        spec["function"]["name"] == "create_project_comment" for spec in comment_tool_schemas
     )
-    if project_comment_approval_settings.mode != "off" and project_comment_approval_state_gate_obj.eligible:
-        project_comment_approval_classifier_obj = run_project_comment_approval_classifier(
-            settings=project_comment_approval_settings,
-            gate=project_comment_approval_state_gate_obj,
-            trigger=project_comment_trigger,
-            user_message=payload.message,
-            prior_assistant_message=last_assistant_text_for_turn_decision,
-            focused_project_id=focused_project_id,
-            generate_reply_fn=generate_reply,
-            generate_classifier_reply_fn=generate_classifier_reply,
-        )
-    project_comment_approval_policy_obj, project_comment_approval_ticket_obj = decide_project_comment_policy(
-        settings=project_comment_approval_settings,
-        gate=project_comment_approval_state_gate_obj,
-        trigger=project_comment_trigger,
-        classifier=project_comment_approval_classifier_obj,
+    project_comment_write_tool_reason = "staged_tool" if project_comment_write_tool_exposed else "not_available"
+    project_comment_write_policy_messages = (
+        project_comment_workflow.prompt_messages() if project_comment_write_tool_exposed else []
     )
-    project_comment_authorization = None
-    if project_comment_approval_settings.mode == "own":
-        project_comment_authorization = ProjectCommentAuthorization(
-            gate=project_comment_approval_state_gate_obj, ticket=project_comment_approval_ticket_obj,
-        )
-        if project_comment_approval_state_gate_obj.eligible:
-            reply_interpretation = reply_interpretation.with_approval_policy(
-                label=project_comment_approval_classifier_obj.label,
-                confidence=project_comment_approval_classifier_obj.confidence,
-                reason="; ".join(project_comment_approval_policy_obj.reasons),
-                authorized=project_comment_approval_ticket_obj.issued,
-            )
-            reply_interpretation_policy_messages = list(reply_interpretation.policy_messages)
-            skip_tool_router_for_reply_interpretation = True
-    project_comment_approval_eval_mode = project_comment_approval_settings.mode
-    project_comment_approval_state_gate = project_comment_approval_state_gate_obj.to_dict()
-    project_comment_approval_classifier = project_comment_approval_classifier_obj.to_dict()
-    project_comment_approval_policy = project_comment_approval_policy_obj.to_dict()
-    project_comment_approval_ticket = project_comment_approval_ticket_obj.to_dict()
-    project_comment_trigger_meta = project_comment_trigger.to_dict()
-    project_comment_trigger_allows_write_tool = project_comment_trigger.kind in {"explicit_save", "direct_note_request"}
-    project_comment_approval_eval_enabled = bool(
-        project_comment_approval_eval_mode != "off"
-        and (
-            project_comment_approval_state_gate.get("eligible")
-            or isinstance(awaiting_reply_state, dict)
-            or explicit_project_comment_save_request
-        )
-    )
-    project_comment_write_policy_messages: list[dict[str, str]] = []
-    project_comment_write_tool_exposed = "create_project_comment" in available_openai_tool_names_full
-    project_comment_write_tool_reason = "not_available"
-    # Shadow evaluation never changes this legacy path. Own mode uses a scoped ticket.
-    project_comment_save_authorized = bool(
-        project_comment_authorization is None
-        and reply_interpretation.has_pending_save
-        and reply_interpretation.runtime_action == "approve_save"
-    )
-    reply_interpretation_removed_write_tools: list[str] = []
-    if (
-        tool_protocol == "openai"
-        and tools_enabled
-        and isinstance(tool_schemas, list)
-        and project_comment_write_tool_exposed
-    ):
-        if project_comment_authorization is not None:
-            project_comment_write_allowed = project_comment_authorization.ticket.issued
-            project_comment_write_tool_reason = "approval_policy:" + project_comment_approval_policy_obj.decision
-        else:
-            project_comment_write_allowed, project_comment_write_tool_reason = _project_comment_write_tool_allowed(
-                explicit_save_requested=explicit_project_comment_save_request,
-                confirmation_reply=confirmation_reply,
-                awaiting_state=awaiting_reply_state,
-                reply_interpretation_action=(
-                    reply_interpretation.runtime_action if reply_interpretation.runtime_action != "none" else None
-                ),
-                trigger_allows_write_tool=project_comment_trigger_allows_write_tool,
-            )
-        if not project_comment_write_allowed:
-            tool_schemas, removed_project_comment_tools = _remove_tool_names_from_openai_schemas(
-                tool_schemas,
-                names={"create_project_comment"},
-            )
-            if removed_project_comment_tools:
-                project_comment_write_tool_exposed = False
-                if project_comment_write_tool_reason.startswith("reply_interpretation:"):
-                    reply_interpretation_removed_write_tools = removed_project_comment_tools
-                else:
-                    project_comment_write_policy_messages = [
-                        _project_comment_write_policy_message(project_id=focused_project_id)
-                    ]
-    elif project_comment_write_tool_exposed:
-        project_comment_write_tool_reason = "available"
 
     selected_policy_rule_name: str | None = None
     tool_selector_source: str | None = None
@@ -1751,8 +1581,6 @@ def chat(
         and isinstance(tool_schemas, list)
         and tool_schemas
         and structured_model
-        and not confirmation_reply
-        and not skip_tool_router_for_reply_interpretation
     ):
         available_tool_names = _openai_tool_names(tool_schemas)
         requested_tool_names_available = _requested_tool_names_from_text(
@@ -1889,32 +1717,11 @@ def chat(
                 if filtered:
                     tool_schemas = filtered
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
-    elif (
-        tool_protocol == "openai"
-        and tools_enabled
-        and isinstance(tool_schemas, list)
-        and tool_schemas
-        and structured_model
-        and (confirmation_reply or skip_tool_router_for_reply_interpretation)
-    ):
-        tool_router = {
-            "ok": True,
-            "skipped": True,
-            "reason": "reply_interpretation" if skip_tool_router_for_reply_interpretation else "confirmation_reply",
-        }
-
-    if (
-        tool_protocol == "openai"
-        and reply_interpretation.applied
-        and reply_interpretation.runtime_action != "approve_save"
-    ):
-        tool_schemas, additional_removed_write_tools = _remove_write_tools_from_openai_schemas(tool_schemas)
-        if additional_removed_write_tools:
-            reply_interpretation_removed_write_tools = sorted(
-                set(reply_interpretation_removed_write_tools) | set(additional_removed_write_tools)
-            )
-        if isinstance(tool_router, dict) and reply_interpretation_removed_write_tools:
-            tool_router["reply_interpretation_removed_write_tools"] = reply_interpretation_removed_write_tools
+    # Routing may select read tools, but cannot hide the draft/save capability.
+    if tool_protocol == "openai":
+        tool_schemas = [
+            spec for spec in tool_schemas or [] if spec["function"]["name"] not in COMMENT_WORKFLOW_TOOLS
+        ] + comment_tool_schemas
 
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
     openai_tool_names = _openai_tool_names(tool_schemas)
@@ -2008,7 +1815,6 @@ def chat(
             *([prepared_followup_message] if prepared_followup_message else []),
             *tool_availability_messages,
             *project_comment_write_policy_messages,
-            *reply_interpretation_policy_messages,
             {"role": "user", "content": payload.message},
         ]
         tokens = estimate_tokens_for_messages(base_messages)
@@ -2055,54 +1861,6 @@ def chat(
     ]
     # Quoted delivery evidence is not input to approval/tool-selection predicates.
     history_payload = outbound_context_message(payload.meta) + history_payload
-    last_assistant_text = next(
-        (
-            str(item.get("content") or "")
-            for item in reversed(history_payload)
-            if isinstance(item, dict) and item.get("role") == "assistant" and item.get("content")
-        ),
-        "",
-    )
-    comment_intent_decision: dict[str, Any] | None = None
-    comment_intent_reply = None
-    comment_intent_messages: list[dict[str, Any]] = []
-    if project_comment_authorization is not None and project_comment_approval_state_gate_obj.eligible:
-        pass  # This bounded policy owns the decision; do not run a competing intent pass.
-    elif turn_decision_runtime_applied and turn_decision_result and turn_decision_result.decision is not None:
-        write_mode = turn_decision_result.decision.write_plan.mode
-        if not (reply_interpretation.applied and reply_interpretation.runtime_action != "approve_save"):
-            comment_intent_messages = comment_intent_messages_for_write_mode(
-                write_mode=write_mode,
-                missing_comment_text=(
-                    write_mode == "save_now"
-                    and turn_decision_result.decision.needs_clarification
-                    and turn_decision_result.decision.clarification_reason == "missing_comment_text"
-                ),
-            )
-    elif (
-        tool_protocol == "openai"
-        and tools_enabled
-        and structured_model
-        and _project_comment_intent_hints_enabled()
-        and "create_project_comment" in openai_tool_names
-        and (confirmation_reply or _PROJECT_COMMENT_INTENT_RE.search(payload.message or ""))
-    ):
-        comment_intent_decision, comment_intent_reply = decide_project_comment_intent_vllm(
-            user_message=payload.message,
-            last_assistant_message=last_assistant_text,
-            focused_project_id=focused_project_id,
-            generate_reply_fn=generate_reply,
-        )
-        if isinstance(comment_intent_decision, dict):
-            intent = str(comment_intent_decision.get("intent") or "").strip()
-            confidence = float(comment_intent_decision.get("confidence") or 0.0)
-            reason = _truncate(str(comment_intent_decision.get("reason") or ""), 240)
-            comment_intent_messages = comment_intent_messages_for_write_mode(
-                write_mode=_legacy_comment_intent_to_write_mode(comment_intent_decision),
-                confidence=confidence,
-                reason=reason,
-            )
-
     tool_calls: list[dict[str, Any]] = []
     tool_messages: list[dict[str, Any]] = []
     tool_result_messages: list[dict[str, Any]] = []
@@ -2118,44 +1876,12 @@ def chat(
     forced_tool_choice: str | dict[str, Any] | None = None
     if (
         tool_protocol == "openai"
-        and reply_interpretation.applied
-        and reply_interpretation.runtime_action == "approve_save"
-        and isinstance(focused_project_id, int)
-        and focused_project_id > 0
-        and "create_project_comment" in openai_tool_names
-    ):
-        forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
-    if (
-        tool_protocol == "openai"
-        and forced_tool_choice is None
-        and explicit_project_comment_save_request
-        and _project_comment_force_tool_choice_requested(payload.message)
-        and not confirmation_reply
-        and isinstance(focused_project_id, int)
-        and focused_project_id > 0
-        and "create_project_comment" in openai_tool_names
-    ):
-        forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
-    if (
-        tool_protocol == "openai"
-        and forced_tool_choice is None
-        and turn_decision_result is not None
-        and getattr(turn_decision_result, "mode", None) == "shadow"
-        and confirmation_reply
-        and reply_interpretation.is_affirmative_reply
-        and reply_interpretation.has_pending_save
-        and isinstance(focused_project_id, int)
-        and focused_project_id > 0
-        and "create_project_comment" in openai_tool_names
-    ):
-        forced_tool_choice = {"type": "function", "function": {"name": "create_project_comment"}}
-    if (
-        tool_protocol == "openai"
         and forced_tool_choice is None
         and turn_decision_runtime_applied
         and turn_decision_result
         and turn_decision_result.decision is not None
         and turn_decision_result.decision.tool_plan.preferred_first_tool in openai_tool_names
+        and turn_decision_result.decision.tool_plan.preferred_first_tool not in COMMENT_WORKFLOW_TOOLS
     ):
         tool_selector_source = tool_selector_source or "turn_decision"
         forced_tool_choice = {
@@ -2168,7 +1894,8 @@ def chat(
     policy_force_tool_choice = bool(support_policy_selection.force_tool_choice) if support_policy_selection is not None else False
     policy_override_tool_args = bool(support_policy_selection.override_tool_args) if support_policy_selection is not None else False
     if policy_tool_name and (
-        policy_tool_name not in openai_tool_names
+        policy_tool_name in COMMENT_WORKFLOW_TOOLS
+        or policy_tool_name not in openai_tool_names
         or (policy_tool_name not in openai_no_arg_tool_names and not policy_tool_args)
     ):
         policy_tool_name = None
@@ -2230,8 +1957,7 @@ def chat(
                     "ok": False,
                     "tool": normalized_name,
                     "error": (
-                        "Project history writing is not allowed in this turn because the user did not explicitly ask to save. "
-                        "Draft or revise the note instead."
+                        "Project-comment tools are unavailable under current access/deployment settings."
                     ),
                 }
             return {
@@ -2243,6 +1969,8 @@ def chat(
 
     def _maybe_block_write_tools_for_turn(tool_name: str | None, tool_payload: dict[str, Any] | None) -> None:
         nonlocal tool_schemas, write_block_reason, project_comment_write_tool_exposed, project_comment_write_tool_reason
+        if tool_name in COMMENT_WORKFLOW_TOOLS:
+            return  # Keep tools visible; the executor blocks/caches repeated attempts.
         reason = _write_block_reason_for_tool_payload(tool_name, tool_payload)
         if not reason:
             return
@@ -2289,6 +2017,11 @@ def chat(
 
     while True:
         llm_round += 1
+        # Tool execution can replace, save, or cancel a draft within this turn.
+        # Rebuild current state rather than replaying the turn-start snapshot.
+        project_comment_write_policy_messages = (
+            project_comment_workflow.prompt_messages() if project_comment_write_tool_exposed else []
+        )
         agent_state = context_payload.get("agent") if isinstance(context_payload.get("agent"), dict) else None
         if agent_state is not None:
             agent_state["round"] = llm_round
@@ -2312,8 +2045,6 @@ def chat(
             *tool_availability_messages,
             *project_comment_write_policy_messages,
             *policy_messages,
-            *reply_interpretation_policy_messages,
-            *comment_intent_messages,
             {"role": "user", "content": payload.message},
             *tool_messages,
         ]
@@ -2344,8 +2075,6 @@ def chat(
             *tool_availability_messages,
             *project_comment_write_policy_messages,
             *policy_messages,
-            *reply_interpretation_policy_messages,
-            *comment_intent_messages,
             *trimmed_history,
             *round_thread_prompt.messages,
             {"role": "user", "content": payload.message},
@@ -2487,10 +2216,8 @@ def chat(
                         user=user,
                         api_schema=api_schema,
                         user_message=payload.message,
-                        project_comment_save_authorized=project_comment_save_authorized,
-                        **({"project_comment_authorization": project_comment_authorization,
-                            "support_turn_id": str(user_message.id)}
-                           if project_comment_authorization is not None else {}),
+                        project_comment_workflow=project_comment_workflow,
+                        support_turn_id=str(user_message.id),
                         support_session_id=session.session_id,
                     )
                     _maybe_block_write_tools_for_turn(tool_name, tool_payload)
@@ -2516,9 +2243,16 @@ def chat(
                         "content": json.dumps(tool_payload, ensure_ascii=False),
                     }
                 )
+                # Text-only templates (including cached Tulu) omit role=tool.
+                # Keep the compatibility copy until template capabilities are explicit.
                 tool_messages.append({"role": "system", "content": tool_result_text})
             if executed_openai_tools:
                 trace_step["executed_tools"] = executed_openai_tools
+            if project_comment_workflow.response is not None and project_comment_workflow.response.kind == "offered":
+                # Only an actual server-rendered offer arms a later save. Allow
+                # preparation to be followed by an explicit offer tool call.
+                trace_step["action"] = "present_registered_draft"
+                break
             continue
 
         tool_call = None if native_tools_only else parse_tool_call(reply.content)
@@ -2551,10 +2285,8 @@ def chat(
                     user=user,
                     api_schema=api_schema,
                     user_message=payload.message,
-                    project_comment_save_authorized=project_comment_save_authorized,
-                    **({"project_comment_authorization": project_comment_authorization,
-                        "support_turn_id": str(user_message.id)}
-                       if project_comment_authorization is not None else {}),
+                    project_comment_workflow=project_comment_workflow,
+                    support_turn_id=str(user_message.id),
                     support_session_id=session.session_id,
                 )
                 tool_calls.append(
@@ -2606,10 +2338,8 @@ def chat(
                     user=user,
                     api_schema=api_schema,
                     user_message=payload.message,
-                    project_comment_save_authorized=project_comment_save_authorized,
-                    **({"project_comment_authorization": project_comment_authorization,
-                        "support_turn_id": str(user_message.id)}
-                       if project_comment_authorization is not None else {}),
+                    project_comment_workflow=project_comment_workflow,
+                    support_turn_id=str(user_message.id),
                     support_session_id=session.session_id,
                 )
                 tool_calls.append(
@@ -2715,10 +2445,8 @@ def chat(
                 user=user,
                 api_schema=api_schema,
                 user_message=payload.message,
-                project_comment_save_authorized=project_comment_save_authorized,
-                **({"project_comment_authorization": project_comment_authorization,
-                    "support_turn_id": str(user_message.id)}
-                   if project_comment_authorization is not None else {}),
+                project_comment_workflow=project_comment_workflow,
+                support_turn_id=str(user_message.id),
                 support_session_id=session.session_id,
             )
             _maybe_block_write_tools_for_turn(tool_name, tool_payload)
@@ -2744,8 +2472,14 @@ def chat(
         )
         trace_step["action"] = "line_tool_call"
         trace_step["executed_tools"] = [tool_name]
+        if project_comment_workflow.response is not None and project_comment_workflow.response.kind == "offered":
+            trace_step["action"] = "present_registered_draft"
+            break
 
     if reply is None:
+        project_comment_write_policy_messages = (
+            project_comment_workflow.prompt_messages() if project_comment_write_tool_exposed else []
+        )
         history_for_llm = history_payload + list(round_thread_prompt.messages)
         reply = generate_reply(
             messages=[
@@ -2753,7 +2487,6 @@ def chat(
                 {"role": "system", "content": context_message},
                 *tool_availability_messages,
                 *project_comment_write_policy_messages,
-                *reply_interpretation_policy_messages,
                 *history_payload,
                 *round_thread_prompt.messages,
                 {"role": "user", "content": payload.message},
@@ -2792,7 +2525,7 @@ def chat(
     response_contract_mode = response_contracts_mode()
     response_contract_would_apply_if_live, response_contract_protection_reason = _response_contract_live_eligibility(
         tool_calls=tool_calls,
-        comment_intent_decision=comment_intent_decision,
+        comment_intent_decision=None,
         turn_decision_result=turn_decision_result,
     )
     response_contract_request_meta = _merge_response_contract_request_meta(
@@ -2859,6 +2592,14 @@ def chat(
             "and I will handle the tool call myself."
         )
 
+    # Exact review text and transaction status come from successful tools or
+    # their concrete errors, after model review/rewrites. Keep raw model output
+    # in the trace so this presentation is not scored as model correctness.
+    comment_response = project_comment_workflow.delivery_response() if project_comment_write_tool_exposed else None
+    if comment_response is not None:
+        assistant_content = comment_response.text
+        compare_choices = None
+
     turn_decision_meta: dict[str, Any] | None = None
     if turn_decision_result is not None:
         turn_decision_meta = turn_decision_result.as_meta()
@@ -2887,15 +2628,11 @@ def chat(
             "forced_tool_choice": runtime_forced_tool_name,
             "compare_mode_requested": compare_mode_requested,
             "response_contract_policy": _response_contract_policy_meta(response_contract_request_meta),
-            "comment_intent_write_mode": _legacy_comment_intent_to_write_mode(comment_intent_decision),
             "awaiting_reply_state": (
                 str(awaiting_reply_state.get("name") or "").strip()
                 if isinstance(awaiting_reply_state, dict)
                 else None
             ),
-            "reply_interpretation_kind": reply_interpretation.runtime_kind,
-            "reply_interpretation_action": reply_interpretation.runtime_action,
-            "reply_interpretation_applied": reply_interpretation.applied,
         }
         turn_decision_meta["runtime"] = runtime_snapshot
 
@@ -2927,22 +2664,6 @@ def chat(
                 divergence["response_contract_cap"] = {
                     "turn_decision": turn_decision_result.decision.response_plan.contract_cap,
                     "runtime": runtime_contract_cap,
-                }
-            runtime_write_mode = _legacy_comment_intent_to_write_mode(comment_intent_decision)
-            if turn_decision_result.decision.write_plan.mode != runtime_write_mode:
-                divergence["write_mode"] = {
-                    "turn_decision": turn_decision_result.decision.write_plan.mode,
-                    "runtime": runtime_write_mode,
-                }
-            if reply_interpretation.classifier_kind != reply_interpretation.runtime_kind:
-                divergence["reply_interpretation_kind"] = {
-                    "turn_decision": reply_interpretation.classifier_kind,
-                    "runtime": reply_interpretation.runtime_kind,
-                }
-            if reply_interpretation.classifier_action != reply_interpretation.runtime_action:
-                divergence["reply_interpretation_action"] = {
-                    "turn_decision": reply_interpretation.classifier_action,
-                    "runtime": reply_interpretation.runtime_action,
                 }
             if divergence:
                 turn_decision_meta["divergence"] = divergence
@@ -2985,36 +2706,15 @@ def chat(
         "blocked_write_tools": sorted(blocked_write_tool_names),
         "write_block_reason": write_block_reason,
     }
-    if project_comment_approval_eval_enabled:
-        meta["project_comment_approval_eval"] = {
-            "schema_version": 1,
-            "mode": project_comment_approval_eval_mode,
-            "source": "support_chat",
-            "state_gate": project_comment_approval_state_gate,
-            "trigger": project_comment_trigger_meta,
-            "lexical_features": project_comment_approval_lexical_features,
-            "classifier": project_comment_approval_classifier,
-            "policy": project_comment_approval_policy,
-            "legacy_decision": {
-                "write_tool_exposed": bool(project_comment_write_tool_exposed),
-                "write_tool_reason": project_comment_write_tool_reason,
-                "forced_tool_choice": _forced_tool_choice_name(forced_tool_choice),
-                "reply_interpretation_action": reply_interpretation.runtime_action,
-            },
-            **({"write_ticket": {
-                **project_comment_approval_ticket,
-                "consumed": project_comment_authorization.consumed,
-                "attempted_comment_hash": project_comment_authorization.attempted_comment_hash,
-            }} if project_comment_authorization is not None
-               else {"write_ticket_shadow": project_comment_approval_ticket}),
-            "write_outcome": project_comment_write_outcome,
-            "expected_outcome": {
-                "available": False,
-                "source": "none",
-                "decision": None,
-                "notes": None,
-            },
-        }
+    meta["project_comment_workflow"] = {
+        "schema_version": 2,
+        "mode": project_comment_workflow.settings.mode,
+        "save_checks": project_comment_workflow.evaluations,
+        "write_outcome": project_comment_write_outcome,
+        "presentation": ({"kind": comment_response.kind, "applied": True,
+                          "model_content": final_raw_reply_content}
+                         if comment_response is not None else None),
+    }
     meta["context"] = {
         "history_messages_used": len(history_payload),
         "slack_thread_context": slack_thread_prompt.metadata,
@@ -3028,17 +2728,6 @@ def chat(
         meta["tool_router"] = tool_router
     if turn_decision_meta is not None:
         meta["turn_decision"] = turn_decision_meta
-    if reply_interpretation.should_log_meta:
-        meta["reply_interpretation"] = reply_interpretation.meta(
-            removed_write_tools=reply_interpretation_removed_write_tools
-        )
-    if comment_intent_decision is not None or comment_intent_reply is not None:
-        meta["comment_intent"] = {
-            "enabled": _project_comment_intent_hints_enabled(),
-            "decision": comment_intent_decision,
-            "provider": getattr(comment_intent_reply, "provider", None),
-            "model": getattr(comment_intent_reply, "model", None),
-        }
     if final_reply.meta:
         meta["provider_meta"] = final_reply.meta
     if final_prompt_observability:
@@ -3153,10 +2842,10 @@ def chat(
             ),
         )
 
-    if not final_reply.ok:
+    if not final_reply.ok and comment_response is None:
         assistant_content = RETAINED_REPLY
 
-    if slack_thread_context is not None:
+    if slack_thread_context is not None and comment_response is None:
         assistant_content = render_participant_mentions(assistant_content, slack_thread_context.participants)
 
     assistant_message = SupportMessage(
@@ -3170,6 +2859,10 @@ def chat(
     assistant_db.add(assistant_message)
     session.updated_at = utcnow()
     assistant_db.flush()
+
+    presentation = project_comment_workflow.record_delivery(message=assistant_message)
+    if presentation is not None:
+        meta["project_comment_presentation"] = presentation
 
     work_bag_entries = build_work_bag_entries_from_tool_calls(
         tool_calls=tool_calls,

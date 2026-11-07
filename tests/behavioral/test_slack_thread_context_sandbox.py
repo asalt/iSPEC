@@ -110,10 +110,11 @@ def test_thread_reaches_decision_router_and_planner_without_becoming_approval(tm
         metadata = json.loads(reply.meta_json)
         assert metadata["tooling"]["used_tool_calls"] == 0
         assert metadata["tooling"]["forced_tool_choice"] is None
-        if request_text:
-            assert "project_comment_approval_eval" not in metadata
-        else:
-            assert metadata["project_comment_approval_eval"]["write_outcome"]["status"] == "not_attempted"
+        # Prose alone does not register a draft or trigger an approval check.
+        assert "project_comment_approval_eval" not in metadata
+        workflow = metadata["project_comment_workflow"]
+        assert workflow["save_checks"] == []
+        assert workflow["write_outcome"]["status"] == "not_attempted"
         assert metadata["context"]["slack_thread_context"]["message_count"] == (8 if request_text else 7)
         planner_trace = next(t for t in metadata["llm_trace"] if t["prompt"] == "planner")
         assert planner_trace["slack_thread_context"]["included"]

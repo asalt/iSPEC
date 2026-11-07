@@ -3,6 +3,7 @@ from ispec.logging import get_logger
 
 from .base import Base, make_timestamp_mixin
 from .core import Person, ProjectType, Project, ProjectComment, ProjectPerson
+from .comment_draft import ProjectCommentDraft, ProjectCommentSaveOffer
 from .experiment import Experiment, ExperimentRun, Job, JobType, JobStatus
 from .lab import Assay, Reagent
 from .omics import E2G, GeneContrast, GeneContrastStat, GSEAAnalysis, GSEAResult, PSM
@@ -23,6 +24,8 @@ __all__ = [
     "ProjectType",
     "Project",
     "ProjectComment",
+    "ProjectCommentDraft",
+    "ProjectCommentSaveOffer",
     "ProjectPerson",
     "Assay",
     "Reagent",

@@ -225,7 +225,10 @@ def _planner_tool_use_block(*, tool_names: set[str] | None = None) -> str:
         )
     if has("experiments_for_project"):
         tool_use_lines.append("- For experiments in a specific project, use experiments_for_project.")
-    if has("create_project_comment"):
+    # Staged chat supplies its workflow prompt separately. Keep the legacy
+    # direct-write guidance only for callers using the original tool interface.
+    staged_comments = tool_names is not None and "prepare_project_comment" in tool_names
+    if has("create_project_comment") and not staged_comments:
         tool_use_lines.append(
             "- For collaborative project work, draft notes first; only write to project history if the user explicitly asks you to save."
         )

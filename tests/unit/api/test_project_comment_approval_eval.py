@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import types
-from typing import Any
 
 import pytest
 
@@ -150,348 +149,6 @@ def test_project_comment_approval_policy_denial_feature_blocks_shadow_ticket() -
     assert ticket["issued"] is False
 
 
-@pytest.mark.parametrize(
-    "classifier_result", ["approve_save", "deny_save", "invalid_json", "timeout"]
-)
-def test_shadow_evaluation_does_not_change_independently_authorized_write(
-    tmp_path,
-    db_session,
-    monkeypatch,
-    classifier_result,
-):
-    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "stub")
-    monkeypatch.setenv("ISPEC_ASSISTANT_PROJECT_COMMENT_APPROVAL_EVAL_MODE", "shadow")
-    monkeypatch.setenv("ISPEC_ASSISTANT_TURN_DECISION_MODE", "off")
-    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
-    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
-    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
-
-    db_session.add(
-        Project(id=1602, prj_AddedBy="test", prj_ProjectTitle="Project 1602")
-    )
-    db_session.commit()
-
-    llm_calls: list[dict[str, Any]] = []
-
-    def fake_classifier_reply(**kwargs: Any) -> AssistantReply:
-        assert kwargs["timeout_seconds"] == 6.0
-        if classifier_result == "timeout":
-            raise TimeoutError("synthetic classifier timeout")
-        return AssistantReply(
-            content=(
-                "not json"
-                if classifier_result == "invalid_json"
-                else json.dumps(
-                    {
-                        "label": classifier_result,
-                        "confidence": 0.93,
-                        "reason": "The user explicitly asked to save the project comment.",
-                    }
-                )
-            ),
-            provider="classifier_vllm",
-            model="test-classifier",
-            meta={"elapsed_ms": 12},
-        )
-
-    def fake_generate_reply(
-        *, messages=None, tools=None, tool_choice=None, **_: Any
-    ) -> AssistantReply:
-        llm_calls.append(
-            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
-        )
-        if len(llm_calls) == 1:
-            assert tool_choice == {
-                "type": "function",
-                "function": {"name": "create_project_comment"},
-            }
-            return AssistantReply(
-                content="",
-                provider="test",
-                model="test-model",
-                meta=None,
-                tool_calls=[
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "create_project_comment",
-                            "arguments": json.dumps(
-                                {
-                                    "project_id": 1602,
-                                    "comment": "Tattym Sheikh's iLab request is awaiting a charge source number.",
-                                    "comment_type": "note",
-                                    "confirm": True,
-                                }
-                            ),
-                        },
-                    }
-                ],
-            )
-        return AssistantReply(
-            content="FINAL:\nSaved the note to project 1602.",
-            provider="test",
-            model="test-model",
-            meta=None,
-        )
-
-    monkeypatch.setattr(
-        support_routes, "generate_classifier_reply", fake_classifier_reply
-    )
-    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
-
-    db_path = tmp_path / "assistant.db"
-    with get_assistant_session(db_path) as assistant_db:
-        support_session = SupportSession(
-            session_id="session-approval-eval", user_id=None
-        )
-        assistant_db.add(support_session)
-        assistant_db.flush()
-
-        service_user = types.SimpleNamespace(
-            id=1,
-            username="api_key",
-            role=UserRole.viewer,
-            project_access_mode=ProjectAccessMode.all_projects,
-            can_write_project_comments=True,
-        )
-
-        schedule_path = tmp_path / "schedule.db"
-        with get_schedule_session(schedule_path) as schedule_db:
-            response = chat(
-                ChatRequest.model_validate(
-                    {
-                        "sessionId": "session-approval-eval",
-                        "message": "Please make a note for project 1602 and save it.",
-                        "history": [],
-                        "ui": None,
-                    }
-                ),
-                assistant_db=assistant_db,
-                core_db=db_session,
-                schedule_db=schedule_db,
-                user=service_user,
-            )
-
-        assert response.message == "Saved the note to project 1602."
-        comment = (
-            db_session.query(ProjectComment)
-            .filter(ProjectComment.project_id == 1602)
-            .first()
-        )
-        assert comment is not None
-
-        assistant_row = (
-            assistant_db.query(support_routes.SupportMessage)
-            .filter(support_routes.SupportMessage.session_pk == support_session.id)
-            .filter(support_routes.SupportMessage.role == "assistant")
-            .order_by(support_routes.SupportMessage.id.desc())
-            .first()
-        )
-        assert assistant_row is not None
-        meta = json.loads(assistant_row.meta_json)
-        approval_eval = meta["project_comment_approval_eval"]
-        assert approval_eval["state_gate"]["eligible"] is True
-        assert approval_eval["state_gate"]["kind"] == "direct_write_candidate"
-        assert approval_eval["policy"]["live_applied"] is False
-        assert approval_eval["write_ticket_shadow"]["issued"] is (
-            classifier_result == "approve_save"
-        )
-        if classifier_result in {"approve_save", "deny_save"}:
-            assert approval_eval["classifier"]["label"] == classifier_result
-            assert approval_eval["classifier"]["confidence"] == 0.93
-            assert approval_eval["policy"]["decision"] == (
-                "shadow_ticket" if classifier_result == "approve_save" else "no_ticket"
-            )
-        else:
-            assert approval_eval["classifier"]["ok"] is False
-            assert approval_eval["policy"]["decision"] == "classifier_unavailable"
-        assert approval_eval["write_ticket_shadow"]["shadow_only"] is True
-        assert (
-            approval_eval["legacy_decision"]["forced_tool_choice"]
-            == "create_project_comment"
-        )
-        assert approval_eval["write_outcome"]["status"] == "succeeded"
-        assert approval_eval["write_outcome"]["comment_id"] == comment.id
-
-
-@pytest.mark.parametrize("eval_mode", ["off", "shadow"])
-@pytest.mark.parametrize("attempt_write", [False, True])
-def test_evaluation_ticket_cannot_force_or_authorize_a_live_write(
-    tmp_path,
-    db_session,
-    monkeypatch,
-    eval_mode,
-    attempt_write,
-):
-    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "stub")
-    monkeypatch.setenv("ISPEC_ASSISTANT_PROJECT_COMMENT_APPROVAL_EVAL_MODE", eval_mode)
-    monkeypatch.setenv("ISPEC_ASSISTANT_TURN_DECISION_MODE", "off")
-    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
-    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
-    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
-
-    db_session.add(
-        Project(
-            id=1574,
-            prj_AddedBy="test",
-            prj_ProjectTitle="Phospho differential analysis",
-        )
-    )
-    db_session.commit()
-
-    def fake_classifier_reply(**kwargs: Any) -> AssistantReply:
-        assert eval_mode != "off"
-        return AssistantReply(
-            content=json.dumps(
-                {
-                    "label": "approve_save",
-                    "confidence": 0.94,
-                    "reason": "The user directly asks to make a project note with specific content.",
-                }
-            ),
-            provider="classifier_vllm",
-            model="test-classifier",
-            meta={"elapsed_ms": 8},
-        )
-
-    llm_calls: list[dict[str, Any]] = []
-    tool_results: list[dict[str, Any]] = []
-    real_run_tool = support_routes.run_tool
-
-    def checked_run_tool(*args: Any, **kwargs: Any):
-        assert kwargs["project_comment_save_authorized"] is False
-        result = real_run_tool(*args, **kwargs)
-        tool_results.append(result)
-        return result
-
-    def fake_generate_reply(
-        *, messages=None, tools=None, tool_choice=None, **_: Any
-    ) -> AssistantReply:
-        llm_calls.append(
-            {"messages": messages, "tools": tools, "tool_choice": tool_choice}
-        )
-        assert tool_choice in (None, "auto", "none")
-        if len(llm_calls) == 1 and attempt_write:
-            return AssistantReply(
-                content="",
-                provider="test",
-                model="test-model",
-                meta=None,
-                tool_calls=[
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "create_project_comment",
-                            "arguments": json.dumps(
-                                {
-                                    "project_id": 1574,
-                                    "comment": (
-                                        "Had a meeting with project 1574 and am working on follow-up "
-                                        "phospho differential analysis."
-                                    ),
-                                    "comment_type": "assistant_note",
-                                    "confirm": True,
-                                }
-                            ),
-                        },
-                    }
-                ],
-            )
-        return AssistantReply(
-            content="FINAL:\nHere is a draft. Please confirm saving it to project 1574.",
-            provider="test",
-            model="test-model",
-            meta=None,
-        )
-
-    monkeypatch.setattr(
-        support_routes, "generate_classifier_reply", fake_classifier_reply
-    )
-    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
-    monkeypatch.setattr(support_routes, "run_tool", checked_run_tool)
-
-    db_path = tmp_path / "assistant.db"
-    with get_assistant_session(db_path) as assistant_db:
-        support_session = SupportSession(session_id="session-direct-note", user_id=None)
-        assistant_db.add(support_session)
-        assistant_db.flush()
-
-        service_user = types.SimpleNamespace(
-            id=1,
-            username="api_key",
-            role=UserRole.viewer,
-            project_access_mode=ProjectAccessMode.all_projects,
-            can_write_project_comments=True,
-        )
-
-        schedule_path = tmp_path / "schedule.db"
-        with get_schedule_session(schedule_path) as schedule_db:
-            response = chat(
-                ChatRequest.model_validate(
-                    {
-                        "sessionId": "session-direct-note",
-                        "message": (
-                            "note i had meeting with 1574 project and am working on follow up "
-                            "phospho differential analysis"
-                        ),
-                        "history": [],
-                        "ui": None,
-                    }
-                ),
-                assistant_db=assistant_db,
-                core_db=db_session,
-                schedule_db=schedule_db,
-                user=service_user,
-            )
-
-        assert "Saved the note" not in response.message
-        assert (
-            db_session.query(ProjectComment)
-            .filter(ProjectComment.project_id == 1574)
-            .count()
-            == 0
-        )
-        assert len(tool_results) == int(attempt_write)
-        if attempt_write:
-            assert tool_results[0]["ok"] is False
-            assert (
-                tool_results[0]["error"]
-                == "User did not explicitly request saving to project history."
-            )
-
-        assistant_row = (
-            assistant_db.query(support_routes.SupportMessage)
-            .filter(support_routes.SupportMessage.session_pk == support_session.id)
-            .filter(support_routes.SupportMessage.role == "assistant")
-            .order_by(support_routes.SupportMessage.id.desc())
-            .first()
-        )
-        assert assistant_row is not None
-        meta = json.loads(assistant_row.meta_json)
-        if eval_mode == "off":
-            assert "project_comment_approval_eval" not in meta
-            return
-        approval_eval = meta["project_comment_approval_eval"]
-        assert approval_eval["trigger"]["kind"] == "direct_note_request"
-        assert approval_eval["state_gate"]["kind"] == "direct_write_candidate"
-        assert approval_eval["classifier"]["label"] == "approve_save"
-        assert approval_eval["policy"]["decision"] == "shadow_ticket"
-        assert approval_eval["policy"]["live_applied"] is False
-        assert approval_eval["write_ticket_shadow"]["issued"] is True
-        assert approval_eval["write_ticket_shadow"]["shadow_only"] is True
-        assert approval_eval["legacy_decision"]["forced_tool_choice"] is None
-        assert approval_eval["write_outcome"]["status"] == (
-            "failed" if attempt_write else "not_attempted"
-        )
-        assert approval_eval["write_outcome"]["comment_id"] is None
-
-
 def test_project_comment_approval_eval_gate_catches_typo_project_note_candidate() -> None:
     message = "mkae a note on project 1387 is is a mlewis liver pdx dataset for the portal"
 
@@ -525,107 +182,63 @@ def test_project_comment_approval_eval_gate_catches_typo_project_note_candidate(
     assert gate["reason"] == "project_comment_write_candidate"
 
 
-def test_project_comment_approval_eval_keeps_tool_exposed_for_typo_note_candidate_without_forcing_write(
-    tmp_path,
-    db_session,
-    monkeypatch,
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "own"])
+@pytest.mark.parametrize("message,attempt_write", [
+    ("correct i confirm", False),
+    ("correct i confirm", True),
+    ("mkae a note on project 1387", False),
+    ("Please save a note to project 1387 now", True),
+    ("Yes that's the project. No, don't save a comment.", True),
+    ("Compare project 1387 and project 1602", False),
+])
+def test_prose_does_not_create_pending_action_or_trigger_classifier(
+    tmp_path, db_session, monkeypatch, mode, message, attempt_write,
 ):
-    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "stub")
-    monkeypatch.setenv("ISPEC_ASSISTANT_PROJECT_COMMENT_APPROVAL_EVAL_MODE", "shadow")
-    monkeypatch.setenv("ISPEC_ASSISTANT_TURN_DECISION_MODE", "off")
-    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
-    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
-    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
-    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
-
-    db_session.add(Project(id=1387, prj_AddedBy="test", prj_ProjectTitle="Phosphoproteomic profiling of PDX samples"))
+    for key, value in {
+        "PROVIDER": "stub", "PROJECT_COMMENT_APPROVAL_EVAL_MODE": mode,
+        "TURN_DECISION_MODE": "off", "TOOL_PROTOCOL": "openai", "MAX_TOOL_CALLS": "2",
+        "HISTORY_LIMIT": "10", "MAX_PROMPT_TOKENS": "4000", "SUMMARY_MAX_CHARS": "0",
+        "ENABLE_SELF_REVIEW": "0", "ENABLE_RESPONSE_CONTRACTS": "off",
+    }.items():
+        monkeypatch.setenv("ISPEC_ASSISTANT_" + key, value)
+    db_session.add(Project(id=1387, prj_AddedBy="test", prj_ProjectTitle="Synthetic project"))
     db_session.commit()
-
-    def fake_classifier_reply(**kwargs: Any) -> AssistantReply:
-        return AssistantReply(
-            content=json.dumps(
-                {
-                    "label": "requires_explicit_confirmation",
-                    "confidence": 0.72,
-                    "reason": "The user likely wants a project note, but the action word is misspelled.",
-                }
-            ),
-            provider="classifier_vllm",
-            model="test-classifier",
-            meta={"elapsed_ms": 11},
-        )
-
-    llm_calls: list[dict[str, Any]] = []
-
-    def fake_generate_reply(*, messages=None, tools=None, tool_choice=None, **_: Any) -> AssistantReply:
-        llm_calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
-        tool_names = {
-            str(tool.get("function", {}).get("name") or "")
-            for tool in (tools or [])
-            if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
-        }
-        assert "create_project_comment" in tool_names
-        return AssistantReply(
-            content="FINAL:\nPlease confirm whether you want me to save that project note.",
-            provider="test",
-            model="test-model",
-            meta=None,
-        )
-
-    monkeypatch.setattr(support_routes, "generate_classifier_reply", fake_classifier_reply)
-    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
-
-    db_path = tmp_path / "assistant.db"
-    with get_assistant_session(db_path) as assistant_db:
-        support_session = SupportSession(session_id="session-typo-note-eval", user_id=None)
-        assistant_db.add(support_session)
-        assistant_db.flush()
-
-        service_user = types.SimpleNamespace(
-            id=1,
-            username="api_key",
-            role=UserRole.viewer,
-            project_access_mode=ProjectAccessMode.all_projects,
-            can_write_project_comments=True,
-        )
-
-        schedule_path = tmp_path / "schedule.db"
-        with get_schedule_session(schedule_path) as schedule_db:
-            response = chat(
-                ChatRequest.model_validate(
-                    {
-                        "sessionId": "session-typo-note-eval",
-                        "message": "mkae a note on project 1387 is is a mlewis liver pdx dataset for the portal",
-                        "history": [],
-                        "ui": None,
-                    }
-                ),
-                assistant_db=assistant_db,
-                core_db=db_session,
-                schedule_db=schedule_db,
-                user=service_user,
-            )
-
-        assert response.message == "Please confirm whether you want me to save that project note."
-        assert llm_calls
-        assert db_session.query(ProjectComment).filter(ProjectComment.project_id == 1387).first() is None
-
-        assistant_row = (
-            assistant_db.query(support_routes.SupportMessage)
-            .filter(support_routes.SupportMessage.session_pk == support_session.id)
-            .filter(support_routes.SupportMessage.role == "assistant")
-            .order_by(support_routes.SupportMessage.id.desc())
-            .first()
-        )
-        assert assistant_row is not None
-        meta = json.loads(assistant_row.meta_json)
-        approval_eval = meta["project_comment_approval_eval"]
-        assert meta["tooling"]["project_comment_write_tool_exposed"] is True
-        assert meta["tooling"]["project_comment_write_tool_reason"] == "project_comment_trigger"
-        assert approval_eval["state_gate"]["eligible"] is True
-        assert approval_eval["state_gate"]["kind"] == "direct_write_candidate"
-        assert approval_eval["lexical_features"]["project_comment_write_candidate"] is True
-        assert approval_eval["classifier"]["label"] == "requires_explicit_confirmation"
-        assert approval_eval["policy"]["decision"] == "ask_explicit_confirmation"
-        assert approval_eval["write_outcome"]["status"] == "not_attempted"
+    calls = []
+    def classify(**kwargs):
+        pytest.fail("No registered draft: approval classifier must not run")
+    def generate(**kwargs):
+        calls.append(kwargs)
+        names = {t["function"]["name"] for t in kwargs.get("tools") or []}
+        assert {"prepare_project_comment", "create_project_comment"} <= names
+        assert kwargs.get("tool_choice") is None
+        if attempt_write and len(calls) == 1:
+            return AssistantReply(content="", provider="test", model="test", tool_calls=[{
+                "id": "save", "type": "function", "function": {
+                    "name": "create_project_comment",
+                    "arguments": json.dumps({"project_id": 1387, "comment": "A note", "confirm": True}),
+                },
+            }])
+        if attempt_write:
+            result = next(json.loads(m["content"]) for m in kwargs["messages"] if m["role"] == "tool")
+            assert not result["ok"]
+            assert result["error_code"] == "invalid_arguments"
+        return AssistantReply(content="FINAL:\\nLet's review the draft.", provider="test", model="test")
+    monkeypatch.setattr(support_routes, "generate_classifier_reply", classify)
+    monkeypatch.setattr(support_routes, "generate_reply", generate)
+    with get_assistant_session(tmp_path / "assistant.db") as adb, get_schedule_session(tmp_path / "schedule.db") as sdb:
+        session = SupportSession(session_id="prose-only", state_json=json.dumps({"current_project_id": 1387}))
+        adb.add(session)
+        adb.flush()
+        adb.add(support_routes.SupportMessage(session_pk=session.id, role="assistant",
+            content='Draft for project 1387: "A note". Would you like me to save this note to project history?'))
+        adb.commit()
+        user = types.SimpleNamespace(id=1, username="test", role=UserRole.editor,
+                                     project_access_mode=ProjectAccessMode.all_projects)
+        result = chat(ChatRequest(sessionId=session.session_id, message=message, history=[]),
+                      assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
+        meta = json.loads(adb.get(support_routes.SupportMessage, result.messageId).meta_json)
+        assert not meta["project_comment_workflow"]["save_checks"]
+        assert meta["tooling"]["project_comment_write_tool_exposed"]
+        assert meta["project_comment_workflow"]["write_outcome"]["status"] == ("failed" if attempt_write else "not_attempted")
+        assert db_session.query(ProjectComment).count() == 0

@@ -42,6 +42,18 @@ def test_create_project_comment_tool_visible_for_client():
     assert "create_project_comment" in tool_names
 
 
+def test_create_project_comment_description_requires_successful_write_result():
+    user = _make_user("staff", role=UserRole.editor)
+    spec = next(
+        tool["function"]
+        for tool in openai_tools_for_user(user)
+        if tool["function"]["name"] == "create_project_comment"
+    )
+    assert "Only report the note saved after this tool returns ok=true for that note." in spec["description"]
+    assert "Returns ok=true and result.comment_id after a successful write" in spec["description"]
+    assert "ok=false and error on failure" in spec["description"]
+
+
 def test_create_project_comment_tool_visible_for_service_viewer():
     user = types.SimpleNamespace(
         username="api_key",

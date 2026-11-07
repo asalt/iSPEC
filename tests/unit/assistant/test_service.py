@@ -101,6 +101,21 @@ def test_planner_tool_use_block_project_comment_confirmation_includes_candidate_
     assert "create_project_comment(confirm=true)" in block
 
 
+def test_staged_planner_does_not_advertise_legacy_save_contract(monkeypatch) -> None:
+    monkeypatch.setenv("ISPEC_ASSISTANT_READ_ONLY", "0")
+    monkeypatch.setenv("ISPEC_ASSISTANT_ALLOWED_WRITE_TOOLS", "create_project_comment")
+    prompt = service._system_prompt_planner(
+        tools_available=True,
+        tool_names={"prepare_project_comment", "create_project_comment", "cancel_project_comment_draft"},
+    )
+    assert "prepare_project_comment(project_id: int, comment: str)" in prompt
+    assert "create_project_comment(draft_id: str, confirm: bool)" in prompt
+    assert "cancel_project_comment_draft(draft_id: str)" in prompt
+    assert "create_project_comment(project_id:" not in prompt
+    assert "create_project_comment(confirm=true)" not in prompt
+    assert "write the draft text directly" not in prompt
+
+
 def test_generate_reply_vllm_passes_temperature_from_env(monkeypatch):
     monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
     monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")

@@ -17,6 +17,7 @@ from ispec.assistant.small_classifier import (
     build_small_classifier_task,
     normalize_small_classifier_decision,
 )
+from ispec.prompt import render_prompt
 
 
 ApprovalMode = Literal["off", "shadow", "own"]
@@ -203,6 +204,18 @@ class ProjectCommentClassifierResult:
             "timeout_ms": self.timeout_ms,
             "error": self.error,
         }
+
+    def response_messages(self, *, mode: ApprovalMode) -> list[dict[str, str]]:
+        # Shadow evidence must not influence the live response or tool selection.
+        if mode != "own" or not self.ran:
+            return []
+        result = (
+            f"{self.label} with confidence {self.confidence:.3f}"
+            if self.ok
+            else "no usable result"
+        )
+        prompt = render_prompt("assistant.project_comment.classifier_result", values={"result": result})
+        return [{"role": "system", "content": prompt.text.strip()}]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -619,8 +632,9 @@ def decide_project_comment_policy(
     *,
     settings: ProjectCommentApprovalSettings,
     gate: ProjectCommentGate,
-    trigger: ProjectCommentTrigger,
+    trigger: ProjectCommentTrigger | None,
     classifier: ProjectCommentClassifierResult,
+    candidate_comment_hash: str | None = None,
 ) -> tuple[ProjectCommentPolicyDecision, ProjectCommentWriteTicket]:
     reasons: list[str] = []
     policy_decision = "not_gated"
@@ -636,7 +650,7 @@ def decide_project_comment_policy(
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             policy_decision = "classifier_unavailable"
             reasons.append("invalid_confidence")
-        elif trigger.command_protocol == "explicit_deny" and settings.mode != "own":
+        elif trigger is not None and trigger.command_protocol == "explicit_deny" and settings.mode != "own":
             policy_decision = "no_ticket"
             reasons.append("explicit_command_protocol_deny")
         elif confidence < float(settings.decision_threshold):
@@ -692,7 +706,7 @@ def decide_project_comment_policy(
             thread_key=gate.thread_key,
             current_turn_id=gate.current_turn_id,
             pending_draft_hash=gate.pending_draft_hash,
-            candidate_comment_hash=None,
+            candidate_comment_hash=candidate_comment_hash,
             issued_at=issued_at,
             expires_at=expires_at,
             ttl_seconds=int(settings.ticket_ttl_seconds),
@@ -715,7 +729,9 @@ def project_comment_write_outcome(
         "comment_id": None,
         "error": None,
     }
-    for call in tool_calls:
+    # An earlier blocked attempt must not conceal a later successful write.
+    ordered_calls = sorted(tool_calls, key=lambda call: not bool(call.get("ok")) if isinstance(call, dict) else True)
+    for call in ordered_calls:
         if not isinstance(call, dict) or str(call.get("name") or "").strip() != _PENDING_TOOL:
             continue
         args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}

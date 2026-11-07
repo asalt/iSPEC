@@ -32,6 +32,7 @@ from ispec.assistant.models import (
 from ispec.assistant.prompt_header import build_prompt_header, header_legend
 if TYPE_CHECKING:
     from ispec.assistant.project_comment_approval import ProjectCommentAuthorization
+    from ispec.assistant.project_comment_workflow import ProjectCommentWorkflow
 from ispec.assistant.schedules import (
     ASSISTANT_SCHEDULE_PATH_ENV,
     assistant_schedule_path,
@@ -153,6 +154,9 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "repo_search": ToolScope.staff,
     "repo_read_file": ToolScope.staff,
     "create_project_comment": ToolScope.user,
+    "prepare_project_comment": ToolScope.user,
+    "offer_project_comment_save": ToolScope.user,
+    "cancel_project_comment_draft": ToolScope.user,
 }
 
 _WRITE_TOOL_NAMES: set[str] = {
@@ -174,6 +178,20 @@ def tool_writes_data(name: str | None) -> bool:
 def assistant_read_only() -> bool:
     """An explicit read-only deployment blocks writes even for privileged users."""
     return os.getenv("ISPEC_ASSISTANT_READ_ONLY", "0").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def assistant_write_error(name: str | None) -> str | None:
+    """Deployment restrictions narrow capabilities; they never grant authorization."""
+    if name in {"prepare_project_comment", "offer_project_comment_save", "cancel_project_comment_draft"}:
+        name = "create_project_comment"
+    if not tool_writes_data(name):
+        return None
+    if assistant_read_only():
+        return "Assistant writes are disabled in read-only mode."
+    allowed = os.getenv("ISPEC_ASSISTANT_ALLOWED_WRITE_TOOLS")
+    if allowed is not None and name not in {item.strip() for item in allowed.split(",") if item.strip()}:
+        return "This write tool is disabled by the deployment allowlist."
+    return None
 
 
 @prompt_binding("assistant.tools.read_only")
@@ -1800,7 +1818,7 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     ]
 
     def add(tool_name: str, line: str) -> None:
-        if assistant_read_only() and tool_writes_data(tool_name):
+        if assistant_write_error(tool_name):
             return
         if allowed is not None and tool_name not in allowed:
             return
@@ -1940,10 +1958,16 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
         "- project_files_for_project(project_id: int, limit: int = 50, query: str | None = None)",
     )
     add("search_api", "- search_api(query: str, limit: int = 10)  # search FastAPI/OpenAPI endpoints")
-    add(
-        "create_project_comment",
-        "- create_project_comment(project_id: int, comment: str, comment_type: str | None = None, confirm: bool = true)  # write: requires explicit user request; client notes saved as client_note",
-    )
+    if allowed is not None and "prepare_project_comment" in allowed:
+        add("prepare_project_comment", "- prepare_project_comment(project_id: int, comment: str)  # register a draft for review; returns draft_id; not a saved comment")
+        add("offer_project_comment_save", "- offer_project_comment_save(draft_id: str)  # show stored draft and offer a save for later approval; no write")
+        add("create_project_comment", "- create_project_comment(draft_id: str, confirm: bool)  # save the registered draft after user approval; returns comment_id on success")
+        add("cancel_project_comment_draft", "- cancel_project_comment_draft(draft_id: str)  # discard a pending draft, not a saved comment")
+    else:
+        add(
+            "create_project_comment",
+            "- create_project_comment(project_id: int, comment: str, comment_type: str | None = None, confirm: bool = true)  # write: requires explicit user request; client notes saved as client_note",
+        )
 
     add(
         "repo_list_files",
@@ -2165,6 +2189,7 @@ def _assistant_list_tools_payload(
     limit: int,
     include_unavailable: bool,
     user: AuthUser | None,
+    staged_project_comments: bool = False,
 ) -> dict[str, Any]:
     """Return a compact catalog of tools and their availability for this user.
 
@@ -2177,7 +2202,6 @@ def _assistant_list_tools_payload(
 
     # Don't leak internal-only tool names to client roles if this ever becomes
     # user-facing. Today this is primarily for internal/staff use.
-    role = getattr(user, "role", None)
     include_unavailable_effective = bool(include_unavailable) and (
         user is None or not uses_explicit_project_access(user)
     )
@@ -2197,7 +2221,11 @@ def _assistant_list_tools_payload(
     matched_total = 0
     matched_unavailable_total = 0
 
-    for tool_name, spec in sorted(_OPENAI_TOOL_SPECS.items(), key=lambda pair: str(pair[0])):
+    specs = _OPENAI_TOOL_SPECS
+    if staged_project_comments:
+        from ispec.assistant.project_comment_workflow import comment_workflow_tools
+        specs = {spec["function"]["name"]: spec for spec in comment_workflow_tools(tools=list(specs.values()))}
+    for tool_name, spec in sorted(specs.items(), key=lambda pair: str(pair[0])):
         func_obj = spec.get("function") if isinstance(spec, dict) else None
         desc = ""
         params: dict[str, Any] = {}
@@ -2211,8 +2239,8 @@ def _assistant_list_tools_payload(
         scope_err = _scope_error(scope, user)
 
         unavailable_reason: str | None = None
-        if assistant_read_only() and tool_writes_data(tool_name):
-            unavailable_reason = "Assistant writes are disabled in read-only mode."
+        if write_error := assistant_write_error(tool_name):
+            unavailable_reason = write_error
         elif _tool_requires_code_access(tool_name) and not code_tools_enabled:
             unavailable_reason = code_tools_reason or "Code tools are unavailable."
         elif tool_name == "assistant_enqueue_dev_restart_services" and not dev_restart_enabled:
@@ -2248,12 +2276,12 @@ def _assistant_list_tools_payload(
             unavailable_reason = (
                 f"Repo tools are unavailable ({repo_reason or 'disabled'})."
             )
-        elif tool_name in _WRITE_TOOL_NAMES:
+        elif tool_name in _WRITE_TOOL_NAMES or tool_name in {"prepare_project_comment", "offer_project_comment_save", "cancel_project_comment_draft"}:
             if user is None:
                 unavailable_reason = "Authentication required for write tools."
-            elif tool_name == "create_project_comment" and getattr(user, "can_write_project_comments", True) is not True:
+            elif tool_name in {"create_project_comment", "prepare_project_comment", "offer_project_comment_save", "cancel_project_comment_draft"} and getattr(user, "can_write_project_comments", True) is not True:
                 unavailable_reason = "Project-comment writes are disabled for this service identity."
-            elif uses_explicit_project_access(user) and tool_name != "create_project_comment":
+            elif uses_explicit_project_access(user) and tool_name not in {"create_project_comment", "prepare_project_comment", "offer_project_comment_save", "cancel_project_comment_draft"}:
                 unavailable_reason = "Write access required."
 
         if unavailable_reason is None and scope_err:
@@ -3019,11 +3047,12 @@ def run_tool(
     user_message: str | None = None,
     project_comment_save_authorized: bool = False,
     project_comment_authorization: ProjectCommentAuthorization | None = None,
+    project_comment_workflow: ProjectCommentWorkflow | None = None,
     support_turn_id: str | None = None,
     support_session_id: str | None = None,
 ) -> dict[str, Any]:
-    if assistant_read_only() and tool_writes_data(name):
-        return {"ok": False, "tool": name, "error": "Assistant writes are disabled in read-only mode."}
+    if write_error := assistant_write_error(name):
+        return {"ok": False, "tool": name, "error": write_error}
     # the large try block is not great - but these if statements for
     # resolving tool call results is probably fine
     # also not great to define closure inside as that makes it more difficult to test
@@ -3041,6 +3070,23 @@ def run_tool(
         scope_error = _scope_error(scope, user)
         if scope_error:
             return {"ok": False, "tool": name, "error": scope_error}
+        if name in {"prepare_project_comment", "offer_project_comment_save", "create_project_comment", "cancel_project_comment_draft"}:
+            if project_comment_workflow is not None:
+                result = project_comment_workflow.run(name=name, args=args)
+                saved = result.get("result") or {}
+                if name == "create_project_comment" and result.get("ok") and not saved.get("already_saved"):
+                    # The comment is committed already. A queue failure must not
+                    # turn a successful write into an ambiguous retry request.
+                    try:
+                        saved["legacy_push_enqueue"] = _enqueue_legacy_project_comment_push(
+                            project_id=saved["project_id"], comment_id=saved["comment_id"],
+                            added_by=getattr(user, "username", None),
+                        )
+                    except Exception as exc:
+                        saved["legacy_push_enqueue"] = {"ok": False, "error": type(exc).__name__}
+                return result
+            if name != "create_project_comment" or support_session_id:
+                return {"ok": False, "tool": name, "error": "A server-created staged-comment workflow is required for chat writes."}
         if _tool_requires_code_access(name):
             code_tools_enabled, code_tools_reason = _code_tool_access_status(user)
             if not code_tools_enabled:
@@ -3141,6 +3187,7 @@ def run_tool(
                     limit=int(limit),
                     include_unavailable=bool(include_unavailable),
                     user=user,
+                    staged_project_comments=project_comment_workflow is not None,
                 ),
             }
 
@@ -7291,7 +7338,13 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "create_project_comment",
-            "description": "Create a new project comment in project history (write). Use only when the user explicitly asks to save/log a note.",
+            "description": (
+                "Create a new project comment in project history (write). "
+                "Use only when the user explicitly asks to save/log a note. "
+                "Returns ok=true and result.comment_id after a successful write, "
+                "or ok=false and error on failure. "
+                "Only report the note saved after this tool returns ok=true for that note."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -7565,7 +7618,7 @@ def openai_tools_for_user(user: AuthUser | None) -> list[dict[str, Any]]:
     tmux_tools_enabled, _ = _tmux_tools_status()
     code_tools_enabled, _ = _code_tool_access_status(user)
     for name, spec in _OPENAI_TOOL_SPECS.items():
-        if assistant_read_only() and tool_writes_data(name):
+        if assistant_write_error(name):
             continue
         if _tool_requires_code_access(name) and not code_tools_enabled:
             continue
