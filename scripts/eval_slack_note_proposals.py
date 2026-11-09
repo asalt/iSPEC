@@ -10,7 +10,7 @@ from pathlib import Path
 from ispec.assistant.service import generate_reply
 from ispec.assistant.runtime_settings import max_output_tokens
 from ispec.cli.env import load_env_files
-from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context
+from ispec.prompt import load_bound_prompt, prompt_binding, prompt_observability_context, render_prompt
 
 
 SCHEMA = {"type": "object", "additionalProperties": False, "properties": {
@@ -24,8 +24,9 @@ def proposal_prompt():
     return load_bound_prompt(proposal_prompt)
 
 
-def evaluate_case(case, *, generate_reply_fn=generate_reply, constrain_json=True, output_tokens=None):
-    prompt = proposal_prompt()
+def evaluate_case(case, *, generate_reply_fn=generate_reply, constrain_json=True, output_tokens=None,
+                  prompt_family=None):
+    prompt = render_prompt(prompt_family) if prompt_family else proposal_prompt()
     # Expectations belong in the report, not in the model's input.
     inputs = {key: case[key] for key in ("date", "project_id", "thread", "existing_comments")}
     messages = [
@@ -46,6 +47,7 @@ def evaluate_case(case, *, generate_reply_fn=generate_reply, constrain_json=True
               "expected_decision": case.get("expected_decision"), "sent": False, "saved": False,
               "constrained_json": constrain_json,
               "max_output_tokens": output_tokens,
+              "prompt": prompt.observability_fields(),
               "messages_sha256": hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()}
     try:
         if not reply.ok or reply.tool_calls:
@@ -73,13 +75,14 @@ def main(argv=None):
     parser.add_argument("--no-json-constraint", action="store_true", help="Prompt-only JSON for cross-runtime comparison")
     parser.add_argument("--env-file", action="append", default=[], help="Runtime preset/overrides; later files win")
     parser.add_argument("--max-output-tokens", type=int, help="Override preset generation budget, including reasoning")
+    parser.add_argument("--prompt-family", help="Explicit offline prompt candidate; default uses the existing bound prompt")
     args = parser.parse_args(argv)
     if args.max_output_tokens is not None and args.max_output_tokens <= 0:
         parser.error("--max-output-tokens must be positive")
     load_env_files(args.env_file)
     cases = json.loads(args.cases.read_text())
     report = [evaluate_case(case, constrain_json=not args.no_json_constraint,
-                            output_tokens=args.max_output_tokens) for case in cases]
+                            output_tokens=args.max_output_tokens, prompt_family=args.prompt_family) for case in cases]
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(report, indent=2, ensure_ascii=False))
     return int(not all(row["ok"] for row in report))

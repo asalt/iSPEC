@@ -1,0 +1,56 @@
+[
+  {
+    "id": "fresh_same_receipt_paraphrase",
+    "date": "2026-09-17",
+    "project_id": 9001,
+    "thread": [{"user": "Staff A", "text": "Project 9001: the six samples arrived this morning."}],
+    "existing_comments": [{"id": 1, "date": "2026-09-17 09:00", "text": "Received 6 samples for project 9001."}],
+    "expected_decision": "already_recorded",
+    "review_criteria": "Same receipt, quantity and day; no new draft."
+  },
+  {
+    "id": "fresh_same_count_new_batch",
+    "date": "2026-09-24",
+    "project_id": 9002,
+    "thread": [{"user": "Staff A", "text": "A new batch of six samples for 9002 arrived today, separate from last week's six."}],
+    "existing_comments": [{"id": 2, "date": "2026-09-17 09:00", "text": "Received 6 samples for project 9002."}],
+    "expected_decision": "propose",
+    "review_criteria": "Draft the new six-sample batch; equal counts do not mean the same event."
+  },
+  {
+    "id": "fresh_transfer_plan",
+    "date": "2026-09-24",
+    "project_id": 9003,
+    "thread": [{"user": "Staff B", "text": "9003 raw files are located on the source disk. Next step is to copy them to the delivery folder and notify the customer once the copy is complete."}],
+    "existing_comments": [{"id": 3, "date": "2026-09-01 09:00", "text": "Data acquisition complete."}],
+    "expected_decision": "propose",
+    "review_criteria": "Files located; copying and customer notification remain future work."
+  },
+  {
+    "id": "fresh_upload_completed",
+    "date": "2026-09-24",
+    "project_id": 9004,
+    "thread": [{"user": "Staff B", "text": "9004 upload finished this afternoon. The files are available in the delivery folder. I will email the customer tomorrow."}],
+    "existing_comments": [{"id": 4, "date": "2026-09-23 09:00", "text": "Plan to upload the raw files and email the customer."}],
+    "expected_decision": "propose",
+    "review_criteria": "Upload completed, customer email still planned; preserve both distinct statuses."
+  },
+  {
+    "id": "fresh_correct_prior_completion",
+    "date": "2026-09-24",
+    "project_id": 9005,
+    "thread": [{"user": "Staff C", "text": "Correction for 9005: QC review is still pending. Yesterday's entry saying complete was my mistake."}],
+    "existing_comments": [{"id": 5, "date": "2026-09-23 09:00", "text": "QC review complete."}],
+    "expected_decision": "propose",
+    "review_criteria": "Explicit corrective comment: QC remains pending, earlier completion entry was mistaken."
+  },
+  {
+    "id": "fresh_social_with_project_hint",
+    "date": "2026-09-24",
+    "project_id": 9006,
+    "thread": [{"user": "Staff A", "text": "Lunch at noon?"}, {"user": "Staff B", "text": "Sure, see you there."}],
+    "existing_comments": [],
+    "expected_decision": "no_update",
+    "review_criteria": "A routing project ID does not make social chatter a project update."
+  }
+]

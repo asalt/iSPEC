@@ -50,6 +50,60 @@ belong under ignored `tests/behavioral/local/`; they are not public fixtures.
 Use `--no-json-constraint` for a prompt-only baseline. Input hashes allow
 comparison against the standalone cached-Transformers replay script.
 
+Use `--prompt-family experimental.slack.note_proposal.minimal` to test an
+explicit candidate without replacing the default prompt. Reports include the
+actual prompt family, source path and body hash. The `minimal_status` sibling
+adds only the status examples; `minimal_fields` adds one sentence explaining
+the existing `note` and `reason` fields. These are experimental prompt families,
+not production activation settings.
+
+### Tulu prompt trial, October 28, 2026
+
+Remote Tulu 3 8B was tested through the current iSPEC evaluator with temperature
+zero, a 512-token output cap, strict protocol validation and the existing JSON
+schema. Five saved private cases were replayed with two shorter prompts. Six
+fresh synthetic cases were evaluated with the original and both shorter prompts:
+28 calls total. Existing original-prompt results on private cases were reused,
+not rerun. No Slack sends, project writes, service restarts or configuration
+changes occurred. This is not an end-to-end Slack approval test.
+
+The six synthetic cases are in
+`tests/behavioral/data/note_proposal_minimal_20261028.json`. They test repeated
+receipts, a new batch with the same count, a transfer plan, completed upload with
+pending notification, a correction, and unrelated conversation. Expectations
+and review criteria are excluded from model input. These are small, freshly
+authored variations on known failure categories, not a representative benchmark.
+
+| Prompt | Words | Correct labels on fresh cases | Valid field combinations on fresh cases |
+| --- | ---: | ---: | ---: |
+| Original | 131 | 5/6 | 4/6 |
+| Minimal | 76 | 2/6 | 0/6 |
+| Minimal plus status examples | 81 | 2/6 | 0/6 |
+
+All 28 outputs were syntactically valid JSON. Label counts above include labels
+inside otherwise rejected responses; they are not usable-response or grounding
+scores. Short prompts often put explanations in `note` after choosing not to
+propose. The unchanged validator rejects that field combination. They also
+incorrectly treated a new batch, changed completion status and a correction as
+already recorded. Status examples did not resolve these errors.
+
+Eight additional diagnostic calls compared a one-sentence field explanation
+against a conditional JSON schema on four private cases. Both variants produced
+4/4 valid field combinations but only 2/4 correct decisions. The conditional
+schema allowed a nonempty note for `propose` and forced an empty note for the
+other labels. It was accepted by the current remote runtime and was used only
+as a per-call test override; the default schema and validation remain unchanged.
+This separates structural enforcement from factual judgment: fixing the former
+did not fix the latter.
+
+Private inputs, outbound schemas, raw outputs, timings and prompt hashes are
+under ignored `tests/behavioral/local/slack-draft-20261028/minimal-ablation/`.
+Initial trial calls took 1.35-5.28 seconds; warm-cache/order effects were not
+controlled, so these are observations rather than comparative performance scores.
+Keep the default prompt until further review. A useful next bounded test is
+explicit separation of incoming evidence from stored comments, emphasizing new
+events, status changes and corrections rather than adding prohibition lists.
+
 The existing approval corpus also supports `ISPEC_APPROVAL_EVAL_PROVIDER=ollama`
 with `ISPEC_RUN_LLM_TESTS=1`; it permits only the configured loopback inference
 endpoint and never executes a write. A correct JSON shape is not proof of a
