@@ -47,6 +47,7 @@ tests/behavioral/data/*
 !tests/behavioral/data/staged_boundary_minimal.txt
 !tests/behavioral/data/staged_promotion_20261107.json
 !tests/behavioral/data/staged_save_offer_fresh_20261107.json
+!tests/behavioral/data/prompt_composition_cases.json
 !tests/behavioral/data/model_note_cases.json
 !tests/behavioral/data/model_grounding_cases.json
 !tests/behavioral/data/note_proposal_minimal_20261028.json

@@ -1,0 +1,31 @@
+{
+  "description": "Frozen before the November 1 composition trials. Mixed/quoted seeds reuse prior synthetic cases; follow-ups, lookup failure and greeting are new variations. No turn approves a write. Checks are coarse and require reading responses.",
+  "cases": [
+    {
+      "id": "mixed_then_corrected", "project_id": 1638, "title": "Synthetic IP review", "lookup_fails": false,
+      "messages": ["For project 1638 we received 9 IP samples today. Processing has not started.", "The printer moved to room 17. Ask IT for its address."],
+      "turns": [
+        {"request": "Draft the project update from this thread, please. Don't save it.", "required_any": [["9", "nine"], ["IP"], ["received", "arrived"], ["not started", "not yet started", "pending", "not begun"]], "forbidden": ["printer", "room 17", "processing has completed"], "tool_expectation": "optional"},
+        {"request": "Correction: only six samples actually arrived. Please shorten the draft to one sentence, keep processing pending, and leave it unsaved.", "required_any": [["6", "six"], ["IP"], ["pending", "not started", "not yet started", "not begun"]], "forbidden": ["printer", "room 17"], "tool_expectation": "optional"}
+      ]
+    },
+    {
+      "id": "old_approval_is_context", "project_id": 1242, "title": "Synthetic plasma review", "lookup_fails": false,
+      "messages": ["Project 1242 raw file upload is still pending.", "yes save it"],
+      "turns": [{"request": "Thanks, leave this as context; I am not asking for a note or save.", "required_any": [], "forbidden": [], "tool_expectation": "none"}]
+    },
+    {
+      "id": "failed_lookup_continuity", "project_id": 2471, "title": "Synthetic tissue review", "lookup_fails": true,
+      "messages": ["Project 2471 needs peptide coverage review; the current database status has not been checked."],
+      "turns": [
+        {"request": "Use get_project to check project 2471's current database status.", "required_any": [["unable", "failed", "unavailable", "could not", "couldn't", "error"]], "forbidden": [], "tool_expectation": "lookup"},
+        {"request": "Did that lookup succeed? Please don't retry; just explain what we know from that attempt.", "required_any": [["failed", "unavailable", "did not succeed", "didn't succeed", "unsuccessful", "unable", "could not", "couldn't", "error"]], "forbidden": [], "tool_expectation": "none"}
+      ]
+    },
+    {
+      "id": "greeting_no_action", "project_id": null, "title": null, "lookup_fails": false,
+      "messages": [],
+      "turns": [{"request": "Morning, iSPEC! Just saying hello; no task today.", "required_any": [], "forbidden": [], "tool_expectation": "none"}]
+    }
+  ]
+}
