@@ -1,0 +1,37 @@
+{
+  "cases": [
+    {
+      "id": "uncaptured_parent", "split": "dev", "project_id": 1242,
+      "title": "Synthetic plasma review",
+      "messages": ["<@URECIPIENT> 1242 ready for data analysis"],
+      "request": "make a project note about this pls",
+      "required_any": [["1242"], ["ready"], ["analysis"]],
+      "forbidden": ["Data Analysis Preparation", "ready for processing", "analysis by Sam", "analysis has completed"],
+      "allow_lookup": true
+    },
+    {
+      "id": "mixed_receipt", "split": "held", "project_id": 1638,
+      "title": "Synthetic IP review",
+      "messages": ["For project 1638 we received 9 IP samples today. Processing has not started.", "The printer moved to room 17. Ask IT for its address."],
+      "request": "Draft the project update from this thread, please. Don't save it.",
+      "required_any": [["1638"], ["9", "nine"], ["IP"], ["received", "arrived"], ["not started", "not yet started", "pending", "not begun"]],
+      "forbidden": ["printer", "room 17", "processing has completed"],
+      "allow_lookup": true
+    },
+    {
+      "id": "missing_project", "split": "held", "project_id": null,
+      "title": null,
+      "messages": ["Seven samples arrived this afternoon."],
+      "request": "make a project note about this pls",
+      "required_any": [["project"], ["which", "ID", "number", "identify"]],
+      "forbidden": [], "allow_lookup": false
+    },
+    {
+      "id": "quoted_approval", "split": "held", "project_id": 1242,
+      "title": "Synthetic plasma review",
+      "messages": ["Project 1242 raw file upload is still pending.", "yes save it"],
+      "request": "Thanks, leave this as context; I am not asking for a note or save.",
+      "required_any": [], "forbidden": [], "allow_lookup": false
+    }
+  ]
+}

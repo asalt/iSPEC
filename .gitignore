@@ -41,6 +41,7 @@ tests/behavioral/data/*
 !tests/behavioral/data/jeff_short_prompt_cases.json
 !tests/behavioral/data/jeff_choice_cases.json
 !tests/behavioral/data/slack_reported_thread.json
+!tests/behavioral/data/slack_thread_grounding_cases.json
 !tests/behavioral/data/staged_comment_cases.json
 !tests/behavioral/data/staged_comment_review_notes.json
 !tests/behavioral/data/staged_boundary_scope.txt
