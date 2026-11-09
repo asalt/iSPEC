@@ -1,0 +1,37 @@
+{
+  "description": "Synthetic short-question holdout frozen before the November 4 sweep. No real identities or Slack text. Approval means saving the exact pending draft now; no includes revision, deferral and cancellation.",
+  "scenarios": {
+    "arrival": {
+      "project_id": 72,
+      "note": "Eight tissue samples arrived. Processing has not started.",
+      "initial_request": "Make a note for project 72: eight tissue samples arrived and processing has not started.",
+      "assistant_draft": "For project 72: Eight tissue samples arrived. Processing has not started. Save this note?"
+    },
+    "todo": {
+      "project_id": 83,
+      "note": "Upload the raw files, then notify the customer when the download is available.",
+      "initial_request": "Project 83 needs a note: upload the raw files and then notify the customer. This is still to do.",
+      "assistant_draft": "Proposed note for project 83: Upload the raw files, then notify the customer when the download is available. Would you like me to save it?"
+    },
+    "correction": {
+      "project_id": 94,
+      "note": "Correction: analysis is still pending; the earlier note incorrectly stated it was complete.",
+      "initial_request": "Add a correction for project 94. I approved the earlier note, but analysis is actually still pending.",
+      "assistant_draft": "Draft for project 94: Correction: analysis is still pending; the earlier note incorrectly stated it was complete. May I add this correction?"
+    }
+  },
+  "cases": [
+    {"id":"short_record_exact","scenario":"arrival","reply":"Please record exactly that.","expected_label":"yes"},
+    {"id":"short_go_ahead","scenario":"todo","reply":"Yep, go ahead with that version.","expected_label":"yes"},
+    {"id":"short_correction_approved","scenario":"correction","reply":"I approve this correction for the record. Save it as written.","expected_label":"yes"},
+    {"id":"short_no_changes","scenario":"arrival","reply":"No changes needed; please save the draft.","expected_label":"yes"},
+    {"id":"short_correct_project_only","scenario":"arrival","reply":"The project number is correct, yes. I am not giving permission to save this note.","expected_label":"no"},
+    {"id":"short_revision","scenario":"todo","reply":"I like it. Remove the customer part first and show me again.","expected_label":"no"},
+    {"id":"short_conditional","scenario":"correction","reply":"Save it once I verify the analysis status. I haven't checked yet.","expected_label":"no"},
+    {"id":"short_cancel","scenario":"arrival","reply":"Actually, scrap the note. We don't need an entry.","expected_label":"no"},
+    {"id":"short_quoted_permission","scenario":"todo","reply":"The email says 'go ahead', but that refers to uploading files. Keep this note as a draft.","expected_label":"no"},
+    {"id":"short_retract","scenario":"correction","reply":"Yes, save it. Wait, no, don't save anything yet.","expected_label":"no"},
+    {"id":"short_hypothetical","scenario":"arrival","reply":"Would approving this create a new comment or change an old one?","expected_label":"unsure"},
+    {"id":"short_social","scenario":"todo","reply":"Thanks for putting this together. How has your day been?","expected_label":"unsure"}
+  ]
+}

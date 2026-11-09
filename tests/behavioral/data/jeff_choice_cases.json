@@ -1,0 +1,29 @@
+{
+  "description": "Fresh synthetic November 5 cases frozen before the binary/ternary and context ablation. Expected labels are provisional reviewer annotations, never sent to Jeff. The default approval question uses wording seen in Alex's iSPEC transcript; project IDs/content are synthetic. Matched alternative questions are explicitly diagnostic contrasts, not claimed model outputs.",
+  "scenario": {
+    "project_id": 57,
+    "note": "Eight tissue samples arrived. Analysis has not started.",
+    "initial_request": "Make a note for project 57: eight tissue samples arrived, and analysis has not started.",
+    "assistant_draft": "Project 57 draft: Eight tissue samples arrived. Analysis has not started. Would you like me to save this note to the project history?"
+  },
+  "cases": [
+    {"id":"choice_exact_accept","reply":"That is the entry I want in the record. Add it.","expected_label":"yes"},
+    {"id":"choice_casual_accept","reply":"yeah, go for it","expected_label":"yes"},
+    {"id":"choice_plain_accept","reply":"Please save it exactly as it stands.","expected_label":"yes"},
+    {"id":"choice_revise","reply":"Looks good, except it was nine samples. Fix that and let me check.","expected_label":"no"},
+    {"id":"choice_schedule","reply":"Yes, tomorrow after I confirm the count. Not today.","expected_label":"no"},
+    {"id":"choice_identity_not_save","reply":"Yes, you've found the right project. Keep the note unsaved.","expected_label":"no"},
+    {"id":"choice_ask_consequence","reply":"Does saving this also update the legacy database?","expected_label":"unsure"},
+    {"id":"choice_ack","reply":"Thank you for explaining the process.","expected_label":"unsure"},
+    {"id":"choice_looks_good_save","reply":"Correct, looks good.","expected_label":"yes", "context":{"assistant_draft":"Project 57 draft: Eight tissue samples arrived. Analysis has not started. Does this draft look right to you? Shall I save it?"}},
+    {"id":"choice_looks_good_wording","evaluation_role":"forced_gate_boundary","reply":"Correct, looks good.","expected_label":"unsure", "context":{"initial_request":"Help me word a draft for project 57: eight tissue samples arrived; analysis has not started. I'm reviewing wording only for now.","assistant_draft":"Project 57 draft: Eight tissue samples arrived. Analysis has not started. Does this draft look right to you?"}},
+    {"id":"choice_short_yes_save","reply":"Yes.","expected_label":"yes", "context":{"assistant_draft":"Project 57 draft: Eight tissue samples arrived. Analysis has not started. Shall I save it?"}},
+    {"id":"choice_short_yes_keep_draft","evaluation_role":"forced_gate_boundary","reply":"Yes.","expected_label":"no", "context":{"initial_request":"Help me draft a note for project 57: eight tissue samples arrived; analysis has not started. I'm not ready to save it.","assistant_draft":"Project 57 draft: Eight tissue samples arrived. Analysis has not started. Should I keep this as an unsaved draft?"}},
+    {"id":"choice_agreement_thanks","reply":"That's right, thanks.","expected_label":"yes"},
+    {"id":"choice_agreement_captured","reply":"Exactly, you've captured it.","expected_label":"yes"},
+    {"id":"choice_ambiguous_part","reply":"That part looks right.","expected_label":"unsure"},
+    {"id":"choice_ambiguous_already","reply":"I thought we'd already saved that.","expected_label":"unsure"},
+    {"id":"choice_ambiguous_leave","reply":"Let's leave it there.","expected_label":"unsure"},
+    {"id":"choice_ambiguous_version","reply":"Is this the corrected version or the first one?","expected_label":"unsure"}
+  ]
+}
