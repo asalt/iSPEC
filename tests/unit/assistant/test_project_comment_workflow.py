@@ -287,10 +287,23 @@ def test_acl_and_deployment_checks_precede_staging(conversation, monkeypatch):
 def test_chat_tool_schemas_do_not_depend_on_reply_text(conversation):
     schemas = comment_workflow_tools(tools=openai_tools_for_user(conversation.user))
     names = {spec["function"]["name"] for spec in schemas}
-    assert {"prepare_project_comment", "create_project_comment", "cancel_project_comment_draft"} <= names
+    assert {"prepare_project_comment", "offer_project_comment_save", "create_project_comment", "cancel_project_comment_draft"} <= names
     write = next(spec["function"] for spec in schemas if spec["function"]["name"] == "create_project_comment")
     assert set(write["parameters"]["properties"]) == {"draft_id", "confirm"}
     assert comment_workflow_tools(tools=[]) == []
+
+
+def test_model_instructions_include_explicit_offer_step(conversation):
+    workflow = conversation.turn(message="Please draft a project-history note.")
+    instructions = workflow.prompt_messages()[0]
+    assert instructions["role"] == "system"
+    assert "then call offer_project_comment_save" in instructions["content"]
+    assert "For wording-only review, prepare without offering to save" in instructions["content"]
+    schemas = comment_workflow_tools(tools=openai_tools_for_user(conversation.user))
+    preparation = next(spec["function"] for spec in schemas if spec["function"]["name"] == "prepare_project_comment")
+    assert "next call offer_project_comment_save" in preparation["description"]
+    assert workflow.pending() is None
+    assert not conversation.checks
 
 
 def test_database_failure_rolls_back_claim_and_does_not_retry_same_turn(conversation):

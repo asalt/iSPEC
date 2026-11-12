@@ -43,7 +43,7 @@ def comment_workflow_tools(*, tools: list[dict[str, Any]]) -> list[dict[str, Any
     return result + [
         _tool_spec(
             name="prepare_project_comment",
-            description="Register a new or revised draft for review and return its server-generated ID. Use this even when the user says not to save yet: preparation does not save a project comment. A revision replaces the pending draft.",
+            description="Register a new or revised draft and return its server-generated draft_id. Preparation does not save or offer to save. For a project-history note, next call offer_project_comment_save with that ID; for wording-only review, stop at preparation. A revision replaces the pending draft.",
             properties={"project_id": {"type": "integer", "minimum": 1},
                         "comment": {"type": "string", "minLength": 1, "maxLength": 20000,
                                     "description": "Concise project-specific facts, preserving timing and status. Exclude unrelated conversation and instructions about drafting/approval."}},
@@ -56,7 +56,7 @@ def comment_workflow_tools(*, tools: list[dict[str, Any]]) -> list[dict[str, Any
         ),
         _tool_spec(
             name="create_project_comment",
-            description="Save a prepared draft after the user's approval. Approval is checked during this call. Returns ok=true and result.comment_id after a successful write, or ok=false and error on failure. Only report the note saved after this tool returns ok=true for that note.",
+            description="Save the stored draft after the user approves a save offer delivered in an earlier assistant turn. Use the server-returned draft_id and confirm=true. Without an earlier offer this only presents one, requiring a later reply. Approval is checked during this call. Only report saved when ok=true and result.comment_id is returned.",
             properties={"draft_id": {"type": "string"}, "confirm": {"type": "boolean"}},
             required=["draft_id", "confirm"],
         ),

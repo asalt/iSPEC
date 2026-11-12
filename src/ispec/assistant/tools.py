@@ -1961,7 +1961,7 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     if allowed is not None and "prepare_project_comment" in allowed:
         add("prepare_project_comment", "- prepare_project_comment(project_id: int, comment: str)  # register a draft for review; returns draft_id; not a saved comment")
         add("offer_project_comment_save", "- offer_project_comment_save(draft_id: str)  # show stored draft and offer a save for later approval; no write")
-        add("create_project_comment", "- create_project_comment(draft_id: str, confirm: bool)  # save the registered draft after user approval; returns comment_id on success")
+        add("create_project_comment", "- create_project_comment(draft_id: str, confirm: bool)  # save the stored draft after approval of an earlier save offer; returns comment_id on success")
         add("cancel_project_comment_draft", "- cancel_project_comment_draft(draft_id: str)  # discard a pending draft, not a saved comment")
     else:
         add(
