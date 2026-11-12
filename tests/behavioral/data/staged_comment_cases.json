@@ -2,6 +2,22 @@
   "description": "Retained regressions plus held_* variations. fresh_* cases were added after the state-routing and exact-presentation trials, before the yield-on-prepare trial. Expected facts are coarse checks, not a semantic judge. Do not expose expected outcomes to the model.",
   "cases": [
     {
+      "id": "offer_contract_approval",
+      "messages": ["Please prepare a project-history note for project 57: fourteen liver samples were received; digestion is scheduled for Wednesday. Show the note and ask me before saving.", "I have reviewed it. Please save the version you showed, unchanged."],
+      "comment_counts": [0, 1],
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "saved"}],
+      "required_facts": [["fourteen", "14"], ["liver"], ["wednesday"], ["scheduled", "planned"]],
+      "forbidden_facts": ["digestion completed", "digestion is complete"]
+    },
+    {
+      "id": "offer_contract_conditional",
+      "messages": ["Please draft a project-history note for project 57: three enrichment batches are ready; database searching has not started. Ask before saving it.", "You can save it once Priya verifies the batch count. She has not checked yet, so leave it pending."],
+      "comment_counts": [0, 0],
+      "turn_expectations": [{"draft_status": "pending", "presented": true}, {"draft_status": "pending"}],
+      "required_facts": [],
+      "forbidden_facts": []
+    },
+    {
       "id": "fresh_approval",
       "messages": ["Prepare a project 57 note for review: seven serum aliquots arrived today; instrument time is booked for Thursday. Nothing has run yet.", "Please put the version you just showed into the project record."],
       "comment_counts": [0, 1],
