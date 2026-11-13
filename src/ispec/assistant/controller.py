@@ -1,3 +1,5 @@
+"""Review generated replies and queue conversation-scoped follow-up preparation."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -31,6 +33,7 @@ ControllerStageName = Literal["response_contract", "self_review"]
 
 
 def utcnow() -> datetime:
+    """Return a timezone-aware UTC timestamp."""
     return datetime.now(UTC)
 
 
@@ -43,6 +46,7 @@ class ControllerStageResult:
     meta: dict[str, Any] = field(default_factory=dict)
 
     def as_meta(self) -> dict[str, Any]:
+        """Serialize the stage outcome for the persisted controller trace."""
         return {
             "name": self.name,
             "status": self.status,
@@ -54,6 +58,7 @@ class ControllerStageResult:
 
 @dataclass(frozen=True)
 class ControllerPreSendResult:
+    """Final reply plus stage decisions and retained pre-review evidence."""
     action: PreSendAction
     final_content: str
     final_reply: AssistantReply
@@ -78,6 +83,7 @@ class ControllerPostSendEnqueueResult:
     reason: str | None = None
 
     def as_meta(self) -> dict[str, Any]:
+        """Serialize queue status, command IDs, and the enqueue/skip reason."""
         return {
             "action": self.action,
             "enqueued": self.enqueued,
@@ -90,6 +96,7 @@ class ControllerPostSendEnqueueResult:
 
 @dataclass(frozen=True)
 class ControllerContext:
+    """Inputs shared by the configured pre-send stages for one response."""
     generate_reply_fn: Callable[..., AssistantReply]
     source: ArtifactSource
     context_message: str
@@ -111,6 +118,7 @@ class ControllerContext:
 
 @dataclass
 class ControllerState:
+    """Mutable reply and diagnostics accumulated as pre-send stages run."""
     content: str
     reply: AssistantReply
     raw_content: str
@@ -135,6 +143,7 @@ _SOURCE_CONTROLLER_POLICIES: dict[ArtifactSource, SourceControllerPolicy] = {
 
 
 def support_post_send_thread_key(session_id: str) -> str:
+    """Build the follow-up queue key for a support conversation."""
     return f"support:{str(session_id or '').strip()}"
 
 
@@ -144,6 +153,7 @@ def scheduled_post_send_thread_key(
     job_name: str | None,
     command_id: int | None,
 ) -> str:
+    """Use a schedule key, or fall back to job name and optional command ID."""
     schedule_text = str(schedule_key or "").strip()
     if schedule_text:
         return f"scheduled:{schedule_text}"
@@ -162,6 +172,12 @@ def enqueue_post_send_prepare_command(
     priority: int = 0,
     current_command_id: int | None = None,
 ) -> ControllerPostSendEnqueueResult:
+    """Queue follow-up preparation for a source/thread, respecting its enable flag.
+
+    Return the matching in-flight command when one is found, excluding
+    current_command_id. Otherwise add and flush a queued command. The caller
+    owns the transaction commit; the result explains each enqueue or skip.
+    """
     normalized_thread_key = str(thread_key or "").strip()
     if os.getenv("ISPEC_ASSISTANT_POST_SEND_PREPARE_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
         return ControllerPostSendEnqueueResult(
@@ -221,6 +237,13 @@ def enqueue_post_send_prepare_command(
 
 
 def _response_contract_stage(ctx: ControllerContext, state: ControllerState) -> ControllerStageResult:
+    """Evaluate a shadow response candidate and record comparison metadata.
+
+    Eligible shadow requests run the response-contract pipeline. Store its
+    output in response_contract_meta.shadow_candidate. The returned changed
+    flag compares that candidate with the current reply; applied means the
+    evaluation produced a candidate. Skip/error results include their reason.
+    """
     if ctx.response_contract_mode != "shadow":
         return ControllerStageResult(name="response_contract", status="skipped", reason="disabled")
     if ctx.compare_mode:
@@ -278,6 +301,13 @@ def _response_contract_stage(ctx: ControllerContext, state: ControllerState) -> 
 
 
 def _self_review_should_run(ctx: ControllerContext, state: ControllerState) -> tuple[bool, str | None]:
+    """Return (should_review, skip_reason) for the current response.
+
+    Review requires an enabled support-chat request, a successful nonempty
+    draft, tool use, and an available review stage. Eligible returns (True,
+    None); otherwise the second item identifies the first failed condition.
+    Contract and no-tool skips also set state.self_review_mode for the trace.
+    """
     if not ctx.self_review_enabled:
         return False, "disabled"
     if ctx.source != "support_chat":
@@ -296,6 +326,13 @@ def _self_review_should_run(ctx: ControllerContext, state: ControllerState) -> t
 
 
 def _self_review_decider(ctx: ControllerContext, *, assistant_content: str) -> tuple[str | None, str | None]:
+    """Return (decision, error) from the optional bounded KEEP/REWRITE check.
+
+    Decisions are 'keep', 'rewrite', or None. Disabled returns (None, None).
+    A provider failure returns ('keep', 'review_decider_error'); malformed
+    output returns (None, 'review_decider_invalid_output'), allowing the caller
+    to attempt the full review. This helper performs one inference when enabled.
+    """
     if not ctx.self_review_decider_enabled:
         return None, None
 
@@ -333,6 +370,13 @@ def _self_review_decider(ctx: ControllerContext, *, assistant_content: str) -> t
 
 
 def _self_review_stage(ctx: ControllerContext, state: ControllerState) -> ControllerStageResult:
+    """Run eligibility, optional KEEP/REWRITE selection, and model-authored review.
+
+    A valid changed review updates state.content, reply, and raw_content while
+    retaining the earlier raw reply in draft_raw_content. Unusable reviews
+    preserve the existing answer and record an error. Return a stage result
+    identifying the skip, error, or completed review and whether text changed.
+    """
     should_run, skip_reason = _self_review_should_run(ctx, state)
     if not should_run:
         return ControllerStageResult(name="self_review", status="skipped", reason=skip_reason)
@@ -440,6 +484,14 @@ def run_message_pre_send_controller(
     self_review_decider_enabled: bool,
     used_tool_calls: int,
 ) -> ControllerPreSendResult:
+    """Run the source's ordered review stages and return reply plus diagnostics.
+
+    Support chat runs shadow response-contract evaluation followed by optional
+    self-review; scheduled responses run the contract stage. Each stage owns
+    its eligibility checks and updates a shared ControllerState. The result
+    carries final model output, earlier review evidence, and per-stage outcomes
+    for the caller to persist and deliver.
+    """
     ctx = ControllerContext(
         generate_reply_fn=generate_reply_fn,
         source=source,
