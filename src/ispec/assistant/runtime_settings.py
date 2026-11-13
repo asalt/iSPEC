@@ -27,6 +27,17 @@ def max_output_tokens() -> int | None:
     return result
 
 
+def max_input_tokens() -> int | None:
+    """Return the configured input budget for the fully rendered prompt."""
+    value = (os.getenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS") or "").strip()
+    if not value:
+        return None
+    result = int(value)
+    if result <= 0:
+        raise ValueError("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS must be positive")
+    return result
+
+
 def runtime_metadata(provider: str) -> dict[str, object]:
     """Record nonsecret configured identity, not an assertion about server state."""
     result: dict[str, object] = {}

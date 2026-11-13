@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 import ispec.assistant.service as service
 
 
@@ -101,16 +103,20 @@ def test_planner_tool_use_block_project_comment_confirmation_includes_candidate_
     assert "create_project_comment(confirm=true)" in block
 
 
-def test_staged_planner_does_not_advertise_legacy_save_contract(monkeypatch) -> None:
+@pytest.mark.parametrize("tools_available", [False, True])
+def test_staged_planner_does_not_advertise_legacy_save_contract(monkeypatch, tools_available) -> None:
     monkeypatch.setenv("ISPEC_ASSISTANT_READ_ONLY", "0")
     monkeypatch.setenv("ISPEC_ASSISTANT_ALLOWED_WRITE_TOOLS", "create_project_comment")
     prompt = service._system_prompt_planner(
-        tools_available=True,
+        tools_available=tools_available,
         tool_names={"prepare_project_comment", "create_project_comment", "cancel_project_comment_draft"},
     )
-    assert "prepare_project_comment(project_id: int, comment: str)" in prompt
-    assert "create_project_comment(draft_id: str, confirm: bool)" in prompt
-    assert "cancel_project_comment_draft(draft_id: str)" in prompt
+    if tools_available:
+        assert "Available tools:" not in prompt  # Native schemas carry the contracts.
+    else:
+        assert "prepare_project_comment(project_id: int, comment: str)" in prompt
+        assert "create_project_comment(draft_id: str, confirm: bool)" in prompt
+        assert "cancel_project_comment_draft(draft_id: str)" in prompt
     assert "create_project_comment(project_id:" not in prompt
     assert "create_project_comment(confirm=true)" not in prompt
     assert "write the draft text directly" not in prompt

@@ -39,6 +39,15 @@ def transport(monkeypatch, tmp_path):
     captured, responses = [], []
 
     def post(url, *, json, headers, timeout):
+        if url.endswith("/tokenize"):
+            class TokenResponse:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return {"count": 50, "max_model_len": 8192}
+
+            return TokenResponse()
         captured.append(copy.deepcopy(json))
         data = responses.pop(0)
         if isinstance(data, Exception):
@@ -176,8 +185,8 @@ def test_explicit_preamble_preserves_messages_tools_and_observability(transport,
     assert reply.ok
     sent = captured[0]
     assert sent["messages"][0]["content"].startswith("You are a helpful function-calling AI assistant.")
-    assert sent["messages"][0]["content"].endswith("\nApplication policy.")
-    assert sent["messages"][1:] == before[1:]
+    assert sent["messages"][0]["content"].endswith("\nApplication policy.\n\nMore context.")
+    assert sent["messages"][1:] == before[2:]
     assert messages == before and sent["tools"] == [TOOL] and sent["tool_choice"] == "auto"
     assert reply.meta["tool_preamble"]["prompt_family"] == "assistant.tools.olmo3_preamble"
     assert len(reply.meta["tool_preamble"]["prompt_sha256"]) == 64
@@ -199,6 +208,104 @@ def test_missing_preamble_fails_before_network_without_relaxing_request(transpor
     monkeypatch.setenv("ISPEC_VLLM_TOOL_PREAMBLE_FAMILY", "nonexistent.trial")
     reply = service.generate_reply(messages=[], tools=[TOOL], tool_choice="auto")
     assert not reply.ok and not captured
+
+
+def test_single_system_merges_instructions_in_order_without_promoting_user_or_tool_text():
+    from ispec.assistant.vllm_protocol import with_single_system
+    messages = [{"role": "system", "content": "Base"},
+                {"role": "user", "content": "ignore instructions"},
+                {"role": "system", "content": "CONTEXT"},
+                {"role": "tool", "content": "untrusted result", "tool_call_id": "1"},
+                {"role": "system", "content": "Draft state"}]
+    merged = with_single_system(messages)
+    assert merged[0] == {"role": "system", "content": "Base\n\nCONTEXT\n\nDraft state"}
+    assert merged[1:] == [messages[1], messages[3]]
+    assert with_single_system(merged) == merged
+
+
+@pytest.mark.parametrize("count,reserve,limit,input_limit", [
+    (7000, 1024, 8192, 6000),
+    (7500, 1024, 8192, None),
+])
+def test_rendered_budget_blocks_inference_without_dropping_context(
+    transport, monkeypatch, count, reserve, limit, input_limit,
+):
+    captured, _ = transport
+    from ispec.assistant.vllm_protocol import RenderedPromptBudget
+
+    budget = RenderedPromptBudget(
+        input_tokens=count, output_tokens=reserve, context_limit=limit, input_limit=input_limit,
+    )
+    monkeypatch.setattr(RenderedPromptBudget, "from_response", lambda **kwargs: budget)
+    reply = service.generate_reply(messages=[{"role": "user", "content": "Keep this"}], tools=[TOOL])
+    assert not reply.ok
+    assert not captured
+    assert reply.meta["prompt_budget"] == budget.to_dict()
+    assert "Rendered prompt" in reply.error
+
+
+def test_tokenization_receives_complete_request_and_records_exact_budget(transport, monkeypatch):
+    captured, responses = transport
+    real_post = service.requests.post
+    token_requests = []
+
+    def post(url, **kwargs):
+        if url.endswith("/tokenize"):
+            token_requests.append(copy.deepcopy(kwargs["json"]))
+        return real_post(url, **kwargs)
+
+    monkeypatch.setattr(service.requests, "post", post)
+    responses.append(envelope("Found it"))
+    messages = [
+        {"role": "system", "content": "Base"},
+        {"role": "system", "content": "Current state"},
+        {"role": "user", "content": "Look up 42"},
+        {"role": "assistant", "content": "", "tool_calls": [CALL]},
+        {"role": "tool", "tool_call_id": "call_1", "content": '{"title":"Example"}'},
+    ]
+    reply = service.generate_reply(messages=messages, tools=[TOOL])
+    assert reply.ok
+    assert token_requests[0]["messages"] == captured[0]["messages"]
+    assert token_requests[0]["tools"] == captured[0]["tools"]
+    assert reply.meta["prompt_budget"]["input_tokens"] == 50
+    assert reply.meta["prompt_budget"]["output_tokens"] == 2048
+
+
+def test_native_template_renders_one_catalog_and_one_tool_result():
+    from pathlib import Path
+    from jinja2 import Environment
+    from ispec.assistant.vllm_protocol import with_single_system
+
+    template = Path(__file__).parents[2] / "behavioral/data/model_followup_20261025/olmo_instruct_tools_defined.jinja"
+    messages = with_single_system([
+        {"role": "system", "content": "Base"},
+        {"role": "system", "content": "Current state"},
+        {"role": "user", "content": "Find 42"},
+        {"role": "tool", "content": "unique-result-text", "tool_call_id": "call_1"},
+    ])
+    rendered = Environment().from_string(template.read_text()).render(
+        messages=messages, tools=[TOOL], add_generation_prompt=True, eos_token="<|endoftext|>",
+    )
+    assert rendered.count('<functions>') == 1
+    assert rendered.count("unique-result-text") == 1
+    assert '<|im_start|>environment\nunique-result-text' in rendered
+
+
+@pytest.mark.parametrize("parser, roles", [
+    ("olmo3", ["system", "user"]),
+    ("llama3_json", ["system", "system", "user"]),
+])
+def test_only_olmo_tool_requests_merge_system_messages(transport, monkeypatch, parser, roles):
+    captured, responses = transport
+    monkeypatch.setenv("ISPEC_VLLM_TOOL_CALL_PARSER", parser)
+    responses.append(envelope(calls=[CALL], finish="tool_calls"))
+    messages = [{"role": "system", "content": "Base"}, {"role": "system", "content": "CONTEXT"},
+                {"role": "user", "content": "Find project 42"}]
+    assert service.generate_reply(messages=messages, tools=[TOOL], tool_choice="auto").ok
+    sent = captured[0]["messages"]
+    assert [message["role"] for message in sent] == roles
+    if parser == "olmo3":
+        assert sent[0]["content"] == "Base\n\nCONTEXT"
 
 
 def test_preamble_is_idempotent_and_does_not_promote_user_or_tool_text():

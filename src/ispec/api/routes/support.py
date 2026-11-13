@@ -43,7 +43,7 @@ from ispec.assistant.project_comment_cards import CardOrigin, ConfirmationCard
 from ispec.assistant.reply_delivery import RETAINED_REPLY, ReplyRetention
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
-from ispec.assistant.runtime_settings import vllm_strict_protocol
+from ispec.assistant.runtime_settings import vllm_strict_protocol, vllm_tool_parser
 from ispec.assistant.response_contracts import (
     response_contracts_mode,
     response_contract_names,
@@ -2226,9 +2226,9 @@ def chat(
                         "content": json.dumps(tool_payload, ensure_ascii=False),
                     }
                 )
-                # Text-only templates (including cached Tulu) omit role=tool.
-                # Keep the compatibility copy until template capabilities are explicit.
-                tool_messages.append({"role": "system", "content": tool_result_text})
+                # OLMo renders role=tool as environment; Tulu needs the system copy.
+                if not (reply.provider == "vllm" and vllm_tool_parser() == "olmo3"):
+                    tool_messages.append({"role": "system", "content": tool_result_text})
             if executed_openai_tools:
                 trace_step["executed_tools"] = executed_openai_tools
             continue
@@ -2298,6 +2298,7 @@ def chat(
 
             if (
                 tools_enabled
+                and not (native_tools_only and vllm_tool_parser() == "olmo3")
                 and used_tool_calls == 0
                 and policy_tool_name
                 and used_tool_calls < max_tool_calls

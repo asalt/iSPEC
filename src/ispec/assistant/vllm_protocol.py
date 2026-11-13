@@ -3,7 +3,68 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, dataclass
 from typing import Any
+
+
+def with_single_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge system instructions so templates that attach tool schemas per system message emit them once."""
+    result = [dict(message) for message in messages]
+    systems = [message for message in result if message.get("role") == "system"]
+    if len(systems) < 2:
+        return result
+    if any(not isinstance(message.get("content"), str) for message in systems):
+        raise ValueError("System merge requires text system messages")
+    return [{"role": "system", "content": "\n\n".join(message["content"] for message in systems)}] + [
+        message for message in result if message.get("role") != "system"
+    ]
+
+
+@dataclass(frozen=True, kw_only=True)
+class RenderedPromptBudget:
+    """Server-tokenized input and the space reserved for generated output."""
+
+    input_tokens: int
+    output_tokens: int
+    context_limit: int
+    input_limit: int | None
+
+    @classmethod
+    def from_response(cls, *, response: Any, output_tokens: int,
+                      input_limit: int | None) -> RenderedPromptBudget:
+        """Validate the tokenization server's count and model context limit."""
+        if not isinstance(response, dict):
+            raise ValueError("Invalid vLLM tokenization response")
+        count = response.get("count")
+        limit = response.get("max_model_len")
+        if type(count) is not int or count < 0 or type(limit) is not int or limit <= 0:
+            raise ValueError("Invalid vLLM tokenization count/context limit")
+        return cls(input_tokens=count, output_tokens=output_tokens,
+                   context_limit=limit, input_limit=input_limit)
+
+    def validate(self) -> None:
+        """Reject requests exceeding the input budget or total model context."""
+        if self.input_limit is not None and self.input_tokens > self.input_limit:
+            raise ValueError(
+                f"Rendered prompt has {self.input_tokens} tokens; input budget is {self.input_limit}"
+            )
+        if self.input_tokens + self.output_tokens > self.context_limit:
+            raise ValueError(
+                f"Rendered prompt ({self.input_tokens}) plus output reserve ({self.output_tokens}) "
+                f"exceeds model context ({self.context_limit})"
+            )
+
+    def to_dict(self) -> dict[str, int | None]:
+        return asdict(self)
+
+
+def tokenization_request(*, payload: dict[str, Any]) -> dict[str, Any]:
+    """Send the same messages, schemas and template options to vLLM's tokenizer."""
+    fields = (
+        "model", "messages", "tools", "chat_template", "chat_template_kwargs",
+        "add_generation_prompt", "continue_final_message", "add_special_tokens",
+    )
+    return {key: payload[key] for key in fields if key in payload}
 
 
 def with_system_preamble(messages: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:

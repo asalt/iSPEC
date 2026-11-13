@@ -14,7 +14,7 @@ from ispec.assistant.tools import TOOL_CALL_PREFIX, TOOL_RESULT_PREFIX, tool_pro
 from ispec.assistant.usage_logging import record_inference_usage_event
 from ispec.assistant import ollama_protocol, vllm_protocol
 from ispec.assistant.runtime_settings import (
-    max_output_tokens, runtime_metadata, vllm_strict_protocol, vllm_tool_parser, vllm_tool_preamble_family,
+    max_input_tokens, max_output_tokens, runtime_metadata, vllm_strict_protocol, vllm_tool_parser, vllm_tool_preamble_family,
 )
 from ispec.logging import get_logger
 from ispec.prompt import PromptSource, PromptVersionInfo, RenderedPrompt, load_bound_prompt, prompt_binding, prompt_observability_context
@@ -376,7 +376,13 @@ def _render_system_prompt_planner(
                 tools_available=tools_available,
                 provider=(os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub"),
             ),
-            "tool_catalog_block": tool_prompt(tool_names=tool_names).strip() + "\n",
+            # Native calls carry the complete schemas separately. Line-protocol
+            # callers still need the textual catalog to discover their tools.
+            "tool_catalog_block": (
+                ""
+                if tools_available and tool_names is not None
+                else tool_prompt(tool_names=tool_names).strip() + "\n"
+            ),
             "response_format_block": _planner_response_format_block(response_format=response_format),
         },
     )
@@ -530,7 +536,11 @@ def generate_reply(
     if messages is None:
         if message is None:
             raise ValueError("message is required when messages is not provided")
-        stage_prompt = _render_stage_prompt(stage=stage, tools_available=bool(tools))
+        stage_prompt = _render_stage_prompt(
+            stage=stage,
+            tools_available=bool(tools),
+            tool_names={tool["function"]["name"] for tool in tools} if tools else None,
+        )
         messages = _build_messages(
             message=message,
             history=history,
@@ -570,9 +580,15 @@ def _render_stage_prompt(
     *,
     stage: Literal["planner", "answer", "review"],
     tools_available: bool,
+    tool_names: set[str] | None = None,
 ) -> RenderedPrompt:
-    if stage == "planner":
-        return _render_system_prompt_planner(tools_available=tools_available)
+    if stage == "planner" or (
+        stage != "review" and tools_available and tool_names is not None
+    ):
+        return _render_system_prompt_planner(
+            tools_available=tools_available,
+            tool_names=tool_names,
+        )
     if stage == "review":
         return _render_system_prompt_review()
     return _render_system_prompt_answer()
@@ -942,19 +958,38 @@ def _generate_vllm_reply(
     strict_protocol = vllm_strict_protocol()
     validated_reply = None
     tool_preamble_meta = None
+    prompt_budget = None
     data = None
     try:
+        prepared_messages = messages
+        if tools and tool_choice != "none" and vllm_tool_parser() == "olmo3":
+            # OLMo's chat template repeats every tool schema in each system message.
+            prepared_messages = vllm_protocol.with_single_system(prepared_messages)
         family = vllm_tool_preamble_family()
         if family and tools and tool_choice != "none":
             preamble = render_prompt(family)
-            prepared_messages = vllm_protocol.with_system_preamble(messages, preamble.text)
-            payload_base["messages"] = prepared_messages
-            payload["messages"] = prepared_messages
+            prepared_messages = vllm_protocol.with_system_preamble(prepared_messages, preamble.text)
             tool_preamble_meta = preamble.observability_fields()
+        payload_base["messages"] = prepared_messages
+        payload["messages"] = prepared_messages
         output_limit = max_output_tokens()
         if output_limit is not None:
             payload_base.setdefault("max_tokens", output_limit)
             payload.setdefault("max_tokens", output_limit)
+        if vllm_tool_parser() == "olmo3":
+            token_response = requests.post(
+                f"{base_url}/tokenize",
+                json=vllm_protocol.tokenization_request(payload=payload),
+                headers=headers,
+                timeout=timeout,
+            )
+            token_response.raise_for_status()
+            prompt_budget = vllm_protocol.RenderedPromptBudget.from_response(
+                response=token_response.json(),
+                output_tokens=int(payload.get("max_tokens") or 0),
+                input_limit=max_input_tokens(),
+            )
+            prompt_budget.validate()
         response = None
         data = None
         candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = [("full", payload, {})]
@@ -1025,6 +1060,8 @@ def _generate_vllm_reply(
             meta["status_code"] = status_code
         if tool_preamble_meta:
             meta["tool_preamble"] = tool_preamble_meta
+        if prompt_budget is not None:
+            meta["prompt_budget"] = prompt_budget.to_dict()
         response_text = _truncate_text(response_text)
         if response_text:
             meta["response_text"] = response_text
@@ -1067,6 +1104,8 @@ def _generate_vllm_reply(
                 meta["finish_reason"] = choices[0].get("finish_reason")
         if tool_preamble_meta:
             meta["tool_preamble"] = tool_preamble_meta
+        if prompt_budget is not None:
+            meta["prompt_budget"] = prompt_budget.to_dict()
         record_inference_usage_event(
             provider="vllm",
             model=model,
@@ -1127,6 +1166,8 @@ def _generate_vllm_reply(
         meta["finish_reason"] = finish_reason
     if tool_preamble_meta:
         meta["tool_preamble"] = tool_preamble_meta
+    if prompt_budget is not None:
+        meta["prompt_budget"] = prompt_budget.to_dict()
     if usage is not None:
         meta["usage"] = usage
     if tools is not None:
