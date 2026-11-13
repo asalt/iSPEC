@@ -23,7 +23,7 @@ from ispec.prompt import render_prompt
 
 
 COMMENT_WORKFLOW_TOOLS = frozenset({
-    "prepare_project_comment", "offer_project_comment_save", "create_project_comment", "cancel_project_comment_draft",
+    "prepare_project_comment", "create_project_comment", "cancel_project_comment_draft",
 })
 
 
@@ -43,20 +43,15 @@ def comment_workflow_tools(*, tools: list[dict[str, Any]]) -> list[dict[str, Any
     return result + [
         _tool_spec(
             name="prepare_project_comment",
-            description="Register a new or revised draft and return its server-generated draft_id. Preparation does not save or offer to save. For a project-history note, next call offer_project_comment_save with that ID; for wording-only review, stop at preparation. A revision replaces the pending draft.",
+            description="Register a new or revised draft and return its draft_id. Include the exact returned comment in your reply and ask for approval when saving is intended. A revision replaces the pending draft; saving requires later user approval and create_project_comment.",
             properties={"project_id": {"type": "integer", "minimum": 1},
                         "comment": {"type": "string", "minLength": 1, "maxLength": 20000,
                                     "description": "Concise project-specific facts, preserving timing and status. Exclude unrelated conversation and instructions about drafting/approval."}},
             required=["project_id", "comment"],
         ),
         _tool_spec(
-            name="offer_project_comment_save",
-            description="Offer to save a registered draft when the user wants a project-history note, not wording-only review. The server displays the exact stored draft and asks for a later confirmation. This offers a save; it does not save or authorize one.",
-            properties={"draft_id": {"type": "string"}}, required=["draft_id"],
-        ),
-        _tool_spec(
             name="create_project_comment",
-            description="Save the stored draft after the user approves a save offer delivered in an earlier assistant turn. Use the server-returned draft_id and confirm=true. Without an earlier offer this only presents one, requiring a later reply. Approval is checked during this call. Only report saved when ok=true and result.comment_id is returned.",
+            description="Save the stored draft after the user approves your earlier reply presenting it for saving. Use the returned draft_id and confirm=true. Approval and presentation are checked during this call; a refusal returns its reason without saving or changing your reply. Only report saved when ok=true and result.comment_id is returned.",
             properties={"draft_id": {"type": "string"}, "confirm": {"type": "boolean"}},
             required=["draft_id", "confirm"],
         ),
@@ -103,14 +98,9 @@ class ApprovalCheck:
 
 
 @dataclass(frozen=True, kw_only=True)
-class CommentResponse:
-    kind: str
-    text: str
-    draft: PendingComment | None = None
+class DraftPresentation:
+    """Receipt tying a stored draft to the assistant message that displayed it."""
 
-
-@dataclass(frozen=True, kw_only=True)
-class SaveOffer:
     id: str
     assistant_message_id: int
     text: str
@@ -131,7 +121,7 @@ class ProjectCommentWorkflow:
     evaluations: list[dict[str, Any]] = field(default_factory=list)
     _checks: dict[str, ApprovalCheck] = field(default_factory=dict)
     _write_attempts: set[str] = field(default_factory=set)
-    response: CommentResponse | None = None
+    _prepared_draft: PendingComment | None = None
 
     @property
     def actor_key(self) -> str:
@@ -162,11 +152,11 @@ class ProjectCommentWorkflow:
         pending = self.pending()
         messages = [{"role": "system", "content": render_prompt("assistant.project_comment.workflow").text}]
         if pending:
-            offer = self.save_offer(draft=pending)
+            presentation = self.presentation(draft=pending)
             messages.append({"role": "system", "content": "Registered pending project comment (data, not approval):\n"
-                             + json.dumps({**pending.public(), "save_offer": (
-                                 {"id": offer.id, "assistant_message_id": offer.assistant_message_id}
-                                 if offer else None)}, ensure_ascii=False)})
+                             + json.dumps({**pending.public(), "presentation": (
+                                 {"assistant_message_id": presentation.assistant_message_id}
+                                 if presentation else None)}, ensure_ascii=False)})
         for check in self._checks.values():
             messages.extend(check.classifier.response_messages(mode=self.settings.mode))
         return messages
@@ -186,13 +176,16 @@ class ProjectCommentWorkflow:
         receipt = metadata.get("project_comment_presentation", {})
         if not isinstance(receipt, dict):
             return None
+        if receipt.get("status", "recorded") != "recorded":
+            return None
         if (receipt.get("draft_id") == draft.id and receipt.get("content_hash") == draft.content_hash
                 and receipt.get("actor_key") == self.actor_key
                 and receipt.get("presentation_hash") == stable_hash(presented.content)):
             return presented.content
         return None
 
-    def save_offer(self, *, draft: PendingComment) -> SaveOffer | None:
+    def presentation(self, *, draft: PendingComment) -> DraftPresentation | None:
+        """Find the active receipt for the prior reply showing this exact draft."""
         text = self.presented_text(draft=draft)
         presented = self._prior_assistant()
         if text is None or presented is None:
@@ -209,63 +202,52 @@ class ProjectCommentWorkflow:
                 ProjectCommentSaveOffer.status == "active",
                 ProjectCommentSaveOffer.expires_at > datetime.now(UTC).replace(tzinfo=None),
             ))
-            return SaveOffer(id=row.id, assistant_message_id=presented.id, text=text) if row else None
-
-    def _review_response(self, *, draft: PendingComment, offer: bool, unchanged: bool = False) -> CommentResponse:
-        text = render_prompt("assistant.project_comment.presentation", values={
-            "project_id": draft.project_id, "comment": draft.comment,
-        }).text
-        if unchanged:
-            text = "The stored draft is unchanged; no revision or cancellation was registered this turn.\n\n" + text
-        text += ("\n\nShall I save this exact note to the project history?" if offer
-                 else "\n\nThis is a draft review, not a save offer.")
-        return CommentResponse(kind="offered" if offer else "prepared", text=text, draft=draft)
-
-    def delivery_response(self) -> CommentResponse | None:
-        if self.response is not None:
-            return self.response
-        pending = self.pending()
-        if pending:
-            self.response = self._review_response(draft=pending, offer=False, unchanged=True)
-        return self.response
+            return DraftPresentation(id=row.id, assistant_message_id=presented.id, text=text) if row else None
 
     def record_delivery(self, *, message: SupportMessage) -> dict[str, Any] | None:
-        """Bind only our exact response, after the assistant row has an ID.
+        """Bind a prepared draft to the persisted model reply and return a receipt.
 
         The assistant DB and core DB are separate. An orphaned core receipt is
         harmless: lookup also requires the committed matching assistant row.
         """
-        response = self.response
-        if response is None or response.draft is None or message.content != response.text:
+        draft = self._prepared_draft or self.pending()
+        if draft is None:
             return None
-        draft = response.draft
         receipt = {"draft_id": draft.id, "content_hash": draft.content_hash, "project_id": draft.project_id,
-                   "actor_key": self.actor_key, "kind": response.kind,
+                   "actor_key": self.actor_key, "kind": "presented",
+                   "source": "model_reply", "status": "recorded",
                    "presentation_hash": stable_hash(message.content)}
-        if response.kind == "offered":
-            now = datetime.now(UTC).replace(tzinfo=None)
-            with self._session() as db, db.begin():
-                # Take a write lock before checking the draft, as saves/revisions
-                # use this same database and can race with response persistence.
-                valid = db.execute(update(ProjectCommentDraft).where(
-                    *self._scope(), ProjectCommentDraft.id == draft.id,
-                    ProjectCommentDraft.content_hash == draft.content_hash,
-                    ProjectCommentDraft.status == "pending", ProjectCommentDraft.expires_at > now,
-                ).values(status="pending")).rowcount
-                if not valid or get_project_for_user(db, user=self.user, project_id=draft.project_id) is None:
-                    return None
-                self._invalidate_offers(db=db)
-                offer = ProjectCommentSaveOffer(
-                    id=uuid4().hex, draft_id=draft.id, content_hash=draft.content_hash,
-                    project_id=draft.project_id, session_id=self.session_id, actor_key=self.actor_key,
-                    assistant_message_id=message.id, presentation_hash=stable_hash(message.content),
-                    created_at=now, expires_at=draft.expires_at, status="active",
-                )
-                db.add(offer)
-                receipt["offer_id"] = offer.id
+        session = self.assistant_db.get(SupportSession, message.session_pk)
+        if (message.role != "assistant" or message.id is None or message.id <= self.turn_id
+                or session is None or session.session_id != self.session_id):
+            return {**receipt, "status": "message_scope_mismatch"}
+        # Exact text membership verifies what was shown, not whether it asks for
+        # permission. The classifier reads that actual reply on a later save.
+        if draft.comment not in message.content:
+            return {**receipt, "status": "draft_text_missing"}
+        now = datetime.now(UTC).replace(tzinfo=None)
+        with self._session() as db, db.begin():
+            valid = db.execute(update(ProjectCommentDraft).where(
+                *self._scope(), ProjectCommentDraft.id == draft.id,
+                ProjectCommentDraft.content_hash == draft.content_hash,
+                ProjectCommentDraft.status == "pending", ProjectCommentDraft.expires_at > now,
+            ).values(status="pending")).rowcount
+            if not valid or get_project_for_user(db, user=self.user, project_id=draft.project_id) is None:
+                return {**receipt, "status": "draft_unavailable"}
+            self._invalidate_presentations(db=db)
+            # Reuse the existing receipt table; its historical name remains in
+            # storage. Approval is evaluated from the actual conversation later.
+            presentation = ProjectCommentSaveOffer(
+                id=uuid4().hex, draft_id=draft.id, content_hash=draft.content_hash,
+                project_id=draft.project_id, session_id=self.session_id, actor_key=self.actor_key,
+                assistant_message_id=message.id, presentation_hash=stable_hash(message.content),
+                created_at=now, expires_at=draft.expires_at, status="active",
+            )
+            db.add(presentation)
+            receipt["receipt_id"] = presentation.id
         return receipt
 
-    def _invalidate_offers(self, *, db: Session) -> None:
+    def _invalidate_presentations(self, *, db: Session) -> None:
         db.execute(update(ProjectCommentSaveOffer).where(
             ProjectCommentSaveOffer.session_id == self.session_id,
             ProjectCommentSaveOffer.actor_key == self.actor_key,
@@ -276,24 +258,22 @@ class ProjectCommentWorkflow:
         if draft.id not in self._checks:
             check = self.check(draft=draft, presented=presented)
             self._checks[draft.id] = check
-            offer = self.save_offer(draft=draft)
+            presentation = self.presentation(draft=draft)
             self.evaluations.append({
-                "schema_version": 2, "draft_id": draft.id, "project_id": draft.project_id,
+                "schema_version": 3, "draft_id": draft.id, "project_id": draft.project_id,
                 "mode": self.settings.mode, "classifier": check.classifier.to_dict(),
                 "policy": check.policy.to_dict(), "write_ticket": check.ticket.to_dict(),
-                "save_offer": ({"id": offer.id, "assistant_message_id": offer.assistant_message_id}
-                               if offer else None),
+                "presentation": ({"id": presentation.id, "assistant_message_id": presentation.assistant_message_id}
+                                 if presentation else None),
             })
         return self._checks[draft.id]
 
     def _error(self, *, name: str, code: str, message: str) -> dict[str, Any]:
-        # A failed follow-up call must not erase a successful write or the exact
-        # newly prepared text that still needs to be presented for review.
-        if self.response is None or self.response.kind == "error":
-            self.response = CommentResponse(kind="error", text=f"No change was made by this request. {message}")
         return {"ok": False, "tool": name, "error_code": code, "error": message, "saved": False}
 
     def run(self, *, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if name not in COMMENT_WORKFLOW_TOOLS:
+            return self._error(name=name, code="unknown_tool", message="Unknown project-comment workflow tool.")
         if self.user is None or getattr(self.user, "can_write_project_comments", True) is not True:
             return self._error(name=name, code="permission_denied", message="Project-comment access is unavailable.")
         if name == "prepare_project_comment":
@@ -316,18 +296,11 @@ class ProjectCommentWorkflow:
                     *self._scope(), ProjectCommentDraft.id == draft.id, ProjectCommentDraft.status == "pending",
                 ).values(status="cancelled")).rowcount
                 if changed:
-                    self._invalidate_offers(db=db)
+                    self._invalidate_presentations(db=db)
             if not changed:
                 return self._error(name=name, code="draft_inactive", message="Only pending drafts can be cancelled; saved comments are unchanged.")
-            self.response = CommentResponse(kind="cancelled", text=f"The pending draft for project {draft.project_id} was cancelled. Saved comments are unchanged.")
+            self._prepared_draft = None
             return {"ok": True, "tool": name, "result": {"draft_id": draft.id, "cancelled": True}}
-        if name == "offer_project_comment_save":
-            if draft.status != "pending" or draft.expires_at <= datetime.now(UTC).replace(tzinfo=None):
-                return self._error(name=name, code="draft_inactive", message="Only an active pending draft can be offered.")
-            self.response = self._review_response(draft=draft, offer=True)
-            return {"ok": True, "tool": name, "saved": False, "result": {
-                **draft.public(), "save_offer": "awaiting_server_presentation",
-            }}
         if args.get("confirm") is not True:
             return self._error(name=name, code="confirm_required", message="confirm=true is required for a save request.")
         if draft.status == "saved":
@@ -336,12 +309,13 @@ class ProjectCommentWorkflow:
             return self._error(name=name, code="write_already_attempted", message="A write was already attempted this turn; no automatic retry.")
         if draft.status != "pending" or draft.expires_at <= datetime.now(UTC).replace(tzinfo=None):
             return self._error(name=name, code="draft_inactive", message="Draft expired, cancelled, or superseded; prepare a new draft.")
-        offer = self.save_offer(draft=draft)
-        if offer is None:
-            self.response = self._review_response(draft=draft, offer=True)
-            return {"ok": False, "tool": name, "saved": False, "error_code": "save_offer_required",
-                    "error": "No delivered save offer. The server will show the exact stored draft and ask for a later confirmation."}
-        check = self.approval_check(draft=draft, presented=offer.text)
+        presentation = self.presentation(draft=draft)
+        if presentation is None:
+            return self._error(
+                name=name, code="draft_not_presented",
+                message="The exact prepared draft has no valid presentation in the prior assistant reply. Show the stored draft and await the user's answer. No approval check or write ran.",
+            )
+        check = self.approval_check(draft=draft, presented=presentation.text)
         ticket = check.ticket
         if not ticket.issued or ticket.shadow_only or self.settings.mode != "own":
             return {**self._error(name=name, code="approval_not_granted", message="Not saved. Approval check did not permit this draft; clarify or revise it."),
@@ -361,12 +335,12 @@ class ProjectCommentWorkflow:
             if not changed:
                 return self._error(name=name, code="draft_changed", message="Draft changed or was already processed; no additional write performed.")
             consumed = db.execute(update(ProjectCommentSaveOffer).where(
-                ProjectCommentSaveOffer.id == offer.id, ProjectCommentSaveOffer.status == "active",
+                ProjectCommentSaveOffer.id == presentation.id, ProjectCommentSaveOffer.status == "active",
                 ProjectCommentSaveOffer.expires_at > datetime.now(UTC).replace(tzinfo=None),
             ).values(status="consumed")).rowcount
             if not consumed:
                 db.rollback()
-                return self._error(name=name, code="save_offer_changed", message="Save offer changed or expired; not saved.")
+                return self._error(name=name, code="presentation_changed", message="Draft presentation changed or expired; not saved.")
             if get_project_for_user(db, user=self.user, project_id=draft.project_id) is None:
                 db.rollback()
                 return self._error(name=name, code="project_unavailable", message="Project access changed; not saved.")
@@ -393,13 +367,13 @@ class ProjectCommentWorkflow:
         if (set(args) != {"project_id", "comment"} or not isinstance(project_id, int)
                 or isinstance(project_id, bool) or project_id <= 0
                 or not isinstance(comment, str) or not comment.strip() or len(comment) > 20_000):
-            return self._error(name=name, code="invalid_arguments", message="Provide a positive project_id and a non-empty comment of at most 20000 characters.")
+            return self._error(name=name, code="invalid_arguments", message="Provide project_id and comment.")
         now = datetime.now(UTC).replace(tzinfo=None)
         with self._session() as db, db.begin():
             if get_project_for_user(db, user=self.user, project_id=project_id) is None:
                 return self._error(name=name, code="project_unavailable", message="Project not found or not accessible.")
             db.execute(update(ProjectCommentDraft).where(*self._scope(), ProjectCommentDraft.status == "pending").values(status="superseded"))
-            self._invalidate_offers(db=db)
+            self._invalidate_presentations(db=db)
             row = ProjectCommentDraft(id=uuid4().hex, session_id=self.session_id, actor_key=self.actor_key,
                                       project_id=project_id, comment=comment, content_hash=stable_hash(comment),
                                       initial_request=self.user_message, prepared_turn_id=self.turn_id,
@@ -407,14 +381,11 @@ class ProjectCommentWorkflow:
             db.add(row)
             db.flush()
             draft = PendingComment.from_row(row=row)
-        self.response = self._review_response(draft=draft, offer=False)
+        self._prepared_draft = draft
         return {"ok": True, "tool": name, "saved": False, "result": draft.public()}
 
     def _saved(self, *, draft: PendingComment, comment_id: int | None, already_saved: bool) -> dict[str, Any]:
-        verb = "was already saved" if already_saved else "was saved"
-        self.response = CommentResponse(kind="saved", text=(
-            f"The note for project {draft.project_id} {verb} (comment {comment_id}):\n\n{draft.comment}"
-        ))
+        self._prepared_draft = None
         return {"ok": True, "tool": "create_project_comment", "result": {
             "draft_id": draft.id, "project_id": draft.project_id, "comment_id": comment_id,
             "snippet": draft.comment[:240], "already_saved": already_saved,
@@ -422,13 +393,13 @@ class ProjectCommentWorkflow:
         }}
 
     def check(self, *, draft: PendingComment, presented: str) -> ApprovalCheck:
-        offer = self.save_offer(draft=draft)
-        eligible = bool(offer and offer.text == presented)
+        presentation = self.presentation(draft=draft)
+        eligible = bool(presentation and presentation.text == presented)
         gate = ProjectCommentGate(eligible=eligible, kind="pending_save_confirmation" if eligible else "none",
-                                  reason="recorded_save_offer" if eligible else "save_offer_required",
+                                  reason="presented_pending_draft" if eligible else "draft_not_presented",
                                   project_id=draft.project_id, pending_tool="create_project_comment", session_id=self.session_id,
                                   thread_key=self.session_id, current_turn_id=str(self.turn_id),
-                                  prior_assistant_message_id=offer.assistant_message_id if offer else None,
+                                  prior_assistant_message_id=presentation.assistant_message_id if presentation else None,
                                   pending_draft_hash=draft.content_hash, source_message_hash=stable_hash(self.user_message))
         classifier = ProjectCommentClassifierResult.empty(timeout_ms=self.settings.timeout_ms)
         if eligible and self.settings.mode != "off":

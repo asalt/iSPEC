@@ -40,8 +40,7 @@ def test_concurrent_save_requests_commit_one_comment(tmp_path, monkeypatch):
             turn_id=initial.id, user_message=initial.content, settings=settings,
             generate_reply_fn=None, generate_classifier_reply_fn=None)
         draft_id = workflow.prepare(args={"project_id": 57, "comment": "Samples arrived."})["result"]["draft_id"]
-        workflow.run(name="offer_project_comment_save", args={"draft_id": draft_id})
-        presented = SupportMessage(session_pk=session.id, role="assistant", content=workflow.response.text)
+        presented = SupportMessage(session_pk=session.id, role="assistant", content='Draft: "Samples arrived." Shall I save it?')
         adb.add(presented)
         adb.flush()
         presented.meta_json = json.dumps({"project_comment_presentation": workflow.record_delivery(message=presented)})

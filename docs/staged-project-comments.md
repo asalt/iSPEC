@@ -7,15 +7,18 @@ path now uses explicit tools rather than inferring a pending save from prose.
 
 1. The responding model calls `prepare_project_comment(project_id, comment)`.
 2. iSPEC validates project access and stores the exact draft, returning its ID.
-   No project comment is inserted. Server presentation shows the returned exact
-   text for review, rather than relying on the model to repeat it correctly.
-   Preparation alone creates no save offer. The model can call
-   `offer_project_comment_save(draft_id)` to request an explicit offer; the server
-   renders the stored text and save question and binds a receipt to that assistant
-   message. A save attempt without an existing offer presents one instead of writing.
+   The model writes the reply, including the exact note and its own approval
+   question when appropriate. iSPEC tracks that actual reply after persistence.
+   Redisplaying an existing pending draft also records presentation with the
+   same draft ID, so recovery from an omitted draft needs no new preparation.
+   Displaying the exact note creates a presentation receipt, regardless of how
+   the model phrases its question. The receipt proves which draft was shown.
+   The separate offer tool, review-mode flag and server-authored draft/question
+   replacement were removed on November 12. A failed save returns a tool error
+   to the model.
 3. On a later reply the model may revise, cancel, answer normally, or call
    `create_project_comment(draft_id, confirm=true)`.
-4. A model-requested save answering the preceding recorded offer runs the bounded
+4. A model-requested save of the previously presented draft runs the bounded
    approval check. Policy applies the existing confidence/timeout settings. Its
    result cannot automatically initiate a save; repeated calls share one cached check.
 5. A permitted save inserts the stored text and records the resulting comment
@@ -37,15 +40,18 @@ back to lexical approval. The result is cached for repeated calls in that turn.
 - Drafts are bound to the authenticated principal, support session/thread, and
   Slack actor when supplied by the receiver. Another participant cannot confirm
   someone else's draft in this first slice; cross-staff approval is separate.
-- An offer must match the draft ID/hash, project, thread/user and preceding
-  assistant message, including its presentation hash. Model prose is not an offer.
+- A presentation receipt must match the draft ID/hash, project, thread/user and
+  preceding assistant message, including its presentation hash.
+  Exact text membership checks draft fidelity, not approval language. The
+  classifier reads the actual prior reply and user's answer before a save.
   A same-turn call cannot self-approve. This proves server-side conversation
   presentation, not delivery/read receipt.
-- Preparing a revision supersedes the old pending draft and invalidates its offers.
-  Cancellation invalidates offers without deleting existing comments. Pending
-  drafts and their offers expire after 24 hours.
+- Preparing a revision supersedes the old pending draft and invalidates its receipts.
+  Cancellation invalidates receipts without deleting existing comments. Pending
+  drafts and their receipts expire after 24 hours.
 - The core `project_comment_draft` and `project_comment_save_offer` tables are
-  created by normal `initialize_db`.
+  created by normal `initialize_db`. The latter keeps its historical table name
+  and now stores presentation receipts; it conveys no approval by itself.
   Keeping it alongside comments allows one atomic claim/insert/completion.
   The workflow closes its draft-store transaction before inference. Duplicate requests return
   the saved ID or a changed-state failure, never a second insert.
@@ -65,12 +71,16 @@ this flow. Existing non-chat low-level callers retain their legacy interface;
 this is not a wholesale removal of regex or other routing throughout iSPEC.
 The generic read-tool router and final-response safeguards remain separate.
 
-Prepared text and save/cancel outcomes are rendered from tool state after model
-response review. The raw model reply is preserved under `presentation.model_content`
-and in inference traces, not silently credited as correct. Unknown/stale IDs
-still fail without substitution; an ambiguous pending set is not selected.
-This improves transaction continuity, not semantic grounding: the model still
-has to prepare a relevant note and register revisions or cancellation.
+The model authors draft, save, cancellation and failure replies. The workflow
+records `review_receipt` metadata with `source=model_reply`;
+it does not replace conversational text. Missing or changed draft text records
+`draft_text_missing` and cannot authorize a later save. Unregistered revisions
+remain model output in history, with no new valid receipt. Unknown/stale IDs still
+fail without substitution; an ambiguous pending set is not selected.
+Model-authored wording can still be wrong. The regex-driven write-claim retry
+was removed: it falsely classified draft-registration language as a completed
+comment write. Protocol-format retries remain separate. Actual tool outcomes
+and model replies are retained for behavioral review.
 The classifier result is supplied as a short system message after a save check
 in `own` mode only. Shadow evidence is not presented as actionable authority.
 
@@ -88,9 +98,9 @@ capabilities. Separate result evidence for the response-review path is retained.
 The default workflow is `src/ispec/prompts/assistant.project_comment.workflow.md`.
 The shorter `experimental.project_comment.workflow.concise.md` is retained for
 replay, not selected by default: the comparison did not establish improvement.
-The earlier prompt-only trial restored the original descriptions. The latest
-retained prompt adds a short project-facts-only instruction. Server presentation
-is separate from model prose; access, thresholds and parser/ticket checks remain.
+The earlier prompt-only trial restored the original descriptions. The current
+prompt explains one preparation call, model-authored presentation, and later
+approval. Access, thresholds and parser/ticket checks remain.
 
 The November 6 `state-routed-trial` tested automatic dispatch after a classifier
 ticket. It was rejected: Tulu misclassified wording-only agreement at 0.90 and
@@ -137,6 +147,10 @@ The trial now uses named `RecordedTurn`, `RecordedDraft`, and `RecordedComment`
 snapshots, serializing only when saving evidence. Count failures report the
 specific turn, conversation, registered draft and presentation state, executed
 tools and approval-check count instead of only differing integer lists.
+Each run labels its result as end-to-end controller integration and records
+per-turn `save_path` evidence: model requests, executor errors, approval checks
+and saved counts, plus whether the prior reply actually showed the pending
+draft. A count mismatch alone is not assigned to the model.
 Per-turn expectations now check registered state, exact presentation, revision
 IDs/supersession and note facts. A no-save turn also fails on an unexpected save
 attempt, even if the executor blocks it. Cancellation tests require an actual
@@ -184,7 +198,7 @@ the live approval policy.
 The follow-up context/template diagnosis and the rejected concise-prompt trial
 are recorded in [`staged-context-cleanup-20261106.md`](staged-context-cleanup-20261106.md).
 
-The latest save-offer gate is recorded in
+The historical separate-tool save-offer gate is recorded in
 [`save-offer-gate-20261107.md`](save-offer-gate-20261107.md). It blocked all unsafe
 writes but also completed none of the eleven genuine approvals. The frozen prompt
 still teaches prose offers rather than the new offer tool; that contract mismatch

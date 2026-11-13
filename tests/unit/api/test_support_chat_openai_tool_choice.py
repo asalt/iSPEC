@@ -4,6 +4,8 @@ import json
 import types
 from typing import Any
 
+import pytest
+
 from ispec.api.routes import support as support_routes
 from ispec.api.routes.support import ChatRequest, chat
 from ispec.assistant.connect import get_assistant_session
@@ -19,19 +21,6 @@ from ispec.assistant.turn_decision import (
 )
 from ispec.db.models import Project, ProjectAccessMode, ProjectComment, UserRole
 from ispec.schedule.connect import get_schedule_session
-
-
-def test_write_claim_guard_allows_historical_prior_note_reference():
-    assert support_routes._assistant_claims_write_success(  # noqa: SLF001
-        "Correction to prior note: the raw file upload is not complete yet. "
-        "The prior note was saved after normal draft-and-confirm approval, "
-        "but the approved draft incorrectly implied completion."
-    ) is False
-
-
-def test_write_claim_guard_still_catches_current_save_claim():
-    assert support_routes._assistant_claims_write_success("Saved the note. Comment ID is 556.") is True  # noqa: SLF001
-    assert support_routes._assistant_claims_write_success("The note has been successfully added.") is True  # noqa: SLF001
 
 
 def test_support_chat_does_not_force_openai_tool_choice_for_generic_tool_request(
@@ -127,10 +116,16 @@ def test_support_chat_does_not_force_openai_tool_choice_for_generic_tool_request
 
 
 
-def test_support_chat_blocks_repeated_unsupported_write_claim(
+@pytest.mark.parametrize("model_reply", [
+    "I have made a note on project 1351. The comment ID is 23.",
+    "The draft was registered successfully. You can review it or provide the updated comment text.",
+    "The prior note was saved after confirmation, but its content needs a correction.",
+])
+def test_support_chat_preserves_reply_and_actual_outcome_without_prose_based_retry(
     tmp_path,
     db_session,
     monkeypatch,
+    model_reply,
 ):
     monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
     monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
@@ -147,7 +142,7 @@ def test_support_chat_blocks_repeated_unsupported_write_claim(
         calls.append({"messages": messages, "tools": tools, "tool_choice": tool_choice})
         assert tool_choice is None
         return AssistantReply(
-            content="FINAL:\nI have made a note on project 1351. The comment ID is 23.",
+            content="FINAL:\n" + model_reply,
             provider="test",
             model="test-model",
             meta=None,
@@ -188,11 +183,8 @@ def test_support_chat_blocks_repeated_unsupported_write_claim(
                 user=service_user,
             )
 
-        assert response.message == (
-            "I can't confirm that I saved that because no write tool actually succeeded. "
-            "I haven't made that change yet."
-        )
-        assert len(calls) == 2
+        assert response.message == model_reply
+        assert len(calls) == 1
         assert (
             db_session.query(ProjectComment)
             .filter(ProjectComment.project_id == 1351)
@@ -207,10 +199,11 @@ def test_support_chat_blocks_repeated_unsupported_write_claim(
             .first()
         )
         assert assistant_row is not None
+        assert assistant_row.content == response.message
         meta = json.loads(assistant_row.meta_json)
-        assert meta["write_claim_guard"]["triggered"] is True
-        assert meta["write_claim_guard"]["retried"] is True
-        assert meta["write_claim_guard"]["blocked_final_claim"] is True
+        assert "write_claim_guard" not in meta
+        assert meta["project_comment_workflow"]["write_outcome"]["status"] == "not_attempted"
+        assert meta["tool_calls"] == []
 
 
 

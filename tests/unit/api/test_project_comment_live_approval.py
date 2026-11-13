@@ -44,7 +44,7 @@ def test_presented_draft_followup_uses_policy_and_real_save_result(tmp_path, db_
 
     def classify(**kwargs):
         checks.append(kwargs)
-        assert len(calls) == 3  # Prepare, offer, then a model-requested later save.
+        assert len(calls) == 3  # Prepare, model reply, then a model-requested later save.
         if label == "timeout":
             raise TimeoutError("synthetic")
         return AssistantReply(content="not json" if label == "invalid" else json.dumps({
@@ -56,6 +56,7 @@ def test_presented_draft_followup_uses_policy_and_real_save_result(tmp_path, db_
         calls.append(kwargs)
         names = {t["function"]["name"] for t in kwargs.get("tools") or []}
         assert {"prepare_project_comment", "create_project_comment"} <= names
+        assert "offer_project_comment_save" not in names
         assert kwargs.get("tool_choice") != {
             "type": "function", "function": {"name": "create_project_comment"},
         }
@@ -73,11 +74,10 @@ def test_presented_draft_followup_uses_policy_and_real_save_result(tmp_path, db_
             assert len(pending) == 1 and draft_id in pending[0]["content"]
             assert not checks and db_session.query(ProjectComment).count() == 0
             if len(calls) == 2:
-                return AssistantReply(content="", provider="test", model="test", tool_calls=[{
-                    "id": "offer", "type": "function", "function": {
-                        "name": "offer_project_comment_save", "arguments": json.dumps({"draft_id": draft_id}),
-                    },
-                }])
+                return AssistantReply(content='Here is the note: "Received 24 IP samples." Does this look right to save?',
+                                      provider="test", model="test")
+            earlier_replies = [m["content"] for m in kwargs["messages"] if m["role"] == "assistant"]
+            assert 'Here is the note: "Received 24 IP samples." Does this look right to save?' in earlier_replies
             return AssistantReply(content="", provider="test", model="test", tool_calls=[{
                 "id": f"save_{n}", "type": "function", "function": {
                     "name": "create_project_comment",
@@ -92,7 +92,7 @@ def test_presented_draft_followup_uses_policy_and_real_save_result(tmp_path, db_
         assert len(visible_results) == 2
         if expected:
             assert '"comment_id":1' in visible_results[0]
-        return AssistantReply(content="FINAL:\\n" + ("Saved." if expected else "Not saved; please clarify."),
+        return AssistantReply(content="FINAL:\n" + ("Saved." if expected else "Not saved; please clarify."),
                               provider="test", model="test")
 
     monkeypatch.setattr(support, "generate_classifier_reply", classify)
@@ -106,7 +106,8 @@ def test_presented_draft_followup_uses_policy_and_real_save_result(tmp_path, db_
         first = support.chat(support.ChatRequest(sessionId="staged-1568", message="Prepare a note", history=[]),
                              assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
         adb.commit()
-        assert "Received 24 IP samples." in first.message
+        assert first.message == 'Here is the note: "Received 24 IP samples." Does this look right to save?'
+        assert adb.get(SupportMessage, first.messageId).content == first.message
         assert not checks
         result = support.chat(support.ChatRequest(sessionId="staged-1568",
             message="correct i confirm; please save", history=[]),
@@ -120,9 +121,11 @@ def test_presented_draft_followup_uses_policy_and_real_save_result(tmp_path, db_
         assert len(saves) == 2
         if expected:
             assert saves[0]["ok"]
-            assert meta["presentation"]["kind"] == "saved"
         else:
             assert not any(call["ok"] for call in saves)
+        assert meta["presentation"] is None
+        assert result.message == ("Saved." if expected else "Not saved; please clarify.")
+        assert adb.get(SupportMessage, result.messageId).content == result.message
         assert "project_comment_approval_eval" not in json.loads(adb.get(SupportMessage, result.messageId).meta_json)
 
 
@@ -194,12 +197,15 @@ def test_current_draft_context_refreshes_after_revision_and_cancellation(tmp_pat
     user = SimpleNamespace(id=1, username="test", role=UserRole.editor,
                            project_access_mode=ProjectAccessMode.all_projects, can_write_project_comments=True)
     with get_assistant_session(tmp_path / "assistant.db") as adb, get_schedule_session(tmp_path / "schedule.db") as sdb:
-        support.chat(support.ChatRequest(sessionId="refresh", message="Draft a note for project 57.", history=[]),
+        initial = support.chat(support.ChatRequest(sessionId="refresh", message="Draft a note for project 57.", history=[]),
                      assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
-        support.chat(support.ChatRequest(sessionId="refresh", message="Change twelve to ten; do not save.", history=[]),
+        revised = support.chat(support.ChatRequest(sessionId="refresh", message="Change twelve to ten; do not save.", history=[]),
                      assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
-        support.chat(support.ChatRequest(sessionId="refresh", message="Cancel the draft.", history=[]),
+        cancelled = support.chat(support.ChatRequest(sessionId="refresh", message="Cancel the draft.", history=[]),
                      assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
+        assert initial.message == "Draft for review."
+        assert revised.message == "Revised draft for review."
+        assert cancelled.message == "The pending draft is cancelled."
     assert len(seen) == 6
     assert db_session.query(ProjectComment).count() == 0
 
@@ -242,6 +248,84 @@ def test_registered_draft_does_not_classify_without_model_save(tmp_path, db_sess
         meta = json.loads(adb.get(SupportMessage, result.messageId).meta_json)
         assert not checks and not meta["project_comment_workflow"]["save_checks"]
         assert not meta["tool_calls"]
+        assert db_session.query(ProjectComment).count() == 0
+        assert result.message == "This remains a draft; nothing has been saved to project history."
+        assert adb.get(SupportMessage, result.messageId).content == result.message
+
+
+@pytest.mark.parametrize("model_draft_reply", [
+    'Here is the note: "Nine samples arrived." Shall I save it?',
+    "I need another detail before finishing the draft.",
+])
+def test_presentation_mismatch_preserves_replies_and_returns_error_to_model(
+    tmp_path, db_session, monkeypatch, model_draft_reply,
+):
+    from ispec.db.models import ProjectCommentDraft, ProjectCommentSaveOffer
+
+    for key, value in {
+        "PROVIDER": "stub", "PROJECT_COMMENT_APPROVAL_EVAL_MODE": "own",
+        "TURN_DECISION_MODE": "off", "READ_ONLY": "0", "TOOL_PROTOCOL": "openai",
+        "MAX_TOOL_CALLS": "3", "HISTORY_LIMIT": "10", "MAX_PROMPT_TOKENS": "8000",
+        "SUMMARY_MAX_CHARS": "0", "ENABLE_SELF_REVIEW": "0", "ENABLE_RESPONSE_CONTRACTS": "off",
+    }.items():
+        monkeypatch.setenv("ISPEC_ASSISTANT_" + key, value)
+    db_session.add(Project(id=57, prj_AddedBy="test", prj_ProjectTitle="Synthetic"))
+    db_session.commit()
+    model_error_reply = "The draft I registered was not the one I showed you. Let me correct that first."
+    requests = []
+
+    def generate(*, messages, **kwargs):
+        requests.append(messages)
+        if len(requests) == 1:
+            name = "prepare_project_comment"
+            arguments = {"project_id": 57, "comment": "Eight samples arrived."}
+        elif len(requests) == 2:
+            return AssistantReply(content=model_draft_reply, provider="stub", model="stub")
+        elif len(requests) == 3:
+            assert model_draft_reply in [m["content"] for m in messages if m["role"] == "assistant"]
+            draft = db_session.query(ProjectCommentDraft).one()
+            name = "create_project_comment"
+            arguments = {"draft_id": draft.id, "confirm": True}
+        else:
+            assert len(requests) == 4
+            results = [json.loads(m["content"]) for m in messages if m["role"] == "tool"]
+            assert len(results) == 1
+            assert results[0]["error_code"] == "draft_not_presented"
+            assert results[0]["saved"] is False
+            assert any(m["role"] == "system" and m["content"].startswith("TOOL_RESULT create_project_comment")
+                       for m in messages)
+            return AssistantReply(content=model_error_reply, provider="stub", model="stub")
+        return AssistantReply(content="", provider="stub", model="stub", tool_calls=[{
+            "id": f"call-{len(requests)}", "type": "function",
+            "function": {"name": name, "arguments": json.dumps(arguments)},
+        }])
+
+    monkeypatch.setattr(support, "generate_reply", generate)
+    monkeypatch.setattr(support, "generate_classifier_reply", lambda **kwargs: pytest.fail("Unpresented draft must not classify"))
+    monkeypatch.setattr(support, "select_support_tool_policy", lambda **kwargs: None)
+    monkeypatch.setattr(support, "route_tool_groups_vllm",
+                        lambda **kwargs: (None, AssistantReply(content="", provider="stub", model="stub")))
+    user = SimpleNamespace(id=1, username="test", role=UserRole.editor,
+                           project_access_mode=ProjectAccessMode.all_projects, can_write_project_comments=True)
+    with get_assistant_session(tmp_path / "assistant.db") as adb, get_schedule_session(tmp_path / "schedule.db") as sdb:
+        draft_reply = support.chat(support.ChatRequest(sessionId="mismatch", message="Draft a note about eight samples.", history=[]),
+                                   assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
+        adb.commit()
+        assert draft_reply.message == model_draft_reply
+        stored_reply = adb.get(SupportMessage, draft_reply.messageId)
+        assert stored_reply.content == model_draft_reply
+        presentation = json.loads(stored_reply.meta_json)["project_comment_presentation"]
+        assert presentation["status"] == "draft_text_missing"
+        assert presentation["source"] == "model_reply"
+        assert db_session.query(ProjectCommentSaveOffer).count() == 0
+        save_reply = support.chat(support.ChatRequest(sessionId="mismatch", message="Yes, save that exact note.", history=[]),
+                                 assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
+        assert save_reply.message == model_error_reply
+        stored_save_reply = adb.get(SupportMessage, save_reply.messageId)
+        assert stored_save_reply.content == model_error_reply
+        workflow = json.loads(stored_save_reply.meta_json)["project_comment_workflow"]
+        assert workflow["save_checks"] == []
+        assert workflow["write_outcome"]["status"] == "failed"
         assert db_session.query(ProjectComment).count() == 0
 
 

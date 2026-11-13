@@ -96,31 +96,6 @@ _PROJECT_ROUTE_RE = re.compile(r"/project/(\d+)", re.IGNORECASE)
 _EXPERIMENT_ROUTE_RE = re.compile(r"/experiment/(\d+)", re.IGNORECASE)
 _EXPERIMENT_RUN_ROUTE_RE = re.compile(r"/experiment-run/(\d+)", re.IGNORECASE)
 _CONTEXT_SCHEMA_VERSION = 1
-_WRITE_SUCCESS_VERB_RE = re.compile(
-    r"\b(saved|added|logged|recorded|created|written|updated|committed)\b",
-    re.IGNORECASE,
-)
-_WRITE_SUCCESS_NOTE_RE = re.compile(
-    r"\b(?:i|we)\s+(?:have|ve)\s+(?:made|added|saved|logged|recorded|created)\s+(?:a|an|the)?\s*(?:note|comment|entry|memo)\b",
-    re.IGNORECASE,
-)
-_WRITE_SUCCESS_FIRST_PERSON_RE = re.compile(
-    r"\b(?:i|we)\s+(?:(?:have|ve)\s+)?(?:saved|added|logged|recorded|created|written|updated|committed)\b"
-    r".*\b(?:note|comment|history|memo|entry)\b",
-    re.IGNORECASE,
-)
-_WRITE_SUCCESS_PASSIVE_RE = re.compile(
-    r"\b(?:note|comment|history|entry|memo)\b.*\b(?:has|have|is|was)\s+(?:been\s+)?\b(saved|added|logged|recorded|created|written|updated|committed)\b"
-    r"|\bsuccessfully\b.*\b(saved|added|logged|recorded|created|written|updated|committed)\b",
-    re.IGNORECASE,
-)
-_WRITE_RESULT_ID_RE = re.compile(r"\bcomment\s+id\b", re.IGNORECASE)
-_HISTORICAL_WRITE_REFERENCE_RE = re.compile(
-    r"\b(?:prior|previous|earlier|first|original)\s+(?:note|comment|history|entry|memo)\b"
-    r"[^.!?\n]{0,240}\b(?:was|were|had|has|have|is)\s+(?:been\s+)?"
-    r"(?:saved|added|logged|recorded|created|written|updated|committed)\b",
-    re.IGNORECASE,
-)
 _TRUTHY_ENV = {"1", "true", "yes", "y", "on"}
 _FALSY_ENV = {"0", "false", "no", "n", "off"}
 
@@ -734,22 +709,6 @@ def _assistant_leaks_tool_protocol(message: str | None) -> bool:
     if TOOL_CALL_PREFIX not in text:
         return False
     return True
-
-
-def _assistant_claims_write_success(message: str | None) -> bool:
-    text = (message or "").strip()
-    if not text:
-        return False
-    text = _HISTORICAL_WRITE_REFERENCE_RE.sub("", text)
-    if _WRITE_RESULT_ID_RE.search(text):
-        return True
-    if _WRITE_SUCCESS_NOTE_RE.search(text):
-        return True
-    if _WRITE_SUCCESS_FIRST_PERSON_RE.search(text):
-        return True
-    if _WRITE_SUCCESS_PASSIVE_RE.search(text):
-        return True
-    return False
 
 
 def _load_state(raw: str | None) -> dict[str, Any]:
@@ -1869,8 +1828,6 @@ def chat(
     history_for_llm: list[dict[str, Any]] = []
     final_prompt_observability: dict[str, Any] = {}
     final_prompt_stage: str | None = None
-    write_claim_retry_used = False
-    write_claim_guard_triggered = False
     tool_protocol_retry_used = False
     tool_protocol_guard_triggered = False
     forced_tool_choice: str | dict[str, Any] | None = None
@@ -2230,6 +2187,7 @@ def chat(
                         "arguments": parsed_args if isinstance(parsed_args, dict) else {},
                         "ok": bool(tool_payload.get("ok")),
                         "error": tool_payload.get("error"),
+                        "error_code": tool_payload.get("error_code"),
                         "result_preview": _tool_result_preview(tool_payload),
                         "protocol": "openai",
                     }
@@ -2248,11 +2206,6 @@ def chat(
                 tool_messages.append({"role": "system", "content": tool_result_text})
             if executed_openai_tools:
                 trace_step["executed_tools"] = executed_openai_tools
-            if project_comment_workflow.response is not None and project_comment_workflow.response.kind == "offered":
-                # Only an actual server-rendered offer arms a later save. Allow
-                # preparation to be followed by an explicit offer tool call.
-                trace_step["action"] = "present_registered_draft"
-                break
             continue
 
         tool_call = None if native_tools_only else parse_tool_call(reply.content)
@@ -2389,38 +2342,6 @@ def chat(
                     tool_protocol_retry_used = True
                     tool_protocol_guard_triggered = True
                     continue
-            successful_write_tools = {
-                str(call.get("name") or "").strip()
-                for call in tool_calls
-                if isinstance(call, dict) and call.get("ok") and tool_writes_data(call.get("name"))
-            }
-            if not successful_write_tools and _assistant_claims_write_success(reply.content):
-                if not write_claim_retry_used:
-                    corrective_parts = [
-                        "Your previous draft claimed a successful write/save/update, but no successful write tool call has occurred in this turn.",
-                        "Do not invent saved data, record IDs, or success outcomes.",
-                    ]
-                    if available_write_tool_names:
-                        corrective_parts.append(
-                            "If a write is actually needed, choose the appropriate tool now from: "
-                            + ", ".join(available_write_tool_names)
-                            + "."
-                        )
-                    else:
-                        corrective_parts.append(
-                            "No write tool is available in this turn, so explain that nothing was saved yet."
-                        )
-                    tool_messages.extend(
-                        [
-                            {"role": "assistant", "content": reply.content or ""},
-                            {"role": "system", "content": " ".join(corrective_parts)},
-                        ]
-                    )
-                    trace_step["action"] = "retry_after_unsupported_write_claim"
-                    trace_step["guardrail"] = "unsupported_write_claim"
-                    write_claim_retry_used = True
-                    write_claim_guard_triggered = True
-                    continue
             trace_step["action"] = "final_no_tool"
             break
 
@@ -2472,9 +2393,6 @@ def chat(
         )
         trace_step["action"] = "line_tool_call"
         trace_step["executed_tools"] = [tool_name]
-        if project_comment_workflow.response is not None and project_comment_workflow.response.kind == "offered":
-            trace_step["action"] = "present_registered_draft"
-            break
 
     if reply is None:
         project_comment_write_policy_messages = (
@@ -2564,41 +2482,16 @@ def chat(
     self_review_mode = controller_pre_send.self_review_mode
     self_review_decision = controller_pre_send.self_review_decision
 
-    successful_write_tools_final = {
-        str(call.get("name") or "").strip()
-        for call in tool_calls
-        if isinstance(call, dict) and call.get("ok") and tool_writes_data(call.get("name"))
-    }
     project_comment_write_outcome = _project_comment_write_outcome(
         tool_calls=tool_calls,
         focused_project_id=focused_project_id,
         safe_int_fn=_safe_int,
     )
-    blocked_unsupported_write_claim = False
-    if not successful_write_tools_final and _assistant_claims_write_success(assistant_content):
-        blocked_unsupported_write_claim = True
-        write_claim_guard_triggered = True
-        assistant_content = (
-            "I can't confirm that I saved that because no write tool actually succeeded. "
-            "I haven't made that change yet."
-        )
-
-    blocked_tool_protocol_leak = False
-    if _assistant_leaks_tool_protocol(assistant_content):
-        blocked_tool_protocol_leak = True
+    tool_protocol_leak = _assistant_leaks_tool_protocol(assistant_content)
+    if tool_protocol_leak:
         tool_protocol_guard_triggered = True
-        assistant_content = (
-            "I can help with that directly. Tell me the draft you want, or ask me to save a project note, "
-            "and I will handle the tool call myself."
-        )
-
-    # Exact review text and transaction status come from successful tools or
-    # their concrete errors, after model review/rewrites. Keep raw model output
-    # in the trace so this presentation is not scored as model correctness.
-    comment_response = project_comment_workflow.delivery_response() if project_comment_write_tool_exposed else None
-    if comment_response is not None:
-        assistant_content = comment_response.text
-        compare_choices = None
+    # Retries above feed labeled evidence back to the model. Remaining issues
+    # are diagnostics, never replacement text attributed to the assistant.
 
     turn_decision_meta: dict[str, Any] | None = None
     if turn_decision_result is not None:
@@ -2707,13 +2600,12 @@ def chat(
         "write_block_reason": write_block_reason,
     }
     meta["project_comment_workflow"] = {
-        "schema_version": 2,
+        "schema_version": 4,
         "mode": project_comment_workflow.settings.mode,
         "save_checks": project_comment_workflow.evaluations,
         "write_outcome": project_comment_write_outcome,
-        "presentation": ({"kind": comment_response.kind, "applied": True,
-                          "model_content": final_raw_reply_content}
-                         if comment_response is not None else None),
+        "presentation": None,
+        "review_receipt": None,
     }
     meta["context"] = {
         "history_messages_used": len(history_payload),
@@ -2764,19 +2656,12 @@ def chat(
             draft_raw = str(controller_pre_send.draft_raw_content or "").strip()
             if draft_raw and draft_raw != raw_final:
                 meta["draft_raw_content"] = draft_raw
-    if write_claim_guard_triggered:
-        meta["write_claim_guard"] = {
-            "triggered": True,
-            "retried": write_claim_retry_used,
-            "blocked_final_claim": blocked_unsupported_write_claim,
-            "available_write_tools": available_write_tool_names,
-            "successful_write_tools": sorted(successful_write_tools_final),
-        }
     if tool_protocol_guard_triggered:
         meta["tool_protocol_guard"] = {
             "triggered": True,
             "retried": tool_protocol_retry_used,
-            "blocked_final_leak": blocked_tool_protocol_leak,
+            "blocked_final_leak": False,
+            "final_leak_detected": bool(tool_protocol_leak),
         }
 
     if compare_choices is not None and final_reply.ok and assistant_content.strip():
@@ -2842,10 +2727,10 @@ def chat(
             ),
         )
 
-    if not final_reply.ok and comment_response is None:
+    if not final_reply.ok:
         assistant_content = RETAINED_REPLY
 
-    if slack_thread_context is not None and comment_response is None:
+    if slack_thread_context is not None:
         assistant_content = render_participant_mentions(assistant_content, slack_thread_context.participants)
 
     assistant_message = SupportMessage(
@@ -2860,9 +2745,10 @@ def chat(
     session.updated_at = utcnow()
     assistant_db.flush()
 
-    presentation = project_comment_workflow.record_delivery(message=assistant_message)
+    presentation = project_comment_workflow.record_delivery(message=assistant_message) if final_reply.ok else None
     if presentation is not None:
         meta["project_comment_presentation"] = presentation
+        meta["project_comment_workflow"]["review_receipt"] = presentation
 
     work_bag_entries = build_work_bag_entries_from_tool_calls(
         tool_calls=tool_calls,
