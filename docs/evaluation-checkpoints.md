@@ -2,49 +2,85 @@
 
 ## Current Status
 
-Updated November 12, 2026. This section is the current handoff; linked reports
-retain historical results. Update this section after each run.
+Updated November 12, 2026. Keep this single section current after each run;
+linked reports retain historical evidence.
 
-- **Design:** one `prepare_project_comment(project_id, comment)` call registers
-  the draft. The model shows it; the server records exact presentation. A later
-  model-requested save invokes the approval classifier and existing guards.
-  Refactor checkpoint: `19e2c5d`; controller docstrings: `3cdf122`. No second
-  offer tool or server-written replacement assistant reply.
-  See [workflow](staged-project-comments.md).
-- **Blockers:** showing draft text does not establish intent to save. Wording-only
-  agreement can reach the classifier if the model requests a save. N02-N04's
-  historical false approvals remain untested on this refactor. Also open:
-  false cancellation claims with pending drafts, prose-only revisions, and
-  R01/N08/N16/N18 grounding failures.
-- **Last refactor batch:** OLMo 4/7, two approved saves, zero observed unapproved
-  writes; only the two true approvals reached the classifier. This is not
-  negative-approval safety evidence. Tulu 0/7 and excluded from further runs
-  unless Alex asks. [Results](single-preparation-retest-20261112.md).
-- **Latest behavioral run:** the Jeff tool-use trial passed three no-action
-  controls and missed three required actions; zero advisories fired, about
-  7.5 seconds per check. Retired by Alex: no further tuning or integration.
-  This is separate from the save-approval classifier.
-  [Evidence](jeff-tool-use-advisory-20261112.md).
-- **Harness repaired:** cancellation requires the original draft to be cancelled
-  in storage and a successful matching tool call; revision requires a new
-  registered/presented draft, a superseded prior draft and matching preparation.
-  Negative diagnostics now run on pre-turn state, remain separate from all
-  actual checks, and report completed/failed/skipped inference. A diagnostic
-  ticket cannot authorize execution. These are test changes, not model fixes.
-- **Latest verification:** 190 focused unit/integration tests passed;
-  `git diff --check` passed. No model inference ran. Passing stubs do not resolve the
-  behavioral blockers above; two existing FastAPI deprecation warnings remain.
-- **Next:** run the committed refactor/harness frozen with OLMo only: N01-N04,
-  N13, N15, N18, N19, deny/cancel, explicit/natural approval, revision and
-  printer-thread cases; include N08/N16 for count/date/QC grounding. The new
-  behavioral batch has not run yet.
-  Report structural remedies for approval intent and truthful state display
-  before implementation; no regex claim detection or silent prose replacement.
-- **Boundary:** Alex approved three commit groups and focused harness repairs.
-  No prompt/threshold tuning, service restarts or deployment. Retired Jeff
-  prototype code is excluded from these commits; its result report is retained.
-  Production remains Tulu with comment writes enabled per Alex's handoff;
-  production was not inspected or changed during this assessment.
+- **Current design:** one balanced shared application base prompt; native schemas
+  replace only their duplicate prose catalog. The checked-in OLMo profile selects
+  `assistant.tools.olmo3_preamble`, its native checkpoint template and `olmo3`
+  parser. There is no concise application mode or short-prompt plugin.
+- **Comment workflow:** one preparation call registers a draft. Exact server cards
+  stay separate from model prose. Both button saves and model-requested text
+  saves are enabled in the local implementation. Text uses the classifier and
+  existing ticket path at **0.75**; Alex accepts its false-approval risk for local
+  comments. Both paths share the atomic claim and saved-card Undo. Authoritative
+  draft state returns to the model. No model-authored messages are replaced.
+  [Implementation and remaining delivery limits](project-comment-cards.md).
+- **Repairs implemented:** one catalog per OLMo request; one native tool-result
+  message; server-tokenized input/output budgeting; no lexical-policy lookup
+  forced after OLMo's strict native no-tool response. Other parsers retain their
+  previous lookup behavior. The omitted-provider planner fallback is repaired.
+  Full base instructions,
+  stored assistant prose, schemas and approval thresholds are preserved. The
+  approved checkpoint `tools | default(none)` startup correction remains; no
+  vLLM edit or monkeypatch. [Causes, repairs and case tables](olmo-integration-repair-20261112.md).
+- **Last completed batch:** nine real OLMo cases, frozen repaired working tree:
+  12 native calls, one approved save out of three save scenarios, no unapproved
+  writes (one classifier check, true approval). Cancellation and greeting worked;
+  project lookup worked through a valid alias. No server context errors. P01's
+  input fell from 7,519 to 3,559 tokens, post-tool from 9,643 to 3,784. All 41
+  preflight token counts matched actual inference usage. Eight preparations
+  delivered cards, including an unwanted wording-only card in N02.
+  Evidence: `tests/behavioral/local/staged-20261112/olmo-integration-repair-v2/`.
+- **Current blockers:** P01/R01 prepare again instead of saving; R01 retains
+  printer chatter. N07's router returned incomplete JSON, then the existing
+  fallback exposed 51 tools (7,236 tokens); the new budget check stopped that
+  request. This fallback still needs repair. C05's follow-up completed: it asks
+  for the missing ID, invents none, but first makes an unnecessary tool-discovery
+  call (the strict no-tool assertion fails). N09 truly
+  cancels but inaccurately implies the draft had been in project history.
+  **Do not promote.** These results do not establish false-approval safety.
+- **Previous full-application gate:** 27 cases plus five controls, 28 native
+  calls, 43 context-overflow HTTP errors, 0/8 saves, no classifier checks. Raw
+  pytest 23/32 was not a behavioral score: failed inference left negative write
+  counts at zero. Retained intact at `olmo-application-template-default/` under
+  the same dated evidence root; the initial failed-start attempt is separate.
+- **Next:** consolidate rendered-prompt tests and package the exact guarded
+  template for explicit launcher use; cover both token budgets, long history
+  and failed routing. Fix the router-error catalog expansion, then rerun the
+  missed-save, revision, grounding and cancellation cases with frozen source.
+  A guarded refusal is not a successful conversation. No additional prompt
+  tuning or full gate has been performed. See the
+  [deployment checklist](deployment-readiness-20261112.md).
+- **Previous behavioral baseline:** `3be57d2` with the short introduction and
+  custom template completed 27 cases: 14 mechanical passes / 13 failures,
+  5/8 intended-save conversations wrote, and N02 made one unapproved write.
+  N09/N10 falsely claimed cancellation; revisions and grounding also failed.
+  [Baseline case evidence](olmo-frozen-gate-20261112.md). Those remain historical,
+  not scores for the current card/prompt integration.
+- **Deterministic checks:** 257 focused backend checks passed from a clean archive
+  of committed source `29af63a`, including opt-in HTTP tests and rendered OLMo
+  prompts with the installed tokenizer. Another 16 template/runtime-snapshot and
+  prompt-observability checks passed. The separate card commit's staged snapshot
+  passed 165 checks. Wrapper: all 126 tests passed. Frontend: build, six mocked
+  Cypress checks and two Node test files passed; desktop/mobile captures inspected.
+  These overlap with earlier runs; do not sum historical totals. This is not the
+  full backend suite or fresh model evidence. Alternate compare/choose card
+  delivery remains unfinished.
+- **Commit checkpoint:** backend `9fb7c1f` (provider default), `026a188` (dual-path
+  cards/Undo), `9071b99` (OLMo integration/budget checks), `29af63a` (isolated gate
+  tooling); wrapper `9013687`; frontend `4d11116`. Documentation is checkpointed
+  separately. Five abandoned Jeff tool-use experiment files remain uncommitted
+  and unused; preserve them outside any release source rather than deleting or
+  staging them to make this worktree clean.
+- **Scope and data:** OLMo only; Tulu and Jeff tool-use arms remain excluded.
+  Real collected examples stay distinct from synthetic/derived evaluation cases.
+  Training-related synthetic generation would use gpt-oss-20b; no DPO/training here.
+  Local commits were authorized and made. No push, deployment, production setting
+  change, existing-service restart, external send or real-database write occurred.
+  Production state is retained from Alex's handoff, not newly inspected. The
+  prior model batch cleaned up its owned GPU services; this commit pass started
+  no model. Its isolated frontend preview was stopped after the browser tests.
 
 ## Historical Checkpoints
 
@@ -83,8 +119,10 @@ useful independently.
 ## Validation Boundary
 
 Unit tests use stubbed inference and synthetic storage. Passing them validates
-the experiment machinery, not model behavior. No fresh model inference, downloads,
-production activation, Slack sends or driver changes are part of this checkpoint.
+the experiment machinery, not model behavior. November 12 included a failed
+startup, a completed full-application run and focused integration repair retests.
+Each has a separate frozen working-tree snapshot and service receipt. None made
+downloads, production changes, Slack sends or driver changes.
 Runtime launchers require already installed software/checkpoints and explicitly
 requested execution. Inspect occupancy first; retain their ownership/cleanup
 receipts and use new output directories rather than replacing prior evidence.

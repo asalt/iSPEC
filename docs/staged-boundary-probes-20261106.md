@@ -1,5 +1,33 @@
 # Staged-note boundary experiments
 
+## Application Integration: November 12
+
+Alex's current decision is one shared application prompt, not a concise mode.
+`service._render_system_prompt_planner` retains the existing base instructions,
+tool-use guidance, model-specific protocol and response format. Native tool
+schemas are sent once through `tools`; the duplicate prose catalog is omitted.
+Direct service calls with tools use the same planner binding as web/Slack chat.
+Classifiers and explicit caller-supplied messages keep their own instructions.
+
+The checked-in OLMo Instruct runtime profile now enables the existing
+`assistant.tools.olmo3_preamble`. The checkpoint's native tokenizer chat template
+and `olmo3` parser are retained. No controller or prompt monkeypatch is needed in
+the application. The ignored historical `boundary_plugin.py` files remain as
+evidence of the old experiments; do not load them when evaluating the app.
+
+The earlier short-introduction scores below are historical, not validation of
+this shared prompt. Deterministic controller-to-wire tests use synthetic SQLite
+and stub only HTTP model responses. At the initial integration checkpoint the
+focused backend suite passed 265 tests; wrapper/release checks passed 52. Later
+real OLMo runs and repairs are recorded in
+[the integration report](olmo-integration-repair-20261112.md); their remaining
+behavioral failures still block promotion.
+`tests/unit/api/test_support_olmo_application.py` verifies the real web/Slack
+controller path, prompt traces, native calls and approval/save outcomes without
+replacing `support.generate_reply` or loading a behavioral prompt plugin.
+The dual approval/card/Undo design and accepted text false-approval risk are
+tracked in [Current Status](evaluation-checkpoints.md#current-status).
+
 ## Promotion Gate: Preregistered November 7
 
 This gate is written before the promotion batch starts. It supersedes further
