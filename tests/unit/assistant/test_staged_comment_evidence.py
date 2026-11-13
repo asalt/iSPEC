@@ -4,7 +4,7 @@ import pytest
 
 from tests.behavioral.staged_comment_evidence import (
     RecordedComment, RecordedDraft, RecordedTurn, assert_comment_counts,
-    TurnExpectation, assert_registered_state,
+    TurnExpectation, assert_registered_state, save_path_evidence,
 )
 
 
@@ -69,3 +69,31 @@ def test_grounding_failure_is_not_a_missed_write():
     with pytest.raises(AssertionError, match="forbidden fact wifi"):
         assert_registered_state(case_id="mixed", turn=recorded_turn(reply="Saved.", drafts=[draft]),
                                 previous=None, expected=TurnExpectation(draft_status="saved", forbidden_facts=("wifi",)))
+
+
+def test_executor_refusal_is_separate_from_model_request_and_classifier():
+    turn = recorded_turn(reply="The save was blocked.")
+    calls = [{"turn": 0, "name": "create_project_comment",
+              "result": {"ok": False, "error_code": "draft_not_presented"}}]
+    evidence, = save_path_evidence(turns=[turn], tool_calls=calls)
+    assert evidence.model_save_requests == 1
+    assert evidence.executor_errors == ("draft_not_presented",)
+    assert evidence.approval_checks == 0
+    assert evidence.saved_comments_total == 0
+    assert not evidence.prior_draft_presented
+
+
+def test_save_path_preserves_partial_evidence_when_tool_raises():
+    evidence, = save_path_evidence(turns=[recorded_turn(reply="")],
+                                  tool_calls=[{"turn": 0, "name": "create_project_comment"}])
+    assert evidence.model_save_requests == 1
+    assert evidence.executor_errors == ()
+
+
+@pytest.mark.parametrize("reply,presented", [("Draft prepared.", False), ("Samples arrived. Save it?", True)])
+def test_scripted_followup_records_whether_draft_was_actually_shown(reply, presented):
+    draft = RecordedDraft(id="d1", text="Samples arrived.", status="pending", comment_id=None)
+    previous = recorded_turn(reply=reply, drafts=[draft])
+    current = recorded_turn(reply="Not saved.", drafts=[draft])
+    _, evidence = save_path_evidence(turns=[previous, current], tool_calls=[])
+    assert evidence.prior_draft_presented == presented

@@ -25,7 +25,7 @@ from ispec.schedule.connect import get_schedule_session
 from tests.behavioral.test_model_runtime_followup_live import isolated_runtime  # noqa: F401
 from tests.behavioral.staged_comment_evidence import (
     RecordedComment, RecordedDraft, RecordedTurn, assert_comment_counts,
-    TurnExpectation, assert_registered_state, response_review,
+    TurnExpectation, assert_registered_state, response_review, save_path_evidence,
 )
 
 
@@ -82,6 +82,7 @@ def test_staged_conversation(isolated_runtime, monkeypatch, tmp_path, case):  # 
     monkeypatch.setattr(support, "run_tool", observed_tool)
     user = _ApiKeyServiceUser(can_write_project_comments=True)
     report = {"case": case.id, "model": os.environ["ISPEC_VLLM_MODEL"],
+              "result_scope": "end_to_end_controller_integration",
               "production": False, "tool_calls": calls,
               "expected_comment_counts": case.comment_counts}
     try:
@@ -111,6 +112,7 @@ def test_staged_conversation(isolated_runtime, monkeypatch, tmp_path, case):  # 
     finally:
         report["turns"] = [asdict(turn) for turn in turns]
         report["response_review"] = response_review(turns=turns)
+        report["save_path"] = [asdict(item) for item in save_path_evidence(turns=turns, tool_calls=calls)]
         (tmp_path / "conversation.json").write_text(json.dumps(report, indent=2, default=str) + "\n")
         print("\nSTAGED " + json.dumps({"case": case.id, "turns": [
             {"assistant": turn.assistant, "comments": turn.comment_count, "checks": turn.save_checks}

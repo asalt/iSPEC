@@ -51,6 +51,35 @@ class TurnExpectation:
     revised: bool = False
 
 
+@dataclass(frozen=True, kw_only=True)
+class SavePathEvidence:
+    """Separate model save requests, executor refusals, checks and stored results."""
+
+    turn: int
+    prior_draft_presented: bool
+    model_save_requests: int
+    executor_errors: tuple[str, ...]
+    approval_checks: int
+    saved_comments_total: int
+
+
+def save_path_evidence(*, turns: list[RecordedTurn], tool_calls: list[dict[str, Any]]) -> list[SavePathEvidence]:
+    """Record the observed stages of each turn's save path for failure diagnosis."""
+    evidence = []
+    for index, turn in enumerate(turns):
+        previous = turns[index - 1] if index else None
+        prior_draft_presented = bool(previous and any(draft.text in previous.assistant
+                                                      for draft in previous.pending_drafts))
+        saves = [call for call in tool_calls if call["turn"] == index and call["name"] == "create_project_comment"]
+        errors = tuple(call["result"]["error_code"] for call in saves
+                       if "result" in call and "error_code" in call["result"])
+        evidence.append(SavePathEvidence(turn=index + 1, prior_draft_presented=prior_draft_presented,
+                                        model_save_requests=len(saves),
+                                        executor_errors=errors, approval_checks=len(turn.save_checks),
+                                        saved_comments_total=turn.comment_count))
+    return evidence
+
+
 def assert_registered_state(*, case_id: str, turn: RecordedTurn, previous: RecordedTurn | None,
                             expected: TurnExpectation) -> None:
     label = f"{case_id}: after {turn.user!r}"
@@ -94,7 +123,8 @@ def assert_comment_counts(*, case_id: str, turns: list[RecordedTurn], expected_c
                   if turn.comment_count != expected]
     if not mismatches:
         return
-    lines = [f"Case {case_id}: comment-count expectation failed", *mismatches,
+    lines = [f"Case {case_id}: end-to-end save expectation failed", *mismatches,
+             "This is a controller integration result; inspect the stages below before assigning a model failure.",
              "Conversation and registered state (these are distinct):"]
     for index, turn in enumerate(turns):
         lines += [f"Turn {index + 1}", f"  User: {turn.user}", f"  Delivered reply: {turn.assistant}",
