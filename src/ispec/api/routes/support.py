@@ -39,6 +39,7 @@ from ispec.assistant.project_comment_approval import (
 from ispec.assistant.project_comment_workflow import (
     COMMENT_WORKFLOW_TOOLS, ProjectCommentWorkflow, comment_workflow_tools,
 )
+from ispec.assistant.project_comment_cards import CardOrigin, ConfirmationCard
 from ispec.assistant.reply_delivery import RETAINED_REPLY, ReplyRetention
 from ispec.assistant.prompt_header import build_prompt_header, prompt_header_enabled
 from ispec.assistant.prompting import estimate_tokens_for_messages, summarize_messages
@@ -391,6 +392,7 @@ class ChatResponse(BaseModel):
     compare: ChatComparePayload | None = None
     responseStatus: Literal["ok", "unavailable"] = "ok"
     retention: ReplyRetention | None = None
+    commentCards: list[ConfirmationCard] = Field(default_factory=list)
 
 
 class ChooseResponse(ChatResponse):
@@ -1510,25 +1512,46 @@ def chat(
         )
     controller_thread_key = support_post_send_thread_key(session.session_id)
     slack_actor = (payload.meta or {}).get("slack")
+    try:
+        card_origin = CardOrigin.for_request(
+            user=user,
+            slack=slack_actor if isinstance(slack_actor, dict) else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
     project_comment_workflow = ProjectCommentWorkflow(
-        core_db=core_db, assistant_db=assistant_db, user=user,
-        session_id=session.session_id, turn_id=int(user_message.id), user_message=payload.message,
+        core_db=core_db,
+        assistant_db=assistant_db,
+        user=user,
+        session_id=session.session_id,
+        turn_id=int(user_message.id),
+        user_message=payload.message,
         settings=ProjectCommentApprovalSettings.from_env(
-            assistant_provider=assistant_provider, state_dir_is_dev=_state_dir_is_dev(),
+            assistant_provider=assistant_provider,
+            state_dir_is_dev=_state_dir_is_dev(),
         ),
-        generate_reply_fn=generate_reply, generate_classifier_reply_fn=generate_classifier_reply,
-        source_actor=str(slack_actor.get("user_id") or "") if isinstance(slack_actor, dict) else "",
+        generate_reply_fn=generate_reply,
+        generate_classifier_reply_fn=generate_classifier_reply,
+        source_actor=(
+            str(slack_actor.get("user_id") or "")
+            if isinstance(slack_actor, dict)
+            else ""
+        ),
+        card_origin=card_origin,
     )
     tool_schemas = comment_workflow_tools(tools=tool_schemas or []) if tool_protocol == "openai" else tool_schemas
     comment_tool_schemas = [
         spec for spec in tool_schemas or [] if spec["function"]["name"] in COMMENT_WORKFLOW_TOOLS
     ]
     project_comment_write_tool_exposed = any(
-        spec["function"]["name"] == "create_project_comment" for spec in comment_tool_schemas
+        spec["function"]["name"] == "prepare_project_comment" for spec in comment_tool_schemas
     )
     project_comment_write_tool_reason = "staged_tool" if project_comment_write_tool_exposed else "not_available"
     project_comment_write_policy_messages = (
-        project_comment_workflow.prompt_messages() if project_comment_write_tool_exposed else []
+        project_comment_workflow.prompt_messages()
+        if project_comment_write_tool_exposed
+        else project_comment_workflow.state_messages()
     )
 
     selected_policy_rule_name: str | None = None
@@ -1977,7 +2000,9 @@ def chat(
         # Tool execution can replace, save, or cancel a draft within this turn.
         # Rebuild current state rather than replaying the turn-start snapshot.
         project_comment_write_policy_messages = (
-            project_comment_workflow.prompt_messages() if project_comment_write_tool_exposed else []
+            project_comment_workflow.prompt_messages()
+            if project_comment_write_tool_exposed
+            else project_comment_workflow.state_messages()
         )
         agent_state = context_payload.get("agent") if isinstance(context_payload.get("agent"), dict) else None
         if agent_state is not None:
@@ -2396,7 +2421,9 @@ def chat(
 
     if reply is None:
         project_comment_write_policy_messages = (
-            project_comment_workflow.prompt_messages() if project_comment_write_tool_exposed else []
+            project_comment_workflow.prompt_messages()
+            if project_comment_write_tool_exposed
+            else project_comment_workflow.state_messages()
         )
         history_for_llm = history_payload + list(round_thread_prompt.messages)
         reply = generate_reply(
@@ -2745,10 +2772,16 @@ def chat(
     session.updated_at = utcnow()
     assistant_db.flush()
 
-    presentation = project_comment_workflow.record_delivery(message=assistant_message) if final_reply.ok else None
+    presentation = (
+        project_comment_workflow.record_delivery(message=assistant_message)
+        if final_reply.ok
+        else None
+    )
     if presentation is not None:
         meta["project_comment_presentation"] = presentation
         meta["project_comment_workflow"]["review_receipt"] = presentation
+    comment_cards = project_comment_workflow.response_cards()
+    meta["project_comment_cards"] = [card.model_dump() for card in comment_cards]
 
     work_bag_entries = build_work_bag_entries_from_tool_calls(
         tool_calls=tool_calls,
@@ -2801,6 +2834,7 @@ def chat(
         message=assistant_message.content,
         responseStatus="ok" if final_reply.ok else "unavailable",
         retention=retention,
+        commentCards=comment_cards,
     )
 
 

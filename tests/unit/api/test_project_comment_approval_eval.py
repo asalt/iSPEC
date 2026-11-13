@@ -210,7 +210,8 @@ def test_prose_does_not_create_pending_action_or_trigger_classifier(
     def generate(**kwargs):
         calls.append(kwargs)
         names = {t["function"]["name"] for t in kwargs.get("tools") or []}
-        assert {"prepare_project_comment", "create_project_comment"} <= names
+        assert {"prepare_project_comment", "show_project_comment_card"} <= names
+        assert "create_project_comment" in names
         assert kwargs.get("tool_choice") is None
         if attempt_write and len(calls) == 1:
             return AssistantReply(content="", provider="test", model="test", tool_calls=[{

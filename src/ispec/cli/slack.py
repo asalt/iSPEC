@@ -1168,6 +1168,10 @@ def _run_socket_mode(args) -> None:
     logger.info("Slack durable inbox ready passive_channels=%s", len(inbox.channels))
 
     app = App(token=cfg.bot_token)
+    from ispec.cli.slack_comment_cards import SlackCommentCards
+
+    comment_cards = SlackCommentCards(server=cfg.ispec_server, api_key=cfg.api_key)
+    comment_cards.register(app=app)
     from slack_sdk.web import WebClient
     from ispec.assistant.slack_thread_fetch import TIMEOUT_SECONDS
 
@@ -1443,6 +1447,13 @@ def _run_socket_mode(args) -> None:
             return
 
         inbox.backend_result(context, payload)
+        comment_cards.publish(
+            payload=payload,
+            client=client,
+            team_id=str(team_id or ""),
+            channel_id=channel,
+            thread_ts=str(thread_ts or ""),
+        )
         compare = payload.get("compare") if isinstance(payload.get("compare"), dict) else None
         message = chat_reply_text(payload)
         if compare is not None:
@@ -1672,6 +1683,13 @@ def _run_socket_mode(args) -> None:
             return
 
         inbox.backend_result(context, payload)
+        comment_cards.publish(
+            payload=payload,
+            client=client,
+            team_id=str(team_id or ""),
+            channel_id=channel,
+            thread_ts=str(reply_thread or ""),
+        )
         compare = payload.get("compare") if isinstance(payload.get("compare"), dict) else None
         message = chat_reply_text(payload)
         if compare is not None:

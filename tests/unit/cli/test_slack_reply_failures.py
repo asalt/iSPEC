@@ -132,6 +132,9 @@ def receiver(monkeypatch, tmp_path):
         def error(self, fn):
             return fn
 
+        def action(self, name):
+            return self.event(name)
+
         def middleware(self, fn):
             middleware.append(fn)
 

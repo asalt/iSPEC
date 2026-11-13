@@ -753,6 +753,8 @@ def project_comment_write_outcome(
             if isinstance(result, dict):
                 outcome["comment_id"] = safe_int_fn(result.get("comment_id"))
                 outcome["project_id"] = safe_int_fn(result.get("project_id")) or outcome.get("project_id")
+        if outcome["status"] == "succeeded" and not outcome["comment_id"]:
+            outcome["status"] = "not_written"
         return outcome
     return outcome
 

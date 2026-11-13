@@ -155,6 +155,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "repo_read_file": ToolScope.staff,
     "create_project_comment": ToolScope.user,
     "prepare_project_comment": ToolScope.user,
+    "show_project_comment_card": ToolScope.user,
     "cancel_project_comment_draft": ToolScope.user,
 }
 
@@ -181,7 +182,7 @@ def assistant_read_only() -> bool:
 
 def assistant_write_error(name: str | None) -> str | None:
     """Deployment restrictions narrow capabilities; they never grant authorization."""
-    if name in {"prepare_project_comment", "cancel_project_comment_draft"}:
+    if name in {"prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
         name = "create_project_comment"
     if not tool_writes_data(name):
         return None
@@ -1958,8 +1959,9 @@ def tool_prompt(*, tool_names: set[str] | None = None) -> str:
     )
     add("search_api", "- search_api(query: str, limit: int = 10)  # search FastAPI/OpenAPI endpoints")
     if allowed is not None and "prepare_project_comment" in allowed:
-        add("prepare_project_comment", "- prepare_project_comment(project_id: int, comment: str)  # register draft and track your reply; include the exact returned comment; returns draft_id; not a saved comment")
-        add("create_project_comment", "- create_project_comment(draft_id: str, confirm: bool)  # save the stored draft after the user approves its presentation in an earlier reply; returns comment_id on success")
+        add("prepare_project_comment", "- prepare_project_comment(project_id: int, comment: str)  # register draft; server displays exact text in a Save/Cancel card; returns draft_id")
+        add("create_project_comment", "- create_project_comment(draft_id: str, confirm: bool)  # classifier-checked text approval; returns actual saved comment ID or refusal")
+        add("show_project_comment_card", "- show_project_comment_card(draft_id: str)  # show confirmation card; the person clicks Save; this tool never writes a comment")
         add("cancel_project_comment_draft", "- cancel_project_comment_draft(draft_id: str)  # discard a pending draft, not a saved comment")
     else:
         add(
@@ -2274,12 +2276,12 @@ def _assistant_list_tools_payload(
             unavailable_reason = (
                 f"Repo tools are unavailable ({repo_reason or 'disabled'})."
             )
-        elif tool_name in _WRITE_TOOL_NAMES or tool_name in {"prepare_project_comment", "cancel_project_comment_draft"}:
+        elif tool_name in _WRITE_TOOL_NAMES or tool_name in {"prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
             if user is None:
                 unavailable_reason = "Authentication required for write tools."
-            elif tool_name in {"create_project_comment", "prepare_project_comment", "cancel_project_comment_draft"} and getattr(user, "can_write_project_comments", True) is not True:
+            elif tool_name in {"create_project_comment", "prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"} and getattr(user, "can_write_project_comments", True) is not True:
                 unavailable_reason = "Project-comment writes are disabled for this service identity."
-            elif uses_explicit_project_access(user) and tool_name not in {"create_project_comment", "prepare_project_comment", "cancel_project_comment_draft"}:
+            elif uses_explicit_project_access(user) and tool_name not in {"create_project_comment", "prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
                 unavailable_reason = "Write access required."
 
         if unavailable_reason is None and scope_err:
@@ -3068,20 +3070,9 @@ def run_tool(
         scope_error = _scope_error(scope, user)
         if scope_error:
             return {"ok": False, "tool": name, "error": scope_error}
-        if name in {"prepare_project_comment", "create_project_comment", "cancel_project_comment_draft"}:
+        if name in {"prepare_project_comment", "create_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
             if project_comment_workflow is not None:
                 result = project_comment_workflow.run(name=name, args=args)
-                saved = result.get("result") or {}
-                if name == "create_project_comment" and result.get("ok") and not saved.get("already_saved"):
-                    # The comment is committed already. A queue failure must not
-                    # turn a successful write into an ambiguous retry request.
-                    try:
-                        saved["legacy_push_enqueue"] = _enqueue_legacy_project_comment_push(
-                            project_id=saved["project_id"], comment_id=saved["comment_id"],
-                            added_by=getattr(user, "username", None),
-                        )
-                    except Exception as exc:
-                        saved["legacy_push_enqueue"] = {"ok": False, "error": type(exc).__name__}
                 return result
             if name != "create_project_comment" or support_session_id:
                 return {"ok": False, "tool": name, "error": "A server-created staged-comment workflow is required for chat writes."}
