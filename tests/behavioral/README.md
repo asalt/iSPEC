@@ -13,6 +13,26 @@ Use this lane for:
 
 These tests are skipped by default.
 
+## Example Provenance
+
+Keep real collected conversations, derived/de-identified cases, and synthetic
+cases distinct in storage, labels, and reports. New case bundles use separate
+`collected/`, `derived/`, and `synthetic/` directories with provenance metadata:
+`origin`, source receipt or parent case IDs, transformation/generator, model
+checkpoint when applicable, and creation date. De-identification creates a
+derived case; retain the original privately rather than relabelling the rewrite
+as collected evidence. Unverified older cases remain `origin: unknown` until
+audited, not presumed real.
+
+Report results separately by origin, including primary **false text saves** and
+their denominator. A unit-test classifier stub that always approves demonstrates
+execution behavior, not a measured model false-approval rate.
+
+Training-related synthetic generation uses **gpt-oss-20b**. Hand-authored synthetic
+unit fixtures test deterministic software invariants and are not training data.
+Do not promote these fixtures into training examples implicitly. DPO remains
+backburnered; this work starts no training or synthetic training-data generation.
+
 The [October 25 OLMo follow-up](../../docs/olmo-vllm-evaluation-2026-10-25.md)
 adds a separate curated holdout directory and an opt-in real-controller fixture
 test. Its experimental Think template is never loaded by ordinary application

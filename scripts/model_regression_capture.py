@@ -26,11 +26,11 @@ def regression_wire(monkeypatch, request, tmp_path):
         target = urlsplit(url)
         assert any((target.scheme, target.hostname, target.port) ==
                    (e.scheme, e.hostname, e.port) for e in endpoints)
-        assert target.path in {"/health", "/v1/models", "/v1/chat/completions", "/v1/systemone"}
+        assert target.path in {"/health", "/v1/models", "/tokenize", "/v1/chat/completions", "/v1/systemone"}
         kwargs["allow_redirects"] = False
         if method.upper() != "POST":
             return original(session, method, url, **kwargs)
-        if len(rows) >= 25:
+        if target.path != "/tokenize" and sum(row["path"] != "/tokenize" for row in rows) >= 25:
             pytest.fail("Per-case inference budget of 25 exhausted")
         row = {"path": target.path, "request": copy.deepcopy(kwargs.get("json"))}
         rows.append(row)
