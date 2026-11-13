@@ -281,7 +281,9 @@ def _native_tool_protocol() -> str:
 
 
 def _planner_tool_protocol_block(*, tools_available: bool, provider: str | None = None) -> str:
-    normalized_provider = str(provider or _assistant_provider()).strip().lower()
+    normalized_provider = str(
+        provider or os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub"
+    ).strip().lower()
     if tools_available:
         if normalized_provider == "ollama" or (normalized_provider == "vllm" and vllm_tool_parser() != "llama3_json"):
             return _native_tool_protocol()
