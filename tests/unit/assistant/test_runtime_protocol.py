@@ -305,11 +305,11 @@ def test_tokenization_receives_complete_request_and_records_exact_budget(transpo
 
 
 def test_native_template_renders_one_catalog_and_one_tool_result():
-    from pathlib import Path
     from jinja2 import Environment
+    from ispec.assistant.chat_templates import chat_template_path
     from ispec.assistant.vllm_protocol import with_single_system
 
-    template = Path(__file__).parents[2] / "behavioral/data/model_followup_20261025/olmo_instruct_tools_defined.jinja"
+    template = chat_template_path(name="olmo3")
     messages = with_single_system([
         {"role": "system", "content": "Base"},
         {"role": "system", "content": "Current state"},

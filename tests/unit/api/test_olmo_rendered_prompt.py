@@ -19,6 +19,7 @@ import pytest
 
 from ispec.api.routes import support
 from ispec.assistant import service
+from ispec.assistant.chat_templates import chat_template_path
 from ispec.schedule.connect import get_schedule_session
 from tests.unit.api.test_support_olmo_application import (  # noqa: F401
     ScriptedModel,
@@ -29,11 +30,8 @@ from tests.unit.assistant.test_project_comment_cards import (  # noqa: F401
     conversation,
 )
 
-# Pinned upstream template plus the tools default guard (see test_olmo_eval_template.py).
-TEMPLATE = (
-    Path(__file__).resolve().parents[2]
-    / "behavioral/data/model_followup_20261025/olmo_instruct_tools_defined.jinja"
-)
+# The same verified application resource selected by the runtime launcher.
+TEMPLATE = chat_template_path(name="olmo3")
 TOKENIZER = Path(
     os.getenv("ISPEC_OLMO_TOKENIZER")
     or "/mnt/e/ispec-model-cache/olmo3-instruct-6e5971d9/tokenizer.json"

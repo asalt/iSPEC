@@ -35,12 +35,13 @@ The dropped Jeff tool-use experiment remains uncommitted, outside this series.
 
 ## Before Deployment
 
-1. **Make the template deployable.** Move the exact upstream-plus-`tools`-default
-   template into packaged application resources and resolve it from the launchers
-   with explicit `--chat-template`. Tests and services must use the same bytes/hash.
-   Currently the successful runner uses a repaired local checkpoint template;
-   the matching committed copy lives under behavioral fixtures. Merely choosing
-   the model profile does not ship that local cache correction.
+1. **Review the template packaging diff.** The exact native-plus-`tools`-default
+   template is now an application resource, resolved by dev/evaluation launchers
+   with explicit `--chat-template` and hash verification. Rendering tests use the
+   same file. An offline wheel check verified 265 source/resource files and loaded
+   all 65 prompts from the extracted wheel. These additions remain uncommitted;
+   the production service still needs a separately reviewed launcher change.
+   [Packaging details and reproduction](olmo-template-packaging.md).
 2. **Finish integration coverage.** Consolidate the test renderer, replace the
    fixed tokenizer stub in rendered-controller tests, and test long history and
    router failure against both the 6,000 input budget and context/output reserve.
@@ -48,15 +49,18 @@ The dropped Jeff tool-use experiment remains uncommitted, outside this series.
    conversation is not a success. Compare/choose card delivery also needs coverage
    before enabling that path.
 3. **Resolve behavior, then rerun selected cases.** P01/R01 re-prepare instead of
-   saving, R01 includes printer chatter, N07 expands a failed router to 51 tools,
-   and N09 describes a real cancellation inaccurately. Keep approval thresholds
+   saving, R01 includes printer chatter, and N09 describes a real cancellation
+   inaccurately. N07's whitespace generation and full-catalog fallback are now
+   repaired locally; replaying its full revision conversation remains necessary.
+   [November 13 evidence](router-repair-20261113.md). Keep approval thresholds
    and permission checks unchanged. The repaired run's zero unapproved writes
    included only one true-approval classifier call; it is not negative-safety proof.
 4. **Prepare an explicit runtime release.** The tracked production service is
    still Tulu/checkpoint/parser-specific. Prepare a reviewed OLMo configuration
    and retain a tested Tulu rollback; do not blindly apply these shared prompt/
    workflow changes to the current production Tulu and assume equivalence. Recheck
-   amms06 occupancy and the previously reported driver/reboot issue before startup.
+   amms06 occupancy after its pending reboot before startup. Alex reports the
+   driver upgrade is complete; this pass did not access or start anything there.
 5. **Stage from clean exact commits.** The existing `deploy/mariana/stage.py`
    requires clean wrapper/backend/frontend sources and a matching frontend build
    receipt. Use clean release checkouts, leaving abandoned experiments untouched
