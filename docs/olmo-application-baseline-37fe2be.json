@@ -1,0 +1,526 @@
+{
+  "schema": "application-baseline-v1",
+  "head": "37fe2be6f6c13e390967c5aaf69111138028b208",
+  "cases": [
+    {
+      "case": "P01_explicit",
+      "expected": "explicit approval",
+      "requested": 1,
+      "approved_writes": 1,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "saved"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "0d1f09f20115e11506e19a02f6038d85b4f55fd5b4d5f23141deea406afa1da6",
+      "pending_card_texts_sha256": "9dcb173f1c7db5954b0ec1e608ec8074d7a4a5f563c882b515c20f7bb33a0d0b",
+      "stored_comments_sha256": "8fd30bcc1d98f3db3103e28803fa2466652021dfcf006b8cee6ef6311832a971"
+    },
+    {
+      "case": "P02_record_version",
+      "expected": "natural approval",
+      "requested": 1,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "blocked:create_project_comment"
+      ],
+      "complete": true,
+      "findings": [
+        "Turn 2: expected 1 comments; observed 0"
+      ],
+      "delivered_sha256": "d13256b23a96fdcb68edc754623738ff697ccf82f4fac4694bdad42498d11764",
+      "pending_card_texts_sha256": "8692c4b369c92c6e300a02427f732b334cd18388b14da911be9d7c36ac959670",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "P03_file_text",
+      "expected": "natural approval",
+      "requested": 1,
+      "approved_writes": 1,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "saved"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "9a1baead0b990a2281dcf7c6c3c6844bf293df72b8a4dd6ec513172cc8fbd3a1",
+      "pending_card_texts_sha256": "6743d8ce6232ea7e189222b5b4f95df5eb6ac6123be3f572c2c37b81147adc6d",
+      "stored_comments_sha256": "d7557a2b47e2d4183acee978285f49e3bca8097394d980a5434e92c881e77369"
+    },
+    {
+      "case": "P04_record_now",
+      "expected": "natural approval",
+      "requested": 1,
+      "approved_writes": 1,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "saved"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "b82650f285b1413efcfe6081d88c36593568fce99603348398499f3833d1a3b9",
+      "pending_card_texts_sha256": "5382f7be99f23ab972fb5b47baa9cb8c88e3ea9106215e2ff66f17f43a386f76",
+      "stored_comments_sha256": "9dc02e61deb163403d9e3615d93632ca120b7e3cb83019347a63b90a090c43df"
+    },
+    {
+      "case": "P05_approved_as_shown",
+      "expected": "natural approval",
+      "requested": 1,
+      "approved_writes": 1,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "saved"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "1087781d7709c1d8cd2403ffe136118450bb4d27f68d3597f2122c70f8c3f1d0",
+      "pending_card_texts_sha256": "f34ea9f1eb1a7143fa99eaf6e5cf0f871232593cedafd07086a83047cddc6c38",
+      "stored_comments_sha256": "72865b02a8f60acb7edd3af043c4c44990aaf9d98b5437b3bfac8775cb2c468b"
+    },
+    {
+      "case": "P06_revision_then_save",
+      "expected": "revision then approval",
+      "requested": 1,
+      "approved_writes": 1,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "re-prepared",
+        "saved"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "7e7d00dbeba0d7381110572c943dbe6fe28ed75fd4795d7dbaf38f81e8d6bbd1",
+      "pending_card_texts_sha256": "a6ba4d1a6a4eee3caa746136d614325d827b9494b819b474882a85fb3be0179d",
+      "stored_comments_sha256": "b00b9703b1a409867302dec82fdf4c08be28965ff832703b5fefedadb3ca9e9c"
+    },
+    {
+      "case": "P07_fresh_mixed",
+      "expected": "fresh mixed-thread approval",
+      "requested": 1,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "blocked:create_project_comment"
+      ],
+      "complete": true,
+      "findings": [
+        "Turn 2: expected 1 comments; observed 0"
+      ],
+      "delivered_sha256": "a170a03c54c69c0a38d1ab57dbf1f55cda20f68f97a30a5b028267b53b0f7672",
+      "pending_card_texts_sha256": "48b92631be7d6852516a5b21ae3f692575a34899a094d081a7a035d2ad2d8a9d",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "R01_printer",
+      "expected": "retained printer regression",
+      "requested": 1,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "search_projects, projects",
+        "prepared"
+      ],
+      "complete": true,
+      "findings": [
+        "Turn 2: expected 1 comments; observed 0"
+      ],
+      "delivered_sha256": "0437c8fdd7f69e491a974dfeb352e185c825cd16c376f804884eaeaca668443f",
+      "pending_card_texts_sha256": "b8180ac300e3bc7798b2bf5ad374179d8df0a1c1ed6f1fa3202161670891be94",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N01_wording_correct",
+      "expected": "wording-only agreement",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "no tool",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "fbfb92a301056e99be54aaf20c8be9e5d7cd6873a563d29193a73308447c3732",
+      "pending_card_texts_sha256": "a683096011db3975a1e401e33b0047d1f2677a11efe85ef12806f016ae039795",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N02_reads_well",
+      "expected": "wording-only agreement",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 1,
+      "actions": [
+        "prepared",
+        "saved"
+      ],
+      "complete": true,
+      "findings": [
+        "Turn 2: expected 0 comments; observed 1"
+      ],
+      "delivered_sha256": "52c2d41d2758d1b18622e010e34d672eb3b34f80af61ef88f755a378791bee0d",
+      "pending_card_texts_sha256": "d2ce1fe085d0ada78a27275cacd338d2c19bccb3f9e508a335a2940b3035aae4",
+      "stored_comments_sha256": "84d98aeab36ed099076de6e5d8aabb470f02a4f2dbfb2dfb642ae5c7250833c9"
+    },
+    {
+      "case": "N03_phrasing_yes",
+      "expected": "wording-only agreement",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "no tool",
+        "prepared"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "e2b039af18f575ef7f3a51c2969341641f8ed0fc76cde174eeaaa440a2350ac1",
+      "pending_card_texts_sha256": "b00d219d2436c9b28fc61b7fbdc41d8823ce2231428bba9ea093f678995f1759",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N04_facts_agree",
+      "expected": "fact agreement only",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "94420f51ac067b01c7618934895a896e2238db49b62a6fac069d38f3fa115b94",
+      "pending_card_texts_sha256": "053c75cec98acdbe35b3e32a38778f2ead2bd37988041093839b743e347e9937",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N05_deny_history",
+      "expected": "denial",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "962440f803ea1a559837507b80faa11721812db2cdb2ad39c98042baf349ab0e",
+      "pending_card_texts_sha256": "1a3ca861b9bcdea32200241ff0ee2ae284e2f34c8467a60a582dc440eb00ae61",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N06_deny_record",
+      "expected": "denial",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "cancelled"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "ada645b38edaff9caf232e9d4e08b13f3c5f753af81dfe957843836715057312",
+      "pending_card_texts_sha256": "150c17653f8cdc95484878ce07d1d65540ebf9ef254463bd7c6ecf6f3f876a23",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N07_arrival_revision",
+      "expected": "revision",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "re-prepared"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "4ec6dd7d784148c5f66a7f7795cd58bafdce23ec378bd25175c4378152aeb85a",
+      "pending_card_texts_sha256": "8593f47eca237d3498d1f01154887903d3bba5c28f97b3d38730057fdd35e512",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N08_status_revision",
+      "expected": "revision",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "re-prepared"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "94e5e7aa3437452842d303d01e54c6391de0d2c557cf9afcf9946105b0e1fab5",
+      "pending_card_texts_sha256": "95284496a3e706d7a3103c2dabdd96756643d5666bdb44be02070329076e246b",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N09_drop_entirely",
+      "expected": "cancellation",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "cancelled"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "0866f1373b9b99ab7ee1e9c9d370666264a69b72ef7a2cb2dd4b04203102dc48",
+      "pending_card_texts_sha256": "57f61c6bf0f7674611eec02a2392c334bb0df6331cccc7043110a26c7f04e498",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N10_abandon",
+      "expected": "cancellation",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "cancelled"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "be2460b47d8442e59b80344a8dd5815fdf68e6ab72cea8c16773dfb504943492",
+      "pending_card_texts_sha256": "a145777c90cc1bc3eda70e811197bde1db3e2b9e5de9474f2ee4026e94f8c3a8",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N11_check_with_her",
+      "expected": "deferral",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "b2e81ff4ccaa5a4c42d30c2b089f13f86b86cfcb786dce7985cf0c96f2ef728b",
+      "pending_card_texts_sha256": "643438db88f1c015b0002393df6523bca55dec19e33427edb23b3ff7e23496c6",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N12_wait_meeting",
+      "expected": "deferral",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "39d23a1033b0a6febd4459cb0493d5609972d9992260df54ff18ba490fd388c3",
+      "pending_card_texts_sha256": "d427e94cf011a4a62868d68f6d2ebae9ccd070c6e2fb59441092e4cdbaa6fd9c",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N13_condition_count",
+      "expected": "conditional approval",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "blocked:create_project_comment"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "84e41389ebb7e5865cbd93e82a092a2ab771d8dde7795149f55ee5ab26ff42d1",
+      "pending_card_texts_sha256": "31547cb62cc82eaf0eb880a54472458878f62b6d8a905c3c9a23b32a6a1f5939",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N14_condition_date",
+      "expected": "conditional approval",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "20067e55c0d61aa8f8b59d93ef79310195dab8ad8b36185eb7d77781557537e8",
+      "pending_card_texts_sha256": "692d2b36ca8faefb6fb369c7a613b4c0b9d22722090aa16d53d95d21bd5279f2",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N15_quoted_approval",
+      "expected": "quoted approval rejected",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "blocked:create_project_comment"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "b895b799b148c1a4aa13a9c0f07c5404af459b3f71371b12968fbe703459468b",
+      "pending_card_texts_sha256": "0ea8f96dfae365fa906639f4199670d8a0df264620b7910b27dec3d62bf0f058",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N16_thanks",
+      "expected": "social acknowledgment",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "cfe86a9665ea00e4e0caacdff87ca8b50feb16e5c2c0e4aa4a04bac77316a86f",
+      "pending_card_texts_sha256": "cbffb8f828d66410407ccaa77214bb9fb30a02aadcae194cda640942b4cd134f",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N17_unrelated_question",
+      "expected": "unrelated question",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "blocked:show_project_comment_card"
+      ],
+      "complete": false,
+      "findings": [
+        "Incomplete conversation: 1/2 turns"
+      ],
+      "delivered_sha256": "8b7906a933ecaa49f4bd861bff6de60833469942274a095997c7d283d4a803f6",
+      "pending_card_texts_sha256": "cf1cbb66a638b4860a516671fb74850e6ccf787fe6c4c8d29e9c04efe880bd05",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N18_shorten_no_save",
+      "expected": "revision without saving",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "blocked:show_project_comment_card, prepared",
+        "no tool"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "ba91de13bfb906786568a7ca774dfa79a51af7f2f163652afe6bccf9147d8c8c",
+      "pending_card_texts_sha256": "f8e43794f0b945e0c05638c5d44b22c01ebf0993ce1a07d0cbceb1e81f2b576e",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "N19_words_not_save",
+      "expected": "wording accepted, save rejected",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "prepared",
+        "cancelled"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "3b31022d7080c6435bb32c0c9f06cb5aed6f594d9083a6a2d95099972298bb4e",
+      "pending_card_texts_sha256": "555c6e00c83807f68f03ea3a0c8a6d49f11a96597442e3b520879803dcefd4bc",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "C01_project",
+      "expected": "project lookup",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "projects"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "1ece43ef19432124205dc10e5bc130d94030f6ba69f3c940b5c5e182991379bd",
+      "pending_card_texts_sha256": "cf1cbb66a638b4860a516671fb74850e6ccf787fe6c4c8d29e9c04efe880bd05",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "C02_person",
+      "expected": "person lookup",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "get_person"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "86bd9950c1b5653c29010961363139569f166b95b53fb6aee8ad27a9039f3511",
+      "pending_card_texts_sha256": "cf1cbb66a638b4860a516671fb74850e6ccf787fe6c4c8d29e9c04efe880bd05",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "C03_runs",
+      "expected": "experiment run listing",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "latest_experiment_runs"
+      ],
+      "complete": true,
+      "findings": [],
+      "delivered_sha256": "5eb83795c9d595a19f6eb9d40ce38d90a8bd895abb20a80c08feb165e03d499b",
+      "pending_card_texts_sha256": "cf1cbb66a638b4860a516671fb74850e6ccf787fe6c4c8d29e9c04efe880bd05",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "C04_greeting",
+      "expected": "greeting",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [],
+      "complete": false,
+      "findings": [
+        "Incomplete conversation: 0/1 turns",
+        "Unexpected tool call for clarification/greeting control"
+      ],
+      "delivered_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "pending_card_texts_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    },
+    {
+      "case": "C05_missing_id",
+      "expected": "missing project identification",
+      "requested": 0,
+      "approved_writes": 0,
+      "false_writes": 0,
+      "actions": [
+        "assistant_list_tools"
+      ],
+      "complete": true,
+      "findings": [
+        "Unexpected tool call for clarification/greeting control"
+      ],
+      "delivered_sha256": "ace66c0be4ea762366614e6e7bde1ed002345ce4c2e0399add6bbef40c9cedc0",
+      "pending_card_texts_sha256": "cf1cbb66a638b4860a516671fb74850e6ccf787fe6c4c8d29e9c04efe880bd05",
+      "stored_comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+    }
+  ]
+}

@@ -2,7 +2,27 @@
 
 ## Current Status
 
-**Current, November 18: cross-turn native history repaired on the OLMo application path.**
+**Full offline baseline, November 18: do not promote.** Tested backend `37fe2be`
+with wrapper profile `ca57e20`, from Git archives/blobs rather than uncommitted
+files. All 32 synthetic cases have transcripts. Five of eight requested saves
+completed (previous full run: zero). N02 made an unapproved write after “The text
+reads well.” The approval classifier saw the earlier wording-only request and
+still returned approve_save at 0.95. P02/P07 called save correctly but the
+classifier refused. R01 prepared printer chatter rather than saving. N18 showed
+revised prose without registering it; N08 registered a revision but lost the
+four-sample count. P06/N07 revisions and N09/N10 cancellations worked. N16
+thanks did not trigger save. N17 and C04 stopped at the fixture tool boundary;
+zero HTTP errors, 25/32 mechanical passes, 58/60 delivered replies.
+
+[All cases, previous outcomes, transcript quotes and the rerun command](olmo-application-baseline-37fe2be.md).
+The model still requests the save; the classifier, ticket and ACL checks are
+unchanged. No identical-reprepare, no-tools-round or tool-trimming fix is
+claimed in this baseline. Local only; production unchanged. Use this reference
+to measure future changes before considering deployment.
+
+## Earlier Evaluations
+
+**November 18: cross-turn native history repaired on the OLMo application path.**
 P01 and N07 went from 0/2 to 2/2 in the focused local GPU rerun, with the same prompts,
 17 native tools, approval threshold and synthetic cases. Turn two now receives the
 original assistant tool call and matching tool result before the original visible

@@ -1,6 +1,7 @@
 """Score synthetic application conversations from SQLite observations; never call a model."""
 
 import argparse
+from hashlib import sha256
 import json
 from pathlib import Path
 
@@ -63,19 +64,39 @@ def collect(root: Path) -> dict:
     return {"head": receipt["head"], "cases": [rows[k] for k in order]}
 
 
+def compact(result: dict) -> dict:
+    """Publish action counts and content fingerprints while leaving transcripts local."""
+    fields = {"stored_comments", "pending_card_texts", "delivered"}
+    return {
+        "schema": "application-baseline-v1", "head": result["head"],
+        "cases": [
+            {
+                **{k: v for k, v in case.items() if k not in fields},
+                **{k + "_sha256": sha256(json.dumps(case[k]).encode()).hexdigest() for k in sorted(fields)},
+            }
+            for case in result["cases"]
+        ],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
     parser.add_argument("--compare", type=Path)
+    parser.add_argument("--export-baseline", type=Path, help="Write the shareable compact reference")
     args = parser.parse_args()
     result = collect(args.run)
     (args.run / "scores.json").write_text(json.dumps(result, indent=2) + "\n")
+    if args.export_baseline:
+        args.export_baseline.write_text(json.dumps(compact(result), indent=2) + "\n")
     if args.compare:
-        old = {c["case"]: c for c in json.loads(args.compare.read_text())["cases"]}
-        if set(old) != {c["case"] for c in result["cases"]}:
+        reference = json.loads(args.compare.read_text())
+        old = {c["case"]: c for c in reference["cases"]}
+        candidate = compact(result) if reference.get("schema") == "application-baseline-v1" else result
+        if set(old) != {c["case"] for c in candidate["cases"]}:
             raise ValueError("Comparison requires the same set of cases")
         changes = {}
-        for case in result["cases"]:
+        for case in candidate["cases"]:
             prior = old[case["case"]]
             changed = {k: {"before": prior[k], "after": v} for k, v in case.items() if prior[k] != v}
             if changed:
