@@ -52,3 +52,5 @@ def regression_wire(monkeypatch, request, tmp_path):
         (tmp_path / "wire.json").write_text(json.dumps({
             "nodeid": request.node.nodeid, "calls": rows,
         }, indent=2, default=str) + "\n")
+        from scripts.wire_transcript import render
+        render(tmp_path / "wire.json")

@@ -267,6 +267,8 @@ def main():
         except (ValueError, KeyError, IndexError) as error:
             result["evaluation_error"] = str(error)
         (folder / "wire.json").write_text(json.dumps({"calls": calls}, indent=2) + "\n")
+        from scripts.wire_transcript import render
+        render(folder / "wire.json")
         (folder / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         summary.append(result)
         (args.output / "results.json").write_text(json.dumps(summary, indent=2) + "\n")

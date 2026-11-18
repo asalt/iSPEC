@@ -11,11 +11,12 @@ import shutil
 import subprocess
 import sys
 import time
+import tarfile
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from scripts.run_model_regression import endpoint, stop
+from scripts.run_model_regression import endpoint, stop  # noqa: E402
 
 CHECKPOINT = Path("/mnt/e/ispec-model-cache/olmo3-instruct-6e5971d9")
 GPU_PYTHON = "/home/alex/venvs/py3.12/bin/python"
@@ -25,9 +26,29 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def snapshot(*, output: Path) -> tuple[Path, dict]:
+def snapshot(*, output: Path, committed: bool = False) -> tuple[Path, dict]:
     """Copy Git-listed working files, including untracked application additions."""
     source = output / "source"
+    if committed:
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        wrapper = ROOT.parent
+        wrapper_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=wrapper, text=True).strip()
+        with subprocess.Popen(["git", "archive", head], cwd=ROOT, stdout=subprocess.PIPE) as proc:
+            with tarfile.open(fileobj=proc.stdout, mode="r|") as archive:
+                archive.extractall(source, filter="data")
+            if proc.wait():
+                raise RuntimeError("Could not export committed backend")
+        profile = output / "model-profile.env"
+        profile.write_bytes(subprocess.check_output(
+            ["git", "show", f"{wrapper_head}:configs/models/olmo7b-instruct-vllm.env"], cwd=wrapper,
+        ))
+        manifest = {
+            "head": head, "wrapper_head": wrapper_head, "snapshot_kind": "git_archive",
+            "source": str(source), "profile_sha256": digest(profile),
+            "files": {str(p.relative_to(source)): digest(p) for p in source.rglob("*") if p.is_file()},
+        }
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return source, manifest
     names = subprocess.check_output(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=ROOT,
     ).decode().split("\0")
@@ -60,6 +81,35 @@ def read_profile(path: Path) -> dict[str, str]:
                 if line.strip() and not line.startswith("#"))
 
 
+def resolve_chat_template(*, source: Path, python: str, profile: dict[str, str]) -> Path:
+    """Resolve the reviewed template from the frozen source, not the model cache."""
+    resolved = subprocess.check_output(
+        [python, str(source / "src/ispec/assistant/chat_templates.py"),
+         profile["VLLM_CHAT_TEMPLATE_NAME"]],
+        text=True,
+    ).strip()
+    return Path(resolved)
+
+
+def server_command(
+    *, source: Path, python: str, checkpoint: Path, profile: dict[str, str],
+    template: Path, fd: int, port: int,
+) -> list[str]:
+    """Build the exact isolated server command retained in its launch receipt."""
+    command = [
+        python, str(source / "scripts/run_model_regression.py"), "--vllm-child", str(fd),
+        "--model", str(checkpoint), "--served-model-name", profile["ISPEC_VLLM_MODEL"],
+        "--host", "127.0.0.1", "--port", str(port), "--dtype", profile["VLLM_DTYPE"],
+        "--max-model-len", profile["VLLM_MAX_MODEL_LEN"], "--max-num-seqs", "1",
+        "--gpu-memory-utilization", "0.8", "--enforce-eager", "--attention-backend", "TRITON_ATTN",
+        "--generation-config", "vllm", "--enable-auto-tool-choice", "--tool-call-parser", "olmo3",
+        "--chat-template", str(template), "--no-enable-log-requests",
+    ]
+    if profile.get("VLLM_STRUCTURED_OUTPUTS_CONFIG"):
+        command.extend(["--structured-outputs-config", profile["VLLM_STRUCTURED_OUTPUTS_CONFIG"]])
+    return command
+
+
 def verify_inference(*, port: int, model: str) -> dict:
     """Require a real generated reply before starting the behavioral batch."""
     payload = {
@@ -85,6 +135,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--cases", nargs="+", help="Exact case IDs for a focused retest")
+    parser.add_argument("--head", action="store_true", help="Export committed backend and wrapper profile")
+    parser.add_argument("--compare", type=Path, help="Compare application outcomes against a saved scores.json")
+    parser.add_argument("--directory-test", action="store_true", help="Isolated eight-case read-only directory batch")
     options = parser.parse_args()
     output = options.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -93,15 +146,30 @@ def main() -> None:
     ).strip()
     if occupancy:
         raise RuntimeError("Existing GPU compute workload; refusing startup")
-    source, manifest = snapshot(output=output)
-    shutil.copy2(CHECKPOINT / "chat_template.jinja", output / "chat_template.jinja")
+    if options.compare and (options.directory_test or not options.compare.is_file()):
+        parser.error("--compare needs an existing application baseline scores file")
+    source, manifest = snapshot(output=output, committed=options.head)
+    test_node = "tests/behavioral/test_olmo_application_live.py::test_application_conversation"
+    if options.directory_test:
+        from tests.behavioral.directory_fixture import adapt_snapshot
+        route = source / "src/ispec/api/routes/support.py"
+        adapt_snapshot(route)
+        manifest["files"]["src/ispec/api/routes/support.py"] = digest(route)
+        manifest["test_adapter"] = "directory_fixture.adapt_snapshot"
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        test_node = "tests/behavioral/test_directory_live.py::test_directory"
     profile = read_profile(output / "model-profile.env")
+    template = resolve_chat_template(source=source, python=GPU_PYTHON, profile=profile)
+    shutil.copy2(template, output / "chat_template.jinja")
     gate_cases = json.loads((source / "tests/behavioral/data/staged_promotion_20261107.json").read_text())["cases"]
     turn_counts = {case["id"]: len(case["messages"]) for case in gate_cases}
     turn_counts.update({name: 1 for name in (
         "C01_project", "C02_person", "C03_runs", "C04_greeting", "C05_missing_id",
     )})
     selected = options.cases or list(turn_counts)
+    if options.directory_test:
+        turn_counts = {f"D{i}": 1 for i in range(1, 9)}
+        selected = options.cases or list(turn_counts)
     unknown = set(selected) - turn_counts.keys()
     if unknown:
         raise ValueError(f"Unknown cases: {sorted(unknown)}")
@@ -112,7 +180,11 @@ def main() -> None:
         "expected_turns": sum(turn_counts[name] for name in selected), "case_ids": selected,
         "checkpoint": str(CHECKPOINT), "head": manifest["head"], "production": False,
         "services": [], "custom_template": False, "prompt_plugin": None,
-        "template_fix": "Checkpoint template defaults omitted tools to None; no other template edits",
+        "template_fix": "Packaged native template plus the tools default guard; no wording changes",
+        "served_chat_template": {
+            "path": str(template), "sha256": digest(template), "source": "frozen_application_package",
+            "explicit_override": True,
+        },
         "versions": {name: importlib.metadata.version(name)
                      for name in ("vllm", "torch", "transformers", "pytest")},
         "checkpoint_artifacts": {name: digest(CHECKPOINT / name)
@@ -135,15 +207,10 @@ def main() -> None:
     }
 
     def command(fd, port):
-        argv = [
-            GPU_PYTHON, str(source / "scripts/run_model_regression.py"), "--vllm-child", str(fd),
-            "--model", str(CHECKPOINT), "--served-model-name", profile["ISPEC_VLLM_MODEL"],
-            "--host", "127.0.0.1", "--port", str(port), "--dtype", profile["VLLM_DTYPE"],
-            "--max-model-len", profile["VLLM_MAX_MODEL_LEN"], "--max-num-seqs", "1",
-            "--gpu-memory-utilization", "0.8", "--enforce-eager", "--attention-backend", "TRITON_ATTN",
-            "--generation-config", "vllm", "--enable-auto-tool-choice", "--tool-call-parser", "olmo3",
-            "--no-enable-log-requests",
-        ]
+        argv = server_command(
+            source=source, python=GPU_PYTHON, checkpoint=CHECKPOINT, profile=profile,
+            template=template, fd=fd, port=port,
+        )
         receipt["server_command"] = argv
         record()
         return argv
@@ -173,7 +240,7 @@ def main() -> None:
             receipt["test_env"] = env
             receipt["test_command"] = [
                 GPU_PYTHON, "-m", "pytest",
-                *[f"tests/behavioral/test_olmo_application_live.py::test_application_conversation[{name}]"
+                *[f"{test_node}[{name}]"
                   for name in selected],
                 "-p", "scripts.model_regression_capture", "--run-behavioral", "-q", "-s", "--tb=short",
                 "--basetemp=" + str(folder / "pytest"), "--junitxml=" + str(folder / "results.xml"),
@@ -209,6 +276,12 @@ def main() -> None:
             "state": receipt["state"], "test_exit_code": receipt.get("test_exit_code"),
             "output": str(output),
         }), flush=True)
+    if not options.directory_test:
+        command = [sys.executable, str(source / "scripts/score_olmo_application.py"), str(output)]
+        if options.compare:
+            command.extend(["--compare", str(options.compare.resolve())])
+        subprocess.run(command, check=True)
+    raise SystemExit(receipt["test_exit_code"])
 
 
 if __name__ == "__main__":
