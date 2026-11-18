@@ -32,6 +32,7 @@ from ispec.assistant.controller import (
 from ispec.assistant.formatting import split_compare_finals, split_plan_final
 from ispec.assistant.memory import update_state_from_message
 from ispec.assistant.models import SupportMessage, SupportSession
+from ispec.assistant import native_history
 from ispec.assistant.project_comment_approval import (
     ProjectCommentApprovalSettings,
     project_comment_write_outcome as _project_comment_write_outcome,
@@ -1542,6 +1543,12 @@ def chat(
         card_origin=card_origin,
     )
     tool_schemas = comment_workflow_tools(tools=tool_schemas or []) if tool_protocol == "openai" else tool_schemas
+    history_scope = None
+    if assistant_provider == "vllm" and vllm_tool_parser() == "olmo3" and tool_protocol == "openai":
+        history_scope = native_history.access_key(
+            db=core_db, user=user, actor=project_comment_workflow.actor_key,
+            tool_names=_openai_tool_names(tool_schemas),
+        )
     comment_tool_schemas = [
         spec for spec in tool_schemas or [] if spec["function"]["name"] in COMMENT_WORKFLOW_TOOLS
     ]
@@ -2062,6 +2069,12 @@ def chat(
             tokens += message_tokens
             trimmed_rev.append(item)
         trimmed_history = list(reversed(trimmed_rev))
+        if history_scope and trimmed_history and selected_history:
+            # The budgeted suffix ends with database rows; outbound evidence is a prefix.
+            count = min(len(trimmed_history), len(selected_history))
+            trimmed_history = trimmed_history[:-count] + native_history.replay_history(
+                selected_history[-count:], scope=history_scope, remaining_tokens=max_tokens - tokens,
+            )
         history_for_llm = trimmed_history + list(round_thread_prompt.messages)
 
         messages_for_llm: list[dict[str, Any]] = [
@@ -2670,6 +2683,16 @@ def chat(
     if final_prompt_stage:
         meta["prompt_stage"] = final_prompt_stage
     meta["tool_calls"] = tool_calls
+    if history_scope and tool_messages:
+        exchanges = native_history.recent_exchanges(
+            native_history.complete_exchanges(tool_messages), budget=native_history.MAX_RETAINED_TOKENS,
+        )
+        if exchanges:
+            meta["native_history"] = {
+                "scope": history_scope,
+                "user_message_id": user_message.id,
+                "messages": exchanges,
+            }
     prompt_header_configured = prompt_header_enabled()
     if prompt_header_configured or prompt_header_error:
         meta["prompt_header"] = {

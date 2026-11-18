@@ -18,7 +18,7 @@ from ispec.schedule.connect import get_schedule_session
 from scripts.staged_prompt_trace import WireRequest
 from tests.unit.assistant.test_project_comment_cards import (
     NOTE,
-    conversation,
+    conversation,  # noqa: F401 (pytest fixture)
 )  # noqa: F401
 
 
@@ -102,15 +102,24 @@ class ScriptedModel:
             self.draft_id = result["draft_id"]
             return {"content": "The note is ready for review."}
         if self.tool_round == 3:
-            assert self.draft_id
+            roles = [message.role for message in request.messages]
+            assert roles == ["system", "user", "assistant", "tool", "assistant", "user"]
+            _, _, preparation, receipt, delivered, approval = request.messages
+            call, = preparation.tool_calls
+            assert call.function.name == "prepare_project_comment"
+            assert receipt.tool_call_id == call.id
+            assert delivered.content == "The note is ready for review."
+            assert approval.content == "Yes, save that exact note."
+            stored_id = loads(receipt.content)["result"]["draft_id"]
+            assert stored_id == self.draft_id
             return self.call(
                 name="create_project_comment",
-                arguments={"draft_id": self.draft_id, "confirm": True},
+                arguments={"draft_id": stored_id, "confirm": True},
             )
 
         assert self.tool_round == 4
         result_message = next(
-            message for message in request.messages if message.role == "tool"
+            message for message in reversed(request.messages) if message.role == "tool"
         )
         outcome = loads(result_message.content)
         text = (
@@ -180,7 +189,7 @@ def application_settings(monkeypatch, tmp_path):
     ],
 )
 def test_real_controller_uses_application_olmo_prompts(
-    conversation,
+    conversation,  # noqa: F811 (pytest fixture)
     application_settings,
     monkeypatch,
     tmp_path,
@@ -281,7 +290,7 @@ def test_real_controller_uses_application_olmo_prompts(
 
 @pytest.mark.parametrize("parser", ["olmo3", "llama3_json"])
 def test_clarification_bypasses_policy_lookup_only_for_olmo(
-    conversation, application_settings, monkeypatch, tmp_path, parser,
+    conversation, application_settings, monkeypatch, tmp_path, parser,  # noqa: F811
 ):
     monkeypatch.setenv("ISPEC_VLLM_TOOL_CALL_PARSER", parser)
     answer = "Which project do you mean? Please provide its ID or name."

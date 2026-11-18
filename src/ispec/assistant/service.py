@@ -367,12 +367,24 @@ def _render_system_prompt_planner(
     response_format: ResponseFormat = "single",
     tool_names: set[str] | None = None,
 ) -> RenderedPrompt:
+    native_olmo = (
+        tools_available and tool_names is not None
+        and os.getenv("ISPEC_ASSISTANT_PROVIDER", "").strip().lower() == "vllm"
+        and vllm_tool_parser() == "olmo3"
+    )
+    tool_use = _planner_tool_use_block(tool_names=tool_names)
+    if native_olmo:
+        tool_use = (
+            "If the request needs something your current tools do not cover, call "
+            "open_tool_category before saying it is unavailable."
+            if "open_tool_category" in tool_names else ""
+        )
     prompt = load_bound_prompt(
         _system_prompt_planner,
         values={
             "base_prompt": _render_base_system_prompt(),
-            "tool_use_block": _planner_tool_use_block(tool_names=tool_names),
-            "tool_protocol_block": _planner_tool_protocol_block(
+            "tool_use_block": tool_use,
+            "tool_protocol_block": "" if native_olmo else _planner_tool_protocol_block(
                 tools_available=tools_available,
                 provider=(os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub"),
             ),
@@ -383,7 +395,11 @@ def _render_system_prompt_planner(
                 if tools_available and tool_names is not None
                 else tool_prompt(tool_names=tool_names).strip() + "\n"
             ),
-            "response_format_block": _planner_response_format_block(response_format=response_format),
+            "response_format_block": (
+                "" if native_olmo and response_format == "single"
+                else _final_template(response_format=response_format) if native_olmo
+                else _planner_response_format_block(response_format=response_format)
+            ),
         },
     )
     return _apply_prompt_extras(prompt)

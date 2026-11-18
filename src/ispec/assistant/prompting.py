@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+from typing import Any
 from typing import Iterable
 
 
@@ -19,7 +21,7 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
-def estimate_tokens_for_messages(messages: Iterable[dict[str, str]]) -> int:
+def estimate_tokens_for_messages(messages: Iterable[dict[str, Any]]) -> int:
     """Estimate tokens for an OpenAI-style chat `messages` list."""
 
     total = 0
@@ -27,6 +29,9 @@ def estimate_tokens_for_messages(messages: Iterable[dict[str, str]]) -> int:
         role = (message.get("role") or "").strip()
         content = message.get("content") or ""
         total += estimate_tokens(content)
+        if calls := message.get("tool_calls"):
+            total += estimate_tokens(json.dumps(calls, ensure_ascii=False))
+        total += estimate_tokens(message.get("tool_call_id") or "")
         # Small per-message overhead (role/formatting).
         total += 4 if role else 2
     return total
