@@ -150,6 +150,39 @@ def test_explicit_classifier_limit_overrides_profile_default(transport):
     assert captured[0]["max_tokens"] == reply.meta["runtime"]["max_output_tokens"] == 160
 
 
+@pytest.mark.parametrize("parser", ["olmo3", "llama3_json"])
+@pytest.mark.parametrize("constraint", [
+    {"structured_outputs": {"json": {"type": "object"}}},
+    {"structured_outputs": {"choice": ["KEEP", "REWRITE"]}},
+    {"guided_json": {"type": "object"}},
+    {"guided_choice": ["KEEP", "REWRITE"]},
+    {"structured_outputs": {"json_object": True, "disable_any_whitespace": False}},
+])
+def test_structured_requests_bound_whitespace_without_mutating_callers(
+    transport, monkeypatch, parser, constraint,
+):
+    captured, responses = transport
+    monkeypatch.setenv("ISPEC_VLLM_TOOL_CALL_PARSER", parser)
+    original = copy.deepcopy(constraint)
+    responses.append(envelope("{}"))
+
+    reply = service.generate_reply(messages=[], vllm_extra_body=constraint)
+
+    assert reply.ok
+    assert captured[0]["structured_outputs"]["disable_any_whitespace"] is True
+    assert constraint == original
+
+
+@pytest.mark.parametrize("parser", ["olmo3", "llama3_json"])
+def test_plain_generation_has_no_structured_constraint(transport, monkeypatch, parser):
+    captured, responses = transport
+    monkeypatch.setenv("ISPEC_VLLM_TOOL_CALL_PARSER", parser)
+    responses.append(envelope("Hello."))
+
+    assert service.generate_reply(messages=[]).ok
+    assert "structured_outputs" not in captured[0]
+
+
 def test_prompt_uses_native_format_except_for_llama(transport, monkeypatch):
     for provider in ("vllm", "ollama"):
         block = service._planner_tool_protocol_block(tools_available=True, provider=provider)

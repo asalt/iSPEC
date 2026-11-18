@@ -100,6 +100,8 @@ def test_choice_is_decoded_for_existing_callers(transport):
     reply = service.generate_reply(messages=[], vllm_extra_body={"guided_choice": ["draft_only", "save_now"]})
     assert reply.ok and reply.content == "draft_only"
     assert captured[0]["payload"]["format"]["enum"] == ["draft_only", "save_now"]
+    assert "structured_outputs" not in captured[0]["payload"]
+    assert "disable_any_whitespace" not in captured[0]["payload"]
 
 
 def test_named_choice_filters_tools_and_checks_response(transport):

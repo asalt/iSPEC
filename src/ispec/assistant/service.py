@@ -773,6 +773,8 @@ def _normalize_vllm_structured_outputs(extra_body: dict[str, Any]) -> dict[str, 
         cleaned.pop("guided_choice", None)
 
     if structured_outputs:
+        # Bound JSON formatting so a classifier cannot spend its budget on spaces.
+        structured_outputs["disable_any_whitespace"] = True
         cleaned["structured_outputs"] = structured_outputs
     elif "structured_outputs" in cleaned and not isinstance(cleaned.get("structured_outputs"), dict):
         cleaned.pop("structured_outputs", None)

@@ -187,6 +187,14 @@ def tool_router_schema(group_names: list[str]) -> dict[str, Any]:
     }
 
 
+def router_fallback_tool_names(
+    *, groups: list[ToolGroup], workflow_tool_names: set[str],
+) -> set[str]:
+    """Keep project work and tool discovery available after an unusable route."""
+    projects = next((group.tool_names for group in groups if group.name == "projects"), ())
+    return set(projects) | workflow_tool_names | {"assistant_list_tools", "assistant_prompt_header"}
+
+
 @prompt_binding("assistant.tool_router.classifier")
 def _tool_router_system_prompt(groups: list[ToolGroup]) -> str:
     groups_block = "\n".join(f"- {group.name}: {group.description}" for group in groups)

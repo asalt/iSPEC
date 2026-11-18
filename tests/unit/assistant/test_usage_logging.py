@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import ispec.assistant.classifier_service as classifier_service
 import ispec.assistant.service as service
@@ -119,7 +118,10 @@ def test_generate_classifier_reply_records_usage_event(tmp_path, monkeypatch):
     monkeypatch.setenv('ISPEC_ASSISTANT_CLASSIFIER_VLLM_MODEL', 'tiny-classifier')
 
     def fake_post(url, *, json, headers, timeout):
-        assert json['structured_outputs'] == {'json': {'type': 'object'}}
+        assert json['structured_outputs'] == {
+            'json': {'type': 'object'},
+            'disable_any_whitespace': True,
+        }
         assert 'guided_json' not in json
         return _DummyResponse({
             'choices': [{'message': {'role': 'assistant', 'content': '{"kind": "approve"}'}}],

@@ -62,8 +62,8 @@ def test_support_chat_tool_router_filters_openai_tools_by_group(tmp_path, db_ses
 
         assert isinstance(messages, list)
         system_prompt = str(messages[0].get("content") or "")
-        assert "search_people" in system_prompt
-        assert "count_all_projects" not in system_prompt
+        # Native schemas above carry the selected catalog exactly once.
+        assert "Available tools:" not in system_prompt
 
         return AssistantReply(content="FINAL:\nOk.", provider="test", model="test-model", meta=None)
 

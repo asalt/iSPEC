@@ -58,6 +58,7 @@ from ispec.assistant.support_policies import (
     select_support_tool_policy,
 )
 from ispec.assistant.tool_routing import (
+    router_fallback_tool_names,
     route_tool_groups_vllm,
     tool_groups_for_available_tools,
     tool_names_for_groups,
@@ -1699,6 +1700,20 @@ def chat(
                 if filtered:
                     tool_schemas = filtered
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
+            else:
+                tool_selector_source = "router_error_bounded"
+                selected_tool_names = router_fallback_tool_names(
+                    groups=groups,
+                    workflow_tool_names=_openai_tool_names(comment_tool_schemas),
+                )
+                # Filter the authorized catalog even when the fallback matches nothing.
+                tool_schemas = [
+                    spec for spec in tool_schemas
+                    if spec["function"]["name"] in selected_tool_names
+                ]
+                tool_router["ok"] = False
+                tool_router["fallback"] = "projects_and_workflow"
+                tool_router["selected_tool_names"] = sorted(_openai_tool_names(tool_schemas))
     # Routing may select read tools, but cannot hide the draft/save capability.
     if tool_protocol == "openai":
         tool_schemas = [

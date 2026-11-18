@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from jinja2.ext import loopcontrols
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -143,9 +144,73 @@ def test_rendered_olmo_requests_fit_context_window(save_conversation_payloads):
         prompt_tokens = len(
             tokenizer.encode(render(payload), add_special_tokens=False).ids
         )
-        budget = CONTEXT_WINDOW - payload.get("max_tokens", 0)
+        budget = min(6000, CONTEXT_WINDOW - payload.get("max_tokens", 0))
         assert prompt_tokens <= budget, (
             f"{prompt_tokens} prompt tokens exceed {budget} "
             f"({len(payload.get('tools') or [])} tools, "
             f"{sum(m['role'] == 'system' for m in payload['messages'])} system messages)"
         )
+
+
+@dataclass(kw_only=True)
+class FailedRouterModel(RecordingModel):
+    """Return a truncated router response and a harmless conversational answer."""
+
+    def post(self, url, *, json: dict, **kwargs):
+        constraint = json.get("structured_outputs", {}).get("json", {})
+        if "primary" in constraint.get("properties", {}):
+            self.payloads.append(deepcopy(json))
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "choices": [{
+                        "finish_reason": "length",
+                        "message": {"content": '{"primary":"projects","clarify":   '},
+                    }],
+                },
+            )
+        return super().post(url, json=json, **kwargs)
+
+    def tool_reply(self, *, request):
+        return {"content": "The draft remains pending."}
+
+
+def test_failed_router_keeps_project_workflow_within_budget(
+    conversation, application_settings, monkeypatch, tmp_path,  # noqa: F811 (pytest fixtures)
+):
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_OUTPUT_TOKENS", "1024")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "6000")
+    conversation.prepare()
+    model = FailedRouterModel()
+    monkeypatch.setattr(service.requests, "post", model.post)
+    monkeypatch.setattr(support, "hinted_support_tool_groups", lambda **kwargs: set())
+
+    with get_schedule_session(tmp_path / "schedule.db") as schedule:
+        response = support.chat(
+            support.ChatRequest(
+                sessionId=conversation.session.session_id,
+                message="Change received to expected next week. Show the correction rather than saving it.",
+                history=[],
+            ),
+            assistant_db=conversation.assistant,
+            core_db=conversation.core,
+            schedule_db=schedule,
+            user=conversation.user,
+        )
+
+    request = next(payload for payload in model.payloads if payload.get("tools"))
+    names = {tool["function"]["name"] for tool in request["tools"]}
+    assert {"get_project", "prepare_project_comment", "create_project_comment",
+            "cancel_project_comment_draft", "show_project_comment_card"} <= names
+    assert not {"search_people", "assistant_stats", "db_file_stats"} & names
+    assert len(names) <= 18
+    assert conversation.comments() == []
+    if not TOKENIZER.is_file():
+        pytest.skip("Real OLMo tokenizer is needed for the fallback budget check")
+    from tokenizers import Tokenizer
+
+    count = len(Tokenizer.from_file(str(TOKENIZER)).encode(
+        render(request), add_special_tokens=False,
+    ).ids)
+    assert count <= min(6000, CONTEXT_WINDOW - request["max_tokens"])
+    assert response.message == "The draft remains pending."

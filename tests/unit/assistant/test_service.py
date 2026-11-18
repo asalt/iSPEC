@@ -326,7 +326,9 @@ def test_generate_reply_vllm_can_accept_extra_body(monkeypatch):
 
     payload = captured["json"]
     assert isinstance(payload, dict)
-    assert payload["structured_outputs"] == {"choice": ["KEEP", "REWRITE"]}
+    assert payload["structured_outputs"] == {
+        "choice": ["KEEP", "REWRITE"], "disable_any_whitespace": True,
+    }
     assert "guided_choice" not in payload
     assert payload["max_tokens"] == 1
 
@@ -362,7 +364,9 @@ def test_generate_reply_vllm_normalizes_guided_json_to_structured_outputs(monkey
 
     payload = captured["json"]
     assert isinstance(payload, dict)
-    assert payload["structured_outputs"] == {"json": schema}
+    assert payload["structured_outputs"] == {
+        "json": schema, "disable_any_whitespace": True,
+    }
     assert "guided_json" not in payload
 
 
