@@ -213,6 +213,18 @@ def test_save_tool_uses_classifier_while_show_card_is_read_only(
         assert conversation.comments() == []
 
 
+@pytest.mark.parametrize("present", [False, True])
+def test_headless_text_save_requires_receipt_not_click(conversation, present):
+    _, draft_id = conversation.prepare(present=present)
+    workflow = conversation.turn(text="Put this version in the project's history.")
+    result = workflow.run(name="create_project_comment", args={"draft_id": draft_id, "confirm": True})
+    assert result["saved"] is present
+    assert len(conversation.comments()) == int(present)
+    if not present:
+        assert result["error_code"] == "draft_not_presented"
+        assert not workflow.evaluations
+
+
 def test_model_schema_has_save_and_show_but_no_undo_tool():
     tools = comment_workflow_tools(
         tools=[{"function": {"name": "create_project_comment"}}]

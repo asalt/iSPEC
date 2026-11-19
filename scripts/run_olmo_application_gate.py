@@ -26,13 +26,14 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def snapshot(*, output: Path, committed: bool = False) -> tuple[Path, dict]:
+def snapshot(*, output: Path, committed: bool = False, backend_ref: str = "HEAD",
+             wrapper_ref: str = "HEAD") -> tuple[Path, dict]:
     """Copy Git-listed working files, including untracked application additions."""
     source = output / "source"
     if committed:
-        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        head = subprocess.check_output(["git", "rev-parse", "--verify", f"{backend_ref}^{{commit}}"], cwd=ROOT, text=True).strip()
         wrapper = ROOT.parent
-        wrapper_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=wrapper, text=True).strip()
+        wrapper_head = subprocess.check_output(["git", "rev-parse", "--verify", f"{wrapper_ref}^{{commit}}"], cwd=wrapper, text=True).strip()
         with subprocess.Popen(["git", "archive", head], cwd=ROOT, stdout=subprocess.PIPE) as proc:
             with tarfile.open(fileobj=proc.stdout, mode="r|") as archive:
                 archive.extractall(source, filter="data")

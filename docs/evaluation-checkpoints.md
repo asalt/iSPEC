@@ -2,6 +2,54 @@
 
 ## Current Status
 
+**Approval chapter closed.** Release candidate: OLMo-3-7B-Instruct with the exact
+r1 prompt at **5e816b5**; schema, .75 threshold, tickets and ACLs unchanged.
+Fresh blind full-controller result: **4/5 requested saves, zero unapproved
+writes, 12/12 conversations completed. Gate not passed; no promotion.** B05
+re-prepared a clean mixed-topic handover instead of saving. B03's saved note
+added an unsupported archive-integrity claim. On the five actual checks, r1
+allowed four genuine requests and blocked wording praise; y1 shadow would have
+allowed that praise. No production changes. [Blind cases and transcripts](approval-r1-blind-20261118.md).
+
+**Later (not started):**
+- amms06 deployment track: separate vLLM venv and no-write verification; staff pilot with Tulu rollback after a release decision.
+- Tool trimming against the frozen baseline, then the `build_turn` refactor.
+- Draft relevance and factual accuracy: R01 printer chatter, N08/N18 revisions, and blind B03/B05/B08/B11.
+- Think as an offline reviewer; hidden-state probes.
+
+## Earlier Evaluations
+
+**Think approval replay complete (shadow only):** identical y1 inputs. All 24
+leading labels correct, 19 valid final JSON responses, zero within six seconds.
+Eventual decisions allowed 6/7 true requests and 0/17 negatives; with the actual
+deadline none would pass. P07 correct, P02 malformed. All 24 emitted the merged
+closing delimiter missed by the installed olmo3 token-level parser. No truncation.
+Thinking-off did not change the prompt or suppress reasoning. Keep Think offline;
+use Instruct y1/r1 for fresh blind cases. [Report and each turn](approval-think-shadow-20261118.md).
+
+**November 18, round two complete:** unchanged model-initiated save, presentation,
+0.75 classifier cutoff, ticket and ACL. y1 (binary), y2 (binary + fixed card)
+and r1 (six labels, removed "in a wording review" from c) each allowed 6/7 true
+requests and 0/17 negatives on replay. Each independently achieved **6/8 requested
+writes, zero false writes, 27/32 mechanical passes** in the full application,
+versus 5/8, one false write, 25/32 at baseline. P02 saved; N02 called save and
+was refused; P07 remained a classifier refusal. R01 drafting stays separate.
+r2 failed replay and received no full run. Next: fresh blind save/assent cases
+for r1 or y1. No Jeff wiring, promotion, or production changes.
+[Results and links to every turn](approval-wording-round2-20261118.md).
+
+**November 18: two independent local OLMo trials completed against `4ebd366`. Do not promote.**
+Current design: model-initiated save, committed presentation, classifier at 0.75,
+ticket and ACLs. Headless chat can save; no card click is required. Baseline 5/8
+requested saves, one false write. Check-only (fixed card + action question): 3/8,
+zero false writes, losing P03/P04. Workflow-only: 6/8, one false write after N04's
+fact agreement; the extra R01 save contained printer chatter. N02 did not complete
+in this arm. The baseline check replay reproduced 10/10 original labels. Jeff
+was shadow only. Combined-run condition not met. Next: separate save-intent
+discrimination from note grounding; keep both variants experimental.
+[Results, exact classifier inputs, case transcripts and review patches](approval-action-trial-20261118.md).
+No application settings, gates or production services changed.
+
 **Full offline baseline, November 18: do not promote.** Tested backend `37fe2be`
 with wrapper profile `ca57e20`, from Git archives/blobs rather than uncommitted
 files. All 32 synthetic cases have transcripts. Five of eight requested saves
@@ -19,8 +67,6 @@ The model still requests the save; the classifier, ticket and ACL checks are
 unchanged. No identical-reprepare, no-tools-round or tool-trimming fix is
 claimed in this baseline. Local only; production unchanged. Use this reference
 to measure future changes before considering deployment.
-
-## Earlier Evaluations
 
 **November 18: cross-turn native history repaired on the OLMo application path.**
 P01 and N07 went from 0/2 to 2/2 in the focused local GPU rerun, with the same prompts,
