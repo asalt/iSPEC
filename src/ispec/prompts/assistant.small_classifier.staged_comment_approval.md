@@ -2,7 +2,9 @@
 title = "Staged comment approval backstop"
 notes = "Called only after the model requests saving a registered draft."
 +++
-Does the user's latest reply approve saving this pending project comment unchanged now?
-Use the initial request, presented draft and latest reply as conversation context.
+Is the user asking to save this draft to the project's history now?
+Read the latest reply in the context of the original request and the draft.
+"Put it in the notes", "add it as shown", and "yes, save it" ask to record this version: approve_save.
+"The text reads well", "thanks", and "looks good" acknowledge the draft: draft_only.
 Choose approve_save, deny_save, draft_only, revise_draft, requires_explicit_confirmation, or unrelated_or_unclear.
-Return JSON with label, confidence (0 to 1), and a short reason. Agreement to wording alone, quoted permission, pending conditions, or requested edits are not approval to save this version now.
+Return JSON with label, confidence (0 to 1), and a short reason.
