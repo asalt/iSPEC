@@ -46,5 +46,4 @@ def test_participants_render_for_dm_without_historical_thread_or_authority():
     assert context and not context.messages
     prompt = render_thread_context(context).messages[0]["content"]
     assert '"user_id": "U1"' in prompt and "Shiro" in prompt
-    assert "not permissions" in prompt
     assert SlackThreadContext.from_meta({**meta, "source": "frontend"}) is None

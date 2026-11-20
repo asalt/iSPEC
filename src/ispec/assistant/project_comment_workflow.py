@@ -93,33 +93,33 @@ def comment_workflow_tools(
     workflow = [
         _tool_spec(
             name="prepare_project_comment",
-            description="Register a new or revised project-history draft. The server shows the exact stored text in a confirmation card; the person clicks Save or Cancel. Use prose for wording-only help. A revision requires a new preparation and supersedes the old card.",
+            description="Draft a note for a project's history. The server stores it and shows it in a card with Save and Cancel. To revise, call again with the new text.",
             properties={
                 "project_id": {"type": "integer", "minimum": 1},
                 "comment": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 20000,
-                    "description": "Concise project-specific facts, preserving timing and status. Exclude unrelated conversation and instructions about drafting/approval.",
+                    "description": "The relevant project facts, with their timing and status.",
                 },
             },
             required=["project_id", "comment"],
         ),
         _tool_spec(
             name="create_project_comment",
-            description="Save a registered, previously presented draft after the user's text approval. Use its returned draft_id and confirm=true. The classifier and ticket checks run during this call. Only report saved from a successful result with comment_id. An already saved draft returns its existing comment ID.",
+            description="Save a prepared draft when the user asks you to save it. Pass its draft_id and confirm=true; the server checks the request before saving and returns comment_id.",
             properties={"draft_id": {"type": "string"}, "confirm": {"type": "boolean"}},
             required=["draft_id", "confirm"],
         ),
         _tool_spec(
             name="show_project_comment_card",
-            description="Show the registered draft's current card state. A person may Save, Cancel or Undo using its buttons. This tool only displays state.",
+            description="Show a prepared draft's card again.",
             properties={"draft_id": {"type": "string"}},
             required=["draft_id"],
         ),
         _tool_spec(
             name="cancel_project_comment_draft",
-            description="Cancel the registered pending draft when the user requests cancellation; returns cancellation status. A prose acknowledgment alone does not cancel it. Saved comments are unchanged.",
+            description="Cancel a prepared draft when the user asks.",
             properties={"draft_id": {"type": "string"}},
             required=["draft_id"],
         ),

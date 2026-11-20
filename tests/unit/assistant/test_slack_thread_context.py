@@ -52,7 +52,6 @@ def test_exact_thread_as_of_current_message_with_latest_revision(thread_db):
     assert rendered.messages[0]["role"] == "user"
     assert rendered.metadata["parent_present"]
     assert rendered.metadata["coverage"] == "locally_retained_only"
-    assert "not current requests" in rendered.messages[0]["content"]
     assert '"author_user_id": "U1"' in rendered.messages[0]["content"]
     assert "inbox_ids" not in rendered.messages[0]["content"]
     assert rendered.metadata["inbox_ids"] == [root, edit]

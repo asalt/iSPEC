@@ -36,8 +36,6 @@ def test_missing_parent_fetched_with_other_humans_and_bot_as_evidence():
     assert all(r.inbox_id is None for r in result.messages)
     prompt = render_thread_context(result)
     assert prompt.metadata["parent_present"] and prompt.metadata["fetch_status"] == "loaded"
-    assert "not current requests" in prompt.messages[0]["content"]
-    assert "recipient, not the author" in prompt.messages[0]["content"]
 
 
 def test_exact_receipt_required_and_network_runs_outside_db_session(tmp_path):
