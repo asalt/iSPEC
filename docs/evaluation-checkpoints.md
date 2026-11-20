@@ -2,6 +2,20 @@
 
 ## Current Status
 
+**Staff instruments Phase 2 (Nov 20): real dev demo available; amms06 staged, not active.**
+Dev: http://10.16.1.11:5189/instruments (mock stays on 5188). Independent observer
+`ecefa45`; backend `eca2e36` + `c9e3282`; frontend `b0b2484` merged to main;
+release tooling `839b1f1`. Pull evidence: Eclipse 24 QC RAWs, 451 TNG records,
+two XMB revisions; tims-ultra 12 runs and six LC transitions (bounded scan).
+The core registry is authoritative; UI edits and revision-checked file imports
+use the same settings, and an unavailable mount never means idle.
+158 observer tests, 32 focused backend tests and six Cypress cases passed.
+Scratch Alembic upgraded to 0010; integrity OK. On amms06 all five roots matched
+their configured shares. The inactive `instruments-c9e3282-b0b2484` bundle passed
+its manifest and isolated nginx/authenticated API smoke; the old OLMo API/web
+links remained active. No live migrations, writeback, timer or auto-remount.
+Next: Alex's activation decision. [Registry guide](instrument-registry.md).
+
 **Approval chapter closed.** Release candidate: OLMo-3-7B-Instruct with the exact
 r1 prompt at **5e816b5**; schema, .75 threshold, tickets and ACLs unchanged.
 Fresh blind full-controller result: **4/5 requested saves, zero unapproved
