@@ -46,7 +46,11 @@ remain intact. The dashboard reads only the current generation.
 The API adapts the plugin header to the UI contract: scan time maps to
 `last_collector_contact_at`, file mtime to `source_modified_at`, and
 recorded bytes to `size_bytes`. First/last observation refer to stored
-evidence, not acquisition times. Pages share a high-water mark. A missing
+evidence, not acquisition times. The runs endpoint defaults to the most recent
+10 distinct runs by source file modification time. Use `offset` and `limit`
+(1-100), passing the first page's `snapshot` on later requests to keep the
+order stable. `has_more` indicates another page; `truncated` indicates
+incomplete scan coverage. Reload without a snapshot for newer observations. A missing
 mount leaves last-seen runs visible; neither an old file nor a fresh heartbeat
 means idle. Vendor-local times without an offset have null UTC. The list
 isolates per-instrument archive errors. An unknown ID is 404; a registered

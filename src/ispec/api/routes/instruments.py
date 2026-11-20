@@ -106,16 +106,19 @@ def instruments(core: Session = Depends(get_session_dep)):
 @router.get("/{instrument_id}/runs", dependencies=[Depends(require_staff)])
 def instrument_runs(
     instrument_id: str,
-    limit: int = Query(25, ge=1, le=100),
-    cursor: str | None = Query(None, max_length=512),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0, le=2**53 - 1),
+    snapshot: str | None = Query(None, max_length=128),
     core: Session = Depends(get_session_dep),
 ):
     row = core.get(InstrumentRegistry, instrument_id)
     if row is None:
         raise HTTPException(404, "Unknown instrument")
     try:
-        page = dashboard.read_archive(row, limit=limit, cursor=cursor, runs=True)
-    except dashboard.InvalidCursor as exc:
+        page = dashboard.read_archive(
+            row, limit=limit, offset=offset, snapshot=snapshot, runs=True
+        )
+    except dashboard.InvalidSnapshot as exc:
         raise HTTPException(422, str(exc)) from None
     except dashboard.ArchiveError as exc:
         raise HTTPException(503, str(exc)) from None

@@ -1,7 +1,5 @@
 """Read-only Phase 1 archive adapter. Filesystem times are not run start/end."""
 
-from base64 import urlsafe_b64decode, urlsafe_b64encode
-from binascii import Error as Base64Error
 from contextlib import closing
 import json
 from pathlib import Path
@@ -16,7 +14,7 @@ class ArchiveError(Exception):
     pass
 
 
-class InvalidCursor(ValueError):
+class InvalidSnapshot(ValueError):
     pass
 
 
@@ -51,30 +49,19 @@ def mounted(root, connection=None):
         return False
 
 
-def _page_cursor(stream, cursor, high):
-    if cursor is None:
-        return high, 0
-    try:
-        identity, end, offset = json.loads(urlsafe_b64decode(cursor))
-        if (
-            identity == stream
-            and isinstance(end, int)
-            and not isinstance(end, bool)
-            and isinstance(offset, int)
-            and not isinstance(offset, bool)
-            and 0 <= end <= high
-            and 0 <= offset <= end
-        ):
-            return end, offset
-    except (ValueError, TypeError, Base64Error):
-        pass
-    raise InvalidCursor("Invalid or retired run cursor")
-
-
-def runs_page(db, plugin, stream, limit, cursor):
-    table = {"thermo": "qc_raw", "bruker": "bruker_run"}[plugin]
+def _snapshot_end(db, stream, snapshot):
+    """Pin pages to an event sequence in this archive generation."""
     high = db.execute("select coalesce(max(seq),0) from event").fetchone()[0]
-    end, offset = _page_cursor(stream, cursor, high)
+    if snapshot is None:
+        return high
+    identity, _, seq = snapshot.rpartition(":")
+    if identity == stream and seq.isascii() and seq.isdecimal() and int(seq) <= high:
+        return int(seq)
+    raise InvalidSnapshot("Invalid or retired run snapshot; reload the runs")
+
+
+def runs_page(db, plugin, *, end, offset, limit):
+    table = {"thermo": "qc_raw", "bruker": "bruker_run"}[plugin]
     rows = db.execute(
         f"""
         select * from (
@@ -102,20 +89,23 @@ def runs_page(db, plugin, stream, limit, cursor):
         }
         for r in rows[:limit]
     ]
-    more = len(rows) > limit
-    token = (
-        urlsafe_b64encode(json.dumps([stream, end, offset + limit]).encode()).decode()
-        if more
-        else None
-    )
-    return dict(items=items, next_cursor=token, limit=limit)
+    return dict(items=items, has_more=len(rows) > limit, limit=limit, offset=offset)
 
 
-def read_archive(row, *, limit=1, cursor=None, runs=False):
+def read_archive(row, *, limit=1, offset=0, snapshot=None, runs=False):
     """Missing means never contacted. Reject non-files, linked files and other streams."""
     path = archive_path(row)
     empty = (
-        dict(items=[], next_cursor=None, limit=limit, truncated=False) if runs else None
+        dict(
+            items=[],
+            has_more=False,
+            offset=offset,
+            limit=limit,
+            snapshot=None,
+            truncated=False,
+        )
+        if runs
+        else None
     )
     try:
         if path.is_symlink():
@@ -123,8 +113,8 @@ def read_archive(row, *, limit=1, cursor=None, runs=False):
         if not path.exists():
             if row.archive_seen:
                 raise ArchiveError("Previously observed archive is missing")
-            if cursor:
-                raise InvalidCursor("Run stream unavailable")
+            if snapshot is not None:
+                raise InvalidSnapshot("Run snapshot unavailable; reload the runs")
             return empty
         if not path.is_file() or path.stat().st_nlink != 1:
             raise ArchiveError("Invalid archive file")
@@ -147,13 +137,20 @@ def read_archive(row, *, limit=1, cursor=None, runs=False):
                 {"thermo": 1, "bruker": 2}[plugin],
             ):
                 raise ArchiveError("Unsupported or mismatched archive")
-            page = runs_page(db, plugin, header["stream_id"], limit, cursor)
+            stream = header["stream_id"]
+            end = _snapshot_end(db, stream, snapshot)
+            page = runs_page(db, plugin, end=end, offset=offset, limit=limit)
             scan = db.execute(
-                "select recorded_at,detail from event join scan using(seq) order by seq desc limit 1"
+                "select recorded_at,detail from event join scan using(seq) where seq <= ? order by seq desc limit 1",
+                (end,),
             ).fetchone()
             info = json.loads(scan["detail"]) if scan else {}
             if runs:
-                return {**page, "truncated": bool(info.get("scope", {}).get("truncated"))}
+                return {
+                    **page,
+                    "snapshot": f"{stream}:{end}",
+                    "truncated": bool(info.get("scope", {}).get("truncated")),
+                }
             if not scan:
                 return None
             last_ok = db.execute(
