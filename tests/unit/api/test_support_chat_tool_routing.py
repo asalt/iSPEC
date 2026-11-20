@@ -54,8 +54,6 @@ def test_support_chat_tool_router_filters_openai_tools_by_group(tmp_path, db_ses
             if isinstance(name, str) and name:
                 tool_names.add(name)
         assert tool_names == {
-            "assistant_prompt_header",
-            "assistant_list_tools",
             "search_people",
             "get_person",
         }
@@ -108,8 +106,6 @@ def test_support_chat_tool_router_filters_openai_tools_by_group(tmp_path, db_ses
         meta = json.loads(assistant_row.meta_json)
         assert meta["tool_router"]["decision"]["primary"] == "people"
         assert set(meta["tool_router"]["selected_tool_names"]) == {
-            "assistant_prompt_header",
-            "assistant_list_tools",
             "get_person",
             "search_people",
         }
@@ -169,8 +165,6 @@ def test_support_chat_tool_router_includes_explicitly_requested_tool_name(tmp_pa
 
         # Router picked people group, but the user explicitly mentioned the agent-commands tool.
         assert tool_names == {
-            "assistant_prompt_header",
-            "assistant_list_tools",
             "assistant_recent_agent_commands",
             "search_people",
             "get_person",
@@ -472,8 +466,6 @@ def test_support_chat_tool_router_keeps_file_tools_for_focused_project_results_f
             and isinstance(tool["function"].get("name"), str)
         }
         assert tool_names == {
-            "assistant_prompt_header",
-            "assistant_list_tools",
             "get_project",
             "project_files_for_project",
             "experiments_for_project",

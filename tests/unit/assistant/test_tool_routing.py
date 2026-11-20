@@ -36,7 +36,7 @@ def test_router_failure_keeps_only_project_workflow_and_discovery():
     )
     assert selected == {
         "get_project", "latest_project_comments", "prepare_project_comment",
-        "cancel_project_comment_draft", "assistant_list_tools", "assistant_prompt_header",
+        "cancel_project_comment_draft",
     }
 
 
@@ -45,4 +45,4 @@ def test_router_failure_without_authorized_projects_does_not_add_them():
         groups=tool_groups_for_available_tools({"search_people"}),
         workflow_tool_names=set(),
     )
-    assert selected == {"assistant_list_tools", "assistant_prompt_header"}
+    assert selected == set()

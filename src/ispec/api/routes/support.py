@@ -1614,11 +1614,7 @@ def chat(
             tool_selector_source = "support_policy_rule"
             selected_policy_rule_name = support_policy_selection.rule_name
             grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
-            selected_tool_names = {
-                "assistant_prompt_header",
-                "assistant_list_tools",
-                support_policy_selection.tool_name,
-            }
+            selected_tool_names = {support_policy_selection.tool_name}
             selected_tool_names |= grouped_tool_names.get("tmux", set())
             for group_name in hinted_group_names:
                 selected_tool_names |= grouped_tool_names.get(group_name, set())
@@ -1648,7 +1644,7 @@ def chat(
                 groups=groups,
                 decision=turn_decision_result.decision,
                 explicit_requested_tool_names=requested_tool_names_available,
-                always_include=["assistant_prompt_header", "assistant_list_tools"],
+                always_include=[],
             )
             grouped_tool_names = {group.name: set(group.tool_names) for group in groups}
             for group_name in hinted_group_names:
@@ -1704,7 +1700,6 @@ def chat(
                 )
                 for group_name in hinted_group_names:
                     selected_tool_names |= grouped_tool_names.get(group_name, set())
-                selected_tool_names |= {"assistant_prompt_header", "assistant_list_tools"}
                 if requested_tool_names_available:
                     selected_tool_names |= set(requested_tool_names_available)
                 if selected_tool_names:
@@ -1719,7 +1714,7 @@ def chat(
                     tool_router["selected_tool_names"] = sorted(selected_tool_names)
             elif hinted_group_names:
                 tool_selector_source = "hinted_groups"
-                selected_tool_names = {"assistant_prompt_header", "assistant_list_tools"}
+                selected_tool_names = set()
                 for group_name in hinted_group_names:
                     selected_tool_names |= grouped_tool_names.get(group_name, set())
                 filtered = []
