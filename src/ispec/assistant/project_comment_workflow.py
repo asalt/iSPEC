@@ -93,7 +93,7 @@ def comment_workflow_tools(
     workflow = [
         _tool_spec(
             name="prepare_project_comment",
-            description="Draft a note for a project's history. The server stores it and shows it in a card with Save and Cancel. To revise, call again with the new text.",
+            description="Draft a note for a project's history. The server stores it and shows it in a card with Save and Cancel. To revise, call again with the new text. For help with wording only, reply in prose.",
             properties={
                 "project_id": {"type": "integer", "minimum": 1},
                 "comment": {

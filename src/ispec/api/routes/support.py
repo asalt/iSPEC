@@ -1740,16 +1740,20 @@ def chat(
                 tool_router["ok"] = False
                 tool_router["fallback"] = "projects_and_workflow"
                 tool_router["selected_tool_names"] = sorted(_openai_tool_names(tool_schemas))
-    # Note tools and their instructions join the turn when routed to notes or a draft is pending.
+    # prepare_project_comment is always offered; the other note tools and their
+    # instructions join the turn when routed to notes or a draft is pending.
     if tool_protocol == "openai":
         notes_in_play = (
             tool_router is None
             or "create_project_comment" in _openai_tool_names(tool_schemas)
             or project_comment_workflow.pending() is not None
         )
+        offered_comment_tools = comment_tool_schemas if notes_in_play else [
+            spec for spec in comment_tool_schemas if spec["function"]["name"] == "prepare_project_comment"
+        ]
         tool_schemas = [
             spec for spec in tool_schemas or [] if spec["function"]["name"] not in COMMENT_WORKFLOW_TOOLS
-        ] + (comment_tool_schemas if notes_in_play else [])
+        ] + offered_comment_tools
         if project_comment_write_tool_exposed and not notes_in_play:
             project_comment_write_tool_exposed = False
             project_comment_write_tool_reason = "not_routed"
