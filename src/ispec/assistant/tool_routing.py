@@ -36,7 +36,7 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
     ),
     ToolGroup(
         name="notes",
-        description="Draft, save or cancel a note in a project's history.",
+        description="Draft, revise, save or cancel a note, comment or update for a project's history.",
         tool_names=("create_project_comment",),
     ),
     ToolGroup(
