@@ -12,6 +12,7 @@ from .support import LetterOfSupport
 from .auth import AuthUser, AuthSession, AuthUserProject, ProjectAccessMode, UserRole
 from .sync import LegacySyncState
 from .storage import OmicsDatabaseRegistry
+from .instrument import InstrumentRegistry
 from .engine import sqlite_engine, initialize_db
 
 # Backwards-compatible module-level logger
@@ -54,6 +55,7 @@ __all__ = [
     "UserRole",
     "LegacySyncState",
     "OmicsDatabaseRegistry",
+    "InstrumentRegistry",
     "sqlite_engine",
     "initialize_db",
     "logger",

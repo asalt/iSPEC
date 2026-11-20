@@ -11,6 +11,7 @@ from ispec.agent.models import AgentCommand, InstrumentObservationRow
 from ispec.api.routes.instruments import router
 from ispec.api.security import get_current_user, require_api_key
 from ispec.db.models import UserRole
+from ispec.db.connect import get_session, get_session_dep
 from ispec.instruments.collector import CollectorConfig, blank_observation
 
 
@@ -49,6 +50,12 @@ def setup(tmp_path, monkeypatch):
             yield db
 
     app.dependency_overrides[get_agent_session_dep] = session
+
+    def core_session():
+        with get_session(tmp_path / "core.sqlite") as db:
+            yield db
+
+    app.dependency_overrides[get_session_dep] = core_session
     app.dependency_overrides[get_current_user] = lambda: None
     with TestClient(app) as client:
         yield client, app, path
