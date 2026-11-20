@@ -1745,11 +1745,20 @@ def chat(
                 tool_router["ok"] = False
                 tool_router["fallback"] = "projects_and_workflow"
                 tool_router["selected_tool_names"] = sorted(_openai_tool_names(tool_schemas))
-    # Routing may select read tools, but cannot hide the draft/save capability.
+    # Note tools and their instructions join the turn when routed to notes or a draft is pending.
     if tool_protocol == "openai":
+        notes_in_play = (
+            tool_router is None
+            or "create_project_comment" in _openai_tool_names(tool_schemas)
+            or project_comment_workflow.pending() is not None
+        )
         tool_schemas = [
             spec for spec in tool_schemas or [] if spec["function"]["name"] not in COMMENT_WORKFLOW_TOOLS
-        ] + comment_tool_schemas
+        ] + (comment_tool_schemas if notes_in_play else [])
+        if project_comment_write_tool_exposed and not notes_in_play:
+            project_comment_write_tool_exposed = False
+            project_comment_write_tool_reason = "not_routed"
+            project_comment_write_policy_messages = project_comment_workflow.state_messages()
 
     tool_schemas_count = len(tool_schemas) if isinstance(tool_schemas, list) else 0
     openai_tool_names = _openai_tool_names(tool_schemas)

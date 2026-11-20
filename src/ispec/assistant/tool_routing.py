@@ -19,7 +19,7 @@ class ToolGroup:
 _GROUP_DEFS: tuple[ToolGroup, ...] = (
     ToolGroup(
         name="projects",
-        description="Find project numbers by PI, lab contact name, topic or title; look up, count and manage projects and project comments.",
+        description="Find projects by number, title, topic, PI or lab contact; list and count them; read project details and history.",
         tool_names=(
             "project_counts_snapshot",
             "count_all_projects",
@@ -32,8 +32,12 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
             "projects",
             "get_project",
             "my_projects",
-            "create_project_comment",
         ),
+    ),
+    ToolGroup(
+        name="notes",
+        description="Draft, save or cancel a note in a project's history.",
+        tool_names=("create_project_comment",),
     ),
     ToolGroup(
         name="files",
