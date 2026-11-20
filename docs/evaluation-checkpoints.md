@@ -14,7 +14,13 @@ Scratch Alembic upgraded to 0010; integrity OK. On amms06 all five roots matched
 their configured shares. The inactive `instruments-c9e3282-b0b2484` bundle passed
 its manifest and isolated nginx/authenticated API smoke; the old OLMo API/web
 links remained active. No live migrations, writeback, timer or auto-remount.
-Next: Alex's activation decision. [Registry guide](instrument-registry.md).
+Runs pager (Nov 20): 10 latest by default, sizes 10/25/50/100, Previous/Next on a
+stable snapshot. Dev Eclipse paged 10/10/4; tims-ultra 10/2, with no duplicates.
+33 backend tests and six Cypress tests passed. The newer inactive amms06 candidate
+`instruments-9fdc2f8-03100b9` passed the isolated nginx/API smoke and rollback
+preflight. Nothing activated or pushed; next step is Alex's release decision.
+[Registry guide](instrument-registry.md) and [instrument roadmap](instrument-roadmap.md):
+scan-level QC, persistent mounts, Exploris/Lumos and richer detail views are deferred.
 
 **Approval chapter closed.** Release candidate: OLMo-3-7B-Instruct with the exact
 r1 prompt at **5e816b5**; schema, .75 threshold, tickets and ACLs unchanged.
