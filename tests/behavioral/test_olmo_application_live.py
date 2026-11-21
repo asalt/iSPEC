@@ -1,8 +1,9 @@
 """Working-tree OLMo evaluation through unmodified support.chat and native tools.
 
-All cases are hand-authored synthetic evaluation data. The first 27 are retained
-development cases; the five controls are new. Only storage, network isolation,
-and execution observation differ from the application.
+All cases are hand-authored synthetic evaluation data, except S02, which is an
+anonymized derivative of a real Slack thread. The first 27 are retained
+development cases. Only storage, network isolation, and execution observation
+differ from the application.
 """
 
 import copy
@@ -42,6 +43,8 @@ class ApplicationCase:
     cancelled: bool = False
     expected_tool: str | None = None
     no_tools: bool = False
+    no_draft_turns: list[int] = field(default_factory=list)
+    data_origin: str = "hand_authored_synthetic"
 
 
 GATE = [ApplicationCase(**row) for row in json.loads(
@@ -75,14 +78,21 @@ CONTROLS = [
     ),
 ]
 
-# This execution boundary leaves model-visible schemas and routing untouched.
-# An unexpected external-operation request fails the case before any side effect.
-FIXTURE_TOOLS = COMMENT_WORKFLOW_TOOLS | {
-    "assistant_list_tools",
-    "get_project", "projects", "search_projects", "latest_project_comments",
-    "count_all_projects", "my_projects", "get_person", "search_people", "latest_experiments",
-    "get_experiment", "latest_experiment_runs", "get_experiment_run",
-}
+SCENARIOS = [ApplicationCase(**row) for row in json.loads(
+    (Path(__file__).parent / "data/scenario_cases_20261120.json").read_text()
+)["cases"]]
+
+# The app decides which tools a turn offers; the test only keeps every data
+# store inside the sandbox.
+SANDBOX_PATHS = (
+    "ISPEC_ANALYSIS_DB_PATH", "ISPEC_PSM_DB_PATH", "ISPEC_OMICS_DB_PATH",
+    "ISPEC_AGENT_ARCHIVE_DB_PATH",
+)
+SANDBOX_DIRS = ("ISPEC_DB_DIR", "ISPEC_INSTRUMENT_MOUNT_ROOT", "ISPEC_INFERENCE_USAGE_LOG_DIR")
+DATA_PATHS = SANDBOX_PATHS + SANDBOX_DIRS + (
+    "ISPEC_DB_PATH", "ISPEC_ASSISTANT_DB_PATH", "ISPEC_SCHEDULE_DB_PATH",
+    "ISPEC_AGENT_DB_PATH", "ISPEC_AGENT_STATE_DB_PATH", "ISPEC_PROMPTS_DB_PATH",
+)
 
 
 @pytest.fixture
@@ -91,6 +101,11 @@ def application_store(monkeypatch, behavioral_datastore, tmp_path):
     for key, value in behavioral_datastore.env_overrides().items():
         monkeypatch.setenv(key, value)
     monkeypatch.setenv("ISPEC_PROMPTS_DB_PATH", str(tmp_path / "prompts.db"))
+    for key in SANDBOX_PATHS:
+        monkeypatch.setenv(key, str(tmp_path / f"{key.lower()}.db"))
+    for key in SANDBOX_DIRS:
+        (tmp_path / key.lower()).mkdir()
+        monkeypatch.setenv(key, str(tmp_path / key.lower()))
     assert support.generate_reply.__module__ == "ispec.assistant.service"
     assert Path(support.__file__).is_relative_to(Path(os.environ["ISPEC_EVAL_SOURCE"]))
     assert os.environ["ISPEC_ASSISTANT_MAX_PROMPT_TOKENS"] == "6000"
@@ -103,6 +118,10 @@ def seed_records(*, store) -> None:
     """Create explicit identities for lookups and keep unrelated records visible."""
     with get_session(store.core_db_path) as core:
         core.add(Project(id=57, prj_AddedBy="fixture", prj_ProjectTitle="Synthetic sample follow-up"))
+        core.add(Project(
+            id=64, prj_AddedBy="fixture", prj_ProjectTitle="Viral protein sequence verification",
+            prj_PI="Dana Holt", prj_Project_LabContact="Sam Ortiz", prj_Status="closed",
+        ))
         core.add(Person(
             id=73, ppl_AddedBy="fixture", ppl_Name_First="Morgan",
             ppl_Name_Last="Reed", ppl_Institution="Synthetic Research Institute",
@@ -143,10 +162,13 @@ def count_findings(*, case, turns, calls) -> list[str]:
         findings.append(f"No successful {case.expected_tool} call")
     if case.no_tools and calls:
         findings.append("Unexpected tool call for clarification/greeting control")
+    for index in case.no_draft_turns:
+        if any(call["turn"] == index and call["name"] in COMMENT_WORKFLOW_TOOLS for call in calls):
+            findings.append(f"Turn {index + 1}: unexpected note tool call")
     return findings
 
 
-@pytest.mark.parametrize("case", GATE + CONTROLS, ids=lambda case: case.id)
+@pytest.mark.parametrize("case", GATE + CONTROLS + SCENARIOS, ids=lambda case: case.id)
 def test_application_conversation(application_store, monkeypatch, tmp_path, case):
     store = application_store
     seed_records(store=store)
@@ -157,7 +179,9 @@ def test_application_conversation(application_store, monkeypatch, tmp_path, case
     def observed_tool(**kwargs):
         call = {"turn": current_turn, "name": kwargs["name"], "arguments": copy.deepcopy(kwargs["args"])}
         calls.append(call)
-        assert kwargs["name"] in FIXTURE_TOOLS, f"Outside isolated DB tool boundary: {kwargs['name']}"
+        sandbox = tmp_path
+        for key in DATA_PATHS:
+            assert Path(os.environ[key]).resolve().is_relative_to(sandbox), f"{key} outside sandbox"
         assert Path(kwargs["core_db"].bind.url.database) == store.core_db_path
         result = original_run(**kwargs)
         call["result"] = copy.deepcopy(result)
@@ -167,7 +191,7 @@ def test_application_conversation(application_store, monkeypatch, tmp_path, case
     actor = _ApiKeyServiceUser(can_write_project_comments=True)
     report = {
         "case": case.id, "category": case.category, "case_definition": asdict(case),
-        "data_origin": "hand_authored_synthetic", "production": False,
+        "data_origin": case.data_origin, "production": False,
         "evidence_role": "fresh_control" if case.id.startswith("C") else "development_retest",
         "tool_calls": calls, "cards_by_turn": cards,
         "expected_comment_counts": case.comment_counts,
