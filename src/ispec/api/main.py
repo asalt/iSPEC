@@ -15,6 +15,7 @@ from ispec.api.routes.routes import router as crud_router
 from ispec.api.routes.schedule import router as schedule_router
 from ispec.api.routes.support import router as support_router
 from ispec.api.routes.comment_cards import router as comment_cards_router
+from ispec.api.routes.chat_threads import router as chat_threads_router
 from ispec.api.security import require_access, require_api_key
 from ispec.logging import get_logger
 
@@ -77,6 +78,7 @@ app.include_router(crud_router, prefix="/api", dependencies=[Depends(require_acc
 # Support assistant endpoints (/api/support/*).
 app.include_router(support_router, prefix="/api")
 app.include_router(comment_cards_router, prefix="/api")
+app.include_router(chat_threads_router, prefix="/api")
 
 # Operations endpoints for dashboards (/api/ops/*).
 app.include_router(ops_router, prefix="/api")
