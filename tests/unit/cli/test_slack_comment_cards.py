@@ -137,6 +137,52 @@ def test_click_ack_precedes_backend_and_updates_exact_message(
     assert updates[0]["ts"] == "2.0"
 
 
+@pytest.mark.parametrize("save_confirmed", [True, False])
+def test_save_click_reports_only_confirmed_receipt_when_request_fails(
+    card, monkeypatch, save_confirmed
+):
+    private = []
+    saved = card.model_copy(
+        update={"status": "saved", "comment_id": 123, "message_ts": "2.0"}
+    )
+
+    def backend(self, **kwargs):
+        if not save_confirmed:
+            raise TimeoutError
+        return {"ok": True, "card": saved.model_dump()}
+
+    def refresh(**kwargs):
+        assert save_confirmed
+        raise RuntimeError("Slack update failed")
+
+    monkeypatch.setattr(SlackCommentCards, "_post", backend)
+    client = SimpleNamespace(
+        chat_update=refresh, chat_postEphemeral=lambda **kwargs: private.append(kwargs)
+    )
+    body = {
+        "type": "block_actions",
+        "team": {"id": "T"},
+        "user": {"id": "UCLICKER"},
+        "channel": {"id": "C"},
+        "container": {"message_ts": "2.0"},
+        "actions": [
+            {
+                "action_id": SAVE_ACTION,
+                "value": card_message(card=card)["blocks"][-1]["elements"][0]["value"],
+            }
+        ],
+    }
+    SlackCommentCards(server="http://stub.invalid", api_key="synthetic").handle_action(
+        ack=lambda: None, body=body, client=client
+    )
+    expected = (
+        "Saved as comment #123. Slack couldn't refresh the card. No need to click Save again."
+        if save_confirmed
+        else "Could not confirm the card action. Its saved state will be checked if you click again."
+    )
+    assert private == [{"channel": "C", "user": "UCLICKER", "text": expected}]
+
+
 def test_denied_click_is_ephemeral_and_does_not_change_card(card, monkeypatch):
     private = []
     monkeypatch.setattr(
@@ -178,3 +224,48 @@ def test_bolt_action_registration():
         app=app
     )
     assert set(handlers) == {SAVE_ACTION, CANCEL_ACTION, UNDO_ACTION}
+
+
+def test_bolt_dispatches_save_with_injected_arguments(card, monkeypatch):
+    """Exercise Bolt's argument injection, which a direct callback call skips."""
+    bolt = pytest.importorskip("slack_bolt")
+    from slack_bolt.request import BoltRequest
+    from slack_bolt.response import BoltResponse
+    from unittest.mock import Mock
+
+    app = bolt.App(token="synthetic", token_verification_enabled=False)
+    adapter = SlackCommentCards(server="http://stub.invalid", api_key="synthetic")
+    adapter.register(app=app)
+    body = {
+        "type": "block_actions",
+        "team": {"id": "T"},
+        "user": {"id": "UCLICKER"},
+        "channel": {"id": "C"},
+        "container": {"message_ts": "2.0"},
+        "actions": [card_message(card=card)["blocks"][-1]["elements"][0]],
+    }
+    request = BoltRequest(mode="socket_mode", body=body)
+    client = Mock()
+    request.context["client"] = client
+    saved = card.model_copy(
+        update={"status": "saved", "comment_id": 123, "can_undo": True}
+    )
+
+    def save(self, *, path, payload):
+        assert request.context.ack.response.status == 200
+        assert path == f"{card.card_id}/actions" and payload["action"] == "save"
+        return {"ok": True, "card": saved.model_dump()}
+
+    monkeypatch.setattr(SlackCommentCards, "_post", save)
+    response = BoltResponse(status=200)
+    listeners = [
+        listener
+        for listener in app._listeners
+        if listener.matches(req=request, resp=response)
+    ]
+    assert len(listeners) == 1
+    listeners[0].run_ack_function(request=request, response=response)
+    client.chat_update.assert_called_once_with(
+        channel="C", ts="2.0", **card_message(card=saved)
+    )
+    client.chat_postEphemeral.assert_not_called()

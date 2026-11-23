@@ -159,12 +159,13 @@ class SlackCommentCards:
                     type(exc).__name__,
                 )
 
-    def handle_action(self, *, ack: Any, body: dict[str, Any], client: Any) -> None:
-        """Acknowledge immediately, then validate through the shared backend endpoint."""
+    def handle_action(self, ack: Any, body: dict[str, Any], client: Any) -> None:
+        """Bolt discovers positional argument names to inject into its listener."""
         ack()
         channel = str((body.get("channel") or {}).get("id") or "")
         user_id = str((body.get("user") or {}).get("id") or "")
         message_ts = str((body.get("container") or {}).get("message_ts") or "")
+        saved_comment_id = None
         try:
             actions = body.get("actions") or []
             if body.get("type") != "block_actions" or len(actions) != 1:
@@ -192,8 +193,21 @@ class SlackCommentCards:
                     },
                 },
             )
+            logger.info(
+                "Slack card action=%s accepted=%s already_completed=%s",
+                _ACTION_NAMES[action["action_id"]],
+                result.get("ok") is True,
+                result.get("already_completed") is True,
+            )
             if result.get("card"):
                 card = ConfirmationCard.model_validate(result["card"])
+                if (
+                    action["action_id"] == SAVE_ACTION
+                    and result.get("ok") is True
+                    and card.status == "saved"
+                    and card.comment_id is not None
+                ):
+                    saved_comment_id = card.comment_id
                 client.chat_update(
                     channel=channel, ts=message_ts, **card_message(card=card)
                 )
@@ -212,7 +226,12 @@ class SlackCommentCards:
                 client.chat_postEphemeral(
                     channel=channel,
                     user=user_id,
-                    text="Could not confirm the card action. Its saved state will be checked if you click again.",
+                    text=(
+                        f"Saved as comment #{saved_comment_id}. "
+                        "Slack couldn't refresh the card. No need to click Save again."
+                        if saved_comment_id is not None
+                        else "Could not confirm the card action. Its saved state will be checked if you click again."
+                    ),
                 )
 
     def register(self, *, app: Any) -> None:
