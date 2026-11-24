@@ -27,6 +27,8 @@ def effective_project_access_mode(user: AuthUser | None) -> ProjectAccessMode:
 
     if user is None:
         return ProjectAccessMode.all_projects
+    if getattr(user, "is_comment_agent", False):
+        return ProjectAccessMode.explicit_projects
 
     raw_mode = _enum_value(getattr(user, "project_access_mode", None))
     if raw_mode:

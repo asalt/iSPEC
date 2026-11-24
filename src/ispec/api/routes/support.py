@@ -1129,6 +1129,8 @@ def _enforce_session_access(session: SupportSession, user: AuthUser | None) -> N
         return
 
     if session.user_id is None:
+        if getattr(user, "is_comment_agent", False):
+            raise HTTPException(status_code=403, detail="Session does not belong to this agent.")
         session.user_id = user.id
         return
 
@@ -1304,6 +1306,11 @@ def chat(
     schedule_db: Session = Depends(get_schedule_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ):
+    if getattr(user, "is_comment_agent", False):
+        if not payload.sessionId.startswith(f"agent:{user.id}:"):
+            raise HTTPException(status_code=403, detail="Use this agent's own chat thread.")
+        if request is not None and (payload.history or payload.ui is not None or payload.meta):
+            raise HTTPException(status_code=422, detail="Agent chat accepts a thread and message only.")
     if _chat_queue_enabled() and not _queue_force_inline(payload) and _supervisor_heartbeat_ok(agent_db=agent_db):
         response = _chat_via_queue(payload=payload, assistant_db=assistant_db, agent_db=agent_db, user=user)
         if response.messageId is not None:

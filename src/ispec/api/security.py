@@ -293,6 +293,14 @@ _PASSWORD_CHANGE_ALLOWED_PATHS = {
     "/api/auth/change-password",
 }
 
+_COMMENT_AGENT_ROUTES = {
+    ("GET", "/api/auth/me"),
+    ("POST", "/api/auth/logout"),
+    ("POST", "/api/auth/change-password"),
+    ("POST", "/api/support/chat"),
+    ("GET", "/api/project_comment/by_project/{project_id}"),
+}
+
 
 def require_user(
     request: Request,
@@ -302,6 +310,11 @@ def require_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated.")
 
     require_browser_origin(request)
+
+    if getattr(user, "is_comment_agent", False):
+        route_path = getattr(request.scope.get("route"), "path", None)
+        if user.role != UserRole.viewer or (request.method, route_path) not in _COMMENT_AGENT_ROUTES:
+            raise HTTPException(status_code=403, detail="Outside comment-agent access.")
 
     if getattr(user, "must_change_password", False):
         path = (request.url.path or "").rstrip("/")

@@ -295,6 +295,16 @@ def test_cancel_then_save_and_repeated_cancel(conversation):
     assert conversation.comments() == []
 
 
+def test_comment_agent_cannot_approve_prepared_note_by_text_or_click(conversation):
+    card_id, draft_id = conversation.prepare()
+    conversation.user = AuthUser(id=1, role=UserRole.viewer, is_comment_agent=True)
+    turn = conversation.turn(text="Save this note now.")
+    result = turn.run(name="create_project_comment", args={"draft_id": draft_id, "confirm": True})
+    assert result["error_code"] == "permission_denied"
+    assert conversation.click(card_id=card_id, draft_id=draft_id).error_code == "permission_denied"
+    assert not conversation.comments()
+
+
 def test_acl_denial_and_deployment_switch(conversation, monkeypatch):
     card_id, draft_id = conversation.prepare()
     conversation.user.project_access_mode = ProjectAccessMode.explicit_projects

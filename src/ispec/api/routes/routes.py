@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from ispec.authz import scope_project_query, uses_explicit_project_access
 from ispec.db.connect import get_session_dep
-from typing import Type, Callable
+from typing import Callable
 from ispec.omics.connect import get_omics_session_dep
 from ispec.api.qc import qc_flags_for_experiment_id
 from ispec.db.models import (
@@ -1181,7 +1181,6 @@ if _enabled("jobs"):
 
 
 # ========================= Convenience: E2G by relations ==========
-from sqlalchemy import func as _sa_func
 
 
 if _enabled("experiment_to_gene"):
@@ -1261,7 +1260,9 @@ if _enabled("project_comment"):
         offset: int = Query(default=0, ge=0),
         db: Session = Depends(get_session_dep),
     ):
-        _reject_scoped_user(request)
+        user = getattr(request.state, "user", None) if request else None
+        if not getattr(user, "is_comment_agent", False):
+            _reject_scoped_user(request)
         from ispec.db.models import Person as _Person
 
         rows = (

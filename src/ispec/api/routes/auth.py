@@ -45,6 +45,7 @@ class UserOut(BaseModel):
     person_label: str | None = None
     project_access_mode: ProjectAccessMode | None = None
     is_active: bool
+    is_comment_agent: bool = False
     must_change_password: bool
     assistant_brief: str | None = None
     project_count: int | None = None
@@ -67,6 +68,7 @@ class CreateUserRequest(BaseModel):
     role: UserRole = UserRole.editor
     person_id: int | None = Field(default=None, ge=1)
     must_change_password: bool = False
+    is_comment_agent: bool = False
 
 
 class ChangePasswordRequest(BaseModel):
@@ -138,6 +140,7 @@ def _user_out(user: AuthUser, *, project_count: int | None = None) -> UserOut:
         person_label=_person_label(person),
         project_access_mode=effective_project_access_mode(user),
         is_active=user.is_active,
+        is_comment_agent=bool(user.is_comment_agent),
         must_change_password=bool(getattr(user, "must_change_password", False)),
         assistant_brief=_normalize_assistant_brief(
             getattr(user, "assistant_brief", None)
@@ -271,6 +274,8 @@ def create_user(
 
     _require_person(db, payload.person_id)
 
+    if payload.is_comment_agent and payload.role != UserRole.viewer:
+        raise HTTPException(status_code=422, detail="Comment agents require the viewer role.")
     salt_b64, hash_b64, iterations = hash_password(payload.password)
     user = AuthUser(
         username=payload.username,
@@ -278,6 +283,7 @@ def create_user(
         password_salt=salt_b64,
         password_iterations=iterations,
         role=payload.role,
+        is_comment_agent=payload.is_comment_agent,
         person_id=payload.person_id,
         is_active=True,
         must_change_password=bool(payload.must_change_password),

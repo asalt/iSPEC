@@ -17,6 +17,17 @@ def test_initialize_sqlite_db(tmp_path):
     assert "project_person" in tables
 
 
+def test_existing_accounts_do_not_acquire_comment_agent_access(tmp_path):
+    engine = sqlite_engine(f"sqlite:///{tmp_path}/previous.db")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE auth_user (id INTEGER PRIMARY KEY)"))
+        conn.execute(text("INSERT INTO auth_user (id) VALUES (1)"))
+    initialize_db(engine)
+    initialize_db(engine)
+    with engine.connect() as conn:
+        assert conn.scalar(text("SELECT is_comment_agent FROM auth_user WHERE id = 1")) == 0
+
+
 def test_initialize_db_repairs_missing_project_type_column(tmp_path):
     db_url = f"sqlite:///{tmp_path}/legacy.db"
     engine = sqlite_engine(db_url)

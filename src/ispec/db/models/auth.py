@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import enum
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, Enum as SAEnum, ForeignKey, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base, make_timestamp_mixin
+
+if TYPE_CHECKING:
+    from .core import Person
 
 
 AuthTimestamp = make_timestamp_mixin("auth")
@@ -50,9 +54,15 @@ class AuthUser(AuthTimestamp, Base):
     )
     assistant_brief: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_comment_agent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=False)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     password_changed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    @property
+    def can_write_project_comments(self) -> bool:
+        """Keep a comment-reading agent read-only, including on queued chat turns."""
+        return not self.is_comment_agent
 
     sessions: Mapped[list["AuthSession"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
