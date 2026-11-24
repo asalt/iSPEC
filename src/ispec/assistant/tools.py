@@ -2225,7 +2225,9 @@ def _assistant_list_tools_payload(
     specs = _OPENAI_TOOL_SPECS
     if staged_project_comments:
         from ispec.assistant.project_comment_workflow import comment_workflow_tools
-        specs = {spec["function"]["name"]: spec for spec in comment_workflow_tools(tools=list(specs.values()))}
+        specs = {spec["function"]["name"]: spec for spec in comment_workflow_tools(
+            tools=list(specs.values()), prepare_only=bool(getattr(user, "is_comment_agent", False))
+        )}
     for tool_name, spec in sorted(specs.items(), key=lambda pair: str(pair[0])):
         func_obj = spec.get("function") if isinstance(spec, dict) else None
         desc = ""
@@ -2280,7 +2282,9 @@ def _assistant_list_tools_payload(
         elif tool_name in _WRITE_TOOL_NAMES or tool_name in {"prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
             if user is None:
                 unavailable_reason = "Authentication required for write tools."
-            elif tool_name in {"create_project_comment", "prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"} and getattr(user, "can_write_project_comments", True) is not True:
+            elif tool_name in {"create_project_comment", "prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"} and getattr(user, "can_write_project_comments", True) is not True and not (
+                getattr(user, "is_comment_agent", False) and tool_name in {"prepare_project_comment", "show_project_comment_card"}
+            ):
                 unavailable_reason = "Project-comment writes are disabled for this service identity."
             elif uses_explicit_project_access(user) and tool_name not in {"create_project_comment", "prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
                 unavailable_reason = "Write access required."

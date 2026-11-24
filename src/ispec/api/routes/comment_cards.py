@@ -19,6 +19,7 @@ from ispec.assistant.project_comment_cards import (
     ConfirmationCard,
     act_on_card,
     cards_for_conversation,
+    claim_staff_review,
 )
 from ispec.assistant.connect import get_assistant_session_dep
 from ispec.db.connect import get_session_dep
@@ -84,6 +85,23 @@ class CardDelivery(BaseModel):
     channel_id: str = Field(min_length=1, max_length=80)
     thread_ts: str = Field(default="", max_length=80)
     message_ts: str = Field(min_length=1, max_length=80)
+
+
+class StaffReviewClaim(BaseModel):
+    team_id: str = Field(min_length=1, max_length=80)
+
+
+@router.post("/staff-review/claim", dependencies=[Depends(require_configured_api_key)])
+def claim_review(
+    payload: StaffReviewClaim,
+    db: Session = Depends(get_session_dep),
+    assistant_db: Session = Depends(get_assistant_session_dep),
+):
+    return {
+        "delivery": claim_staff_review(
+            core_db=db, assistant_db=assistant_db, team_id=payload.team_id
+        )
+    }
 
 
 @router.post("/{card_id}/delivery", dependencies=[Depends(require_configured_api_key)])

@@ -179,6 +179,37 @@ def application_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("ISPEC_ASSISTANT_SYSTEM_PROMPT_EXTRA_PATH", raising=False)
 
 
+def test_named_agent_can_prepare_through_controller(conversation, application_settings, monkeypatch, tmp_path):  # noqa: F811
+    from ispec.db.models import AuthUser, UserRole
+
+    class AgentModel(ScriptedModel):
+        def tool_reply(self, *, request):
+            names = {tool.function.name for tool in request.tools}
+            assert "prepare_project_comment" in names and "create_project_comment" not in names
+            self.tool_round += 1
+            if self.tool_round == 1:
+                return self.call(name="prepare_project_comment", arguments={"project_id": 57, "comment": NOTE})
+            if self.tool_round == 2:
+                return {"content": "The draft is ready."}
+            assert '"requested_by": "dot"' in request.messages[0].content
+            return {"content": "Dot requested it."}
+
+    model = AgentModel()
+    monkeypatch.setattr(service.requests, "post", model.post)
+    agent = AuthUser(id=23, username="dot", role=UserRole.viewer, is_comment_agent=True, is_active=True)
+    with get_schedule_session(tmp_path / "schedule.db") as schedule:
+        def send(message, **fields):
+            return support.chat(support.ChatRequest(message=message, **fields), assistant_db=conversation.assistant,
+                                core_db=conversation.core, schedule_db=schedule, user=agent)
+
+        prepared = send("I'm Dot. Draft a note for project 57.")
+        assert prepared.sessionId.startswith("agent:23:")
+        assert prepared.commentCards[-1].comment == NOTE
+        answer = send("Who requested that draft?", sessionId=prepared.sessionId)
+        assert answer.message == "Dot requested it."
+    assert model.classifier_calls == 0 and conversation.comments() == []
+
+
 @pytest.mark.parametrize("surface", ["web", "slack"])
 @pytest.mark.parametrize(
     "label,confidence,saved",

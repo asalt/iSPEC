@@ -1,6 +1,6 @@
 """HTTP adapter tests with cookie identities and trusted receiver stubs."""
 
-from types import SimpleNamespace
+# ruff: noqa: F811 -- pytest injects the shared conversation fixture by name.
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -68,6 +68,15 @@ def test_browser_click_and_restored_card(client, conversation):
     )
     assert undone.json()["ok"] and undone.json()["card"]["status"] == "undone"
     assert conversation.comments() == []
+
+
+def test_review_delivery_requires_receiver_key_even_with_cookie(client):
+    path = "/api/support/project-comment-cards/staff-review/claim"
+    assert client.post(path, json={"team_id": "TSTAFF"}).status_code == 401
+    response = client.post(
+        path, headers={"X-API-Key": "synthetic-key"}, json={"team_id": "TSTAFF"}
+    )
+    assert response.status_code == 200 and response.json() == {"delivery": None}
 
 
 def test_cross_origin_click_is_rejected(client, conversation):

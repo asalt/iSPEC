@@ -1190,8 +1190,10 @@ def _run_socket_mode(args) -> None:
     )
 
     # Best-effort token sanity check so failures show up immediately in logs.
+    verified_team = ""
     try:
         auth = app.client.auth_test()
+        verified_team = str(auth.get("team_id") or "")
         logger.info(
             "Slack auth_test ok team=%s team_id=%s bot_user_id=%s",
             auth.get("team"),
@@ -1727,4 +1729,11 @@ def _run_socket_mode(args) -> None:
         )
 
     logger.info("Starting Slack bot (Socket Mode) -> %s", cfg.ispec_server)
-    SocketModeHandler(app, cfg.app_token).start()
+    reviews = None
+    if verified_team and cfg.api_key and os.getenv("ISPEC_SLACK_AGENT_REVIEW_ENABLED") == "1":
+        reviews = comment_cards.start_staff_reviews(client=thread_client, team_id=verified_team)
+    try:
+        SocketModeHandler(app, cfg.app_token).start()
+    finally:
+        if reviews is not None:
+            reviews.set()

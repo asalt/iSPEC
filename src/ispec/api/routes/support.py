@@ -7,6 +7,7 @@ import json
 import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from ispec.assistant.slack_outbound import outbound_context_message
@@ -370,7 +371,8 @@ class UIContext(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    sessionId: str = Field(min_length=1, max_length=256)
+    sessionId: str | None = Field(default=None, min_length=1, max_length=256)
+    reviewDestination: Literal["staff_slack"] | None = None
     message: str = Field(min_length=1, max_length=20_000)
     history: list[ChatHistoryItem] = Field(default_factory=list)
     ui: UIContext | None = None
@@ -1306,12 +1308,24 @@ def chat(
     schedule_db: Session = Depends(get_schedule_session_dep),
     user: AuthUser | None = Depends(require_assistant_access),
 ):
-    if getattr(user, "is_comment_agent", False):
+    comment_agent = bool(getattr(user, "is_comment_agent", False))
+    if payload.sessionId is None:
+        prefix = f"agent:{user.id}" if comment_agent else "chat"
+        payload = payload.model_copy(update={"sessionId": f"{prefix}:{uuid4().hex}"})
+    review_origin = None
+    if payload.reviewDestination:
+        if not comment_agent:
+            raise HTTPException(status_code=403, detail="Requires a named comment-agent session.")
+        try:
+            review_origin = CardOrigin.for_staff_review(user=user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if comment_agent:
         if not payload.sessionId.startswith(f"agent:{user.id}:"):
             raise HTTPException(status_code=403, detail="Use this agent's own chat thread.")
-        if request is not None and (payload.history or payload.ui is not None or payload.meta):
+        if payload.history or payload.ui is not None or payload.meta:
             raise HTTPException(status_code=422, detail="Agent chat accepts a thread and message only.")
-    if _chat_queue_enabled() and not _queue_force_inline(payload) and _supervisor_heartbeat_ok(agent_db=agent_db):
+    if not comment_agent and _chat_queue_enabled() and not _queue_force_inline(payload) and _supervisor_heartbeat_ok(agent_db=agent_db):
         response = _chat_via_queue(payload=payload, assistant_db=assistant_db, agent_db=agent_db, user=user)
         if response.messageId is not None:
             # Queue mode: assistant message is committed by the supervisor, so we can poke immediately.
@@ -1522,7 +1536,7 @@ def chat(
     controller_thread_key = support_post_send_thread_key(session.session_id)
     slack_actor = (payload.meta or {}).get("slack")
     try:
-        card_origin = CardOrigin.for_request(
+        card_origin = review_origin or CardOrigin.for_request(
             user=user,
             slack=slack_actor if isinstance(slack_actor, dict) else None,
         )
@@ -1549,7 +1563,10 @@ def chat(
         ),
         card_origin=card_origin,
     )
-    tool_schemas = comment_workflow_tools(tools=tool_schemas or []) if tool_protocol == "openai" else tool_schemas
+    if tool_protocol == "openai":
+        tool_schemas = comment_workflow_tools(
+            tools=tool_schemas or [], prepare_only=comment_agent and tools_enabled
+        )
     history_scope = None
     if assistant_provider == "vllm" and vllm_tool_parser() == "olmo3" and tool_protocol == "openai":
         history_scope = native_history.access_key(

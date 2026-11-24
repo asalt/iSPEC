@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import os
+import re
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -72,11 +73,20 @@ class CardResult(BaseModel):
 
 @dataclass(frozen=True, kw_only=True)
 class CardOrigin:
-    surface: Literal["web", "slack"]
+    surface: Literal["web", "slack", "staff_review"]
     requester_id: str
     team_id: str = ""
     channel_id: str = ""
     thread_ts: str = ""
+
+    @classmethod
+    def for_staff_review(cls, *, user: AuthUser) -> "CardOrigin":
+        channel = staff_review_channel()
+        if not channel or not user.is_comment_agent or not user.is_active:
+            raise ValueError("Staff Slack draft review is unavailable.")
+        return cls(
+            surface="staff_review", requester_id=f"agent:{user.id}", channel_id=channel
+        )
 
     @classmethod
     def for_request(
@@ -169,6 +179,84 @@ def cards_for_conversation(
     return [snapshot(card=card, draft=draft) for card, draft in reversed(rows)]
 
 
+def staff_review_channel() -> str | None:
+    """Only explicitly enabled, fixed-channel delivery with named reviewers."""
+    channel = os.getenv("ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL", "").strip()
+    reviewers = os.getenv("ISPEC_SLACK_ALLOWED_USER_IDS", "").split(",")
+    if (
+        os.getenv("ISPEC_SLACK_AGENT_REVIEW_ENABLED") == "1"
+        and re.fullmatch(r"[CG][A-Z0-9]+", channel)
+        and any(item.strip() for item in reviewers)
+    ):
+        return channel
+    return None
+
+
+def claim_staff_review(*, core_db: Session, assistant_db: Session, team_id: str):
+    """Claim once before posting: an ambiguous Slack response must not resend a card."""
+    channel = staff_review_channel()
+    if not channel:
+        return None
+    now = datetime.now(UTC).replace(tzinfo=None)
+    with Session(bind=core_db.get_bind()) as db, db.begin():
+        rows = db.execute(
+            select(ProjectCommentCard, ProjectCommentDraft)
+            .join(
+                ProjectCommentDraft,
+                ProjectCommentDraft.id == ProjectCommentCard.draft_id,
+            )
+            .where(
+                ProjectCommentCard.surface == "staff_review",
+                ProjectCommentCard.assistant_message_id.is_not(None),
+                ProjectCommentCard.channel_id == channel,
+                ProjectCommentDraft.status == "pending",
+                ProjectCommentDraft.expires_at > now,
+            )
+            .order_by(ProjectCommentDraft.created_at)
+            .limit(20)
+        ).all()
+        for card, draft in rows:
+            if not _has_committed_presentation(
+                assistant_db=assistant_db, card=card, draft=draft
+            ):
+                continue
+            changed = db.execute(
+                update(ProjectCommentCard)
+                .where(
+                    ProjectCommentCard.id == card.id,
+                    ProjectCommentCard.surface == "staff_review",
+                )
+                .values(surface="slack", team_id=team_id)
+            ).rowcount
+            if changed:
+                return {"channel": channel, "card": snapshot(card=card, draft=draft)}
+    return None
+
+
+def staff_review_context(*, db: Session, origin: CardOrigin | None) -> dict | None:
+    """Expose requester provenance only inside the bound Slack card's own thread."""
+    if not origin or origin.surface != "slack" or not origin.thread_ts:
+        return None
+    draft = db.scalar(
+        select(ProjectCommentDraft)
+        .join(ProjectCommentCard)
+        .where(
+            ProjectCommentCard.surface == "slack",
+            ProjectCommentCard.requester_id.startswith("agent:"),
+            ProjectCommentCard.team_id == origin.team_id,
+            ProjectCommentCard.channel_id == origin.channel_id,
+            ProjectCommentCard.message_ts == origin.thread_ts,
+        )
+    )
+    if draft:
+        return {
+            "project_id": draft.project_id,
+            "requested_by": draft.actor_key.partition(":")[2],
+            "status": draft.status,
+        }
+    return None
+
+
 def _denied(
     *, code: str, message: str, card: ConfirmationCard | None = None
 ) -> CardResult:
@@ -186,7 +274,7 @@ def _clicker_allowed(
             and getattr(user, "id", 0) > 0
             and str(user.id) == card.requester_id
         )
-    if slack is None or getattr(user, "id", None) != 0:
+    if card.surface != "slack" or slack is None or getattr(user, "id", None) != 0:
         return False
     if (slack.team_id, slack.channel_id, slack.message_ts) != (
         card.team_id,
@@ -199,6 +287,8 @@ def _clicker_allowed(
         for item in os.getenv("ISPEC_SLACK_ALLOWED_USER_IDS", "").split(",")
         if item.strip()
     }
+    if card.requester_id.startswith("agent:"):
+        return slack.user_id in allowed
     return slack.user_id == card.requester_id or slack.user_id in allowed
 
 

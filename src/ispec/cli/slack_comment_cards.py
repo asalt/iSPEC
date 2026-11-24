@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import json
 import logging
+from threading import Event, Thread
 from typing import Any
 
 import requests
@@ -238,3 +239,31 @@ class SlackCommentCards:
         app.action(SAVE_ACTION)(self.handle_action)
         app.action(CANCEL_ACTION)(self.handle_action)
         app.action(UNDO_ACTION)(self.handle_action)
+
+    def deliver_staff_review(self, *, client: Any, team_id: str) -> None:
+        delivery = self._post(path="staff-review/claim", payload={"team_id": team_id})[
+            "delivery"
+        ]
+        if delivery:
+            self.publish(
+                payload={"commentCards": [delivery["card"]]},
+                client=client,
+                team_id=team_id,
+                channel_id=delivery["channel"],
+                thread_ts="",
+            )
+
+    def start_staff_reviews(self, *, client: Any, team_id: str) -> Event:
+        stop = Event()
+
+        def poll() -> None:
+            while not stop.wait(30):
+                try:
+                    self.deliver_staff_review(client=client, team_id=team_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Staff review poll failed error_type=%s", type(exc).__name__
+                    )
+
+        Thread(target=poll, name="slack-staff-reviews", daemon=True).start()
+        return stop

@@ -54,6 +54,29 @@ def test_long_card_text_is_complete(card):
     )
 
 
+def test_publishes_claimed_review_as_thread_root_and_binds_message(card, monkeypatch):
+    calls = []
+    posted = []
+
+    def api(self, *, path, payload):
+        calls.append((path, payload))
+        if path == "staff-review/claim":
+            return {"delivery": {"channel": "CREVIEW", "card": card.model_dump()}}
+        return {"ok": True}
+
+    monkeypatch.setattr(SlackCommentCards, "_post", api)
+    client = SimpleNamespace(
+        chat_postMessage=lambda **kwargs: posted.append(kwargs) or {"ts": "2.0"}
+    )
+    adapter = SlackCommentCards(server="http://stub.invalid", api_key="synthetic")
+    adapter.deliver_staff_review(client=client, team_id="T")
+    assert posted == [{"channel": "CREVIEW", **card_message(card=card)}]
+    assert calls[-1] == (
+        f"{card.card_id}/delivery",
+        {"channel_id": "CREVIEW", "team_id": "T", "thread_ts": "", "message_ts": "2.0"},
+    )
+
+
 def test_delivery_receipt_then_in_place_updates(card, monkeypatch):
     posts, updates, api_calls = [], [], []
     client = SimpleNamespace(

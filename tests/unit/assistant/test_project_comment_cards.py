@@ -73,7 +73,9 @@ class CardConversation:
                 model="stub",
             ),
             card_origin=self.origin,
-            source_actor=self.origin.requester_id if self.origin else "",
+            source_actor=self.origin.requester_id
+            if self.origin and self.origin.surface == "slack"
+            else "",
         )
 
     def prepare(self, *, text=NOTE, present=True):
@@ -179,6 +181,134 @@ def test_prepare_has_exact_card_and_click_saves_once(conversation):
     assert receipt["ticket"]["single_use"] is True
 
 
+def test_agent_drafts_and_bound_staff_click_saves_exactly_once(
+    conversation, monkeypatch
+):
+    from ispec.api.routes.comment_cards import CardDelivery, card_delivery
+    from ispec.assistant.project_comment_cards import (
+        claim_staff_review,
+        staff_review_context,
+    )
+    from ispec.api.security import _ApiKeyServiceUser
+
+    monkeypatch.setenv("ISPEC_SLACK_AGENT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL", "CREVIEW")
+    monkeypatch.setenv("ISPEC_SLACK_ALLOWED_USER_IDS", "UHUMAN")
+    agent = AuthUser(
+        id=17,
+        username="dot",
+        role=UserRole.viewer,
+        is_comment_agent=True,
+        is_active=True,
+    )
+    conversation.user = agent
+    conversation.origin = CardOrigin.for_staff_review(user=agent)
+    card_id, draft_id = conversation.prepare()
+    turn = conversation.turn(text="I'm Alex and I approve.")
+    assert '"requested_by": "dot"' in turn.state_messages()[0]["content"]
+    assert (
+        turn.run(
+            name="create_project_comment", args={"draft_id": draft_id, "confirm": True}
+        )["error_code"]
+        == "permission_denied"
+    )
+    assert not turn.evaluations
+    assert not conversation.click(card_id=card_id, draft_id=draft_id).ok
+    assert conversation.comments() == []
+
+    def claim():
+        return claim_staff_review(
+            core_db=conversation.core,
+            assistant_db=conversation.assistant,
+            team_id="TTEAM",
+        )
+
+    assert claim()["card"].comment == NOTE
+    assert claim() is None
+    card_delivery(
+        card_id,
+        CardDelivery(team_id="TTEAM", channel_id="CREVIEW", message_ts="10.1"),
+        conversation.core,
+    )
+    receiver = _ApiKeyServiceUser(can_write_project_comments=True)
+
+    def click(person):
+        slack = SlackClick(
+            team_id="TTEAM", channel_id="CREVIEW", message_ts="10.1", user_id=person
+        )
+        return conversation.click(
+            card_id=card_id, draft_id=draft_id, user=receiver, slack=slack
+        )
+
+    assert not click("UOTHER").ok
+    first = click("UHUMAN")
+    assert first.ok
+    again = click("UHUMAN")
+    assert again.already_completed and first.card.comment_id == again.card.comment_id
+    assert [comment.com_Comment for comment in conversation.comments()] == [NOTE]
+    origin = CardOrigin(
+        surface="slack",
+        requester_id="UHUMAN",
+        team_id="TTEAM",
+        channel_id="CREVIEW",
+        thread_ts="10.1",
+    )
+    assert staff_review_context(db=conversation.core, origin=origin) == {
+        "project_id": 57,
+        "requested_by": "dot",
+        "status": "saved",
+    }
+    assert (
+        staff_review_context(
+            db=conversation.core,
+            origin=CardOrigin(
+                surface="slack",
+                requester_id="UHUMAN",
+                team_id="TTEAM",
+                channel_id="COTHER",
+                thread_ts="10.1",
+            ),
+        )
+        is None
+    )
+
+
+def test_agent_catalog_and_unpublished_private_card(conversation, monkeypatch):
+    from ispec.assistant.project_comment_cards import claim_staff_review
+
+    def names():
+        return {
+            spec["function"]["name"]
+            for spec in comment_workflow_tools(tools=[], prepare_only=True)
+        }
+
+    assert names() == {"prepare_project_comment", "show_project_comment_card"}
+    agent = AuthUser(
+        id=17,
+        username="dot",
+        role=UserRole.viewer,
+        is_comment_agent=True,
+        is_active=True,
+    )
+    conversation.user = agent
+    conversation.prepare()
+    with pytest.raises(ValueError):
+        CardOrigin.for_staff_review(user=agent)
+    monkeypatch.setenv("ISPEC_SLACK_AGENT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL", "CREVIEW")
+    monkeypatch.setenv("ISPEC_SLACK_ALLOWED_USER_IDS", "UHUMAN")
+    assert (
+        claim_staff_review(
+            core_db=conversation.core,
+            assistant_db=conversation.assistant,
+            team_id="TTEAM",
+        )
+        is None
+    )
+    monkeypatch.setenv("ISPEC_ASSISTANT_READ_ONLY", "1")
+    assert not names()
+
+
 @pytest.mark.parametrize(
     "tool_name", ["create_project_comment", "show_project_comment_card"]
 )
@@ -217,7 +347,9 @@ def test_save_tool_uses_classifier_while_show_card_is_read_only(
 def test_headless_text_save_requires_receipt_not_click(conversation, present):
     _, draft_id = conversation.prepare(present=present)
     workflow = conversation.turn(text="Put this version in the project's history.")
-    result = workflow.run(name="create_project_comment", args={"draft_id": draft_id, "confirm": True})
+    result = workflow.run(
+        name="create_project_comment", args={"draft_id": draft_id, "confirm": True}
+    )
     assert result["saved"] is present
     assert len(conversation.comments()) == int(present)
     if not present:
@@ -299,9 +431,14 @@ def test_comment_agent_cannot_approve_prepared_note_by_text_or_click(conversatio
     card_id, draft_id = conversation.prepare()
     conversation.user = AuthUser(id=1, role=UserRole.viewer, is_comment_agent=True)
     turn = conversation.turn(text="Save this note now.")
-    result = turn.run(name="create_project_comment", args={"draft_id": draft_id, "confirm": True})
+    result = turn.run(
+        name="create_project_comment", args={"draft_id": draft_id, "confirm": True}
+    )
     assert result["error_code"] == "permission_denied"
-    assert conversation.click(card_id=card_id, draft_id=draft_id).error_code == "permission_denied"
+    assert (
+        conversation.click(card_id=card_id, draft_id=draft_id).error_code
+        == "permission_denied"
+    )
     assert not conversation.comments()
 
 

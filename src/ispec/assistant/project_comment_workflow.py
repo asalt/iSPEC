@@ -20,6 +20,7 @@ from ispec.assistant.project_comment_cards import (
     cards_for_conversation,
     new_card,
     save_from_text,
+    staff_review_context,
 )
 from ispec.assistant.project_comment_approval import (
     ProjectCommentApprovalSettings,
@@ -36,6 +37,7 @@ from ispec.assistant.small_classifier import (
     normalize_small_classifier_decision,
 )
 from ispec.db.models import (
+    Project,
     ProjectCommentCard,
     ProjectCommentDraft,
     ProjectCommentSaveOffer,
@@ -71,14 +73,21 @@ def _tool_spec(
     }
 
 
-def comment_workflow_tools(*, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+PREPARE_ONLY_TOOLS = {"prepare_project_comment", "show_project_comment_card"}
+
+
+def comment_workflow_tools(
+    *, tools: list[dict[str, Any]], prepare_only: bool = False
+) -> list[dict[str, Any]]:
     """Replace the chat write signature, preserving deployment/role filtering."""
     result = [
         spec for spec in tools if spec["function"]["name"] not in COMMENT_WORKFLOW_TOOLS
     ]
-    if not any(spec["function"]["name"] == "create_project_comment" for spec in tools):
+    if not prepare_only and not any(
+        spec["function"]["name"] == "create_project_comment" for spec in tools
+    ):
         return result
-    return result + [
+    workflow = [
         _tool_spec(
             name="prepare_project_comment",
             description="Register a new or revised project-history draft. The server shows the exact stored text in a confirmation card; the person clicks Save or Cancel. Use prose for wording-only help. A revision requires a new preparation and supersedes the old card.",
@@ -112,6 +121,16 @@ def comment_workflow_tools(*, tools: list[dict[str, Any]]) -> list[dict[str, Any
             required=["draft_id"],
         ),
     ]
+
+    if prepare_only:
+        from ispec.assistant.tools import assistant_write_error
+
+        if assistant_write_error("prepare_project_comment"):
+            return result
+        workflow = [
+            spec for spec in workflow if spec["function"]["name"] in PREPARE_ONLY_TOOLS
+        ]
+    return result + workflow
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -212,6 +231,17 @@ class ProjectCommentWorkflow:
         # Never hold a core transaction open during model inference.
         return Session(bind=self.core_db.get_bind(), expire_on_commit=False)
 
+    def _can_reference_project(self, db: Session, project_id: int) -> bool:
+        """A comment agent can propose notes across projects without reading project records."""
+        if getattr(self.user, "is_comment_agent", False):
+            return (
+                db.scalar(select(Project.id).where(Project.id == project_id))
+                is not None
+            )
+        return (
+            get_project_for_user(db, user=self.user, project_id=project_id) is not None
+        )
+
     def pending(self) -> PendingComment | None:
         with self._session() as db:
             rows = db.scalars(
@@ -226,11 +256,7 @@ class ProjectCommentWorkflow:
             ).all()
             # Ambiguous state must not silently select the most recent draft.
             row = rows[0] if len(rows) == 1 else None
-            if (
-                row
-                and get_project_for_user(db, user=self.user, project_id=row.project_id)
-                is None
-            ):
+            if row and not self._can_reference_project(db, row.project_id):
                 return None
             return PendingComment.from_row(row=row) if row else None
 
@@ -239,7 +265,12 @@ class ProjectCommentWorkflow:
         messages = [
             {
                 "role": "system",
-                "content": render_prompt("assistant.project_comment.workflow").text,
+                "content": (
+                    "Prepare or revise the requested project note with prepare_project_comment. "
+                    "This account can request a draft; only an authorized reviewer can save it."
+                    if getattr(self.user, "is_comment_agent", False)
+                    else render_prompt("assistant.project_comment.workflow").text
+                ),
             }
         ]
         if pending:
@@ -281,28 +312,30 @@ class ProjectCommentWorkflow:
             cards = cards_for_conversation(
                 db=db, session_id=self.session_id, actor_key=self.actor_key
             )
-        if not cards:
-            return []
-        return [
-            {
-                "role": "system",
-                "content": "Current server confirmation-card state:\n"
-                + json.dumps(
-                    [
-                        card.model_dump(
-                            include={
-                                "draft_id",
-                                "project_id",
-                                "status",
-                                "comment_id",
-                                "can_undo",
-                            }
-                        )
-                        for card in cards
-                    ]
-                ),
-            }
-        ]
+            handoff = staff_review_context(db=db, origin=self.card_origin)
+        messages = []
+        if handoff:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Staff review card (server data): "
+                    + json.dumps(handoff),
+                }
+            )
+        if cards:
+            fields = {"draft_id", "project_id", "status", "comment_id", "can_undo"}
+            states = [card.model_dump(include=fields) for card in cards]
+            if getattr(self.user, "is_comment_agent", False):
+                for state in states:
+                    state["requested_by"] = self.user.username
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Current server confirmation-card state:\n"
+                    + json.dumps(states),
+                }
+            )
+        return messages
 
     def response_cards(self) -> list[ConfirmationCard]:
         """Return authoritative card states separately from model-authored text."""
@@ -416,11 +449,7 @@ class ProjectCommentWorkflow:
                 )
                 .values(status="pending")
             ).rowcount
-            if (
-                not valid
-                or get_project_for_user(db, user=self.user, project_id=draft.project_id)
-                is None
-            ):
+            if not valid or not self._can_reference_project(db, draft.project_id):
                 return {**receipt, "status": "draft_unavailable"}
             db.execute(
                 update(ProjectCommentCard)
@@ -503,9 +532,12 @@ class ProjectCommentWorkflow:
                 code="unknown_tool",
                 message="Unknown project-comment workflow tool.",
             )
-        if (
-            self.user is None
-            or getattr(self.user, "can_write_project_comments", True) is not True
+        if self.user is None or (
+            getattr(self.user, "can_write_project_comments", True) is not True
+            and not (
+                getattr(self.user, "is_comment_agent", False)
+                and name in PREPARE_ONLY_TOOLS
+            )
         ):
             return self._error(
                 name=name,
@@ -544,10 +576,7 @@ class ProjectCommentWorkflow:
                     message="That draft ID does not match a draft in this conversation. No other draft was substituted.",
                 )
             draft = PendingComment.from_row(row=row)
-            if (
-                get_project_for_user(db, user=self.user, project_id=draft.project_id)
-                is None
-            ):
+            if not self._can_reference_project(db, draft.project_id):
                 return self._error(
                     name=name,
                     code="project_unavailable",
@@ -673,7 +702,7 @@ class ProjectCommentWorkflow:
             )
         now = datetime.now(UTC).replace(tzinfo=None)
         with self._session() as db, db.begin():
-            if get_project_for_user(db, user=self.user, project_id=project_id) is None:
+            if not self._can_reference_project(db, project_id):
                 return self._error(
                     name=name,
                     code="project_unavailable",
