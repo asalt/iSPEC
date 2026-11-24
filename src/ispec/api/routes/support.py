@@ -1743,8 +1743,10 @@ def chat(
     # prepare_project_comment is always offered; the other note tools and their
     # instructions join the turn when routed to notes or a draft is pending.
     if tool_protocol == "openai":
+        route_decision = (tool_router or {}).get("decision") or {}
         notes_in_play = (
             tool_router is None
+            or "notes" in {route_decision.get("primary"), *(route_decision.get("secondary") or [])}
             or "create_project_comment" in _openai_tool_names(tool_schemas)
             or project_comment_workflow.pending() is not None
         )
