@@ -70,12 +70,23 @@ def _staged_comment_approval_prompt() -> str:
     return load_bound_prompt(_staged_comment_approval_prompt).text
 
 
+@prompt_binding("assistant.small_classifier.staged_comment_save_since_wait")
+def _staged_comment_save_since_wait_prompt() -> str:
+    return load_bound_prompt(_staged_comment_save_since_wait_prompt).text
+
+
 _SMALL_CLASSIFIER_TASKS: dict[str, SmallClassifierTaskSpec] = {
     "staged_comment_approval": SmallClassifierTaskSpec(
         name="staged_comment_approval",
         labels=_PROJECT_COMMENT_APPROVAL_LABELS,
         required_input_keys=("initial_request", "presented_draft", "pending_comment", "latest_user_reply"),
         binding_callable=_staged_comment_approval_prompt,
+    ),
+    "staged_comment_save_since_wait": SmallClassifierTaskSpec(
+        name="staged_comment_save_since_wait",
+        labels=("yes", "no"),
+        required_input_keys=("initial_request", "presented_draft", "pending_comment", "latest_user_reply"),
+        binding_callable=_staged_comment_save_since_wait_prompt,
     ),
     "project_comment_approval": SmallClassifierTaskSpec(
         name="project_comment_approval",
@@ -168,7 +179,7 @@ def normalize_small_classifier_decision(
     label = str(decision.get("label") or "").strip()
     if label not in task.labels:
         return None
-    if task_name in {"project_comment_approval", "staged_comment_approval"}:
+    if task_name in {"project_comment_approval", "staged_comment_approval", "staged_comment_save_since_wait"}:
         raw = decision.get("confidence")
         if (isinstance(raw, bool) or not isinstance(raw, (int, float))
                 or not math.isfinite(raw) or not 0 <= raw <= 1

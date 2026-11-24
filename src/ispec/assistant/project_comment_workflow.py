@@ -1,6 +1,6 @@
 """Model-initiated drafts with human-click confirmation cards."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 import json
 import time
@@ -93,7 +93,7 @@ def comment_workflow_tools(
     workflow = [
         _tool_spec(
             name="prepare_project_comment",
-            description="Draft a note for a project's history. The server stores it and shows it in a card with Save and Cancel. To revise, call again with the new text. For help with wording only, reply in prose.",
+            description="Draft a note for a project's history when the user asks for one. The server stores it and shows it in a card with Save and Cancel. To revise, call again with the new text. For help with wording only, reply in prose.",
             properties={
                 "project_id": {"type": "integer", "minimum": 1},
                 "comment": {
@@ -790,16 +790,15 @@ class ProjectCommentWorkflow:
         )
         if eligible and self.settings.mode != "off":
             started = time.monotonic()
-            try:
-                prepared = build_small_classifier_task(
-                    "staged_comment_approval",
-                    payload={
-                        "initial_request": draft.initial_request,
-                        "presented_draft": presented,
-                        "pending_comment": draft.public(),
-                        "latest_user_reply": self.user_message,
-                    },
-                )
+            payload = {
+                "initial_request": draft.initial_request,
+                "presented_draft": presented,
+                "pending_comment": draft.public(),
+                "latest_user_reply": self.user_message,
+            }
+
+            def ask(task_name: str):
+                prepared = build_small_classifier_task(task_name, payload=payload)
                 reply = self.generate_classifier_reply_fn(
                     base_generate_reply_fn=self.generate_reply_fn,
                     messages=prepared.messages,
@@ -816,9 +815,21 @@ class ProjectCommentWorkflow:
                         }
                     ),
                 )
-                decision = normalize_small_classifier_decision(
-                    "staged_comment_approval", parse_json_object(reply.content)
+                return reply, normalize_small_classifier_decision(
+                    task_name, parse_json_object(reply.content)
                 )
+
+            try:
+                reply, decision = ask("staged_comment_approval")
+                # A save is confirmed by a second question about any earlier request to wait;
+                # if that question fails, the first answer stands.
+                if reply.ok and decision and decision.label == "approve_save":
+                    follow_reply, follow = ask("staged_comment_save_since_wait")
+                    if follow_reply.ok and follow and follow.label == "no":
+                        decision = replace(
+                            decision, label="draft_only",
+                            reason=f"Save follow-up: {follow.reason}",
+                        )
                 latency = int((time.monotonic() - started) * 1000)
                 valid = bool(
                     reply.ok and decision and latency <= self.settings.timeout_ms

@@ -85,7 +85,7 @@ def test_presented_draft_text_save_uses_unchanged_threshold(tmp_path, db_session
                     "arguments": json.dumps({"draft_id": draft_id, "confirm": True}),
                 },
             } for n in range(2)])
-        assert len(checks) == 1
+        assert len(checks) == (2 if label == "approve_save" and isinstance(confidence, float) and 0 <= confidence <= 1 else 1)  # a valid approve_save adds the save follow-up
         pending = [m for m in kwargs["messages"] if m["content"].startswith("Registered pending project comment")]
         assert len(pending) == (0 if expected else 1)
         visible_results = [m["content"] for m in kwargs["messages"]
@@ -114,7 +114,7 @@ def test_presented_draft_text_save_uses_unchanged_threshold(tmp_path, db_session
             assistant_db=adb, core_db=db_session, schedule_db=sdb, user=user)
         assert db_session.query(ProjectComment).filter_by(project_id=1568).count() == int(expected)
         meta = json.loads(adb.get(SupportMessage, result.messageId).meta_json)["project_comment_workflow"]
-        assert len(checks) == 1
+        assert len(checks) == (2 if label == "approve_save" and isinstance(confidence, float) and 0 <= confidence <= 1 else 1)
         assert meta["write_outcome"]["status"] == ("succeeded" if expected else "failed")
         assert meta["save_checks"][0]["write_ticket"]["issued"] == expected
         turn_meta = json.loads(adb.get(SupportMessage, result.messageId).meta_json)
