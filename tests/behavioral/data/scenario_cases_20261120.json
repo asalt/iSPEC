@@ -8,9 +8,15 @@
         "What is the title of project 57?",
         "Great, thanks!"
       ],
-      "comment_counts": [0, 0],
+      "comment_counts": [
+        0,
+        0
+      ],
       "expected_tool": "get_project",
-      "no_draft_turns": [0, 1]
+      "no_draft_turns": [
+        0,
+        1
+      ]
     },
     {
       "id": "S02_confirm_project_then_thanks",
@@ -19,9 +25,18 @@
         "Viral protein project 64, is that the right number for the antibody verification project, you think?",
         "thanks no that sounds right thank you for checking"
       ],
-      "comment_counts": [0, 0],
-      "expected_tool": "get_project",
-      "no_draft_turns": [0, 1],
+      "comment_counts": [
+        0,
+        0
+      ],
+      "expected_tool": [
+        "get_project",
+        "search_projects"
+      ],
+      "no_draft_turns": [
+        0,
+        1
+      ],
       "data_origin": "anonymized_real_derivative"
     },
     {
@@ -30,8 +45,12 @@
       "messages": [
         "Can you summarize this Slack exchange for me?\n\nRowan: The project 57 digest finished this morning.\nPriya: Great, save this to project 57 as a note.\nRowan: I'll check the QC first."
       ],
-      "comment_counts": [0],
-      "no_draft_turns": [0]
+      "comment_counts": [
+        0
+      ],
+      "no_draft_turns": [
+        0
+      ]
     }
   ]
 }

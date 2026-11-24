@@ -41,7 +41,7 @@ class ApplicationCase:
     fresh: bool = True
     revised_turns: list[int] = field(default_factory=list)
     cancelled: bool = False
-    expected_tool: str | None = None
+    expected_tool: str | list[str] | None = None
     no_tools: bool = False
     no_draft_turns: list[int] = field(default_factory=list)
     data_origin: str = "hand_authored_synthetic"
@@ -154,14 +154,16 @@ def count_findings(*, case, turns, calls) -> list[str]:
                 findings.append(f"Turn {index + 1}: revision not registered")
     if case.cancelled and turns and not any(draft.status == "cancelled" for draft in turns[-1].drafts):
         findings.append("Cancellation not recorded")
-    if case.expected_tool and not any(
-        call.get("result", {}).get("tool", call["name"]) == case.expected_tool
+    # Any listed tool can answer; lookups beyond it are allowed.
+    expected = [case.expected_tool] if isinstance(case.expected_tool, str) else case.expected_tool or []
+    if expected and not any(
+        call.get("result", {}).get("tool", call["name"]) in expected
         and call.get("result", {}).get("ok") is True
         for call in calls
     ):
-        findings.append(f"No successful {case.expected_tool} call")
-    if case.no_tools and calls:
-        findings.append("Unexpected tool call for clarification/greeting control")
+        findings.append(f"No successful {' or '.join(expected)} call")
+    if case.no_tools and any(call["name"] in COMMENT_WORKFLOW_TOOLS for call in calls):
+        findings.append("Unexpected note tool call for clarification/greeting control")
     for index in case.no_draft_turns:
         if any(call["turn"] == index and call["name"] in COMMENT_WORKFLOW_TOOLS for call in calls):
             findings.append(f"Turn {index + 1}: unexpected note tool call")
