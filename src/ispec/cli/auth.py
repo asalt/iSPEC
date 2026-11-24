@@ -454,6 +454,9 @@ def provision_users(
 
 
 def register_subcommands(subparsers) -> None:
+    login = subparsers.add_parser("login", help="Sign in to a remote iSPEC HTTPS origin")
+    login.add_argument("--server", required=True)
+    login.add_argument("--account", required=True)
     provision_parser = subparsers.add_parser(
         "provision",
         help="Provision users with temporary passwords (forces change on first login).",
@@ -557,6 +560,13 @@ def register_subcommands(subparsers) -> None:
 
 
 def dispatch(args) -> None:
+    if args.subcommand == "login":
+        from ispec.cli.remote_session import RemoteSession
+
+        session = RemoteSession(server=args.server, account=args.account)
+        session.login()
+        print(f"Signed in as {args.account}. Private cookie jar: {session.path}")
+        return
     if args.subcommand == "provision":
         output = Path(args.output)
         database = getattr(args, "database", None)

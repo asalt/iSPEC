@@ -19,12 +19,15 @@ from typing import Any
 import requests
 
 from ispec.logging import get_logger
+from ispec.cli.remote_session import RemoteSession
 
 logger = get_logger(__name__)
 
 
 def register_subcommands(subparsers) -> None:
     chat_parser = subparsers.add_parser("chat", help="Send a one-shot message to the support assistant")
+    chat_parser.add_argument("--account", help="Use a named HTTPS login instead of a service key")
+    chat_parser.add_argument("--staff-review", action="store_true", help="Request staff Slack review of the draft prepared in this turn")
     chat_parser.add_argument(
         "--server",
         default=os.getenv("ISPEC_API_URL") or "",
@@ -154,25 +157,26 @@ def _post_chat(
     *,
     server: str,
     api_key: str,
-    session_id: str,
+    session_id: str | None,
     message: str,
     timeout_seconds: float,
+    login: RemoteSession | None = None,
+    staff_review: bool = False,
 ) -> _ChatResult:
     url = server.rstrip("/") + "/api/support/chat"
-    payload: dict[str, Any] = {
-        "sessionId": session_id,
-        "message": message,
-        "history": [],
-        "meta": {"source": "cli", "sent_at_unix": time.time()},
-    }
+    payload: dict[str, Any] = {"message": message}
+    if session_id:
+        payload["sessionId"] = session_id
+    if staff_review:
+        payload["reviewDestination"] = "staff_slack"
     try:
-        resp = requests.post(
-            url,
-            json=payload,
-            headers=_headers(api_key),
-            timeout=max(1.0, float(timeout_seconds)),
-        )
-        resp.raise_for_status()
+        if login:
+            data = login.request("support/chat", payload, timeout=timeout_seconds)
+        else:
+            payload.update(history=[], meta={"source": "cli", "sent_at_unix": time.time()})
+            resp = requests.post(url, json=payload, headers=_headers(api_key), timeout=max(1.0, float(timeout_seconds)))
+            resp.raise_for_status()
+            data = resp.json()
     except requests.exceptions.HTTPError as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         body = ""
@@ -183,7 +187,6 @@ def _post_chat(
         body = body.strip()
         suffix = f": {body}" if body else ""
         raise SystemExit(f"Support chat failed ({status or 'http_error'}){suffix}") from exc
-    data = resp.json()
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected response payload (expected JSON object).")
 
@@ -259,7 +262,16 @@ def _cmd_chat(args) -> None:
     server = _default_server_url(args.server)
     api_key = str(args.api_key or "")
     requested_session_id = str(args.session_id or "").strip()
-    session_id = requested_session_id or _default_session_id()
+    login = None
+    if getattr(args, "account", None):
+        if args.choose is not None:
+            raise SystemExit("--choose is not supported for a named session.")
+        login = RemoteSession(server=server, account=args.account)
+        login.resume()
+        api_key = ""
+    if getattr(args, "staff_review", False) and not login:
+        raise SystemExit("--staff-review requires a named comment-agent login.")
+    session_id = requested_session_id or (None if login else _default_session_id())
     session_id_auto = not bool(requested_session_id)
     message = _read_message(list(getattr(args, "message", []) or []))
 
@@ -269,6 +281,8 @@ def _cmd_chat(args) -> None:
         session_id=session_id,
         message=message,
         timeout_seconds=float(args.timeout_seconds),
+        login=login,
+        staff_review=getattr(args, "staff_review", False),
     )
 
     if args.json:
