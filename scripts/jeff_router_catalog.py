@@ -11,7 +11,8 @@ from ispec.assistant.tools import ToolScope, _TOOL_SCOPES
 
 STAFF_CATEGORIES = frozenset({"assistant", "devops", "tmux", "bridge", "repo", "automation"})
 DIRECTORY_LABELS = {
-    "projects": "Projects, comments, status and metadata.",
+    "projects": "Projects, status and metadata.",
+    "notes": "Drafting, saving or cancelling project notes.",
     "files": "Project files and attachments.",
     "experiments": "Experiments, runs and searches.",
     "omics": "Project gene quantities and QC.",

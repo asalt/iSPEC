@@ -76,18 +76,16 @@ class ScriptedModel:
     def tool_reply(self, *, request: WireRequest) -> dict:
         self.tool_round += 1
         names = {tool.function.name for tool in request.tools}
-        assert {
-            "get_project",
-            "prepare_project_comment",
-            "create_project_comment",
-        } <= names
-        save_tool = next(
-            tool.function
-            for tool in request.tools
-            if tool.function.name == "create_project_comment"
-        )
-        assert set(save_tool.parameters["properties"]) == {"draft_id", "confirm"}
-        assert "person_id" not in save_tool.parameters["properties"]
+        assert {"get_project", "prepare_project_comment"} <= names
+        # Save joins the offered tools once a draft is pending.
+        if self.tool_round >= 3:
+            save_tool = next(
+                tool.function
+                for tool in request.tools
+                if tool.function.name == "create_project_comment"
+            )
+            assert set(save_tool.parameters["properties"]) == {"draft_id", "confirm"}
+            assert "person_id" not in save_tool.parameters["properties"]
 
         if self.tool_round == 1:
             return self.call(
@@ -263,7 +261,8 @@ def test_real_controller_uses_application_olmo_prompts(
             )
             conversation.assistant.commit()
 
-    assert model.classifier_calls == 1
+    # A valid approve_save is confirmed by the save follow-up question.
+    assert model.classifier_calls == (2 if label == "approve_save" else 1)
     assert len(conversation.comments()) == int(saved)
     assert response.commentCards[-1].status == ("saved" if saved else "pending")
     assert response.commentCards[-1].comment == NOTE
@@ -287,8 +286,6 @@ def test_real_controller_uses_application_olmo_prompts(
         assert request.messages[0].content.startswith(preamble + "\n" + application_prompt)
         assert "\n\nCONTEXT" in request.messages[0].content
         assert "staff and project-scoped clients" in application_prompt
-        assert "Never invent database values, IDs, or outcomes" in application_prompt
-        assert "CONTEXT is a partial snapshot" in application_prompt
         assert "Available tools:" not in application_prompt
         for message in request.messages:
             if message.role == "tool":

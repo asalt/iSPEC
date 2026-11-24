@@ -16,8 +16,8 @@ from scripts.jeff_router_catalog import select_categories
 
 def test_feature_complete_staff_and_general_catalogs_filter_before_scoring():
     catalogs = build_catalogs()
-    assert len(catalogs["staff"].groups) == 13
-    assert set(catalogs["general_user"].groups) == {"projects", "files", "schedule", "misc"}
+    assert len(catalogs["staff"].groups) == 14
+    assert set(catalogs["general_user"].groups) == {"projects", "notes", "files", "schedule", "misc"}
     for catalog in catalogs.values():
         question = variant_question(variant="N0", state="Save the draft", catalog=catalog)["question"]
         assert set(question["criteria"]) == catalog.groups.keys() | {"none"}

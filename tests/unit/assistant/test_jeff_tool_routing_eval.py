@@ -18,7 +18,7 @@ def test_one_question_contains_available_categories_and_none(catalog):
     assert row["state"] == "User: Show project 57"
     question = row["question"]
     assert set(question["criteria"]) == catalog.groups.keys() | {"none"}
-    assert question["criteria"]["projects"] == "Create/list/count/search projects and project comments/metadata."
+    assert question["criteria"]["projects"] == "Find projects by number, title, topic, PI or lab contact; list and count them; read project details and history."
     assert "none" in question["criteria"]
     assert "in this conversation, or none?" in question["instructions"]
 
@@ -27,7 +27,7 @@ def test_general_user_question_keeps_none_and_hides_staff_categories(catalog):
     client = ToolCatalog.from_authorized_schemas(schemas=list(catalog.schemas.values()), staff=False)
     choices = routing_question(state="Save that one", catalog=client)["question"]["criteria"]
 
-    assert set(choices) == {"projects", "files", "none"}
+    assert set(choices) == {"projects", "notes", "files", "none"}
     assert "none" in choices
     assert {"assistant", "devops", "tmux", "bridge", "repo", "automation"}.isdisjoint(choices)
 
@@ -303,7 +303,7 @@ def test_client_directory_hides_staff_categories_even_if_supplied(catalog):
     client = ToolCatalog.from_authorized_schemas(schemas=list(catalog.schemas.values()), staff=False)
     names = client.directory_schema()["function"]["parameters"]["properties"]["name"]["enum"]
 
-    assert set(names) == {"projects", "files"}
+    assert set(names) == {"projects", "notes", "files"}
     assert "get_person" not in client.schemas
     assert "get_project" not in client.schemas
     for name in ("assistant", "devops", "tmux", "bridge", "repo", "automation"):
