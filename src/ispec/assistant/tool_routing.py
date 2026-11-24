@@ -145,6 +145,10 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
 )
 
 
+NO_TOOLS_ROUTE = "none"
+NO_TOOLS_DESCRIPTION = "No tools needed: greetings, thanks, or replies the conversation already answers."
+
+
 def tool_groups_for_available_tools(available_tool_names: set[str]) -> list[ToolGroup]:
     """Return tool groups with tool lists restricted to ``available_tool_names``."""
 
@@ -227,6 +231,8 @@ def _validate_router_decision(decision: dict[str, Any], *, group_names: set[str]
 
     if not isinstance(primary, str) or primary not in group_names:
         return None
+    if primary == NO_TOOLS_ROUTE:
+        secondary = []
 
     secondary_list: list[str] = []
     if secondary is None:
@@ -269,11 +275,12 @@ def route_tool_groups_vllm(
 ) -> tuple[dict[str, Any] | None, AssistantReply]:
     """Route a user request to a tool group using vLLM guided JSON output."""
 
-    group_names = [group.name for group in groups]
+    group_names = [group.name for group in groups] + [NO_TOOLS_ROUTE]
     schema = tool_router_schema(group_names)
+    groups_block = "\n".join(f"- {group.name}: {group.description}" for group in groups)
     prompt = load_bound_prompt(
         _tool_router_system_prompt,
-        values={"groups_block": "\n".join(f"- {group.name}: {group.description}" for group in groups)},
+        values={"groups_block": groups_block + f"\n- {NO_TOOLS_ROUTE}: {NO_TOOLS_DESCRIPTION}"},
     )
     router_messages = [
         {"role": "system", "content": prompt.text},

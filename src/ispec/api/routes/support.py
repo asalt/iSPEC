@@ -60,6 +60,7 @@ from ispec.assistant.support_policies import (
     select_support_tool_policy,
 )
 from ispec.assistant.tool_routing import (
+    NO_TOOLS_ROUTE,
     router_fallback_tool_names,
     route_tool_groups_vllm,
     tool_groups_for_available_tools,
@@ -1693,6 +1694,9 @@ def chat(
                     primary=str(decision["primary"]),
                     secondary=list(decision["secondary"]),
                 )
+                if decision["primary"] == NO_TOOLS_ROUTE and not requested_tool_names_available:
+                    tool_schemas = []
+                    tool_router["selected_tool_names"] = []
                 for group_name in hinted_group_names:
                     selected_tool_names |= grouped_tool_names.get(group_name, set())
                 if requested_tool_names_available:
@@ -1745,7 +1749,8 @@ def chat(
             or "create_project_comment" in _openai_tool_names(tool_schemas)
             or project_comment_workflow.pending() is not None
         )
-        offered_comment_tools = comment_tool_schemas if notes_in_play else [
+        no_tools_route = route_decision.get("primary") == NO_TOOLS_ROUTE
+        offered_comment_tools = comment_tool_schemas if notes_in_play else [] if no_tools_route else [
             spec for spec in comment_tool_schemas if spec["function"]["name"] == "prepare_project_comment"
         ]
         tool_schemas = [
