@@ -11,16 +11,25 @@ these accounts and revoke their sessions.
 ```sh
 export ISPEC_API_URL=https://marianaproteomics.org
 ispec auth login --server "$ISPEC_API_URL" --account dot
-ispec support chat --account dot --staff-review "I'm Dot. Draft a note for project 57: eight samples arrived."
+ispec support chat --account dot "I'm Dot. Draft a note for project 57: eight samples arrived. Send it to staff Slack for review."
 ispec support chat --account dot --session-id '<returned session_id>' 'Who requested the draft?'
 ```
 
 The same API accepts `POST /api/support/chat` with `message`, an optional
 `sessionId` to continue, and optional `reviewDestination: "staff_slack"` to
-share **a draft prepared in this turn**. Without that destination the draft
-stays in the requesting chat. No arbitrary channel or Slack metadata is
+share **a draft prepared in this turn** (the existing CLI shortcut is
+`--staff-review`). Normally just tell the assistant what to do: preparing a
+draft keeps it private; `request_staff_review(draft_id)` shares the same
+pending draft now or on a later turn in the same conversation. No arbitrary channel or Slack metadata is
 accepted from the agent. Account name and action receipts are server records;
 the card displays the note, not a requester byline.
+
+In the web widget, **Chats > Outstanding drafts** shows your pending notes and,
+for staff, notes in the configured staff review channel within your project scope.
+The read-only list can be filtered by project; another user's private notes and
+Slack DMs are not shared. API: `GET /api/support/project-comment-cards/outstanding`
+with optional `project_id`, `limit` and `offset`. A queued or unconfirmed card
+is not a confirmed Slack post.
 
 Other operations need no CLI equivalent. For example, use the **same HTTPS
 origin** and the private Netscape-format jar path printed by login:

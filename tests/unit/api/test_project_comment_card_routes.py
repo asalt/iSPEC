@@ -79,6 +79,83 @@ def test_review_delivery_requires_receiver_key_even_with_cookie(client):
     assert response.status_code == 200 and response.json() == {"delivery": None}
 
 
+def test_share_existing_card_and_list_visible_pending_only(
+    client, conversation, monkeypatch
+):
+    from ispec.api.routes.comment_cards import CardDelivery, card_delivery
+    from ispec.assistant.project_comment_cards import claim_staff_review
+    from ispec.assistant.project_comment_workflow import comment_workflow_tools
+    from ispec.db.models import AuthUser, UserRole
+
+    monkeypatch.setenv("ISPEC_SLACK_AGENT_REVIEW_ENABLED", "1")
+    monkeypatch.setenv("ISPEC_ASSISTANT_STAFF_SLACK_CHANNEL", "CREVIEW")
+    monkeypatch.setenv("ISPEC_SLACK_ALLOWED_USER_IDS", "USTAFF")
+    staff = conversation.user
+    dot = AuthUser(
+        id=19,
+        username="dot",
+        role=UserRole.viewer,
+        is_comment_agent=True,
+        is_active=True,
+    )
+    conversation.user = dot
+    _, old_id = conversation.prepare(text="Old wording")
+    card_id, draft_id = conversation.prepare(text="Exact pending draft")
+    share = "request_staff_review"
+    catalog = comment_workflow_tools(tools=[], prepare_only=True)
+    assert share in {spec["function"]["name"] for spec in catalog}
+    turn = conversation.turn(text="Send that draft to staff Slack.")
+
+    def request_review(id=draft_id, **extra):
+        return turn.run(name=share, args={"draft_id": id, **extra})
+
+    def outstanding(user, **params):
+        conversation.user = user
+        response = client.get(
+            "/api/support/project-comment-cards/outstanding", params=params
+        )
+        assert response.status_code == 200
+        return [(r["comment"], r["delivery"]) for r in response.json()["drafts"]]
+
+    assert outstanding(dot) == [("Exact pending draft", "private")]
+    assert outstanding(staff) == []
+    assert not request_review(old_id)["ok"]
+    assert not request_review(channel="COTHER")["ok"]
+    other = AuthUser(
+        id=20,
+        username="other-agent",
+        role=UserRole.viewer,
+        is_comment_agent=True,
+        is_active=True,
+    )
+    conversation.user = other
+    assert not conversation.turn().run(name=share, args={"draft_id": draft_id})["ok"]
+    assert request_review()["result"]["delivery"] == "queued"
+    assert request_review()["result"]["delivery"] == "queued"
+    assert outstanding(staff, project_id=57) == [("Exact pending draft", "queued")]
+    assert outstanding(staff, project_id=58) == []
+    assert outstanding(other) == []
+
+    def claim():
+        return claim_staff_review(
+            core_db=conversation.core,
+            assistant_db=conversation.assistant,
+            team_id="TSTAFF",
+        )
+
+    assert claim()["card"].card_id == card_id
+    assert request_review()["result"]["delivery"] == "unconfirmed"
+    assert claim() is None
+    card_delivery(
+        card_id,
+        CardDelivery(team_id="TSTAFF", channel_id="CREVIEW", message_ts="1.0"),
+        conversation.core,
+    )
+    assert request_review()["result"]["delivery"] == "posted"
+    assert outstanding(staff) == [("Exact pending draft", "posted")]
+    assert conversation.comments() == []
+
+
 def test_cross_origin_click_is_rejected(client, conversation):
     card_id, draft_id = conversation.prepare()
     response = client.post(

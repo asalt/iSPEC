@@ -22,6 +22,7 @@ from ispec.assistant.project_comment_cards import (
     claim_staff_review,
 )
 from ispec.assistant.connect import get_assistant_session_dep
+from ispec.assistant.project_comment_reviews import outstanding_reviews
 from ispec.db.connect import get_session_dep
 from ispec.db.models import ProjectCommentCard
 
@@ -46,6 +47,19 @@ def list_cards(
         for card in cards
         if get_project_for_user(db, user=user, project_id=card.project_id) is not None
     ]
+
+
+@router.get("/outstanding")
+def list_outstanding(
+    project_id: int | None = Query(None, ge=1),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(25, ge=1, le=100),
+    user: Any = Depends(require_user),
+    db: Session = Depends(get_session_dep),
+):
+    return outstanding_reviews(
+        db=db, user=user, project_id=project_id, offset=offset, limit=limit
+    )
 
 
 @router.post("/{card_id}/actions", response_model=CardResult)

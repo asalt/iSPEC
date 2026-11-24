@@ -294,6 +294,7 @@ _PASSWORD_CHANGE_ALLOWED_PATHS = {
 }
 
 _COMMENT_AGENT_ROUTES = {
+    ("GET", "/api/support/project-comment-cards/outstanding"),
     ("GET", "/api/auth/me"),
     ("POST", "/api/auth/logout"),
     ("POST", "/api/auth/change-password"),

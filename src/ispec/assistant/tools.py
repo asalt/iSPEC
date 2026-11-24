@@ -156,6 +156,7 @@ _TOOL_SCOPES: dict[str, ToolScope] = {
     "repo_read_file": ToolScope.staff,
     "create_project_comment": ToolScope.user,
     "prepare_project_comment": ToolScope.user,
+    "request_staff_review": ToolScope.user,
     "show_project_comment_card": ToolScope.user,
     "cancel_project_comment_draft": ToolScope.user,
 }
@@ -183,7 +184,7 @@ def assistant_read_only() -> bool:
 
 def assistant_write_error(name: str | None) -> str | None:
     """Deployment restrictions narrow capabilities; they never grant authorization."""
-    if name in {"prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
+    if name in {"prepare_project_comment", "show_project_comment_card", "cancel_project_comment_draft", "request_staff_review"}:
         name = "create_project_comment"
     if not tool_writes_data(name):
         return None
@@ -3075,7 +3076,7 @@ def run_tool(
         scope_error = _scope_error(scope, user)
         if scope_error:
             return {"ok": False, "tool": name, "error": scope_error}
-        if name in {"prepare_project_comment", "create_project_comment", "show_project_comment_card", "cancel_project_comment_draft"}:
+        if name in {"prepare_project_comment", "create_project_comment", "show_project_comment_card", "cancel_project_comment_draft", "request_staff_review"}:
             if project_comment_workflow is not None:
                 result = project_comment_workflow.run(name=name, args=args)
                 return result

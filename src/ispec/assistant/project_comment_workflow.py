@@ -11,6 +11,8 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ispec.authz import get_project_for_user
+from ispec.assistant.project_comment_reviews import request_review
+from ispec.assistant.project_comment_cards import staff_review_channel
 from ispec.assistant.json_utils import parse_json_object
 from ispec.assistant.models import SupportMessage, SupportSession
 from ispec.assistant.project_comment_cards import (
@@ -48,6 +50,7 @@ from ispec.prompt import render_prompt
 COMMENT_WORKFLOW_TOOLS = frozenset(
     {
         "prepare_project_comment",
+        "request_staff_review",
         "create_project_comment",
         "show_project_comment_card",
         "cancel_project_comment_draft",
@@ -130,6 +133,15 @@ def comment_workflow_tools(
         workflow = [
             spec for spec in workflow if spec["function"]["name"] in PREPARE_ONLY_TOOLS
         ]
+        if staff_review_channel():
+            workflow.append(
+                _tool_spec(
+                    name="request_staff_review",
+                    description="When asked to share a note with staff on Slack, queue its existing draft_id for review. Prepare first if needed. Only a posted delivery result confirms posting.",
+                    properties={"draft_id": {"type": "string"}},
+                    required=["draft_id"],
+                )
+            )
     return result + workflow
 
 
@@ -532,6 +544,21 @@ class ProjectCommentWorkflow:
                 code="unknown_tool",
                 message="Unknown project-comment workflow tool.",
             )
+        if name == "request_staff_review":
+            if set(args) != {"draft_id"} or not isinstance(args["draft_id"], str):
+                return self._error(
+                    name=name,
+                    code="invalid_arguments",
+                    message="Provide only the registered draft_id.",
+                )
+            with self._session() as db, db.begin():
+                return request_review(
+                    db=db,
+                    user=self.user,
+                    session_id=self.session_id,
+                    actor_key=self.actor_key,
+                    draft_id=args["draft_id"],
+                )
         if self.user is None or (
             getattr(self.user, "can_write_project_comments", True) is not True
             and not (
