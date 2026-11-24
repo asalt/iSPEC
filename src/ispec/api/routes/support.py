@@ -83,7 +83,6 @@ from ispec.assistant.tools import (
 from ispec.assistant.work_bag import (
     append_work_bag_entries,
     build_work_bag_entries_from_tool_calls,
-    work_bag_context_summary,
 )
 from ispec.db.connect import get_session_dep
 from ispec.db.models import AuthUser, UserRole
@@ -788,10 +787,6 @@ def _prompt_state_from_session_state(state: dict[str, Any]) -> dict[str, Any]:
         prompt_state["conversation_summary"] = summary
         if summary_up_to_id > 0:
             prompt_state["conversation_summary_up_to_id"] = int(summary_up_to_id)
-
-    work_bag = work_bag_context_summary(state)
-    if work_bag is not None:
-        prompt_state["work_bag"] = work_bag
 
     return prompt_state
 

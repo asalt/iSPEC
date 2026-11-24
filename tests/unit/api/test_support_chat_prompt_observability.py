@@ -99,7 +99,7 @@ def test_support_chat_passes_and_persists_prompt_observability(tmp_path, db_sess
         assert meta["llm_trace"][0]["prompt_composition"] == meta["prompt_composition"]
 
 
-def test_prompt_state_includes_compact_work_bag_summary_only():
+def test_prompt_state_leaves_work_bag_to_tool_history():
     state = {
         "work_bag": {
             "schema_version": 1,
@@ -121,13 +121,6 @@ def test_prompt_state_includes_compact_work_bag_summary_only():
     }
 
     prompt_state = support_routes._prompt_state_from_session_state(state)  # noqa: SLF001
-    work_bag = prompt_state["work_bag"]
 
-    assert work_bag["entry_count"] == 5
-    assert len(work_bag["recent_entries"]) == 3
-    assert [entry["entry_id"] for entry in work_bag["recent_entries"]] == [
-        "wb:a2:t1",
-        "wb:a3:t1",
-        "wb:a4:t1",
-    ]
-    assert work_bag["full_available_via_tool"] == "assistant_recent_session_work_bag"
+    # The model sees earlier tool calls through native history replay.
+    assert "work_bag" not in prompt_state
