@@ -57,7 +57,7 @@ def render(wire):
         if not (call.get("response") or {}).get("choices"):
             lines.append(pretty(call.get("response") or call.get("error")))
     lines.append("## Delivered replies and executor evidence")
-    for filename in ("directory.json", "conversation.json"):
+    for filename in ("directory.json", "conversation.json", "search.json"):
         evidence = wire.with_name(filename)
         if evidence.exists():
             record = json.loads(evidence.read_text())

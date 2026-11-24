@@ -22,6 +22,7 @@ from ispec.authz import get_project_for_user, scope_project_query, uses_explicit
 from ispec.backup import load_backup_status
 from ispec.prompt import load_bound_prompt, prompt_binding
 from ispec.assistant.context import person_summary, project_summary
+from ispec.assistant.project_search import ranked_projects
 from ispec.assistant.models import (
     SupportMemory,
     SupportMemoryEvidence,
@@ -6027,44 +6028,10 @@ def run_tool(
                     "error": "Use count_all_projects or count_current_projects to answer 'how many projects'. search_projects expects a keyword (title/PI/contact) or an id.",
                 }
 
-            matches: list[dict[str, Any]] = []
-            project_id = _safe_int(query)
-            if project_id is not None:
-                project = core_db.get(Project, project_id)
-                if project is not None:
-                    matches.append(
-                        {
-                            "id": int(project.id),
-                            "title": project.prj_ProjectTitle,
-                            "status": project.prj_Status,
-                            "current": bool(getattr(project, "prj_Current_FLAG", False)),
-                        }
-                    )
-                return {"ok": True, "tool": name, "result": {"matches": matches}}
-
-            pattern = f"%{query}%"
-            rows = (
-                core_db.query(Project)
-                .filter(
-                    or_(
-                        Project.prj_ProjectTitle.ilike(pattern),
-                        Project.prj_PI.ilike(pattern),
-                        Project.prj_Project_LabContact.ilike(pattern),
-                    )
-                )
-                .order_by(Project.id.asc())
-                .limit(limit)
-                .all()
+            matches, _ = ranked_projects(
+                scope_project_query(core_db.query(Project), user),
+                text=query, limit=limit, include_comments=not uses_explicit_project_access(user),
             )
-            for project in rows:
-                matches.append(
-                    {
-                        "id": int(project.id),
-                        "title": project.prj_ProjectTitle,
-                        "status": project.prj_Status,
-                        "current": bool(getattr(project, "prj_Current_FLAG", False)),
-                    }
-                )
             return {"ok": True, "tool": name, "result": {"matches": matches}}
 
         if name == "my_projects":
@@ -6080,14 +6047,12 @@ def run_tool(
                 query = query.filter(Project.prj_Current_FLAG.is_(True))
 
             if query_text:
-                pattern = f"%{query_text}%"
-                query = query.filter(
-                    or_(
-                        Project.prj_ProjectTitle.ilike(pattern),
-                        Project.prj_PI.ilike(pattern),
-                        Project.prj_Project_LabContact.ilike(pattern),
-                    )
+                projects, total = ranked_projects(
+                    query, text=query_text, limit=limit, include_comments=False,
                 )
+                return {"ok": True, "tool": name, "result": {
+                    "count": len(projects), "total": total, "projects": projects,
+                }}
 
             try:
                 total = int(query.order_by(None).count())
@@ -7251,11 +7216,11 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "search_projects",
-            "description": "Search projects by keyword (title/PI/contact) or id.",
+            "description": "Find project numbers from any words the user remembers: topic, organism, partial title, PI or lab contact name, or ID. Returns ranked projects with matching fields and snippets.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Keyword or id."},
+                    "query": {"type": "string", "description": "Remembered words and names together, or a project ID."},
                     "limit": {"type": "integer", "description": "Max matches to return."},
                 },
                 "required": ["query"],
@@ -7293,7 +7258,7 @@ _OPENAI_TOOL_SPECS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "my_projects",
-            "description": "List projects the current authenticated user can access.",
+            "description": "List accessible projects, or find their numbers from remembered topics, names or title words. Searches return ranked matches with field evidence.",
             "parameters": {
                 "type": "object",
                 "properties": {

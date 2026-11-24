@@ -64,4 +64,4 @@ ignore_missing_imports = true
 line-length = 88
 
 [tool.setuptools.package-data]
-"ispec" = ["assistant/templates/**/*.j2", "prompts/*.md"]
+"ispec" = ["assistant/templates/**/*.j2", "assistant/project_terms.json", "prompts/*.md"]

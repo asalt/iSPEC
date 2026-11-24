@@ -139,7 +139,14 @@ def main() -> None:
     parser.add_argument("--head", action="store_true", help="Export committed backend and wrapper profile")
     parser.add_argument("--compare", type=Path, help="Compare application outcomes against a saved scores.json")
     parser.add_argument("--directory-test", action="store_true", help="Isolated eight-case read-only directory batch")
+    parser.add_argument("--project-search", action="store_true", help="Also run project retrieval controls on the same model")
+    parser.add_argument("--local-search-case", type=Path, help="Private local search fixture; never copied to source")
+    parser.add_argument("--local-search-backup", type=Path, help="Completed offline core DB backup for the real case (opened immutable)")
     options = parser.parse_args()
+    if options.local_search_case and not (options.project_search and options.local_search_case.is_file()):
+        parser.error("--local-search-case needs --project-search and a readable private fixture")
+    if options.local_search_backup and not (options.local_search_case and options.local_search_backup.is_file()):
+        parser.error("--local-search-backup requires a private case and an existing snapshot")
     output = options.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     occupancy = subprocess.check_output(
@@ -239,8 +246,16 @@ def main() -> None:
             for name in ("DB", "ASSISTANT_DB", "AGENT_DB", "AGENT_STATE_DB", "SCHEDULE_DB", "PROMPTS_DB"):
                 env[f"ISPEC_{name}_PATH"] = str(folder / (name.lower() + ".db"))
             receipt["test_env"] = env
+            extra_tests = []
+            if options.project_search:
+                extra_tests.append("tests/behavioral/test_project_search_live.py")
+                if options.local_search_case:
+                    env["ISPEC_LOCAL_PROJECT_SEARCH_CASE"] = str(options.local_search_case.resolve())
+                if options.local_search_backup:
+                    env["ISPEC_LOCAL_SEARCH_BACKUP"] = str(options.local_search_backup.resolve())
             receipt["test_command"] = [
                 GPU_PYTHON, "-m", "pytest",
+                *extra_tests,
                 *[f"{test_node}[{name}]"
                   for name in selected],
                 "-p", "scripts.model_regression_capture", "--run-behavioral", "-q", "-s", "--tb=short",

@@ -1,4 +1,4 @@
-"""Opt-in pytest wire capture for synthetic local regression runs only."""
+"""Opt-in loopback-only wire capture. Keep real-case recordings in private local output."""
 
 import copy
 import json
