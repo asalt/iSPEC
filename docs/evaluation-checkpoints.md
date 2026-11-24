@@ -22,17 +22,50 @@ preflight. Nothing activated or pushed; next step is Alex's release decision.
 [Registry guide](instrument-registry.md) and [instrument roadmap](instrument-roadmap.md):
 scan-level QC, persistent mounts, Exploris/Lumos and richer detail views are deferred.
 
+**Project text search (dev only, Nov 20): hold deployment.** Local OLMo passed
+all seven lookup cases: six synthetic and one separately stored real incident
+against a read-only production backup. The 32 unchanged r1 controls fell from
+27 to 26 passes: both runs saved 6/8 requested notes, but N04 saved a note in
+scratch SQLite on agreement with the facts (classifier 0.95), versus no save
+in the reference. No approval or permission code changed. Review N04 before
+shipping the model-facing changes. [Search and reproduction](project-text-search.md).
+Private evidence: `tests/behavioral/local/project-search-20261120/`.
+
+**amms06 staff pilot: OLMo Instruct live as of Nov 19, 06:34 UTC.**
+`current` selects `olmo-r1-5e816b5` (frontend `4d11116`); the loopback model
+endpoint reports `allenai/Olmo-3-7B-Instruct`. API and model health both returned
+200; the existing Slack receiver is running. Native prepare, pending card,
+compact JSON, approval (`approve_save`, 0.99) and the exact stored synthetic
+comment passed on amms06. Receipts: `/mnt/e/mariana-runtime/cutover-20261119T063141Z-9z1jrL/olmo-smoke.txt`.
+No live test comment or Slack test message was sent by the cutover. Alex's
+private Slack check and the reversible live-comment check remain separate.
+Frontend follow-up: nginx's independent web root still served the October UI
+after the API cutover. The frontend-only publisher passed preflight against
+the live model and staged build; confirm its origin checks after operator publication.
+Tulu was verified before switching; rollback instructions are in the wrapper
+runbook at `deploy/mariana/README.md`.
+
+**Instrument monitoring: Bruker LC plugin verified on dev, Nov 19 20:32 UTC.**
+Dev's scratch pull verified six Eclipse TNG log tails, two tune/cal hashes, and
+24 QC RAWs. The next read advanced one Firmware cursor by 268 bytes. Bruker
+still has 12 runs in its selected Dshare folder. The LC reader ingested six
+procedure transitions and six measured pressures from three execution logs,
+all verified at source offsets. A repeat process added nothing. LC state and
+measured pressure are last-seen, distinct from MS acquisition status.
+No background service, registry changes or production writes.
+[Evidence and shared UI fields](instrument-pull-phase1-20261119.md).
+
 **Approval chapter closed.** Release candidate: OLMo-3-7B-Instruct with the exact
 r1 prompt at **5e816b5**; schema, .75 threshold, tickets and ACLs unchanged.
 Fresh blind full-controller result: **4/5 requested saves, zero unapproved
-writes, 12/12 conversations completed. Gate not passed; no promotion.** B05
+writes, 12/12 conversations completed. The blind gate did not pass.** Alex
+subsequently approved the limited staff pilot with review of the first notes. B05
 re-prepared a clean mixed-topic handover instead of saving. B03's saved note
 added an unsupported archive-integrity claim. On the five actual checks, r1
 allowed four genuine requests and blocked wording praise; y1 shadow would have
-allowed that praise. No production changes. [Blind cases and transcripts](approval-r1-blind-20261118.md).
+allowed that praise. [Blind cases and transcripts](approval-r1-blind-20261118.md).
 
 **Later (not started):**
-- amms06 deployment track: separate vLLM venv and no-write verification; staff pilot with Tulu rollback after a release decision.
 - Tool trimming against the frozen baseline, then the `build_turn` refactor.
 - Draft relevance and factual accuracy: R01 printer chatter, N08/N18 revisions, and blind B03/B05/B08/B11.
 - Think as an offline reviewer; hidden-state probes.
