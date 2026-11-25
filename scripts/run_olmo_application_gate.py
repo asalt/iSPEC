@@ -174,9 +174,10 @@ def main() -> None:
     turn_counts.update({name: 1 for name in (
         "C01_project", "C02_person", "C03_runs", "C04_greeting", "C05_missing_id",
     )})
-    scenarios = source / "tests/behavioral/data/scenario_cases_20261120.json"
-    if scenarios.exists():
-        turn_counts.update({case["id"]: len(case["messages"]) for case in json.loads(scenarios.read_text())["cases"]})
+    for extra in ("scenario_cases_20261120.json", "blind_r1_20261118.json"):
+        extra_path = source / "tests/behavioral/data" / extra
+        if extra_path.exists():
+            turn_counts.update({case["id"]: len(case["messages"]) for case in json.loads(extra_path.read_text())["cases"]})
     selected = options.cases or list(turn_counts)
     if options.directory_test:
         turn_counts = {f"D{i}": 1 for i in range(1, 9)}

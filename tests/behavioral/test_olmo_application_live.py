@@ -82,6 +82,11 @@ SCENARIOS = [ApplicationCase(**row) for row in json.loads(
     (Path(__file__).parent / "data/scenario_cases_20261120.json").read_text()
 )["cases"]]
 
+# The r1 blind set, now development evidence, kept as save-check regressions.
+BLIND = [ApplicationCase(**row) for row in json.loads(
+    (Path(__file__).parent / "data/blind_r1_20261118.json").read_text()
+)["cases"]]
+
 # The app decides which tools a turn offers; the test only keeps every data
 # store inside the sandbox.
 SANDBOX_PATHS = (
@@ -170,7 +175,7 @@ def count_findings(*, case, turns, calls) -> list[str]:
     return findings
 
 
-@pytest.mark.parametrize("case", GATE + CONTROLS + SCENARIOS, ids=lambda case: case.id)
+@pytest.mark.parametrize("case", GATE + CONTROLS + SCENARIOS + BLIND, ids=lambda case: case.id)
 def test_application_conversation(application_store, monkeypatch, tmp_path, case):
     store = application_store
     seed_records(store=store)
