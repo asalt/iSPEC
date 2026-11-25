@@ -338,7 +338,12 @@ def _render_system_prompt_answer(*, response_format: ResponseFormat = "single") 
         _system_prompt_answer,
         values={
             "base_prompt": _render_base_system_prompt(),
-            "response_format_block": _final_template(response_format=response_format).rstrip(),
+            "response_format_block": (
+                "Response format:\n- Output only:\n"
+                + _final_template(response_format=response_format).rstrip()
+                if response_format == "compare"
+                else ""
+            ),
         },
     )
     override, override_source = _legacy_answer_prompt_override()
