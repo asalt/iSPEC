@@ -1701,8 +1701,8 @@ def chat(
                     selected_tool_names |= grouped_tool_names.get(group_name, set())
                 if requested_tool_names_available:
                     selected_tool_names |= set(requested_tool_names_available)
+                filtered: list[dict[str, Any]] = []
                 if selected_tool_names:
-                    filtered: list[dict[str, Any]] = []
                     for spec in tool_schemas:
                         func_obj = spec.get("function") if isinstance(spec, dict) else None
                         name = func_obj.get("name") if isinstance(func_obj, dict) else None

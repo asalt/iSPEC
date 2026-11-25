@@ -674,3 +674,38 @@ def test_policy_tool_args_for_tmux_message_uses_resolved_target(monkeypatch):
         tool_name="assistant_capture_tmux_pane",
         message="hello what is going on on the ispec tmux session?",
     ) == {"target": "%0", "lines": 40}
+
+
+def test_support_chat_none_route_sends_no_tools(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_COMPACTION_ENABLED", "0")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "1")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
+
+    answer_calls: list[Any] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_) -> AssistantReply:
+        structured = (vllm_extra_body or {}).get("structured_outputs") or {}
+        if "json" in structured:
+            assert "none" in structured["json"]["properties"]["primary"]["enum"]
+            decision = {"primary": "none", "secondary": [], "confidence": 0.9, "clarify": False}
+            return AssistantReply(content=json.dumps(decision), provider="test", model="test-model")
+        answer_calls.append(tools)
+        return AssistantReply(content="You're welcome!", provider="test", model="test-model")
+
+    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
+
+    with get_assistant_session(tmp_path / "assistant.db") as assistant_db:
+        assistant_db.add(SupportSession(session_id="session-none", user_id=None))
+        assistant_db.flush()
+        payload = ChatRequest.model_validate(
+            {"sessionId": "session-none", "message": "Thanks!", "history": [], "ui": None}
+        )
+        with get_schedule_session(tmp_path / "schedule.db") as schedule_db:
+            response = chat(payload, assistant_db=assistant_db, core_db=db_session, schedule_db=schedule_db, user=None)
+
+    assert response.message == "You're welcome!"
+    assert answer_calls and all(not tools for tools in answer_calls)
