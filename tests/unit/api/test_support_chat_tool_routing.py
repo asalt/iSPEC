@@ -693,7 +693,7 @@ def test_support_chat_none_route_sends_no_tools(tmp_path, db_session, monkeypatc
             assert "none" in structured["json"]["properties"]["primary"]["enum"]
             decision = {"primary": "none", "secondary": [], "confidence": 0.9, "clarify": False}
             return AssistantReply(content=json.dumps(decision), provider="test", model="test-model")
-        answer_calls.append(tools)
+        answer_calls.append((tools, str(messages[0].get("content") or "")))
         return AssistantReply(content="You're welcome!", provider="test", model="test-model")
 
     monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
@@ -708,4 +708,7 @@ def test_support_chat_none_route_sends_no_tools(tmp_path, db_session, monkeypatc
             response = chat(payload, assistant_db=assistant_db, core_db=db_session, schedule_db=schedule_db, user=None)
 
     assert response.message == "You're welcome!"
-    assert answer_calls and all(not tools for tools in answer_calls)
+    assert answer_calls and all(not tools for tools, _ in answer_calls)
+    for _, system_prompt in answer_calls:
+        assert "Available tools:" not in system_prompt
+        assert "Tool calling protocol" not in system_prompt

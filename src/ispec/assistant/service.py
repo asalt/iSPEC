@@ -389,7 +389,8 @@ def _render_system_prompt_planner(
         values={
             "base_prompt": _render_base_system_prompt(),
             "tool_use_block": tool_use,
-            "tool_protocol_block": "" if native_olmo else _planner_tool_protocol_block(
+            # An empty native tool set means no tools: no line protocol or catalog.
+            "tool_protocol_block": "" if native_olmo or tool_names == set() else _planner_tool_protocol_block(
                 tools_available=tools_available,
                 provider=(os.getenv("ISPEC_ASSISTANT_PROVIDER") or "stub"),
             ),
@@ -397,7 +398,7 @@ def _render_system_prompt_planner(
             # callers still need the textual catalog to discover their tools.
             "tool_catalog_block": (
                 ""
-                if tools_available and tool_names is not None
+                if (tools_available and tool_names is not None) or tool_names == set()
                 else tool_prompt(tool_names=tool_names).strip() + "\n"
             ),
             "response_format_block": (

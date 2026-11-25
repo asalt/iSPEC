@@ -1798,6 +1798,8 @@ def chat(
     )
     response_format = "compare" if compare_mode_requested else "single"
 
+    if tool_protocol == "openai" and tool_schemas_count == 0:
+        tools_enabled = False  # A turn with no tools answers with the plain answer prompt.
     tools_available = tool_schemas_count > 0 and tools_enabled
     planner_prompt = _render_system_prompt_planner(
         tools_available=tools_available,
