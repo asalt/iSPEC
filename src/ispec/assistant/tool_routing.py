@@ -146,7 +146,7 @@ _GROUP_DEFS: tuple[ToolGroup, ...] = (
 
 
 NO_TOOLS_ROUTE = "none"
-NO_TOOLS_DESCRIPTION = "No tools needed: greetings, thanks, or replies the conversation already answers."
+NO_TOOLS_DESCRIPTION = "No tools needed: greetings, thanks, or small talk."
 
 
 def tool_groups_for_available_tools(available_tool_names: set[str]) -> list[ToolGroup]:
