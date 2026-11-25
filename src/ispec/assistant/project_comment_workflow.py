@@ -100,7 +100,7 @@ def comment_workflow_tools(
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 20000,
-                    "description": "The relevant project facts, with their timing and status.",
+                    "description": "Facts about this project's samples, data and work, with their timing and status.",
                 },
             },
             required=["project_id", "comment"],
