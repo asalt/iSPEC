@@ -4,7 +4,7 @@ import json
 import pytest
 import requests
 
-from ispec.assistant import service
+from ispec.assistant import service, vllm_protocol
 from ispec.assistant.runtime_settings import max_output_tokens
 from ispec.assistant.vllm_protocol import structured_reply
 
@@ -112,12 +112,6 @@ def test_strict_profile_does_not_retry_by_dropping_tools_or_schema(transport, co
     (envelope(calls=[CALL], finish="length"), None),
     (envelope("I saved it."), "required"),
     (envelope(json.dumps({"name": "get_project", "arguments": {"project_id": 42}})), "required"),
-    (envelope(calls=[CALL]), "none"),
-    (envelope(calls=[CALL, CALL]), None),
-    (envelope(calls=[{"id": "x", "type": "function", "function": {"name": "delete_project", "arguments": "{}"}}]), None),
-    (envelope(calls=[{"id": "x", "type": "function", "function": {"name": "get_project", "arguments": "[]"}}]), None),
-    (envelope(calls=[{"id": "x", "type": "function", "function": {"name": "get_project", "arguments": "invalid"}}]), None),
-    (envelope(calls=[{"type": "function", "function": CALL["function"]}]), None),
     (envelope(calls="invalid"), None),
     ({"choices": []}, None),
     ([], None),
@@ -135,9 +129,35 @@ def test_strict_failures_do_not_become_prose_or_calls(transport, data, choice):
         assert reply.meta["finish_reason"] == data["choices"][0]["finish_reason"]
 
 
+@pytest.mark.parametrize("data,choice,problem", [
+    (envelope(calls=[CALL]), "none", "unavailable_tool"),
+    (envelope(calls=[{"id": "x", "type": "function", "function": {"name": "delete_project", "arguments": "{}"}}]), None, "unavailable_tool"),
+    (envelope(calls=[{"id": "x", "type": "function", "function": {"name": "get_project", "arguments": "[]"}}]), None, "invalid_arguments"),
+    (envelope(calls=[{"id": "x", "type": "function", "function": {"name": "get_project", "arguments": "invalid"}}]), None, "invalid_arguments"),
+])
+def test_unusable_calls_are_kept_and_marked_unavailable(transport, data, choice, problem):
+    """The turn answers such a call as an unavailable tool instead of failing."""
+    captured, responses = transport
+    responses.append(data)
+    reply = service.generate_reply(messages=[], tools=[TOOL], tool_choice=choice)
+    assert reply.ok
+    call, = reply.tool_calls
+    assert call[vllm_protocol.UNAVAILABLE_CALL_KEY] == problem
+    assert json.loads(call["function"]["arguments"]) == {}
+
+
+def test_missing_or_repeated_call_ids_are_replaced(transport):
+    captured, responses = transport
+    responses.append(envelope(calls=[CALL, CALL, {"type": "function", "function": CALL["function"]}]))
+    reply = service.generate_reply(messages=[], tools=[TOOL])
+    ids = [call["id"] for call in reply.tool_calls]
+    assert reply.ok and len(set(ids)) == 3
+    assert not any(vllm_protocol.UNAVAILABLE_CALL_KEY in call for call in reply.tool_calls)
+
+
 def test_named_tool_is_not_satisfied_by_another_available_tool():
     other = {"type": "function", "function": {"name": "other"}}
-    with pytest.raises(ValueError, match="unavailable tool"):
+    with pytest.raises(ValueError, match="required tool call"):
         structured_reply(envelope(calls=[CALL]), tools=[TOOL, other],
                          tool_choice={"type": "function", "function": {"name": "other"}})
 

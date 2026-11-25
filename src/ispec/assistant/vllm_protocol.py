@@ -6,6 +6,8 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
+UNAVAILABLE_CALL_KEY = "ispec_unavailable"
+
 
 def with_single_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Merge system instructions so templates that attach tool schemas per system message emit them once."""
@@ -111,28 +113,37 @@ def structured_reply(
         raise ValueError("Invalid vLLM tool-call list")
     calls = []
     ids: set[str] = set()
-    for call in raw_calls:
+    for index, call in enumerate(raw_calls):
         if not isinstance(call, dict) or call.get("type") != "function":
             raise ValueError("Invalid vLLM tool call")
-        function = call.get("function")
-        if not isinstance(function, dict) or function.get("name") not in allowed:
-            raise ValueError("vLLM returned an unavailable tool")
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = function.get("name")
         call_id = call.get("id")
         if not isinstance(call_id, str) or not call_id.strip() or call_id in ids:
-            raise ValueError("Invalid or duplicate vLLM tool-call id")
+            call_id = f"call_unavailable_{index}"
         ids.add(call_id)
         arguments = function.get("arguments")
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
             except (TypeError, ValueError):
-                raise ValueError("Invalid vLLM tool arguments") from None
-        if not isinstance(arguments, dict):
-            raise ValueError("vLLM tool arguments must be an object")
-        calls.append({"id": call_id, "type": "function", "function": {
-            "name": function["name"], "arguments": json.dumps(arguments, ensure_ascii=False),
-        }})
-    if (tool_choice == "required" or isinstance(tool_choice, dict)) and not calls:
+                arguments = None
+        # A call the turn cannot run is kept and answered as an unavailable tool,
+        # so the model learns what happened instead of the turn failing.
+        problem = (
+            "unavailable_tool" if name not in allowed
+            else "invalid_arguments" if not isinstance(arguments, dict)
+            else None
+        )
+        entry = {"id": call_id, "type": "function", "function": {
+            "name": name if isinstance(name, str) and name else "unknown_tool",
+            "arguments": json.dumps(arguments if problem is None else {}, ensure_ascii=False),
+        }}
+        if problem:
+            entry[UNAVAILABLE_CALL_KEY] = problem
+        calls.append(entry)
+    usable = [call for call in calls if UNAVAILABLE_CALL_KEY not in call]
+    if (tool_choice == "required" or isinstance(tool_choice, dict)) and not usable:
         raise ValueError("vLLM did not return the required tool call")
     if not content.strip() and not calls:
         raise ValueError("vLLM returned no final answer or tool call")

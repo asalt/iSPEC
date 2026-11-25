@@ -712,3 +712,41 @@ def test_support_chat_none_route_sends_no_tools(tmp_path, db_session, monkeypatc
     for _, system_prompt in answer_calls:
         assert "Available tools:" not in system_prompt
         assert "Tool calling protocol" not in system_prompt
+
+
+def test_support_chat_answers_an_unoffered_tool_call_as_unavailable(tmp_path, db_session, monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_ASSISTANT_COMPACTION_ENABLED", "0")
+    monkeypatch.setenv("ISPEC_ASSISTANT_TOOL_PROTOCOL", "openai")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_TOOL_CALLS", "2")
+    monkeypatch.setenv("ISPEC_ASSISTANT_HISTORY_LIMIT", "10")
+    monkeypatch.setenv("ISPEC_ASSISTANT_MAX_PROMPT_TOKENS", "2000")
+    monkeypatch.setenv("ISPEC_ASSISTANT_SUMMARY_MAX_CHARS", "0")
+
+    tool_results: list[str] = []
+
+    def fake_generate_reply(*, messages=None, tools=None, vllm_extra_body=None, **_) -> AssistantReply:
+        structured = (vllm_extra_body or {}).get("structured_outputs") or {}
+        if "json" in structured:
+            decision = {"primary": "people", "secondary": [], "confidence": 0.9, "clarify": False}
+            return AssistantReply(content=json.dumps(decision), provider="test", model="test-model")
+        results = [str(m.get("content") or "") for m in messages if m.get("role") == "tool"]
+        if not results:
+            call = {"id": "c1", "type": "function", "function": {"name": "list_schedule_slots", "arguments": "{}"}}
+            return AssistantReply(content="", provider="test", model="test-model", tool_calls=[call])
+        tool_results.extend(results)
+        return AssistantReply(content="I don't have staff-meeting information.", provider="test", model="test-model")
+
+    monkeypatch.setattr(support_routes, "generate_reply", fake_generate_reply)
+
+    with get_assistant_session(tmp_path / "assistant.db") as assistant_db:
+        assistant_db.add(SupportSession(session_id="session-unavailable", user_id=None))
+        assistant_db.flush()
+        payload = ChatRequest.model_validate(
+            {"sessionId": "session-unavailable", "message": "Which day is the staff meeting?", "history": [], "ui": None}
+        )
+        with get_schedule_session(tmp_path / "schedule.db") as schedule_db:
+            response = chat(payload, assistant_db=assistant_db, core_db=db_session, schedule_db=schedule_db, user=None)
+
+    assert response.message == "I don't have staff-meeting information."
+    assert tool_results and "Tool unavailable" in tool_results[0]

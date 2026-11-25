@@ -38,6 +38,7 @@ from ispec.assistant.project_comment_approval import (
     ProjectCommentApprovalSettings,
     project_comment_write_outcome as _project_comment_write_outcome,
 )
+from ispec.assistant.vllm_protocol import UNAVAILABLE_CALL_KEY
 from ispec.assistant.project_comment_workflow import (
     COMMENT_WORKFLOW_TOOLS, ProjectCommentWorkflow, comment_workflow_tools,
 )
@@ -1989,7 +1990,7 @@ def chat(
                 "tool": normalized_name,
                 "error": "Write/save tools were already blocked earlier in this turn; do not retry them.",
             }
-        if tool_protocol == "openai" and openai_tool_names and normalized_name not in openai_tool_names:
+        if tool_protocol == "openai" and normalized_name not in openai_tool_names:
             if normalized_name == "create_project_comment" and not project_comment_write_tool_exposed:
                 return {
                     "ok": False,
@@ -2206,7 +2207,11 @@ def chat(
                 {
                     "role": "assistant",
                     "content": reply.content or "",
-                    "tool_calls": reply.tool_calls,
+                    "tool_calls": [
+                        {key: value for key, value in call.items() if key != UNAVAILABLE_CALL_KEY}
+                        for call in reply.tool_calls
+                        if isinstance(call, dict)
+                    ],
                 }
             )
             executed_openai_tools: list[str] = []
@@ -2239,7 +2244,11 @@ def chat(
                 ):
                     parsed_args = dict(policy_tool_args)
 
-                unavailable_tool_payload = _blocked_or_unavailable_tool_payload(tool_name)
+                unavailable_tool_payload = (
+                    {"ok": False, "tool": tool_name or None, "error": "Tool unavailable for this turn; do not retry it."}
+                    if tool_call.get(UNAVAILABLE_CALL_KEY)
+                    else _blocked_or_unavailable_tool_payload(tool_name)
+                )
                 if used_tool_calls >= max_tool_calls:
                     tool_payload = {
                         "ok": False,
