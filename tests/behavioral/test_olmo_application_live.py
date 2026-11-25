@@ -44,6 +44,7 @@ class ApplicationCase:
     expected_tool: str | list[str] | None = None
     no_tools: bool = False
     no_draft_turns: list[int] = field(default_factory=list)
+    excluded_note_terms: list[str] = field(default_factory=list)
     data_origin: str = "hand_authored_synthetic"
 
 
@@ -81,6 +82,9 @@ CONTROLS = [
 SCENARIOS = [ApplicationCase(**row) for row in json.loads(
     (Path(__file__).parent / "data/scenario_cases_20261120.json").read_text()
 )["cases"]]
+
+# Unrelated chatter that must stay out of the note; R01 keeps its definition.
+EXCLUDED_NOTE_TERMS = {"R01_printer": ["printer"]}
 
 # The r1 blind set, now development evidence, kept as save-check regressions.
 BLIND = [ApplicationCase(**row) for row in json.loads(
@@ -169,6 +173,12 @@ def count_findings(*, case, turns, calls) -> list[str]:
         findings.append(f"No successful {' or '.join(expected)} call")
     if case.no_tools and any(call["name"] in COMMENT_WORKFLOW_TOOLS for call in calls):
         findings.append("Unexpected note tool call for clarification/greeting control")
+    excluded = case.excluded_note_terms or EXCLUDED_NOTE_TERMS.get(case.id, [])
+    notes = [comment.text for comment in turns[-1].comments] if turns else []
+    notes += [draft.text for draft in turns[-1].pending_drafts] if turns else []
+    for term in excluded:
+        if any(term.lower() in note.lower() for note in notes):
+            findings.append(f"Note includes unrelated {term!r}")
     for index in case.no_draft_turns:
         if any(call["turn"] == index and call["name"] in COMMENT_WORKFLOW_TOOLS for call in calls):
             findings.append(f"Turn {index + 1}: unexpected note tool call")

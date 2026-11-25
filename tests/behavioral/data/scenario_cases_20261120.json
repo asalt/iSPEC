@@ -51,6 +51,21 @@
       "no_draft_turns": [
         0
       ]
+    },
+    {
+      "id": "S04_unrelated_chatter",
+      "category": "project update mixed with unrelated lab chatter",
+      "messages": [
+        "For project 57, the digestion finished overnight and the LC queue starts Monday. Separately, the break-room coffee machine is broken again. Please draft a note for project 57.",
+        "Save that note."
+      ],
+      "comment_counts": [
+        0,
+        1
+      ],
+      "excluded_note_terms": [
+        "coffee"
+      ]
     }
   ]
 }
