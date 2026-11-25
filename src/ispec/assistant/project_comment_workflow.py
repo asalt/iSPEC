@@ -790,9 +790,10 @@ class ProjectCommentWorkflow:
         )
         if eligible and self.settings.mode != "off":
             started = time.monotonic()
+            # The check reads only the user's words and the stored draft; that the
+            # draft was shown is the server receipt checked above.
             payload = {
                 "initial_request": draft.initial_request,
-                "presented_draft": presented,
                 "pending_comment": draft.public(),
                 "latest_user_reply": self.user_message,
             }

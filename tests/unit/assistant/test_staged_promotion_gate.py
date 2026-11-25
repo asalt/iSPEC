@@ -123,7 +123,7 @@ def test_diagnostic_preserves_preturn_context_after_state_changes(conversation, 
     assert result["diagnostic_ticket_executed"] is False
     assert len(conversation.checks) == 1
     classifier_input = json.loads(conversation.checks[0]["messages"][-1]["content"])
-    assert classifier_input["presented_draft"] == original_reply.content
+    assert "presented_draft" not in classifier_input  # the check reads the user and the stored draft
     assert classifier_input["pending_comment"]["draft_id"] == draft_id
     assert conversation.core.query(ProjectComment).count() == 0
 
