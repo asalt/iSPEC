@@ -79,13 +79,13 @@ _SMALL_CLASSIFIER_TASKS: dict[str, SmallClassifierTaskSpec] = {
     "staged_comment_approval": SmallClassifierTaskSpec(
         name="staged_comment_approval",
         labels=_PROJECT_COMMENT_APPROVAL_LABELS,
-        required_input_keys=("initial_request", "pending_comment", "latest_user_reply"),
+        required_input_keys=("initial_request", "server_offer", "pending_comment", "latest_user_reply"),
         binding_callable=_staged_comment_approval_prompt,
     ),
     "staged_comment_save_since_wait": SmallClassifierTaskSpec(
         name="staged_comment_save_since_wait",
         labels=("yes", "no"),
-        required_input_keys=("initial_request", "pending_comment", "latest_user_reply"),
+        required_input_keys=("initial_request", "server_offer", "pending_comment", "latest_user_reply"),
         binding_callable=_staged_comment_save_since_wait_prompt,
     ),
     "project_comment_approval": SmallClassifierTaskSpec(
