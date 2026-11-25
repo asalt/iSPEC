@@ -967,7 +967,8 @@ def _generate_vllm_reply(
     temperature = _assistant_temperature()
     if temperature is not None:
         payload_base["temperature"] = temperature
-    if tools is not None:
+    # An empty tool list (a no-tools route) is sent as a plain chat request.
+    if tools:
         payload_base["tools"] = tools
         payload_base["tool_choice"] = tool_choice if tool_choice is not None else "auto"
     cleaned_extra_body: dict[str, Any] | None = None
@@ -1173,7 +1174,7 @@ def _generate_vllm_reply(
                     content = str(choice0.get("text") or "")
     if validated_reply is not None:
         content, tool_calls, finish_reason = validated_reply
-    if tools is not None and not tool_calls and not strict_protocol:
+    if tools and not tool_calls and not strict_protocol:
         salvaged_tool_calls, salvage_shape = _salvage_vllm_tool_calls_from_content(content)
         if salvaged_tool_calls:
             tool_calls = salvaged_tool_calls

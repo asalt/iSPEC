@@ -658,3 +658,20 @@ def test_generate_reply_vllm_salvages_wrapped_function_tool_call_from_content(mo
     assert reply.tool_calls and reply.tool_calls[0]["function"]["name"] == "count_all_projects"
     assert reply.meta["tool_parser_fallback_used"] is True
     assert reply.meta["tool_parser_fallback_shape"] == "function_wrapper"
+
+
+def test_generate_reply_vllm_sends_empty_tool_list_as_plain_chat(monkeypatch):
+    monkeypatch.setenv("ISPEC_ASSISTANT_PROVIDER", "vllm")
+    monkeypatch.setenv("ISPEC_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ISPEC_VLLM_MODEL", "test-model")
+    payloads: list[dict[str, Any]] = []
+
+    def fake_post(url: str, *, json: dict[str, Any], headers: dict[str, str], timeout: float) -> _DummyResponse:
+        payloads.append(json)
+        return _DummyResponse({"choices": [{"message": {"role": "assistant", "content": "You're welcome!"}}]})
+
+    monkeypatch.setattr(service.requests, "post", fake_post)
+
+    reply = service.generate_reply(message="Thanks!", history=None, context=None, tools=[])
+    assert reply.content == "You're welcome!"
+    assert "tools" not in payloads[0] and "tool_choice" not in payloads[0]
